@@ -9,17 +9,18 @@ const buttonVariants = cva(
   {
     variants: {
       variant: {
-        default: "bg-gradient-primary text-white shadow-elevation hover:shadow-glow transition-all duration-300",
+        default: "bg-gradient-primary text-white shadow-elevation hover:shadow-glow transition-all duration-300 font-medium",
         destructive:
-          "bg-destructive text-destructive-foreground hover:bg-destructive/90",
+          "bg-destructive text-destructive-foreground hover:bg-destructive/90 shadow-elevation",
         outline:
-          "border border-input bg-card hover:bg-accent hover:text-accent-foreground shadow-elevation",
+          "border-2 border-border bg-card hover:bg-accent hover:text-accent-foreground shadow-elevation hover:shadow-card transition-all duration-300",
         secondary:
-          "bg-secondary text-secondary-foreground hover:bg-secondary/80 shadow-elevation",
-        ghost: "hover:bg-accent hover:text-accent-foreground",
-        link: "text-primary underline-offset-4 hover:underline",
-        hero: "bg-gradient-hero text-primary-foreground border border-primary/20 hover:shadow-glow transition-all duration-300 font-semibold",
-        success: "bg-gradient-success text-white shadow-elevation hover:shadow-glow transition-all duration-300",
+          "bg-secondary text-secondary-foreground hover:bg-secondary/80 shadow-elevation font-medium",
+        ghost: "hover:bg-accent hover:text-accent-foreground transition-all duration-200",
+        link: "text-primary underline-offset-4 hover:underline font-medium",
+        hero: "bg-gradient-hero text-white border-2 border-primary/30 hover:shadow-elegant transition-all duration-300 font-semibold",
+        success: "bg-gradient-success text-white shadow-elevation hover:shadow-glow transition-all duration-300 font-medium",
+        elegant: "bg-gradient-elegant text-white shadow-elegant hover:shadow-glow transition-all duration-300 font-semibold",
       },
       size: {
         default: "h-10 px-4 py-2",
