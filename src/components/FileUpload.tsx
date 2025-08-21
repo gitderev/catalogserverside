@@ -15,7 +15,7 @@ export const FileUpload: React.FC<FileUploadProps> = ({
   onFileSelect,
   selectedFile,
   title,
-  accept = '.csv'
+  accept = '.txt'
 }) => {
   const onDrop = useCallback((acceptedFiles: File[]) => {
     if (acceptedFiles.length > 0) {
@@ -26,8 +26,8 @@ export const FileUpload: React.FC<FileUploadProps> = ({
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
     accept: {
-      'text/csv': ['.csv'],
-      'application/vnd.ms-excel': ['.csv']
+      'text/plain': ['.txt'],
+      'text/tab-separated-values': ['.txt', '.tsv']
     },
     multiple: false
   });
@@ -52,14 +52,14 @@ export const FileUpload: React.FC<FileUploadProps> = ({
           <input {...getInputProps()} />
           <Upload className="mx-auto h-12 w-12 text-muted-foreground mb-4" />
           {isDragActive ? (
-            <p className="text-primary font-medium">Rilascia il file CSV qui...</p>
+            <p className="text-primary font-medium">Rilascia il file TXT qui...</p>
           ) : (
             <div>
               <p className="text-foreground font-medium mb-2">
-                Trascina il file CSV qui o clicca per selezionare
+                Trascina il file TXT qui o clicca per selezionare
               </p>
               <p className="text-muted-foreground text-sm">
-                Supporta solo file .csv
+                Supporta file .txt con delimitatori (virgola, tab, punto e virgola)
               </p>
             </div>
           )}

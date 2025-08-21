@@ -6,15 +6,15 @@ import { Separator } from '@/components/ui/separator';
 import { FileUpload } from '@/components/FileUpload';
 import { DataPreview } from '@/components/DataPreview';
 import { ColumnMapping } from '@/components/ColumnMapping';
-import { parseCSV, mergeCSVData, exportToExcel, autoDetectSKUColumn, ParsedCSV } from '@/utils/csvMerger';
+import { parseTXT, mergeTXTData, exportToExcel, autoDetectSKUColumn, ParsedTXT } from '@/utils/txtMerger';
 import { useToast } from '@/hooks/use-toast';
 import { Merge, Download, FileSpreadsheet, CheckCircle } from 'lucide-react';
 
 const Index = () => {
   const [file1, setFile1] = useState<File | null>(null);
   const [file2, setFile2] = useState<File | null>(null);
-  const [parsedData1, setParsedData1] = useState<ParsedCSV | null>(null);
-  const [parsedData2, setParsedData2] = useState<ParsedCSV | null>(null);
+  const [parsedData1, setParsedData1] = useState<ParsedTXT | null>(null);
+  const [parsedData2, setParsedData2] = useState<ParsedTXT | null>(null);
   const [skuColumn1, setSkuColumn1] = useState<string>('');
   const [skuColumn2, setSkuColumn2] = useState<string>('');
   const [mergedData, setMergedData] = useState<any[] | null>(null);
@@ -40,7 +40,7 @@ const Index = () => {
           setIsProcessing(true);
           setProgress(25);
           
-          const parsed = await parseCSV(file);
+          const parsed = await parseTXT(file);
           const detectedSKU = autoDetectSKUColumn(parsed.headers);
           
           if (fileNumber === 1) {
@@ -85,7 +85,7 @@ const Index = () => {
       setIsProcessing(true);
       setProgress(20);
 
-      const merged = mergeCSVData(
+      const merged = mergeTXTData(
         parsedData1.data,
         parsedData2.data,
         skuColumn1,
@@ -116,7 +116,7 @@ const Index = () => {
     
     try {
       const timestamp = new Date().toISOString().split('T')[0];
-      exportToExcel(mergedData, `csv_merged_${timestamp}`);
+      exportToExcel(mergedData, `txt_merged_${timestamp}`);
       
       toast({
         title: "Export completato",
@@ -142,10 +142,10 @@ const Index = () => {
           <div className="text-center">
             <div className="flex items-center justify-center gap-3 mb-4">
               <FileSpreadsheet className="h-10 w-10 text-primary" />
-              <h1 className="text-4xl font-bold text-primary">CSV Merger Pro</h1>
+              <h1 className="text-4xl font-bold text-primary">TXT Merger Pro</h1>
             </div>
             <p className="text-xl text-primary/80 max-w-2xl mx-auto">
-              Unisci facilmente due file CSV basandoti sui codici SKU per creare un database completo dei tuoi prodotti
+              Unisci facilmente due file TXT basandoti sui codici SKU per creare un database completo dei tuoi prodotti
             </p>
           </div>
         </div>
@@ -168,12 +168,12 @@ const Index = () => {
         {/* File Upload Section */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
           <FileUpload
-            title="File CSV 1"
+            title="File TXT 1"
             onFileSelect={handleFileSelect(1)}
             selectedFile={file1}
           />
           <FileUpload
-            title="File CSV 2"
+            title="File TXT 2"
             onFileSelect={handleFileSelect(2)}
             selectedFile={file2}
           />
@@ -225,7 +225,7 @@ const Index = () => {
             className="min-w-[200px]"
           >
             <Merge className="mr-2 h-5 w-5" />
-            Unisci File CSV
+            Unisci File TXT
           </Button>
           
           <Button
@@ -260,13 +260,14 @@ const Index = () => {
         {/* Instructions */}
         <Card className="p-6 bg-accent/30">
           <h3 className="text-lg font-semibold text-card-foreground mb-4">
-            Come utilizzare CSV Merger Pro
+            Come utilizzare TXT Merger Pro
           </h3>
           <ol className="list-decimal list-inside space-y-2 text-muted-foreground">
-            <li>Carica i tuoi due file CSV utilizzando i riquadri sopra</li>
+            <li>Carica i tuoi due file TXT utilizzando i riquadri sopra</li>
+            <li>Il sistema rileva automaticamente il delimitatore (virgola, tab, punto e virgola)</li>
             <li>Verifica che le colonne SKU siano state rilevate automaticamente</li>
             <li>Se necessario, seleziona manualmente le colonne contenenti i codici SKU</li>
-            <li>Clicca su "Unisci File CSV" per elaborare i dati</li>
+            <li>Clicca su "Unisci File TXT" per elaborare i dati</li>
             <li>Scarica il file Excel con tutti i dati uniti per codice SKU</li>
           </ol>
         </Card>
