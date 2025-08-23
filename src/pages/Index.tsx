@@ -1,7 +1,7 @@
-import CatalogProcessor from '@/components/CatalogProcessor';
+import ElaboratoreCatalogo from '@/components/ElaboratoreCatalogo';
 
 const Index = () => {
-  return <CatalogProcessor />;
+  return <ElaboratoreCatalogo />;
 };
 
 export default Index;
