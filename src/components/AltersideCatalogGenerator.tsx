@@ -361,83 +361,83 @@ const AltersideCatalogGenerator: React.FC = () => {
     const fileState = files[type];
     
     return (
-      <div className="flat-card p-6">
-        <div className="flex items-center justify-between mb-4">
-          <h3 className="text-xl font-semibold text-card-foreground">{title}</h3>
-          {fileState.status === 'valid' && (
-            <div className="flat-badge-success">
-              <CheckCircle className="w-4 h-4" />
-              Caricato
-            </div>
-          )}
-          {fileState.status === 'error' && (
-            <div className="flat-badge-error">
-              <XCircle className="w-4 h-4" />
-              Errore
-            </div>
-          )}
-        </div>
-
-        <p className="text-muted-foreground text-sm mb-4">{description}</p>
-        
-        <div className="text-xs text-muted-foreground mb-4">
-          <strong>Header richiesti:</strong> {requiredHeaders.join(', ')}
-        </div>
-
-        {!fileState.file ? (
-          <div className="flat-upload-box text-center">
-            <Upload className="mx-auto h-12 w-12 text-muted-foreground mb-4" />
-            <div>
-              <input
-                type="file"
-                accept=".txt,.csv"
-                onChange={(e) => {
-                  const selectedFile = e.target.files?.[0];
-                  if (selectedFile) {
-                    handleFileUpload(selectedFile, type);
-                  }
-                }}
-                className="hidden"
-                id={`file-${type}`}
-              />
-              <label
-                htmlFor={`file-${type}`}
-                className="flat-button cursor-pointer inline-block"
-              >
-                Carica File
-              </label>
-              <p className="text-muted-foreground text-sm mt-3">
-                File CSV con delimitatore ; e encoding UTF-8
-              </p>
-            </div>
+      <div className="card border-strong">
+        <div className="card-body">
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="card-title">{title}</h3>
+            {fileState.status === 'valid' && (
+              <div className="badge-ok">
+                <CheckCircle className="w-4 h-4" />
+                Caricato
+              </div>
+            )}
+            {fileState.status === 'error' && (
+              <div className="badge-err">
+                <XCircle className="w-4 h-4" />
+                Errore
+              </div>
+            )}
           </div>
-        ) : (
-          <div className="flex items-center justify-between p-4 bg-accent rounded-lg">
-            <div className="flex items-center gap-3">
-              <FileText className="h-6 w-6 text-primary" />
+
+          <p className="text-muted text-sm mb-4">{description}</p>
+          
+          <div className="text-xs text-muted mb-4">
+            <strong>Header richiesti:</strong> {requiredHeaders.join(', ')}
+          </div>
+
+          {!fileState.file ? (
+            <div className="dropzone text-center">
+              <Upload className="mx-auto h-12 w-12 icon-dark mb-4" />
               <div>
-                <p className="font-medium text-card-foreground">{fileState.file.name}</p>
-                <p className="text-sm text-muted-foreground">
-                  {fileState.file.data.length} righe
+                <input
+                  type="file"
+                  accept=".txt,.csv"
+                  onChange={(e) => {
+                    const selectedFile = e.target.files?.[0];
+                    if (selectedFile) {
+                      handleFileUpload(selectedFile, type);
+                    }
+                  }}
+                  className="hidden"
+                  id={`file-${type}`}
+                />
+                <label
+                  htmlFor={`file-${type}`}
+                  className="btn btn-primary cursor-pointer px-6 py-3"
+                >
+                  Carica File
+                </label>
+                <p className="text-muted text-sm mt-3">
+                  File CSV con delimitatore ; e encoding UTF-8
                 </p>
               </div>
             </div>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setFiles(prev => ({ ...prev, [type]: { file: null, status: 'none' } }))}
-              className="text-destructive hover:text-destructive"
-            >
-              Rimuovi
-            </Button>
-          </div>
-        )}
+          ) : (
+            <div className="flex items-center justify-between p-4 bg-white rounded-lg border-strong">
+              <div className="flex items-center gap-3">
+                <FileText className="h-6 w-6 icon-dark" />
+                <div>
+                  <p className="font-medium">{fileState.file.name}</p>
+                  <p className="text-sm text-muted">
+                    {fileState.file.data.length} righe
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setFiles(prev => ({ ...prev, [type]: { file: null, status: 'none' } }))}
+                className="btn btn-secondary text-sm px-3 py-2"
+              >
+                Rimuovi
+              </button>
+            </div>
+          )}
 
-        {fileState.status === 'error' && fileState.error && (
-          <div className="mt-4 p-3 bg-destructive/10 border border-destructive/20 rounded-lg">
-            <p className="text-destructive text-sm font-medium">{fileState.error}</p>
-          </div>
-        )}
+          {fileState.status === 'error' && fileState.error && (
+            <div className="mt-4 p-3 rounded-lg border-strong" style={{ background: 'var(--error-bg)', color: 'var(--error-fg)' }}>
+              <p className="text-sm font-medium">{fileState.error}</p>
+            </div>
+          )}
+        </div>
       </div>
     );
   };
@@ -445,34 +445,36 @@ const AltersideCatalogGenerator: React.FC = () => {
   const allFilesValid = files.material.status === 'valid' && files.stock.status === 'valid' && files.price.status === 'valid';
 
   return (
-    <div className="min-h-screen bg-background p-6 font-inter">
+    <div className="min-h-screen p-6" style={{ background: 'var(--bg)', color: 'var(--fg)' }}>
       <div className="max-w-7xl mx-auto space-y-8">
         {/* Header */}
         <div className="text-center">
-          <h1 className="text-5xl font-bold text-foreground mb-4">
+          <h1 className="text-5xl font-bold mb-4">
             Alterside Catalog Generator
           </h1>
-          <p className="text-muted-foreground text-xl max-w-3xl mx-auto">
+          <p className="text-muted text-xl max-w-3xl mx-auto">
             Genera due cataloghi Excel distinti (EAN e ManufPartNr) con calcoli avanzati di prezzo e commissioni
           </p>
         </div>
 
         {/* Instructions */}
-        <Card className="p-6 bg-accent/30 border-2 border-accent">
-          <div className="flex items-start gap-4">
-            <AlertCircle className="h-6 w-6 text-primary mt-1 flex-shrink-0" />
-            <div>
-              <h3 className="text-lg font-semibold text-card-foreground mb-3">Specifiche di Elaborazione</h3>
-              <ul className="text-sm text-muted-foreground space-y-2">
-                <li>• <strong>Filtri comuni:</strong> ExistingStock &gt; 1, prezzi numerici validi</li>
-                <li>• <strong>Export EAN:</strong> solo record con EAN non vuoto</li>
-                <li>• <strong>Export ManufPartNr:</strong> solo record con ManufPartNr non vuoto</li>
-                <li>• <strong>Prezzi:</strong> CustBestPrice arrotondato per eccesso, IVA 22%, commissioni 7% + 5%</li>
-                <li>• <strong>Prezzo finale:</strong> arrotondamento a ,99 (da Best) o intero superiore (da Listino)</li>
-              </ul>
+        <div className="card border-strong">
+          <div className="card-body">
+            <div className="flex items-start gap-4">
+              <AlertCircle className="h-6 w-6 icon-dark mt-1 flex-shrink-0" />
+              <div>
+                <h3 className="card-title mb-3">Specifiche di Elaborazione</h3>
+                <ul className="text-sm text-muted space-y-2">
+                  <li>• <strong>Filtri comuni:</strong> ExistingStock &gt; 1, prezzi numerici validi</li>
+                  <li>• <strong>Export EAN:</strong> solo record con EAN non vuoto</li>
+                  <li>• <strong>Export ManufPartNr:</strong> solo record con ManufPartNr non vuoto</li>
+                  <li>• <strong>Prezzi:</strong> CustBestPrice arrotondato per eccesso, IVA 22%, commissioni 7% + 5%</li>
+                  <li>• <strong>Prezzo finale:</strong> arrotondamento a ,99 (da Best) o intero superiore (da Listino)</li>
+                </ul>
+              </div>
             </div>
           </div>
-        </Card>
+        </div>
 
         {/* File Upload Cards */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -499,11 +501,10 @@ const AltersideCatalogGenerator: React.FC = () => {
         {/* Process Button */}
         {allFilesValid && (
           <div className="text-center">
-            <Button
+            <button
               onClick={processData}
               disabled={processing}
-              size="lg"
-              className="flat-button-success text-lg px-12 py-4"
+              className={`btn btn-primary text-lg px-12 py-4 ${processing ? 'is-disabled' : ''}`}
             >
               {processing ? (
                 <>
@@ -516,177 +517,180 @@ const AltersideCatalogGenerator: React.FC = () => {
                   ELABORA DATI
                 </>
               )}
-            </Button>
+            </button>
           </div>
         )}
 
         {/* Progress Section */}
         {processing && (
-          <Card className="p-6 processing-section">
-            <h3 className="text-xl font-semibold mb-6 flex items-center gap-2">
-              <Activity className="h-5 w-5 animate-spin" />
-              Progresso Elaborazione
-            </h3>
-            
-            <div className="space-y-4">
-              <div className="flat-progress">
-                <div 
-                  className="flat-progress-fill"
-                  style={{ width: `${progress.progress}%` }}
-                />
-              </div>
+          <div className="card border-strong">
+            <div className="card-body">
+              <h3 className="card-title mb-6 flex items-center gap-2">
+                <Activity className="h-5 w-5 animate-spin icon-dark" />
+                Progresso Elaborazione
+              </h3>
               
-              <div className="flex justify-between text-sm">
-                <span className="font-medium">{progress.stage}</span>
-                <span className="font-bold">{progress.progress}%</span>
-              </div>
-              
-              {progress.totalRecords > 0 && (
-                <div className="text-sm text-muted-foreground">
-                  Record elaborati: {progress.recordsProcessed.toLocaleString()} / {progress.totalRecords.toLocaleString()}
+              <div className="space-y-4">
+                <div className="progress">
+                  <span style={{ width: `${progress.progress}%` }} />
                 </div>
-              )}
-              
-              <div className="flex items-center gap-6 text-sm">
-                <div className="flex items-center gap-2">
-                  <Clock className="h-4 w-4" />
-                  <span>Trascorso: {formatTime(processingTime.elapsed)}</span>
+                
+                <div className="flex justify-between text-sm">
+                  <span className="font-medium">{progress.stage}</span>
+                  <span className="font-bold">{progress.progress}%</span>
                 </div>
-                {processingTime.estimated > 0 && (
-                  <div className="flex items-center gap-2">
-                    <Clock className="h-4 w-4" />
-                    <span>Stimato: {formatTime(processingTime.estimated)}</span>
+                
+                {progress.totalRecords > 0 && (
+                  <div className="text-sm text-muted">
+                    Record elaborati: {progress.recordsProcessed.toLocaleString()} / {progress.totalRecords.toLocaleString()}
                   </div>
                 )}
+                
+                <div className="flex items-center gap-6 text-sm">
+                  <div className="flex items-center gap-2">
+                    <Clock className="h-4 w-4 icon-dark" />
+                    <span>Trascorso: {formatTime(processingTime.elapsed)}</span>
+                  </div>
+                  {processingTime.estimated > 0 && (
+                    <div className="flex items-center gap-2">
+                      <Clock className="h-4 w-4 icon-dark" />
+                      <span>Stimato: {formatTime(processingTime.estimated)}</span>
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
-          </Card>
+          </div>
         )}
 
         {/* Statistics */}
         {stats && (
-          <Card className="p-6">
-            <h3 className="text-xl font-semibold text-card-foreground mb-6">Statistiche Elaborazione</h3>
-            <div className="flat-stats-grid">
-              <div className="flat-stats-card bg-accent">
-                <div className="flat-stats-number text-primary">{stats.totalRecords.toLocaleString()}</div>
-                <div className="flat-stats-label">Righe Totali</div>
-              </div>
-              <div className="flat-stats-card bg-success/10">
-                <div className="flat-stats-number text-success">{stats.validRecordsEAN.toLocaleString()}</div>
-                <div className="flat-stats-label">Valide EAN</div>
-              </div>
-              <div className="flat-stats-card bg-success/10">
-                <div className="flat-stats-number text-success">{stats.validRecordsManufPartNr.toLocaleString()}</div>
-                <div className="flat-stats-label">Valide ManufPartNr</div>
-              </div>
-              <div className="flat-stats-card bg-destructive/10">
-                <div className="flat-stats-number text-destructive">{stats.filteredRecordsEAN.toLocaleString()}</div>
-                <div className="flat-stats-label">Scartate EAN</div>
-              </div>
-              <div className="flat-stats-card bg-destructive/10">
-                <div className="flat-stats-number text-destructive">{stats.filteredRecordsManufPartNr.toLocaleString()}</div>
-                <div className="flat-stats-label">Scartate ManufPartNr</div>
+          <div className="card border-strong">
+            <div className="card-body">
+              <h3 className="card-title mb-6">Statistiche Elaborazione</h3>
+              <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
+                <div className="text-center p-4 rounded-lg border-strong" style={{ background: '#f8fafc' }}>
+                  <div className="text-2xl font-bold">{stats.totalRecords.toLocaleString()}</div>
+                  <div className="text-sm text-muted">Righe Totali</div>
+                </div>
+                <div className="text-center p-4 rounded-lg border-strong" style={{ background: 'var(--success-bg)' }}>
+                  <div className="text-2xl font-bold" style={{ color: 'var(--success-fg)' }}>{stats.validRecordsEAN.toLocaleString()}</div>
+                  <div className="text-sm text-muted">Valide EAN</div>
+                </div>
+                <div className="text-center p-4 rounded-lg border-strong" style={{ background: 'var(--success-bg)' }}>
+                  <div className="text-2xl font-bold" style={{ color: 'var(--success-fg)' }}>{stats.validRecordsManufPartNr.toLocaleString()}</div>
+                  <div className="text-sm text-muted">Valide ManufPartNr</div>
+                </div>
+                <div className="text-center p-4 rounded-lg border-strong" style={{ background: 'var(--error-bg)' }}>
+                  <div className="text-2xl font-bold" style={{ color: 'var(--error-fg)' }}>{stats.filteredRecordsEAN.toLocaleString()}</div>
+                  <div className="text-sm text-muted">Scartate EAN</div>
+                </div>
+                <div className="text-center p-4 rounded-lg border-strong" style={{ background: 'var(--error-bg)' }}>
+                  <div className="text-2xl font-bold" style={{ color: 'var(--error-fg)' }}>{stats.filteredRecordsManufPartNr.toLocaleString()}</div>
+                  <div className="text-sm text-muted">Scartate ManufPartNr</div>
+                </div>
               </div>
             </div>
-          </Card>
+          </div>
         )}
 
         {/* Download Buttons */}
         {(processedDataEAN.length > 0 || processedDataManufPartNr.length > 0) && (
-          <div className="export-buttons">
-            <Button 
+          <div className="flex flex-wrap justify-center gap-4">
+            <button 
               onClick={() => downloadExcel('ean')} 
-              className="flat-button-success text-lg px-8 py-3"
+              className={`btn btn-primary text-lg px-8 py-3 ${processedDataEAN.length === 0 ? 'is-disabled' : ''}`}
               disabled={processedDataEAN.length === 0}
             >
               <Download className="mr-3 h-5 w-5" />
               SCARICA EXCEL (EAN)
-            </Button>
-            <Button 
+            </button>
+            <button 
               onClick={() => downloadExcel('manufpartnr')} 
-              className="flat-button-success text-lg px-8 py-3"
+              className={`btn btn-primary text-lg px-8 py-3 ${processedDataManufPartNr.length === 0 ? 'is-disabled' : ''}`}
               disabled={processedDataManufPartNr.length === 0}
             >
               <Download className="mr-3 h-5 w-5" />
               SCARICA EXCEL (ManufPartNr)
-            </Button>
-            <Button 
+            </button>
+            <button 
               onClick={() => downloadLog('ean')} 
-              variant="outline" 
-              className="border-2 text-lg px-8 py-3"
+              className={`btn btn-secondary text-lg px-8 py-3 ${logEntriesEAN.length === 0 ? 'is-disabled' : ''}`}
               disabled={logEntriesEAN.length === 0}
             >
               <Download className="mr-3 h-5 w-5" />
               SCARICA LOG (EAN)
-            </Button>
-            <Button 
+            </button>
+            <button 
               onClick={() => downloadLog('manufpartnr')} 
-              variant="outline" 
-              className="border-2 text-lg px-8 py-3"
+              className={`btn btn-secondary text-lg px-8 py-3 ${logEntriesManufPartNr.length === 0 ? 'is-disabled' : ''}`}
               disabled={logEntriesManufPartNr.length === 0}
             >
               <Download className="mr-3 h-5 w-5" />
               SCARICA LOG (ManufPartNr)
-            </Button>
+            </button>
           </div>
         )}
 
         {/* Data Previews */}
         {processedDataEAN.length > 0 && (
-          <Card className="p-6 preview-section">
-            <h3 className="text-xl font-semibold text-card-foreground mb-6">Anteprima Export EAN (Prime 10 Righe)</h3>
-            <div className="overflow-x-auto">
-              <table className="flat-table">
-                <thead>
-                  <tr>
-                    {Object.keys(processedDataEAN[0]).map((header, index) => (
-                      <th key={index}>{header}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {processedDataEAN.slice(0, 10).map((row, rowIndex) => (
-                    <tr key={rowIndex}>
-                      {Object.values(row).map((value, colIndex) => (
-                        <td key={colIndex}>
-                          {typeof value === 'number' ? value.toLocaleString('it-IT') : String(value)}
-                        </td>
+          <div className="card border-strong">
+            <div className="card-body">
+              <h3 className="card-title mb-6">Anteprima Export EAN (Prime 10 Righe)</h3>
+              <div className="overflow-x-auto">
+                <table className="table-zebra">
+                  <thead>
+                    <tr>
+                      {Object.keys(processedDataEAN[0]).map((header, index) => (
+                        <th key={index}>{header}</th>
                       ))}
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {processedDataEAN.slice(0, 10).map((row, rowIndex) => (
+                      <tr key={rowIndex}>
+                        {Object.values(row).map((value, colIndex) => (
+                          <td key={colIndex}>
+                            {typeof value === 'number' ? value.toLocaleString('it-IT') : String(value)}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             </div>
-          </Card>
+          </div>
         )}
 
         {processedDataManufPartNr.length > 0 && (
-          <Card className="p-6 preview-section">
-            <h3 className="text-xl font-semibold text-card-foreground mb-6">Anteprima Export ManufPartNr (Prime 10 Righe)</h3>
-            <div className="overflow-x-auto">
-              <table className="flat-table">
-                <thead>
-                  <tr>
-                    {Object.keys(processedDataManufPartNr[0]).map((header, index) => (
-                      <th key={index}>{header}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {processedDataManufPartNr.slice(0, 10).map((row, rowIndex) => (
-                    <tr key={rowIndex}>
-                      {Object.values(row).map((value, colIndex) => (
-                        <td key={colIndex}>
-                          {typeof value === 'number' ? value.toLocaleString('it-IT') : String(value)}
-                        </td>
+          <div className="card border-strong">
+            <div className="card-body">
+              <h3 className="card-title mb-6">Anteprima Export ManufPartNr (Prime 10 Righe)</h3>
+              <div className="overflow-x-auto">
+                <table className="table-zebra">
+                  <thead>
+                    <tr>
+                      {Object.keys(processedDataManufPartNr[0]).map((header, index) => (
+                        <th key={index}>{header}</th>
                       ))}
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {processedDataManufPartNr.slice(0, 10).map((row, rowIndex) => (
+                      <tr key={rowIndex}>
+                        {Object.values(row).map((value, colIndex) => (
+                          <td key={colIndex}>
+                            {typeof value === 'number' ? value.toLocaleString('it-IT') : String(value)}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             </div>
-          </Card>
+          </div>
         )}
       </div>
     </div>
