@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { toast } from '@/hooks/use-toast';
@@ -13,9 +13,9 @@ interface FileData {
 }
 
 interface FileUploadState {
-  material: { file: FileData | null; status: 'none' | 'valid' | 'error'; error?: string; warning?: string };
-  stock: { file: FileData | null; status: 'none' | 'valid' | 'error' | 'warning'; error?: string; warning?: string };
-  price: { file: FileData | null; status: 'none' | 'valid' | 'error' | 'warning'; error?: string; warning?: string };
+  material: { file: FileData | null; status: 'empty' | 'valid' | 'error' | 'warning'; error?: string; warning?: string; diagnostics?: any };
+  stock: { file: FileData | null; status: 'empty' | 'valid' | 'error' | 'warning'; error?: string; warning?: string; diagnostics?: any };
+  price: { file: FileData | null; status: 'empty' | 'valid' | 'error' | 'warning'; error?: string; warning?: string; diagnostics?: any };
 }
 
 interface ProcessedRecord {
@@ -70,9 +70,9 @@ const OPTIONAL_HEADERS = {
 
 const AltersideCatalogGenerator: React.FC = () => {
   const [files, setFiles] = useState<FileUploadState>({
-    material: { file: null, status: 'none' },
-    stock: { file: null, status: 'none' },
-    price: { file: null, status: 'none' }
+    material: { file: null, status: 'empty' },
+    stock: { file: null, status: 'empty' },
+    price: { file: null, status: 'empty' }
   });
 
   const [processingState, setProcessingState] = useState<'idle' | 'validating' | 'ready' | 'running' | 'completed' | 'failed'>('idle');
@@ -82,6 +82,19 @@ const AltersideCatalogGenerator: React.FC = () => {
   const [estimatedTime, setEstimatedTime] = useState<number | null>(null);
   const [processedRows, setProcessedRows] = useState(0);
   const [totalRows, setTotalRows] = useState(0);
+  
+  // Debug events
+  const [debugEvents, setDebugEvents] = useState<string[]>([]);
+  const [debugState, setDebugState] = useState({
+    materialValid: false,
+    stockValid: false,
+    priceValid: false,
+    stockReady: false,
+    priceReady: false,
+    materialPreScanDone: false,
+    joinStarted: false
+  });
+
   const [processedDataEAN, setProcessedDataEAN] = useState<ProcessedRecord[]>([]);
   const [processedDataManufPartNr, setProcessedDataManufPartNr] = useState<ProcessedRecord[]>([]);
   const [logEntriesEAN, setLogEntriesEAN] = useState<LogEntry[]>([]);
@@ -89,7 +102,22 @@ const AltersideCatalogGenerator: React.FC = () => {
   const [stats, setStats] = useState<ProcessingStats | null>(null);
 
   const workerRef = useRef<Worker | null>(null);
-  const timeInterval = useRef<NodeJS.Timeout | null>(null);
+
+  const isProcessing = processingState === 'running';
+  const isCompleted = processingState === 'completed';
+  const canProcess = processingState === 'ready';
+  
+  // Global debug function
+  const dbg = useCallback((event: string, data?: any) => {
+    const timestamp = new Date().toLocaleTimeString('it-IT', { hour12: false });
+    const message = `[${timestamp}] ${event}${data ? ' | ' + JSON.stringify(data) : ''}`;
+    setDebugEvents(prev => [...prev, message]);
+  }, []);
+  
+  // Make dbg available globally for worker
+  useEffect(() => {
+    (window as any).dbg = dbg;
+  }, [dbg]);
 
   const validateHeaders = (headers: string[], requiredHeaders: string[], optionalHeaders: string[] = []): { 
     valid: boolean; 
@@ -142,11 +170,11 @@ const AltersideCatalogGenerator: React.FC = () => {
       
       if (!validation.valid) {
         const error = `Header mancanti: ${validation.missing.join(', ')}`;
-      setFiles(prev => ({
-        ...prev,
-        [type]: { file: null, status: 'error', error }
-      }));
-      setProcessingState('idle');
+        setFiles(prev => ({
+          ...prev,
+          [type]: { file: null, status: 'error', error }
+        }));
+        setProcessingState('idle');
         
         toast({
           title: "Errore validazione header",
@@ -169,30 +197,29 @@ const AltersideCatalogGenerator: React.FC = () => {
         }
       }
 
-      setFiles(prev => ({
-        ...prev,
-        [type]: {
-          file: {
-            name: file.name,
-            data: parsed.data,
-            headers: parsed.headers
-          },
-          status,
-          warning: status === 'warning' ? warning : undefined
-        }
-      }));
+      // Create file state with diagnostics
+      const headerLine = parsed.headers.join(', ');
+      const firstDataLine = parsed.data.length > 0 ? Object.values(parsed.data[0]).slice(0, 3).join(', ') + '...' : '';
+
+      const fileState = {
+        name: file.name,
+        data: parsed.data,
+        headers: parsed.headers,
+        isValid: validation.valid
+      };
 
       // Update processing state - ready when all files have valid required headers
       const newFiles = {
         ...files,
         [type]: {
-          file: {
-            name: file.name,
-            data: parsed.data,
-            headers: parsed.headers
-          },
-          status,
-          warning: status === 'warning' ? warning : undefined
+          ...files[type],
+          file: fileState,
+          status: fileState.isValid ? 'valid' : 'error',
+          diagnostics: {
+            headerFound: headerLine,
+            firstDataRow: firstDataLine,
+            validation
+          }
         }
       };
       
@@ -204,9 +231,24 @@ const AltersideCatalogGenerator: React.FC = () => {
         return validation.valid; // Only check required headers
       });
       
+      // Update debug state
+      const newDebugState = {
+        materialValid: newFiles.material.file ? validateHeaders(newFiles.material.file.headers, REQUIRED_HEADERS.material).valid : false,
+        stockValid: newFiles.stock.file ? validateHeaders(newFiles.stock.file.headers, REQUIRED_HEADERS.stock).valid : false,
+        priceValid: newFiles.price.file ? validateHeaders(newFiles.price.file.headers, REQUIRED_HEADERS.price).valid : false,
+        stockReady: !!newFiles.stock.file,
+        priceReady: !!newFiles.price.file,
+        materialPreScanDone: debugState.materialPreScanDone,
+        joinStarted: debugState.joinStarted
+      };
+      setDebugState(newDebugState);
+      dbg('state:change', newDebugState);
+      
       if (allRequiredHeadersValid) {
         setProcessingState('ready');
       }
+
+      setFiles(newFiles);
 
       const toastMessage = status === 'warning' 
         ? `${file.name} - ${parsed.data.length} righe (con avviso)`
@@ -234,6 +276,39 @@ const AltersideCatalogGenerator: React.FC = () => {
     }
   };
 
+  const removeFile = (type: keyof FileUploadState) => {
+    setFiles(prevFiles => ({
+      ...prevFiles,
+      [type]: {
+        file: null,
+        status: 'empty',
+        diagnostics: null
+      }
+    }));
+
+    // Reset processing state if no files remain
+    const remainingFiles = Object.entries(files).filter(([key, _]) => key !== type);
+    if (remainingFiles.every(([_, file]) => !file.file)) {
+      setProcessingState('idle');
+      setProgress(0);
+      setStartTime(null);
+      setElapsedTime(0);
+      setEstimatedTime(null);
+      setProcessedRows(0);
+      setTotalRows(0);
+      setDebugEvents([]);
+      setDebugState({
+        materialValid: false,
+        stockValid: false,
+        priceValid: false,
+        stockReady: false,
+        priceReady: false,
+        materialPreScanDone: false,
+        joinStarted: false
+      });
+    }
+  };
+
   const formatTime = (ms: number): string => {
     if (!ms || ms <= 0) return '00:00';
     const seconds = Math.floor(ms / 1000);
@@ -242,7 +317,7 @@ const AltersideCatalogGenerator: React.FC = () => {
   };
 
   // Timer effect
-  React.useEffect(() => {
+  useEffect(() => {
     let interval: NodeJS.Timeout;
     if (processingState === 'running' && startTime) {
       interval = setInterval(() => {
@@ -290,9 +365,11 @@ const AltersideCatalogGenerator: React.FC = () => {
     }
 
     // Count total rows from material file
+    dbg('material:prescan:start');
     const materialRowsCount = files.material.file.data.length;
     
     if (materialRowsCount === 0) {
+      dbg('material:prescan:error', { message: 'Nessuna riga valida nel Material' });
       toast({
         title: "Errore elaborazione",
         description: "Nessuna riga valida nel Material",
@@ -301,62 +378,55 @@ const AltersideCatalogGenerator: React.FC = () => {
       return;
     }
     
+    dbg('material:prescan:done', { materialRowsCount });
+    setDebugState(prev => ({ ...prev, materialPreScanDone: true }));
+    
     setProcessingState('running');
     setProgress(0);
+    setProcessedRows(0);
+    setTotalRows(materialRowsCount);
     setStartTime(Date.now());
     setElapsedTime(0);
     setEstimatedTime(null);
-    setProcessedRows(0);
-    setTotalRows(Math.max(1, materialRowsCount));
 
     try {
       // Create Web Worker
       workerRef.current = new Worker('/alterside-worker.js');
       
       workerRef.current.onmessage = (e) => {
-        const { type, ...data } = e.data;
-        
-        switch (type) {
-          case 'progress':
-            setProgress(Math.min(99, data.progress));
-            if (data.recordsProcessed !== undefined) {
-              setProcessedRows(data.recordsProcessed);
-            }
-            break;
-            
-          case 'complete':
-            setProcessedDataEAN(data.processedDataEAN);
-            setProcessedDataManufPartNr(data.processedDataManufPartNr);
-            setLogEntriesEAN(data.logEntriesEAN);
-            setLogEntriesManufPartNr(data.logEntriesManufPartNr);
-            setStats(data.stats);
-            setProcessingState('completed');
-            setProgress(100);
-            
-            toast({
-              title: "Elaborazione completata",
-              description: `EAN: ${data.processedDataEAN.length} record | ManufPartNr: ${data.processedDataManufPartNr.length} record`
-            });
-            break;
-            
-          case 'error':
-            setProcessingState('failed');
-            toast({
-              title: "Errore elaborazione",
-              description: data.error,
-              variant: "destructive"
-            });
-            break;
+        if (e.data.type === 'debug') {
+          dbg(e.data.event, e.data.data);
+        } else if (e.data.type === 'progress') {
+          setProcessedRows(e.data.processed);
+          setProgress(Math.min(99, Math.floor(e.data.processed / totalRows * 100)));
+        } else if (e.data.type === 'complete') {
+          setProcessedDataEAN(e.data.data.processedDataEAN || []);
+          setProcessedDataManufPartNr(e.data.data.processedDataManufPartNr || []);
+          setLogEntriesEAN(e.data.data.logEntriesEAN || []);
+          setLogEntriesManufPartNr(e.data.data.logEntriesManufPartNr || []);
+          setStats(e.data.data.statistics);
+          setProcessingState('completed');
+          setProgress(100);
+          
+          toast({
+            title: "Elaborazione completata",
+            description: `EAN: ${(e.data.data.processedDataEAN || []).length} record | ManufPartNr: ${(e.data.data.processedDataManufPartNr || []).length} record`
+          });
+        } else if (e.data.type === 'error') {
+          setProcessingState('failed');
+          toast({
+            title: "Errore elaborazione",
+            description: e.data.error,
+            variant: "destructive"
+          });
         }
       };
 
       // Send data to worker
       workerRef.current.postMessage({
-        files: {
-          material: files.material.file,
-          stock: files.stock.file,
-          price: files.price.file
-        }
+        materialFile: files.material.file,
+        stockFile: files.stock.file,
+        priceFile: files.price.file
       });
 
     } catch (error) {
@@ -533,16 +603,7 @@ const AltersideCatalogGenerator: React.FC = () => {
                 </div>
               </div>
               <button
-                onClick={() => {
-                  setFiles(prev => ({ ...prev, [type]: { file: null, status: 'none' } }));
-                  setProcessingState('idle');
-                  setStartTime(null);
-                  setProcessedRows(0);
-                  setTotalRows(0);
-                  setElapsedTime(0);
-                  setEstimatedTime(null);
-                  setProgress(0);
-                }}
+                onClick={() => removeFile(type)}
                 className="btn btn-secondary text-sm px-3 py-2"
               >
                 Rimuovi
@@ -583,9 +644,6 @@ const AltersideCatalogGenerator: React.FC = () => {
   const allFilesValid = files.material.status === 'valid' && 
     (files.stock.status === 'valid' || files.stock.status === 'warning') && 
     (files.price.status === 'valid' || files.price.status === 'warning');
-  const canProcess = allFilesValid && (processingState === 'ready' || processingState === 'idle');
-  const isProcessing = processingState === 'running';
-  const isCompleted = processingState === 'completed';
 
   return (
     <div className="min-h-screen p-6" style={{ background: 'var(--bg)', color: 'var(--fg)' }}>
@@ -678,7 +736,7 @@ const AltersideCatalogGenerator: React.FC = () => {
               
               <div className="space-y-4">
                 <div className="text-sm text-muted mb-2">
-                  <strong>Stato corrente:</strong> {processingState === 'running' ? 'running' : processingState}
+                  <strong>Stato corrente:</strong> {processingState}
                 </div>
                 
                 <div className="progress">
@@ -699,14 +757,57 @@ const AltersideCatalogGenerator: React.FC = () => {
                     <Clock className="h-4 w-4 icon-dark" />
                     <span>ETA: {estimatedTime ? formatTime(estimatedTime) : (processedRows > 0 && !isCompleted ? 'calcolo…' : '—')}</span>
                   </div>
+                  <div className="text-sm">
+                    <span className="font-medium">Righe elaborate: {processedRows.toLocaleString()}</span>
+                    {totalRows > 0 && <span className="text-muted"> / {totalRows.toLocaleString()}</span>}
+                  </div>
                 </div>
                 
-                {(isProcessing || isCompleted) && (
-                  <div className="text-sm text-muted">
-                    Elaborati: {processedRows.toLocaleString('it-IT')} / {totalRows.toLocaleString('it-IT')} record
+                {/* Debug State */}
+                <div className="mt-4 p-3 bg-muted rounded-lg">
+                  <h4 className="text-sm font-medium mb-2">Stato Debug</h4>
+                  <div className="grid grid-cols-2 gap-2 text-xs">
+                    <div>materialValid: {debugState.materialValid ? '✓' : '✗'}</div>
+                    <div>stockValid: {debugState.stockValid ? '✓' : '✗'}</div>
+                    <div>priceValid: {debugState.priceValid ? '✓' : '✗'}</div>
+                    <div>stockReady: {debugState.stockReady ? '✓' : '✗'}</div>
+                    <div>priceReady: {debugState.priceReady ? '✓' : '✗'}</div>
+                    <div>materialPreScanDone: {debugState.materialPreScanDone ? '✓' : '✗'}</div>
+                    <div>joinStarted: {debugState.joinStarted ? '✓' : '✗'}</div>
                   </div>
-                )}
+                </div>
               </div>
+            </div>
+          </div>
+        )}
+
+        {/* Debug Events Panel */}
+        {(isProcessing || isCompleted || debugEvents.length > 0) && (
+          <div className="card border-strong">
+            <div className="card-body">
+              <h3 className="card-title mb-4 flex items-center gap-2">
+                <AlertCircle className="h-5 w-5 icon-dark" />
+                Eventi Debug
+              </h3>
+              
+              <textarea
+                value={debugEvents.join('\n')}
+                readOnly
+                className="w-full h-64 p-3 font-mono text-xs bg-muted border border-strong rounded-lg resize-none"
+                style={{ whiteSpace: 'pre-wrap' }}
+              />
+              
+              {debugEvents.length > 0 && (
+                <div className="mt-2 flex justify-between text-xs text-muted">
+                  <span>{debugEvents.length} eventi registrati</span>
+                  <button
+                    onClick={() => setDebugEvents([])}
+                    className="text-primary hover:text-primary-dark"
+                  >
+                    Pulisci log
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         )}
