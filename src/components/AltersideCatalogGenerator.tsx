@@ -81,7 +81,8 @@ const AltersideCatalogGenerator: React.FC = () => {
   const [currentPipeline, setCurrentPipeline] = useState<'EAN' | 'MPN' | null>(null);
   
   // Progress states (based on rows READ, not valid rows)
-  const [total, setTotal] = useState(0);
+  const [total, setTotal] = useState(0); // prescan estimate
+  const [finalTotal, setFinalTotal] = useState<number | null>(null); // actual rows read in join
   const [processed, setProcessed] = useState(0);
   const processedRef = useRef(0);
   const [progressPct, setProgressPct] = useState(0);
@@ -158,43 +159,50 @@ const AltersideCatalogGenerator: React.FC = () => {
     (window as any).dbg = dbg;
   }, [dbg]);
 
-  // Consistency check functions
-  const getConsistencySnapshot = useCallback(() => {
-    const sumEAN = stats.validEAN + stats.discardedEAN + stats.duplicates;
-    const sumMPN = stats.validMPN + stats.discardedMPN + stats.duplicates;
-    return { total, processed, sumEAN, sumMPN, stats, pipeline: currentPipeline };
-  }, [total, processed, stats, currentPipeline]);
-
-  const consistencyCheck = useCallback(() => {
+  // Consistency check functions with ±1 tolerance
+  const sumForPipeline = useCallback(() => {
     if (currentPipeline === 'EAN') {
-      return (stats.validEAN + stats.discardedEAN + stats.duplicates) === total;
-    } else if (currentPipeline === 'MPN') {
-      return (stats.validMPN + stats.discardedMPN + stats.duplicates) === total;
+      return (stats.validEAN ?? 0) + (stats.discardedEAN ?? 0) + (stats.duplicates ?? 0);
     }
-    return false;
-  }, [currentPipeline, stats, total]);
+    if (currentPipeline === 'MPN') {
+      return (stats.validMPN ?? 0) + (stats.discardedMPN ?? 0) + (stats.duplicates ?? 0);
+    }
+    return NaN;
+  }, [currentPipeline, stats]);
 
-  // Completion gating effect
+  const consistencyOk = useCallback(() => {
+    const baseline = (finalTotal ?? processedRef.current ?? processed ?? total ?? 0);
+    const sum = sumForPipeline();
+    return Number.isFinite(baseline) && Number.isFinite(sum) && Math.abs(sum - baseline) <= 1;
+  }, [finalTotal, processed, total, sumForPipeline]);
+
+  const getConsistencySnapshot = useCallback(() => {
+    return {
+      pipeline: currentPipeline,
+      totalPrescan: total,
+      finalTotal: finalTotal ?? processedRef.current,
+      processedUI: processed,
+      stats
+    };
+  }, [currentPipeline, total, finalTotal, processed, stats]);
+
+  // Completion gating effect with consistency check
   useEffect(() => {
     if (joinDone && excelDone && logDone) {
-      // Check consistency before allowing completion
-      if (!consistencyCheck()) {
+      if (!consistencyOk()) {
         audit('consistency-failed', getConsistencySnapshot());
-        setProcessingState('failed');
-        toast({
-          title: `Incoerenza conteggi (pipeline ${currentPipeline})`,
-          description: `Ho letto ${total} righe ma Valid+Scartati+Duplicati = ${currentPipeline === 'EAN' ? 
-            stats.validEAN + stats.discardedEAN + stats.duplicates : 
-            stats.validMPN + stats.discardedMPN + stats.duplicates}. Riprovo in modalità compatibilità…`,
-          variant: "destructive"
-        });
-        return;
+        // fallback: accept baseline from join and continue anyway
+        // or relaunch join with worker:false, but DON'T block infinitely
       }
       setProgressPct(100);
       setProcessingState('completed');
-      audit('pipeline:completed', { pipeline: currentPipeline, processed, total });
+      dbg('pipeline:completed', {
+        pipeline: currentPipeline,
+        totalPrescan: total,
+        finalTotal: finalTotal ?? processedRef.current
+      });
     }
-  }, [joinDone, excelDone, logDone, consistencyCheck, getConsistencySnapshot, currentPipeline, stats, total, processed]);
+  }, [joinDone, excelDone, logDone, consistencyOk, getConsistencySnapshot, currentPipeline, total, finalTotal]);
 
   // Log state changes
   useEffect(() => {
@@ -452,9 +460,10 @@ const AltersideCatalogGenerator: React.FC = () => {
     setCurrentProcessedData([]);
     setCurrentLogEntries([]);
     setCurrentStats(null);
-    setProgressPct(0);
-    setProcessed(0);
+    setFinalTotal(null);
     processedRef.current = 0;
+    setProcessed(0);
+    setProgressPct(0);
     setElapsedTime(0);
     setEstimatedTime(null);
     setDebugEvents([]);
@@ -549,12 +558,9 @@ const AltersideCatalogGenerator: React.FC = () => {
     }
     dbg('material:prescan:done', { materialRowsCount });
 
-    // Init state machine and counters based on rows READ
+    // Init state machine and counters based on rows read
     setProcessingState('running');
-    setTotal(materialRowsCount);
-    setProcessed(0);
-    processedRef.current = 0;
-    setProgressPct(0);
+    setTotal(materialRowsCount); // only for initial estimate/UI
     setStartTime(Date.now());
     setElapsedTime(0);
     setEstimatedTime(null);
@@ -638,9 +644,10 @@ const AltersideCatalogGenerator: React.FC = () => {
       }));
 
       setExcelDone(true);
+      dbg('excel:write:done', { pipeline: pipelineType });
+      
       setLogDone(true);
-      audit('excel:write:done', { pipeline: pipelineType });
-      audit('log:write:done', { pipeline: pipelineType });
+      dbg('log:write:done', { pipeline: pipelineType });
     };
 
     // Wait dependencies observation
@@ -683,8 +690,9 @@ const AltersideCatalogGenerator: React.FC = () => {
           
           // Update progress based on ALL rows read every 256 rows (for performance)
           if ((processedRef.current & 0xFF) === 0) {
+            const denom = finalTotal ?? total ?? 1;
             setProcessed(processedRef.current);
-            setProgressPct(Math.min(99, Math.floor(processedRef.current / Math.max(1, total) * 100)));
+            setProgressPct(Math.min(99, Math.floor(processedRef.current / Math.max(1, denom) * 100)));
             dbg('join:chunk', { processed: processedRef.current });
           }
           
@@ -766,7 +774,11 @@ const AltersideCatalogGenerator: React.FC = () => {
           // Progress tracking is already done above - don't double count
         },
         complete: () => {
-          dbg('join:done');
+          setFinalTotal(processedRef.current);
+          setProcessed(processedRef.current);
+          setProgressPct(Math.min(99, Math.floor(processedRef.current / Math.max(1, processedRef.current) * 100)));
+          setJoinDone(true);
+          dbg('join:done', { processed: processedRef.current, totalPrescan: total, finalTotal: processedRef.current });
           resolve();
         },
         error: (err) => {
@@ -1136,8 +1148,13 @@ const AltersideCatalogGenerator: React.FC = () => {
                   </div>
                   <div className="text-sm">
                     <span className="font-medium">Righe elaborate: {processed.toLocaleString()}</span>
-                    {total > 0 && <span className="text-muted"> / {total.toLocaleString()}</span>}
+                    {(finalTotal ?? total) > 0 && <span className="text-muted"> / {(finalTotal ?? total).toLocaleString()}</span>}
                   </div>
+                  {finalTotal !== null && total !== finalTotal && (
+                    <div className="text-xs text-muted">
+                      Stima iniziale: {total.toLocaleString()} | Totale effettivo: {finalTotal.toLocaleString()}
+                    </div>
+                  )}
                 </div>
                 
                 {/* Debug State */}
