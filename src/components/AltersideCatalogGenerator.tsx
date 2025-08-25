@@ -103,6 +103,15 @@ const AltersideCatalogGenerator: React.FC = () => {
   const [currentLogEntries, setCurrentLogEntries] = useState<LogEntry[]>([]);
   const [currentStats, setCurrentStats] = useState<ProcessingStats | null>(null);
   
+  // Stats state for UI
+  const [stats, setStats] = useState({
+    totalRows: 0,
+    validEAN: 0,
+    validMPN: 0,
+    discardedEAN: 0,
+    discardedMPN: 0
+  });
+  
   // Downloaded files state for buttons
   const [downloadReady, setDownloadReady] = useState({
     ean_excel: false,
@@ -532,6 +541,16 @@ const AltersideCatalogGenerator: React.FC = () => {
         const r: LogEntry = { source_file: 'pricefileData_790813.txt', line: 0, Matnr: '', ManufPartNr: '', EAN: '', reason: 'header_optional_missing', details: 'ManufPartNr assente (uso ManufPartNr da Material)' };
         currentLogs.splice(idx, 0, r);
       }
+
+      // Update stats for UI
+      setStats(prev => ({
+        ...prev,
+        totalRows: materialRowsCount,
+        validEAN: pipelineType === 'EAN' ? currentData.length : prev.validEAN,
+        validMPN: pipelineType === 'MPN' ? currentData.length : prev.validMPN,
+        discardedEAN: pipelineType === 'EAN' ? currentLogs.length - 1 : prev.discardedEAN,
+        discardedMPN: pipelineType === 'MPN' ? currentLogs.length - 1 : prev.discardedMPN
+      }));
 
       // Set current pipeline results
       setCurrentProcessedData(currentData);
