@@ -78,6 +78,7 @@ const AltersideCatalogGenerator: React.FC = () => {
   });
 
   const [processingState, setProcessingState] = useState<'idle' | 'validating' | 'ready' | 'running' | 'completed' | 'failed'>('idle');
+  const [currentPipeline, setCurrentPipeline] = useState<'EAN' | 'MPN' | null>(null);
   const [progress, setProgress] = useState(0);
   const [startTime, setStartTime] = useState<number | null>(null);
   const [elapsedTime, setElapsedTime] = useState(0);
@@ -97,11 +98,18 @@ const AltersideCatalogGenerator: React.FC = () => {
     joinStarted: false
   });
 
-  const [processedDataEAN, setProcessedDataEAN] = useState<ProcessedRecord[]>([]);
-  const [processedDataManufPartNr, setProcessedDataManufPartNr] = useState<ProcessedRecord[]>([]);
-  const [logEntriesEAN, setLogEntriesEAN] = useState<LogEntry[]>([]);
-  const [logEntriesManufPartNr, setLogEntriesManufPartNr] = useState<LogEntry[]>([]);
-  const [stats, setStats] = useState<ProcessingStats | null>(null);
+  // Current pipeline results
+  const [currentProcessedData, setCurrentProcessedData] = useState<ProcessedRecord[]>([]);
+  const [currentLogEntries, setCurrentLogEntries] = useState<LogEntry[]>([]);
+  const [currentStats, setCurrentStats] = useState<ProcessingStats | null>(null);
+  
+  // Downloaded files state for buttons
+  const [downloadReady, setDownloadReady] = useState({
+    ean_excel: false,
+    ean_log: false,
+    mpn_excel: false,
+    mpn_log: false
+  });
 
   const workerRef = useRef<Worker | null>(null);
 
@@ -348,7 +356,7 @@ const AltersideCatalogGenerator: React.FC = () => {
     return () => clearInterval(interval);
   }, [processingState, startTime, processedRows, totalRows]);
 
-  const processData = async () => {
+  const processDataPipeline = async (pipelineType: 'EAN' | 'MPN') => {
     if (!files.material.file || !files.stock.file || !files.price.file) {
       toast({
         title: "File mancanti",
@@ -372,12 +380,25 @@ const AltersideCatalogGenerator: React.FC = () => {
       return;
     }
 
-    // Reset outputs
-    setProcessedDataEAN([]);
-    setProcessedDataManufPartNr([]);
-    setLogEntriesEAN([]);
-    setLogEntriesManufPartNr([]);
-    setStats(null);
+    // Reset all state for new pipeline
+    setCurrentPipeline(pipelineType);
+    setCurrentProcessedData([]);
+    setCurrentLogEntries([]);
+    setCurrentStats(null);
+    setProgress(0);
+    setProcessedRows(0);
+    setElapsedTime(0);
+    setEstimatedTime(null);
+    setDebugEvents([]);
+    setDebugState({
+      materialValid: true,
+      stockValid: true,
+      priceValid: true,
+      stockReady: false,
+      priceReady: false,
+      materialPreScanDone: false,
+      joinStarted: false
+    });
 
     // Build maps (parse events)
     const stockMap = new Map<string, { ExistingStock: number }>();
@@ -483,6 +504,9 @@ const AltersideCatalogGenerator: React.FC = () => {
     };
 
     const finalize = () => {
+      dbg('excel:write:start');
+      dbg('log:write:start');
+      
       // Session header + optional header warnings
       const sessionRow: LogEntry = {
         source_file: 'session',
@@ -493,34 +517,44 @@ const AltersideCatalogGenerator: React.FC = () => {
         reason: 'session_start',
         details: JSON.stringify({ event: 'session_start', materialRowsCount, optionalHeadersMissing, fees: { mediaworld: 0.08, alterside: 0.05 }, timestamp: new Date().toISOString() })
       };
-      logsEAN.unshift(sessionRow);
-      logsMPN.unshift(sessionRow);
+      
+      // For current pipeline, filter only relevant data
+      const currentData = pipelineType === 'EAN' ? processedEAN : processedMPN;
+      const currentLogs = pipelineType === 'EAN' ? logsEAN : logsMPN;
+      
+      currentLogs.unshift(sessionRow);
       if (optionalHeadersMissing.stock) {
         const r: LogEntry = { source_file: 'StockFileData_790813.txt', line: 0, Matnr: '', ManufPartNr: '', EAN: '', reason: 'header_optional_missing', details: 'ManufPartNr assente (uso ManufPartNr da Material)' };
-        logsEAN.splice(1, 0, r);
-        logsMPN.splice(1, 0, r);
+        currentLogs.splice(1, 0, r);
       }
       if (optionalHeadersMissing.price) {
         const idx = 1 + (optionalHeadersMissing.stock ? 1 : 0);
         const r: LogEntry = { source_file: 'pricefileData_790813.txt', line: 0, Matnr: '', ManufPartNr: '', EAN: '', reason: 'header_optional_missing', details: 'ManufPartNr assente (uso ManufPartNr da Material)' };
-        logsEAN.splice(idx, 0, r);
-        logsMPN.splice(idx, 0, r);
+        currentLogs.splice(idx, 0, r);
       }
 
-      setProcessedDataEAN(processedEAN);
-      setProcessedDataManufPartNr(processedMPN);
-      setLogEntriesEAN(logsEAN);
-      setLogEntriesManufPartNr(logsMPN);
-      setStats({
+      // Set current pipeline results
+      setCurrentProcessedData(currentData);
+      setCurrentLogEntries(currentLogs);
+      setCurrentStats({
         totalRecords: materialRowsCount,
-        validRecordsEAN: processedEAN.length,
-        validRecordsManufPartNr: processedMPN.length,
-        filteredRecordsEAN: logsEAN.length - 1,
-        filteredRecordsManufPartNr: logsMPN.length - 1,
+        validRecordsEAN: pipelineType === 'EAN' ? currentData.length : 0,
+        validRecordsManufPartNr: pipelineType === 'MPN' ? currentData.length : 0,
+        filteredRecordsEAN: pipelineType === 'EAN' ? currentLogs.length - 1 : 0,
+        filteredRecordsManufPartNr: pipelineType === 'MPN' ? currentLogs.length - 1 : 0,
         stockDuplicates,
         priceDuplicates
       });
 
+      // Update download ready state
+      setDownloadReady(prev => ({
+        ...prev,
+        [pipelineType.toLowerCase() + '_excel']: currentData.length > 0,
+        [pipelineType.toLowerCase() + '_log']: currentLogs.length > 0
+      }));
+
+      dbg('excel:write:done');
+      dbg('log:write:done');
       setProcessingState('completed');
       setProgress(100);
     };
@@ -704,17 +738,20 @@ const AltersideCatalogGenerator: React.FC = () => {
   };
 
   const downloadExcel = (type: 'ean' | 'manufpartnr') => {
-    const data = type === 'ean' ? processedDataEAN : processedDataManufPartNr;
-    if (data.length === 0) return;
-
+    if (currentProcessedData.length === 0) return;
+    
+    dbg('excel:write:start');
+    
     const { timestamp, sheetName } = getTimestamp();
     const filename = `catalogo_${type}_${timestamp}.xlsx`;
 
-    const excelData = formatExcelData(data);
+    const excelData = formatExcelData(currentProcessedData);
     const ws = XLSX.utils.json_to_sheet(excelData);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, sheetName);
     XLSX.writeFile(wb, filename);
+
+    dbg('excel:write:done');
 
     toast({
       title: "Excel scaricato",
@@ -723,13 +760,14 @@ const AltersideCatalogGenerator: React.FC = () => {
   };
 
   const downloadLog = (type: 'ean' | 'manufpartnr') => {
-    const logs = type === 'ean' ? logEntriesEAN : logEntriesManufPartNr;
-    if (logs.length === 0 && !stats) return;
+    if (currentLogEntries.length === 0 && !currentStats) return;
+    
+    dbg('log:write:start');
 
     const { timestamp, sheetName } = getTimestamp();
     const filename = `catalogo_log_${type}_${timestamp}.xlsx`;
 
-    const logData = logs.map(entry => ({
+    const logData = currentLogEntries.map(entry => ({
       'File Sorgente': entry.source_file,
       'Riga': entry.line,
       'Matnr': entry.Matnr,
@@ -743,6 +781,8 @@ const AltersideCatalogGenerator: React.FC = () => {
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, sheetName);
     XLSX.writeFile(wb, filename);
+
+    dbg('log:write:done');
 
     toast({
       title: "Log scaricato",
@@ -931,26 +971,46 @@ const AltersideCatalogGenerator: React.FC = () => {
           />
         </div>
 
-        {/* Process Button */}
+        {/* Action Buttons */}
         {allFilesValid && (
           <div className="text-center">
-            <button
-              onClick={processData}
-              disabled={!canProcess || isProcessing}
-              className={`btn btn-primary text-lg px-12 py-4 ${!canProcess || isProcessing ? 'is-disabled' : ''}`}
-            >
-              {isProcessing ? (
-                <>
-                  <Activity className="mr-3 h-5 w-5 animate-spin" />
-                  Elaborazione in corso...
-                </>
-              ) : (
-                <>
-                  <Upload className="mr-3 h-5 w-5" />
-                  ELABORA DATI
-                </>
-              )}
-            </button>
+            <h3 className="text-2xl font-bold mb-6">Azioni</h3>
+            <div className="flex flex-wrap justify-center gap-6">
+              <button
+                onClick={() => processDataPipeline('EAN')}
+                disabled={!canProcess || isProcessing}
+                className={`btn btn-primary text-lg px-12 py-4 ${!canProcess || isProcessing ? 'is-disabled' : ''}`}
+              >
+                {isProcessing && currentPipeline === 'EAN' ? (
+                  <>
+                    <Activity className="mr-3 h-5 w-5 animate-spin" />
+                    Elaborazione EAN...
+                  </>
+                ) : (
+                  <>
+                    <Upload className="mr-3 h-5 w-5" />
+                    GENERA EXCEL (EAN)
+                  </>
+                )}
+              </button>
+              <button
+                onClick={() => processDataPipeline('MPN')}
+                disabled={!canProcess || isProcessing}
+                className={`btn btn-primary text-lg px-12 py-4 ${!canProcess || isProcessing ? 'is-disabled' : ''}`}
+              >
+                {isProcessing && currentPipeline === 'MPN' ? (
+                  <>
+                    <Activity className="mr-3 h-5 w-5 animate-spin" />
+                    Elaborazione ManufPartNr...
+                  </>
+                ) : (
+                  <>
+                    <Upload className="mr-3 h-5 w-5" />
+                    GENERA EXCEL (ManufPartNr)
+                  </>
+                )}
+              </button>
+            </div>
           </div>
         )}
 
@@ -1042,30 +1102,30 @@ const AltersideCatalogGenerator: React.FC = () => {
         )}
 
         {/* Statistics */}
-        {stats && (
+        {currentStats && (
           <div className="card border-strong">
             <div className="card-body">
-              <h3 className="card-title mb-6">Statistiche Elaborazione</h3>
-              <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
+              <h3 className="card-title mb-6">Statistiche Elaborazione - Pipeline {currentPipeline}</h3>
+              <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
                 <div className="text-center p-4 rounded-lg border-strong" style={{ background: '#f8fafc' }}>
-                  <div className="text-2xl font-bold">{stats.totalRecords.toLocaleString()}</div>
+                  <div className="text-2xl font-bold">{currentStats.totalRecords.toLocaleString()}</div>
                   <div className="text-sm text-muted">Righe Totali</div>
                 </div>
                 <div className="text-center p-4 rounded-lg border-strong" style={{ background: 'var(--success-bg)' }}>
-                  <div className="text-2xl font-bold" style={{ color: 'var(--success-fg)' }}>{stats.validRecordsEAN.toLocaleString()}</div>
-                  <div className="text-sm text-muted">Valide EAN</div>
-                </div>
-                <div className="text-center p-4 rounded-lg border-strong" style={{ background: 'var(--success-bg)' }}>
-                  <div className="text-2xl font-bold" style={{ color: 'var(--success-fg)' }}>{stats.validRecordsManufPartNr.toLocaleString()}</div>
-                  <div className="text-sm text-muted">Valide ManufPartNr</div>
+                  <div className="text-2xl font-bold" style={{ color: 'var(--success-fg)' }}>
+                    {currentPipeline === 'EAN' ? currentStats.validRecordsEAN.toLocaleString() : currentStats.validRecordsManufPartNr.toLocaleString()}
+                  </div>
+                  <div className="text-sm text-muted">Valide {currentPipeline}</div>
                 </div>
                 <div className="text-center p-4 rounded-lg border-strong" style={{ background: 'var(--error-bg)' }}>
-                  <div className="text-2xl font-bold" style={{ color: 'var(--error-fg)' }}>{stats.filteredRecordsEAN.toLocaleString()}</div>
-                  <div className="text-sm text-muted">Scartate EAN</div>
+                  <div className="text-2xl font-bold" style={{ color: 'var(--error-fg)' }}>
+                    {currentPipeline === 'EAN' ? currentStats.filteredRecordsEAN.toLocaleString() : currentStats.filteredRecordsManufPartNr.toLocaleString()}
+                  </div>
+                  <div className="text-sm text-muted">Scartate {currentPipeline}</div>
                 </div>
-                <div className="text-center p-4 rounded-lg border-strong" style={{ background: 'var(--error-bg)' }}>
-                  <div className="text-2xl font-bold" style={{ color: 'var(--error-fg)' }}>{stats.filteredRecordsManufPartNr.toLocaleString()}</div>
-                  <div className="text-sm text-muted">Scartate ManufPartNr</div>
+                <div className="text-center p-4 rounded-lg border-strong" style={{ background: '#fff3cd' }}>
+                  <div className="text-2xl font-bold" style={{ color: '#856404' }}>{currentStats.stockDuplicates + currentStats.priceDuplicates}</div>
+                  <div className="text-sm text-muted">Duplicati</div>
                 </div>
               </div>
             </div>
@@ -1073,89 +1133,44 @@ const AltersideCatalogGenerator: React.FC = () => {
         )}
 
         {/* Download Buttons */}
-        {(processedDataEAN.length > 0 || processedDataManufPartNr.length > 0) && (
-          <div className="flex flex-wrap justify-center gap-4">
-            <button 
-              onClick={() => downloadExcel('ean')} 
-              className={`btn btn-primary text-lg px-8 py-3 ${processedDataEAN.length === 0 ? 'is-disabled' : ''}`}
-              disabled={processedDataEAN.length === 0}
-            >
-              <Download className="mr-3 h-5 w-5" />
-              SCARICA EXCEL (EAN)
-            </button>
-            <button 
-              onClick={() => downloadExcel('manufpartnr')} 
-              className={`btn btn-primary text-lg px-8 py-3 ${processedDataManufPartNr.length === 0 ? 'is-disabled' : ''}`}
-              disabled={processedDataManufPartNr.length === 0}
-            >
-              <Download className="mr-3 h-5 w-5" />
-              SCARICA EXCEL (ManufPartNr)
-            </button>
-            <button 
-              onClick={() => downloadLog('ean')} 
-              className={`btn btn-secondary text-lg px-8 py-3 ${logEntriesEAN.length === 0 ? 'is-disabled' : ''}`}
-              disabled={logEntriesEAN.length === 0}
-            >
-              <Download className="mr-3 h-5 w-5" />
-              SCARICA LOG (EAN)
-            </button>
-            <button 
-              onClick={() => downloadLog('manufpartnr')} 
-              className={`btn btn-secondary text-lg px-8 py-3 ${logEntriesManufPartNr.length === 0 ? 'is-disabled' : ''}`}
-              disabled={logEntriesManufPartNr.length === 0}
-            >
-              <Download className="mr-3 h-5 w-5" />
-              SCARICA LOG (ManufPartNr)
-            </button>
-          </div>
-        )}
-
-        {/* Data Previews */}
-        {processedDataEAN.length > 0 && (
-          <div className="card border-strong">
-            <div className="card-body">
-              <h3 className="card-title mb-6">Anteprima Export EAN (Prime 10 Righe)</h3>
-              <div className="overflow-x-auto">
-                <table className="table-zebra">
-                  <thead>
-                    <tr>
-                      {Object.keys(processedDataEAN[0]).map((header, index) => (
-                        <th key={index}>{header}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {processedDataEAN.slice(0, 10).map((row, rowIndex) => (
-                      <tr key={rowIndex}>
-                        {Object.values(row).map((value, colIndex) => (
-                          <td key={colIndex}>
-                            {typeof value === 'number' ? value.toLocaleString('it-IT') : String(value)}
-                          </td>
-                        ))}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+        {isCompleted && currentProcessedData.length > 0 && (
+          <div className="text-center">
+            <h3 className="text-2xl font-bold mb-6">Download Pipeline {currentPipeline}</h3>
+            <div className="flex flex-wrap justify-center gap-4">
+              <button 
+                onClick={() => downloadExcel(currentPipeline === 'EAN' ? 'ean' : 'manufpartnr')} 
+                className="btn btn-primary text-lg px-8 py-3"
+              >
+                <Download className="mr-3 h-5 w-5" />
+                SCARICA EXCEL ({currentPipeline})
+              </button>
+              <button 
+                onClick={() => downloadLog(currentPipeline === 'EAN' ? 'ean' : 'manufpartnr')} 
+                className="btn btn-secondary text-lg px-8 py-3"
+              >
+                <Download className="mr-3 h-5 w-5" />
+                SCARICA LOG ({currentPipeline})
+              </button>
             </div>
           </div>
         )}
 
-        {processedDataManufPartNr.length > 0 && (
+        {/* Data Preview */}
+        {currentProcessedData.length > 0 && (
           <div className="card border-strong">
             <div className="card-body">
-              <h3 className="card-title mb-6">Anteprima Export ManufPartNr (Prime 10 Righe)</h3>
+              <h3 className="card-title mb-6">Anteprima Export {currentPipeline} (Prime 10 Righe)</h3>
               <div className="overflow-x-auto">
                 <table className="table-zebra">
                   <thead>
                     <tr>
-                      {Object.keys(processedDataManufPartNr[0]).map((header, index) => (
+                      {Object.keys(currentProcessedData[0]).map((header, index) => (
                         <th key={index}>{header}</th>
                       ))}
                     </tr>
                   </thead>
                   <tbody>
-                    {processedDataManufPartNr.slice(0, 10).map((row, rowIndex) => (
+                    {currentProcessedData.slice(0, 10).map((row, rowIndex) => (
                       <tr key={rowIndex}>
                         {Object.values(row).map((value, colIndex) => (
                           <td key={colIndex}>
