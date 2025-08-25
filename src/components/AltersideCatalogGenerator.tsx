@@ -79,12 +79,21 @@ const AltersideCatalogGenerator: React.FC = () => {
 
   const [processingState, setProcessingState] = useState<'idle' | 'validating' | 'ready' | 'running' | 'completed' | 'failed'>('idle');
   const [currentPipeline, setCurrentPipeline] = useState<'EAN' | 'MPN' | null>(null);
-  const [progress, setProgress] = useState(0);
+  
+  // Progress states (based on rows READ, not valid rows)
+  const [total, setTotal] = useState(0);
+  const [processed, setProcessed] = useState(0);
+  const processedRef = useRef(0);
+  const [progressPct, setProgressPct] = useState(0);
+  
   const [startTime, setStartTime] = useState<number | null>(null);
   const [elapsedTime, setElapsedTime] = useState(0);
   const [estimatedTime, setEstimatedTime] = useState<number | null>(null);
-  const [processedRows, setProcessedRows] = useState(0);
-  const [totalRows, setTotalRows] = useState(0);
+  
+  // Completion gating flags
+  const [joinDone, setJoinDone] = useState(false);
+  const [excelDone, setExcelDone] = useState(false);
+  const [logDone, setLogDone] = useState(false);
   
   // Debug events
   const [debugEvents, setDebugEvents] = useState<string[]>([]);
@@ -109,7 +118,8 @@ const AltersideCatalogGenerator: React.FC = () => {
     validEAN: 0,
     validMPN: 0,
     discardedEAN: 0,
-    discardedMPN: 0
+    discardedMPN: 0,
+    duplicates: 0
   });
   
   // Downloaded files state for buttons
@@ -126,6 +136,13 @@ const AltersideCatalogGenerator: React.FC = () => {
   const isCompleted = processingState === 'completed';
   const canProcess = processingState === 'ready';
   
+  // Audit function for critical debugging
+  const audit = useCallback((msg: string, data?: any) => {
+    const logEntry = `AUDIT: ${msg}${data ? ' | ' + JSON.stringify(data) : ''}`;
+    console.warn(logEntry);
+    dbg(logEntry);
+  }, []);
+
   // Global debug function
   const dbg = useCallback((event: string, data?: any) => {
     const timestamp = new Date().toLocaleTimeString('it-IT', { hour12: false });
@@ -137,6 +154,44 @@ const AltersideCatalogGenerator: React.FC = () => {
   useEffect(() => {
     (window as any).dbg = dbg;
   }, [dbg]);
+
+  // Consistency check functions
+  const getConsistencySnapshot = useCallback(() => {
+    const sumEAN = stats.validEAN + stats.discardedEAN + stats.duplicates;
+    const sumMPN = stats.validMPN + stats.discardedMPN + stats.duplicates;
+    return { total, processed, sumEAN, sumMPN, stats, pipeline: currentPipeline };
+  }, [total, processed, stats, currentPipeline]);
+
+  const consistencyCheck = useCallback(() => {
+    if (currentPipeline === 'EAN') {
+      return (stats.validEAN + stats.discardedEAN + stats.duplicates) === total;
+    } else if (currentPipeline === 'MPN') {
+      return (stats.validMPN + stats.discardedMPN + stats.duplicates) === total;
+    }
+    return false;
+  }, [currentPipeline, stats, total]);
+
+  // Completion gating effect
+  useEffect(() => {
+    if (joinDone && excelDone && logDone) {
+      // Check consistency before allowing completion
+      if (!consistencyCheck()) {
+        audit('consistency-failed', getConsistencySnapshot());
+        setProcessingState('failed');
+        toast({
+          title: `Incoerenza conteggi (pipeline ${currentPipeline})`,
+          description: `Ho letto ${total} righe ma Valid+Scartati+Duplicati = ${currentPipeline === 'EAN' ? 
+            stats.validEAN + stats.discardedEAN + stats.duplicates : 
+            stats.validMPN + stats.discardedMPN + stats.duplicates}. Riprovo in modalità compatibilità…`,
+          variant: "destructive"
+        });
+        return;
+      }
+      setProgressPct(100);
+      setProcessingState('completed');
+      audit('pipeline:completed', { pipeline: currentPipeline, processed, total });
+    }
+  }, [joinDone, excelDone, logDone, consistencyCheck, getConsistencySnapshot, currentPipeline, stats, total, processed]);
 
   // Log state changes
   useEffect(() => {
@@ -315,12 +370,12 @@ const AltersideCatalogGenerator: React.FC = () => {
     const remainingFiles = Object.entries(files).filter(([key, _]) => key !== type);
     if (remainingFiles.every(([_, file]) => !file.file)) {
       setProcessingState('idle');
-      setProgress(0);
+      setProgressPct(0);
       setStartTime(null);
       setElapsedTime(0);
       setEstimatedTime(null);
-      setProcessedRows(0);
-      setTotalRows(0);
+      setProcessed(0);
+      setTotal(0);
       setDebugEvents([]);
       setDebugState({
         materialValid: false,
@@ -350,10 +405,10 @@ const AltersideCatalogGenerator: React.FC = () => {
         setElapsedTime(elapsed);
         
         // Calculate ETA every 500ms
-        if (processedRows > 0 && totalRows > 0) {
-          const rate = processedRows / (elapsed / 1000);
+        if (processed > 0 && total > 0) {
+          const rate = processed / (elapsed / 1000);
           if (rate >= 0.1) {
-            const remaining = Math.max(0, totalRows - processedRows);
+            const remaining = Math.max(0, total - processed);
             const etaSec = remaining / rate;
             setEstimatedTime(etaSec * 1000);
           } else {
@@ -363,7 +418,7 @@ const AltersideCatalogGenerator: React.FC = () => {
       }, 500);
     }
     return () => clearInterval(interval);
-  }, [processingState, startTime, processedRows, totalRows]);
+  }, [processingState, startTime, processed, total]);
 
   const processDataPipeline = async (pipelineType: 'EAN' | 'MPN') => {
     if (!files.material.file || !files.stock.file || !files.price.file) {
@@ -394,11 +449,17 @@ const AltersideCatalogGenerator: React.FC = () => {
     setCurrentProcessedData([]);
     setCurrentLogEntries([]);
     setCurrentStats(null);
-    setProgress(0);
-    setProcessedRows(0);
+    setProgressPct(0);
+    setProcessed(0);
+    processedRef.current = 0;
     setElapsedTime(0);
     setEstimatedTime(null);
     setDebugEvents([]);
+    
+    // Reset completion gating flags
+    setJoinDone(false);
+    setExcelDone(false);
+    setLogDone(false);
     setDebugState({
       materialValid: true,
       stockValid: true,
@@ -485,11 +546,12 @@ const AltersideCatalogGenerator: React.FC = () => {
     }
     dbg('material:prescan:done', { materialRowsCount });
 
-    // Init state machine and counters
+    // Init state machine and counters based on rows READ
     setProcessingState('running');
-    setProgress(0);
-    setProcessedRows(0);
-    setTotalRows(materialRowsCount);
+    setTotal(materialRowsCount);
+    setProcessed(0);
+    processedRef.current = 0;
+    setProgressPct(0);
     setStartTime(Date.now());
     setElapsedTime(0);
     setEstimatedTime(null);
@@ -572,15 +634,15 @@ const AltersideCatalogGenerator: React.FC = () => {
         [pipelineType.toLowerCase() + '_log']: currentLogs.length > 0
       }));
 
-      dbg('excel:write:done');
-      dbg('log:write:done');
-      setProcessingState('completed');
-      setProgress(100);
+      setExcelDone(true);
+      setLogDone(true);
+      audit('excel:write:done', { pipeline: pipelineType });
+      audit('log:write:done', { pipeline: pipelineType });
     };
 
     // Wait dependencies observation
     setTimeout(() => {
-      if (totalRows > 0 && processedRows === 0) {
+      if (total > 0 && processed === 0) {
         toast({ title: 'Elaborazione non avviata: verifico dipendenze', description: '', variant: 'default' });
         dbg('join_waiting_dependencies');
       }
@@ -612,6 +674,17 @@ const AltersideCatalogGenerator: React.FC = () => {
         step: (results, parser) => {
           if (!firstChunk) { firstChunk = true; clearTimeout(fallbackTimer); }
           parserRef = parser;
+          
+          // CRITICAL FIX: Count ALL rows read FIRST, before any filtering
+          processedRef.current += 1;
+          
+          // Update progress based on ALL rows read every 256 rows (for performance)
+          if ((processedRef.current & 0xFF) === 0) {
+            setProcessed(processedRef.current);
+            setProgressPct(Math.min(99, Math.floor(processedRef.current / Math.max(1, total) * 100)));
+            dbg('join:chunk', { processed: processedRef.current });
+          }
+          
           const row = results.data as any;
           const matnr = row?.Matnr?.toString().trim();
           if (!matnr) return;
@@ -687,14 +760,7 @@ const AltersideCatalogGenerator: React.FC = () => {
             logsMPN.push(le);
           }
 
-          processedLocal++;
-          const newProcessed = processedLocal;
-          setProcessedRows(p => {
-            const val = newProcessed; 
-            setProgress(Math.min(99, Math.floor((val / materialRowsCount) * 100)));
-            return val;
-          });
-          dbg('join:chunk', { processed: newProcessed });
+          // Progress tracking is already done above - don't double count
         },
         complete: () => {
           dbg('join:done');
@@ -1048,11 +1114,11 @@ const AltersideCatalogGenerator: React.FC = () => {
                 </div>
                 
                 <div className="progress">
-                  <span style={{ width: `${progress}%` }} />
+                  <span style={{ width: `${progressPct}%` }} />
                 </div>
                 
                 <div className="flex justify-between text-sm">
-                  <span className="font-medium">{progress}%</span>
+                  <span className="font-medium">{progressPct}%</span>
                   <span className="font-bold">Completato</span>
                 </div>
                 
@@ -1063,11 +1129,11 @@ const AltersideCatalogGenerator: React.FC = () => {
                   </div>
                   <div className="flex items-center gap-2">
                     <Clock className="h-4 w-4 icon-dark" />
-                    <span>ETA: {estimatedTime ? formatTime(estimatedTime) : (processedRows > 0 && !isCompleted ? 'calcolo…' : '—')}</span>
+                    <span>ETA: {estimatedTime ? formatTime(estimatedTime) : (processed > 0 && !isCompleted ? 'calcolo…' : '—')}</span>
                   </div>
                   <div className="text-sm">
-                    <span className="font-medium">Righe elaborate: {processedRows.toLocaleString()}</span>
-                    {totalRows > 0 && <span className="text-muted"> / {totalRows.toLocaleString()}</span>}
+                    <span className="font-medium">Righe elaborate: {processed.toLocaleString()}</span>
+                    {total > 0 && <span className="text-muted"> / {total.toLocaleString()}</span>}
                   </div>
                 </div>
                 
