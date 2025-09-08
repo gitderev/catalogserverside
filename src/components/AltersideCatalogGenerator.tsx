@@ -8,7 +8,7 @@ import { toast } from '@/hooks/use-toast';
 import { Upload, Download, FileText, CheckCircle, XCircle, AlertCircle, Clock, Activity, Info } from 'lucide-react';
 import { filterAndNormalizeForEAN, type EANStats, type DiscardedRow } from '@/utils/ean';
 import { forceEANText, exportDiscardedRowsCSV } from '@/utils/excelFormatter';
-import { toComma99Cents, validateEnding99, computeFinalEan } from '@/utils/pricing';
+import { toComma99Cents, validateEnding99, computeFinalEan, computeFromListPrice, toCents, formatCents } from '@/utils/pricing';
 import * as XLSX from 'xlsx';
 import Papa from 'papaparse';
 
@@ -1077,7 +1077,7 @@ const AltersideCatalogGenerator: React.FC = () => {
         return;
       }
       
-      // Create dataset with proper column order - FORCE computeFinalEan() for Prezzo Finale
+      // Create dataset with proper column order - UNIFIED pricing via computeFinalEan() and computeFromListPrice()
       const dataset = eanFilteredData.map(record => {
         // MANDATORY: Use computeFinalEan() for every EAN row - same as preview/validation
         const input = {
@@ -1090,6 +1090,14 @@ const AltersideCatalogGenerator: React.FC = () => {
         };
         
         const eanResult = computeFinalEan(input, fees, 6, 22);
+        const listPriceResult = computeFromListPrice(record.ListPrice, fees, 6, 22);
+        
+        // Calculate intermediate values for display
+        const baseCents = input.custBestPrice && input.custBestPrice > 0 ? 
+          toCents(input.custBestPrice) : toCents(input.listPrice);
+        const shippingCents = toCents(6);
+        const afterShippingCents = baseCents + shippingCents;
+        const afterIvaCents = Math.floor((afterShippingCents * 122) / 100);
         
         return {
           Matnr: record.Matnr,
@@ -1098,15 +1106,15 @@ const AltersideCatalogGenerator: React.FC = () => {
           ShortDescription: record.ShortDescription,
           ExistingStock: record.ExistingStock,
           CustBestPrice: record.CustBestPrice,
-          'Costo di Spedizione': record['Costo di Spedizione'], // Fixed header
-          IVA: record.IVA,
-          'Prezzo con spediz e IVA': record['Prezzo con spediz e IVA'],
+          'Costo di Spedizione': '6,00',
+          IVA: '22%',
+          'Prezzo con spediz e IVA': formatCents(afterIvaCents),
           FeeDeRev: record.FeeDeRev,
           'Fee Marketplace': record['Fee Marketplace'],
-          'Subtotale post-fee': record['Subtotale post-fee'],
+          'Subtotale post-fee': eanResult.subtotalDisplay,
           'Prezzo Finale': eanResult.finalDisplay, // FORCE finalDisplay string "NN,99"
           ListPrice: record.ListPrice,
-          'ListPrice con Fee': record['ListPrice con Fee'], // Keep as integer ceiling
+          'ListPrice con Fee': listPriceResult.finalDisplayInt, // Integer ceiling
           _eanFinalCents: eanResult.finalCents // Internal field for validation guard
         };
       });
@@ -1152,13 +1160,19 @@ const AltersideCatalogGenerator: React.FC = () => {
       console.warn('AUDIT: ean-ending:ok', { validated: dataset.length, total: dataset.length });
       console.warn('lpfee:integer:ok', { validated: dataset.length, total: dataset.length });
       
-      // Create worksheet
-      const ws = XLSX.utils.json_to_sheet(dataset, { skipHeader: false });
+      // Remove the internal validation field before export - NO "eanFinalCents" column
+      const cleanDataset = dataset.map(record => {
+        const { _eanFinalCents, ...exportRecord } = record;
+        return exportRecord;
+      });
+      
+      // Create worksheet from clean dataset
+      const ws = XLSX.utils.json_to_sheet(cleanDataset, { skipHeader: false });
       
       // Ensure !ref exists
       if (!ws['!ref']) {
-        const rows = dataset.length + 1; // +1 for header
-        const cols = Object.keys(dataset[0] || {}).length;
+        const rows = cleanDataset.length + 1; // +1 for header
+        const cols = Object.keys(cleanDataset[0] || {}).length;
         ws['!ref'] = XLSX.utils.encode_range({s:{r:0,c:0}, e:{r:rows-1,c:cols-1}});
       }
       

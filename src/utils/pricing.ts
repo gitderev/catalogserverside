@@ -67,6 +67,33 @@ export function validateEnding99(value: number): boolean {
 }
 
 /**
+ * ListPrice with Fee computation - integer ceiling after full pipeline
+ */
+export function computeFromListPrice(
+  listPrice: number,
+  fees: { feeDeRev: number; feeMarketplace: number },
+  shipping: number = 6,
+  ivaPerc: number = 22
+): { finalInt: number; finalDisplayInt: string } {
+  
+  // Convert to cents for all calculations
+  const baseCents = toCents(listPrice);
+  const shippingCents = toCents(shipping);
+  
+  // Step by step calculation in cents
+  const afterShippingCents = baseCents + shippingCents;
+  const afterIvaCents = Math.floor((afterShippingCents * (100 + ivaPerc)) / 100);
+  const afterFeeDeRevCents = Math.floor(afterIvaCents * fees.feeDeRev);
+  const afterFeesCents = Math.floor(afterFeeDeRevCents * fees.feeMarketplace);
+  
+  // Ceiling to next integer (multiple of 100 cents)
+  const finalInt = Math.ceil(afterFeesCents / 100) * 100;
+  const finalDisplayInt = Math.floor(finalInt / 100).toString();
+  
+  return { finalInt, finalDisplayInt };
+}
+
+/**
  * Unified EAN price computation in integer cents
  */
 export function computeFinalEan(
@@ -74,7 +101,14 @@ export function computeFinalEan(
   fees: { feeDeRev: number; feeMarketplace: number },
   shipping: number = 6,
   ivaPerc: number = 22
-): { finalCents: number; finalDisplay: string; route: string; debug: any } {
+): { 
+  subtotalCents: number; 
+  subtotalDisplay: string; 
+  finalCents: number; 
+  finalDisplay: string; 
+  route: string; 
+  debug: any 
+} {
   
   // Select base price source
   const usesCbp = input.custBestPrice && input.custBestPrice > 0 && Number.isFinite(input.custBestPrice);
@@ -91,6 +125,10 @@ export function computeFinalEan(
   const afterFeeDeRevCents = Math.floor(afterIvaCents * fees.feeDeRev);
   const afterFeesCents = Math.floor(afterFeeDeRevCents * fees.feeMarketplace);
   
+  // Subtotal after fees (before ,99 ceiling)
+  const subtotalCents = afterFeesCents;
+  const subtotalDisplay = formatCents(subtotalCents);
+  
   // Apply ,99 ending
   const finalCents = toComma99Cents(afterFeesCents);
   const finalDisplay = formatCents(finalCents);
@@ -103,6 +141,7 @@ export function computeFinalEan(
     afterIvaCents,
     afterFeeDeRevCents,
     afterFeesCents,
+    subtotalCents,
     finalCents
   };
   
@@ -114,16 +153,15 @@ export function computeFinalEan(
     const sampleType = route === 'cbp' ? 'ean:sample:cbp' : 'ean:sample:listprice';
     console.warn(sampleType, {
       base: basePrice,
+      route,
       baseCents,
-      afterShippingCents,
-      afterIvaCents,
-      afterFeeDeRevCents,
-      afterFeesCents,
+      subtotalCents,
       finalCents,
+      subtotalDisplay,
       finalDisplay
     });
     (globalThis as any).eanSampleCount++;
   }
   
-  return { finalCents, finalDisplay, route, debug };
+  return { subtotalCents, subtotalDisplay, finalCents, finalDisplay, route, debug };
 }
