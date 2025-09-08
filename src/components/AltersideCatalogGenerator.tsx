@@ -104,13 +104,40 @@ function ceilInt(x: number): number {
   return Math.ceil(x); 
 }
 
-// Round to next "x,99" - improved for floating point precision
+// Ending ,99 function for EAN catalog using integer arithmetic in cents
 function toComma99(v: number): number {
-  if (!Number.isFinite(v)) return 0;
-  const i = Math.floor(v);
-  const target = i + 0.99;
-  const res = (v <= target) ? target : (i + 1 + 0.99);
-  return Number(res.toFixed(2)); // Avoid floating point artifacts
+  if (!Number.isFinite(v) || v <= 0) return v;
+  
+  // Convert to cents using integer arithmetic to avoid floating point errors
+  const cents = Math.floor(v * 100 + 0.5); // +0.5 neutralizes micro binary errors
+  const euros = Math.floor(cents / 100);
+  let resultCents = euros * 100 + 99;
+  
+  // If original value in cents is higher than euros.99, move to next euro + .99
+  if (cents > resultCents) {
+    resultCents = (euros + 1) * 100 + 99;
+  }
+  
+  // Log sample for debugging (once per session)
+  if (typeof (globalThis as any).eanEndingFunctionLogged === 'undefined') {
+    console.warn('ean:ending:function=int-cents');
+    (globalThis as any).eanEndingFunctionLogged = true;
+    if (typeof (globalThis as any).eanEndingSampleCount === 'undefined') {
+      (globalThis as any).eanEndingSampleCount = 0;
+    }
+  }
+  
+  if ((globalThis as any).eanEndingSampleCount < 3) {
+    console.warn('ean:ending:sample', {
+      preFee: v.toFixed(4),
+      centsIn: cents,
+      centsOut: resultCents,
+      final: resultCents / 100
+    });
+    (globalThis as any).eanEndingSampleCount++;
+  }
+  
+  return resultCents / 100;
 }
 
 function computeFinalPrice({
@@ -1046,13 +1073,15 @@ const AltersideCatalogGenerator: React.FC = () => {
         const finalPrice = record['Prezzo Finale'];
         const lpFee = record['ListPrice con Fee'];
         
-        // Validate EAN ending ,99
+        // Validate EAN ending ,99 using integer arithmetic in cents
         if (typeof finalPrice === 'number') {
-          const isValid99 = Math.round((finalPrice * 100) % 100) === 99;
+          const cents = Math.floor(finalPrice * 100 + 0.5); // Same logic as toComma99
+          const isValid99 = (cents % 100) === 99;
           if (!isValid99) {
             failedSamples.push({
               index: i,
               final: finalPrice,
+              cents: cents,
               expectedEnding: '0.99'
             });
           }
