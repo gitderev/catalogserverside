@@ -4,7 +4,6 @@ import { Card } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Checkbox } from '@/components/ui/checkbox';
-import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { toast } from '@/hooks/use-toast';
 import { Upload, Download, FileText, CheckCircle, XCircle, AlertCircle, Clock, Activity, Info } from 'lucide-react';
 import { filterAndNormalizeForEAN, type EANStats, type DiscardedRow } from '@/utils/ean';
@@ -1208,56 +1207,50 @@ const AltersideCatalogGenerator: React.FC = () => {
                   <Label htmlFor="fee-derev" className="text-sm font-medium">
                     Fee DeRev (moltiplicatore)
                   </Label>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <Input
-                        id="fee-derev"
-                        type="number"
-                        min="1.00"
-                        max="2.00"
-                        step="0.01"
-                        value={feeConfig.feeDrev}
-                        onChange={(e) => {
-                          const val = parseFloat(e.target.value);
-                          if (val >= 1.00 && val <= 2.00) {
-                            setFeeConfig(prev => ({ ...prev, feeDrev: val }));
-                          }
-                        }}
-                        className="text-center"
-                      />
-                    </TooltipTrigger>
-                    <TooltipContent>
-                      <p>Inserisci fee come moltiplicatore: 1,05 = +5%, 1,08 = +8%.<br/>Le fee sono applicate in sequenza dopo IVA e spedizione.</p>
-                    </TooltipContent>
-                  </Tooltip>
+                  <Input
+                    id="fee-derev"
+                    type="number"
+                    min="1.00"
+                    max="2.00"
+                    step="0.01"
+                    value={feeConfig.feeDrev}
+                    onChange={(e) => {
+                      const val = parseFloat(e.target.value);
+                      if (val >= 1.00 && val <= 2.00) {
+                        setFeeConfig(prev => ({ ...prev, feeDrev: val }));
+                      }
+                    }}
+                    className="text-center"
+                    title="Inserisci fee come moltiplicatore: 1,05 = +5%, 1,08 = +8%. Le fee sono applicate in sequenza dopo IVA e spedizione."
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Esempio: 1,05 = +5% commissione DeRev
+                  </p>
                 </div>
                 
                 <div className="space-y-2">
                   <Label htmlFor="fee-marketplace" className="text-sm font-medium">
                     Fee Marketplace (moltiplicatore)
                   </Label>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <Input
-                        id="fee-marketplace"
-                        type="number"
-                        min="1.00"
-                        max="2.00"
-                        step="0.01"
-                        value={feeConfig.feeMkt}
-                        onChange={(e) => {
-                          const val = parseFloat(e.target.value);
-                          if (val >= 1.00 && val <= 2.00) {
-                            setFeeConfig(prev => ({ ...prev, feeMkt: val }));
-                          }
-                        }}
-                        className="text-center"
-                      />
-                    </TooltipTrigger>
-                    <TooltipContent>
-                      <p>Fee marketplace applicata dopo Fee DeRev.<br/>Esempio: 1,08 = +8% commissione marketplace.</p>
-                    </TooltipContent>
-                  </Tooltip>
+                  <Input
+                    id="fee-marketplace"
+                    type="number"
+                    min="1.00"
+                    max="2.00"
+                    step="0.01"
+                    value={feeConfig.feeMkt}
+                    onChange={(e) => {
+                      const val = parseFloat(e.target.value);
+                      if (val >= 1.00 && val <= 2.00) {
+                        setFeeConfig(prev => ({ ...prev, feeMkt: val }));
+                      }
+                    }}
+                    className="text-center"
+                    title="Fee marketplace applicata dopo Fee DeRev. Esempio: 1,08 = +8% commissione marketplace."
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Esempio: 1,08 = +8% commissione marketplace
+                  </p>
                 </div>
               </div>
               
