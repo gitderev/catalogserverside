@@ -1077,24 +1077,39 @@ const AltersideCatalogGenerator: React.FC = () => {
         return;
       }
       
-      // Create dataset with proper column order
-      const dataset = eanFilteredData.map(record => ({
-        Matnr: record.Matnr,
-        ManufPartNr: record.ManufPartNr,
-        EAN: record.EAN,
-        ShortDescription: record.ShortDescription,
-        ExistingStock: record.ExistingStock,
-        CustBestPrice: record.CustBestPrice,
-        'Costo di Spedizione': record['Costo di Spedizione'],
-        IVA: record.IVA,
-        'Prezzo con spediz e IVA': record['Prezzo con spediz e IVA'],
-        FeeDeRev: record.FeeDeRev,
-        'Fee Marketplace': record['Fee Marketplace'],
-        'Subtotale post-fee': record['Subtotale post-fee'],
-        'Prezzo Finale': record['Prezzo Finale'],
-        ListPrice: record.ListPrice,
-        'ListPrice con Fee': record['ListPrice con Fee']
-      }));
+      // Create dataset with proper column order - ensure Prezzo Finale uses finalDisplay from computeFinalEan
+      const dataset = eanFilteredData.map(record => {
+        // Recalculate finalDisplay for Excel export to ensure ",99" ending
+        const input = {
+          listPrice: record.ListPrice,
+          custBestPrice: record.CustBestPrice
+        };
+        const fees = {
+          feeDeRev: record.FeeDeRev / 100 + 1, // Convert percentage to multiplier
+          feeMarketplace: record['Fee Marketplace'] / 100 + 1
+        };
+        
+        const eanResult = computeFinalEan(input, fees, 6, 22);
+        
+        return {
+          Matnr: record.Matnr,
+          ManufPartNr: record.ManufPartNr,
+          EAN: record.EAN,
+          ShortDescription: record.ShortDescription,
+          ExistingStock: record.ExistingStock,
+          CustBestPrice: record.CustBestPrice,
+          'Costo di Spedizione': record['Costo di Spedizione'], // Fixed header
+          IVA: record.IVA,
+          'Prezzo con spediz e IVA': record['Prezzo con spediz e IVA'],
+          FeeDeRev: record.FeeDeRev,
+          'Fee Marketplace': record['Fee Marketplace'],
+          'Subtotale post-fee': record['Subtotale post-fee'],
+          'Prezzo Finale': eanResult.finalDisplay, // Use finalDisplay for ",99" ending
+          ListPrice: record.ListPrice,
+          'ListPrice con Fee': record['ListPrice con Fee'],
+          _eanFinalCents: eanResult.finalCents // Internal field for validation
+        };
+      });
       
       // Pre-export validation for EAN ending ,99
       const sampleSize = Math.min(200, dataset.length);
@@ -1208,8 +1223,12 @@ const AltersideCatalogGenerator: React.FC = () => {
       }
       
       // Format decimal columns for EAN export
-      const decimalColumns = ['Prezzo con spediz e IVA', 'Subtotale post-fee', 'Prezzo Finale'];
+      const decimalColumns = ['Prezzo con spediz e IVA', 'Subtotale post-fee'];
+      const stringColumns = ['Prezzo Finale']; // Prezzo Finale uses finalDisplay (string)
       const integerColumns = ['ListPrice con Fee'];
+      
+      // Count guard for debug - check how many rows would have incorrect ending if using numeric values
+      let incorrectEndingCount = 0;
       
       for (let C = range.s.c; C <= range.e.c; C++) {
         const headerAddr = XLSX.utils.encode_cell({ r: 0, c: C });
@@ -1227,9 +1246,25 @@ const AltersideCatalogGenerator: React.FC = () => {
               ws[addr] = cell;
             }
           }
-          if (headerName === 'Prezzo Finale') {
-            console.warn('excel:numfmt:ean-final=0.00');
+        } else if (stringColumns.includes(headerName)) {
+          // Format Prezzo Finale as text to preserve ",99" ending
+          for (let R = 1; R <= range.e.r; R++) {
+            const addr = XLSX.utils.encode_cell({ r: R, c: C });
+            const cell = ws[addr];
+            if (cell) {
+              // Ensure it's formatted as text to preserve the ",99" ending
+              cell.t = 's';
+              cell.z = '@';
+              ws[addr] = cell;
+              
+              // Debug check: verify the finalDisplay ends with ",99"
+              const cellValue = (cell.v ?? '').toString();
+              if (!cellValue.endsWith(',99')) {
+                incorrectEndingCount++;
+              }
+            }
           }
+          console.warn('excel:guard:finalCentsNot99', { count: incorrectEndingCount });
         } else if (integerColumns.includes(headerName)) {
           // Format as integer
           for (let R = 1; R <= range.e.r; R++) {
