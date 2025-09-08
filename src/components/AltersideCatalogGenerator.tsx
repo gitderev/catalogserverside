@@ -8,7 +8,7 @@ import { toast } from '@/hooks/use-toast';
 import { Upload, Download, FileText, CheckCircle, XCircle, AlertCircle, Clock, Activity, Info } from 'lucide-react';
 import { filterAndNormalizeForEAN, type EANStats, type DiscardedRow } from '@/utils/ean';
 import { forceEANText, exportDiscardedRowsCSV } from '@/utils/excelFormatter';
-import { toComma99Cents, validateEnding99, computeFinalEan, computeFromListPrice, toCents, formatCents } from '@/utils/pricing';
+import { toComma99Cents, validateEnding99, computeFinalEan, computeFromListPrice, toCents, formatCents, applyRate } from '@/utils/pricing';
 import * as XLSX from 'xlsx';
 import Papa from 'papaparse';
 
@@ -1079,25 +1079,27 @@ const AltersideCatalogGenerator: React.FC = () => {
       
       // Create dataset with proper column order - UNIFIED pricing via computeFinalEan() and computeFromListPrice()
       const dataset = eanFilteredData.map(record => {
-        // MANDATORY: Use computeFinalEan() for every EAN row - same as preview/validation
+        // MANDATORY: Use computeFinalEan() for every EAN row - unified cents-based pipeline
         const input = {
           listPrice: record.ListPrice,
           custBestPrice: record.CustBestPrice
         };
         const fees = {
-          feeDeRev: record.FeeDeRev / 100 + 1, // Convert percentage to multiplier
-          feeMarketplace: record['Fee Marketplace'] / 100 + 1
+          feeDeRev: record.FeeDeRev,  // Use exact fee values from record
+          feeMarketplace: record['Fee Marketplace']
         };
         
+        // Use UNIFIED pricing functions - same as preview/validation
         const eanResult = computeFinalEan(input, fees, 6, 22);
         const listPriceResult = computeFromListPrice(record.ListPrice, fees, 6, 22);
         
-        // Calculate intermediate values for display
-        const baseCents = input.custBestPrice && input.custBestPrice > 0 ? 
-          toCents(input.custBestPrice) : toCents(input.listPrice);
+        // Calculate step-by-step intermediate values using cents-based pipeline
+        const usesCbp = input.custBestPrice && input.custBestPrice > 0 && Number.isFinite(input.custBestPrice);
+        const basePrice = usesCbp ? input.custBestPrice : Math.ceil(input.listPrice);
+        const baseCents = toCents(basePrice);
         const shippingCents = toCents(6);
         const afterShippingCents = baseCents + shippingCents;
-        const afterIvaCents = Math.floor((afterShippingCents * 122) / 100);
+        const afterIvaCents = applyRate(afterShippingCents, 1.22); // 22% IVA
         
         return {
           Matnr: record.Matnr,
@@ -1111,7 +1113,7 @@ const AltersideCatalogGenerator: React.FC = () => {
           'Prezzo con spediz e IVA': formatCents(afterIvaCents),
           FeeDeRev: record.FeeDeRev,
           'Fee Marketplace': record['Fee Marketplace'],
-          'Subtotale post-fee': eanResult.subtotalDisplay,
+          'Subtotale post-fee': eanResult.subtotalDisplay, // From computeFinalEan()
           'Prezzo Finale': eanResult.finalDisplay, // FORCE finalDisplay string "NN,99"
           ListPrice: record.ListPrice,
           'ListPrice con Fee': listPriceResult.finalDisplayInt, // Integer ceiling
