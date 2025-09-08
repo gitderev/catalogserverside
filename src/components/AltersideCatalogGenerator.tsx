@@ -104,10 +104,13 @@ function ceilInt(x: number): number {
   return Math.ceil(x); 
 }
 
-// Round to next "x,99"
-function toComma99(val: number): number {
-  const i = Math.floor(val);
-  return (val <= i + 0.99) ? (i + 0.99) : (i + 1 + 0.99);
+// Round to next "x,99" - improved for floating point precision
+function toComma99(v: number): number {
+  if (!Number.isFinite(v)) return 0;
+  const i = Math.floor(v);
+  const target = i + 0.99;
+  const res = (v <= target) ? target : (i + 1 + 0.99);
+  return Number(res.toFixed(2)); // Avoid floating point artifacts
 }
 
 function computeFinalPrice({
@@ -129,6 +132,16 @@ function computeFinalPrice({
   // Two final prices, depending on catalog
   const prezzoFinaleEAN = toComma99(postFee);
   const prezzoFinaleMPN = ceilInt(postFee);
+  
+  // Log samples for debugging (static counter to avoid spam)
+  if (typeof (globalThis as any).eanCalcSampleCount === 'undefined') {
+    (globalThis as any).eanCalcSampleCount = 0;
+  }
+  if ((globalThis as any).eanCalcSampleCount < 3) {
+    console.warn('ean:postfee:sample', { postFee: postFee.toFixed(4) });
+    console.warn('ean:final:sample', { final: prezzoFinaleEAN.toFixed(2) });
+    (globalThis as any).eanCalcSampleCount++;
+  }
 
   // Calculate ListPrice con Fee
   const listPriceConFee = (ListPrice && Number.isFinite(ListPrice) && ListPrice > 0) 
@@ -1001,6 +1014,37 @@ const AltersideCatalogGenerator: React.FC = () => {
         'ListPrice con Fee': record['ListPrice con Fee']
       }));
       
+      // Pre-export validation for EAN ending ,99
+      const sampleSize = Math.min(200, dataset.length);
+      const failedSamples: any[] = [];
+      
+      for (let i = 0; i < sampleSize; i++) {
+        const record = dataset[i];
+        const finalPrice = record['Prezzo Finale'];
+        if (typeof finalPrice === 'number') {
+          const isValid99 = Math.round((finalPrice * 100) % 100) === 99;
+          if (!isValid99) {
+            failedSamples.push({
+              index: i,
+              final: finalPrice,
+              expectedEnding: '0.99'
+            });
+          }
+        }
+      }
+      
+      if (failedSamples.length > 0) {
+        console.warn('AUDIT: ean-ending:fail', { failed: failedSamples.slice(0, 3) });
+        toast({
+          title: "Errore validazione ending ,99",
+          description: "Ending ,99 non applicato a tutte le righe EAN. Correggere e riprovare.",
+          variant: "destructive"
+        });
+        return;
+      }
+      
+      console.warn('AUDIT: ean-ending:ok', { validated: sampleSize, total: dataset.length });
+      
       // Create worksheet
       const ws = XLSX.utils.json_to_sheet(dataset, { skipHeader: false });
       
@@ -1036,6 +1080,43 @@ const AltersideCatalogGenerator: React.FC = () => {
             cell.t = 's';
             cell.z = '@';
             ws[addr] = cell;
+          }
+        }
+      }
+      
+      // Format decimal columns for EAN export
+      const decimalColumns = ['Prezzo con spediz e IVA', 'Subtotale post-fee', 'Prezzo Finale'];
+      const integerColumns = ['ListPrice con Fee'];
+      
+      for (let C = range.s.c; C <= range.e.c; C++) {
+        const headerAddr = XLSX.utils.encode_cell({ r: 0, c: C });
+        const headerCell = ws[headerAddr];
+        const headerName = (headerCell?.v ?? '').toString().trim();
+        
+        if (decimalColumns.includes(headerName)) {
+          // Format as decimal with 2 places
+          for (let R = 1; R <= range.e.r; R++) {
+            const addr = XLSX.utils.encode_cell({ r: R, c: C });
+            const cell = ws[addr];
+            if (cell && typeof cell.v === 'number') {
+              cell.t = 'n';
+              cell.z = '#,##0.00';
+              ws[addr] = cell;
+            }
+          }
+          if (headerName === 'Prezzo Finale') {
+            console.warn('excel:numfmt:ean-final=0.00');
+          }
+        } else if (integerColumns.includes(headerName)) {
+          // Format as integer
+          for (let R = 1; R <= range.e.r; R++) {
+            const addr = XLSX.utils.encode_cell({ r: R, c: C });
+            const cell = ws[addr];
+            if (cell && typeof cell.v === 'number') {
+              cell.t = 'n';
+              cell.z = '0';
+              ws[addr] = cell;
+            }
           }
         }
       }
