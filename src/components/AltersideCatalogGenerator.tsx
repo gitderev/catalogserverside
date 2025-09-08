@@ -8,7 +8,7 @@ import { toast } from '@/hooks/use-toast';
 import { Upload, Download, FileText, CheckCircle, XCircle, AlertCircle, Clock, Activity, Info } from 'lucide-react';
 import { filterAndNormalizeForEAN, type EANStats, type DiscardedRow } from '@/utils/ean';
 import { forceEANText, exportDiscardedRowsCSV } from '@/utils/excelFormatter';
-import { toComma99Cents, validateEnding99 } from '@/utils/pricing';
+import { toComma99Cents, validateEnding99, computeFinalEan } from '@/utils/pricing';
 import * as XLSX from 'xlsx';
 import Papa from 'papaparse';
 
@@ -113,38 +113,85 @@ function computeFinalPrice({
   postFee: number, prezzoFinaleEAN: number, prezzoFinaleMPN: number, listPriceConFee: number | string
 } {
   const shipping = 6.00;
-  const hasBest = Number.isFinite(CustBestPrice) && CustBestPrice! > 0;
-  const base0 = hasBest ? Number(CustBestPrice) : ceilInt(Number(ListPrice || 0));
-  const subtotBaseSped = base0 + shipping;
-  const iva = subtotBaseSped * 0.22;
-  const subtotConIva = subtotBaseSped + iva;
-
-  // Apply fees in sequence as decimal multipliers
-  const postFee = subtotConIva * feeDrev * feeMkt;
-
-  // Two final prices, depending on catalog
-  const prezzoFinaleEAN = toComma99Cents(postFee);
-  const prezzoFinaleMPN = ceilInt(postFee);
+  const ivaMultiplier = 1.22;
   
-  // Log samples for debugging (static counter to avoid spam)
-  if (typeof (globalThis as any).eanCalcSampleCount === 'undefined') {
-    (globalThis as any).eanCalcSampleCount = 0;
+  const hasBest = Number.isFinite(CustBestPrice) && CustBestPrice! > 0;
+  const hasListPrice = Number.isFinite(ListPrice) && ListPrice! > 0;
+  
+  let base = 0;
+  let baseRoute = '';
+  
+  // Select base price with route tracking
+  if (hasBest) {
+    base = CustBestPrice!;
+    baseRoute = 'cbp';
+  } else if (hasListPrice) {
+    base = Math.ceil(ListPrice!); // ONLY ceil allowed in EAN pipeline - on ListPrice as base
+    baseRoute = 'listprice_ceiled';
+  } else {
+    // No valid price
+    return { 
+      base: 0, shipping, iva: 0, subtotConIva: 0, 
+      postFee: 0, prezzoFinaleEAN: 0, prezzoFinaleMPN: 0, listPriceConFee: '' 
+    };
   }
-  if ((globalThis as any).eanCalcSampleCount < 3) {
-    console.warn('ean:postfee:sample', { postFee: postFee.toFixed(4) });
-    console.warn('ean:final:sample', { final: prezzoFinaleEAN.toFixed(2) });
-    (globalThis as any).eanCalcSampleCount++;
+  
+  // Calculate for display/compatibility (old pipeline values)
+  const subtot_base_sped = base + shipping;
+  const iva = subtot_base_sped * 0.22;
+  const subtotConIva = subtot_base_sped + iva;
+  const postFee = subtotConIva * feeDrev * feeMkt;
+  
+  // EAN final price: use new computeFinalEan function (cent-precise with ending ,99)
+  const prezzoFinaleEAN = computeFinalEan(base, shipping, ivaMultiplier, feeDrev, feeMkt);
+  
+  // MPN final price: use old logic (ceil to integer)
+  const prezzoFinaleMPN = Math.ceil(postFee);
+  
+  // Log samples for EAN route debugging (separate counters for cbp vs listprice)
+  if (baseRoute === 'cbp') {
+    if (typeof (globalThis as any).eanSampleCbpCount === 'undefined') {
+      (globalThis as any).eanSampleCbpCount = 0;
+    }
+    if ((globalThis as any).eanSampleCbpCount < 3) {
+      console.warn('ean:sample:cbp', {
+        base: base,
+        withShip: base + shipping,
+        withVat: (base + shipping) * ivaMultiplier,
+        withFeeDR: (base + shipping) * ivaMultiplier * feeDrev,
+        withFeeMkt: (base + shipping) * ivaMultiplier * feeDrev * feeMkt,
+        final: prezzoFinaleEAN
+      });
+      (globalThis as any).eanSampleCbpCount++;
+    }
+  } else if (baseRoute === 'listprice_ceiled') {
+    if (typeof (globalThis as any).eanSampleLpCount === 'undefined') {
+      (globalThis as any).eanSampleLpCount = 0;
+    }
+    if ((globalThis as any).eanSampleLpCount < 3) {
+      console.warn('ean:sample:listprice', {
+        baseSource: 'listprice_ceiled',
+        originalListPrice: ListPrice,
+        base: base,
+        withShip: base + shipping,
+        withVat: (base + shipping) * ivaMultiplier,
+        withFeeDR: (base + shipping) * ivaMultiplier * feeDrev,
+        withFeeMkt: (base + shipping) * ivaMultiplier * feeDrev * feeMkt,
+        final: prezzoFinaleEAN
+      });
+      (globalThis as any).eanSampleLpCount++;
+    }
   }
-
-  // Calculate ListPrice con Fee - full pipeline independent from main calculation
+  
+  // Calculate ListPrice con Fee - SEPARATE pipeline, independent from main calculation
   let listPriceConFee: number | string = '';
-  if (ListPrice && Number.isFinite(ListPrice) && ListPrice > 0) {
-    const baseLP = Number(ListPrice);
+  if (hasListPrice) {
+    const baseLP = ListPrice!; // use ListPrice as-is, no ceil here
     const subtotBasSpedLP = baseLP + shipping;
     const ivaLP = subtotBasSpedLP * 0.22;
     const subtotConIvaLP = subtotBasSpedLP + ivaLP;
     const postFeeLP = subtotConIvaLP * feeDrev * feeMkt;
-    listPriceConFee = Math.ceil(postFeeLP);
+    listPriceConFee = Math.ceil(postFeeLP); // ceil to integer for ListPrice con Fee
     
     // Log samples for debugging (static counter to avoid spam)
     if (typeof (globalThis as any).lpfeeCalcSampleCount === 'undefined') {
@@ -163,7 +210,7 @@ function computeFinalPrice({
     }
   }
 
-  return { base: base0, shipping, iva, subtotConIva, postFee, prezzoFinaleEAN, prezzoFinaleMPN, listPriceConFee };
+  return { base, shipping, iva, subtotConIva, postFee, prezzoFinaleEAN, prezzoFinaleMPN, listPriceConFee };
 }
 
 const AltersideCatalogGenerator: React.FC = () => {
@@ -699,15 +746,19 @@ const AltersideCatalogGenerator: React.FC = () => {
 
     const computeFinalPriceForEAN = (row: any): number => {
       const custBestPrice = parseFloat(row.CustBestPrice);
-      if (!isFinite(custBestPrice)) return 0;
+      const listPrice = parseFloat(row.ListPrice);
       
-      const calc = computeFinalPrice({
-        CustBestPrice: custBestPrice,
-        ListPrice: parseFloat(row.ListPrice),
-        feeDrev: feeConfig.feeDrev,
-        feeMkt: feeConfig.feeMkt
-      });
-      return calc.prezzoFinaleEAN;
+      // Use computeFinalEan for consistency
+      const hasBest = Number.isFinite(custBestPrice) && custBestPrice > 0;
+      const hasListPrice = Number.isFinite(listPrice) && listPrice > 0;
+      
+      if (hasBest) {
+        return computeFinalEan(custBestPrice, 6, 1.22, feeConfig.feeDrev, feeConfig.feeMkt);
+      } else if (hasListPrice) {
+        return computeFinalEan(Math.ceil(listPrice), 6, 1.22, feeConfig.feeDrev, feeConfig.feeMkt);
+      }
+      
+      return 0;
     };
 
     const finalize = () => {
@@ -1039,16 +1090,26 @@ const AltersideCatalogGenerator: React.FC = () => {
         const finalPrice = record['Prezzo Finale'];
         const lpFee = record['ListPrice con Fee'];
         
-        // Validate EAN ending ,99 using the same logic as toComma99Cents
+        // Validate EAN ending ,99 - check the EXACT value that goes to Excel
         if (typeof finalPrice === 'number') {
           const isValid99 = validateEnding99(finalPrice);
           if (!isValid99) {
             const cents = Math.floor(finalPrice * 100 + 0.5);
+            
+            // Determine route for debugging
+            const custBest = record.CustBestPrice;
+            const listPrice = record.ListPrice;
+            const hasBest = Number.isFinite(custBest) && custBest > 0;
+            const route = hasBest ? 'cbp' : 'listprice';
+            const basePrice = hasBest ? custBest : (Number.isFinite(listPrice) ? Math.ceil(listPrice) : 0);
+            
             failedSamples.push({
               index: i,
-              matnr: record['MatNr'] || 'N/A',
-              ean: record['EAN'] || 'N/A',
-              finalEan: finalPrice,
+              matnr: record.Matnr || 'N/A',
+              ean: record.EAN || 'N/A',
+              route: route,
+              basePrice: basePrice,
+              final: finalPrice,
               cents: cents
             });
           }
@@ -1069,7 +1130,7 @@ const AltersideCatalogGenerator: React.FC = () => {
       if (failedSamples.length > 0) {
         console.warn('AUDIT: ean-ending:fail', { 
           count: failedSamples.length,
-          failed: failedSamples.slice(0, 5) 
+          failed: failedSamples.slice(0, 10) // Log first 10 failures as requested
         });
         toast({
           title: "Errore validazione ending ,99",
