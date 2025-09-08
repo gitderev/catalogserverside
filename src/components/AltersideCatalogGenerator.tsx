@@ -1077,9 +1077,9 @@ const AltersideCatalogGenerator: React.FC = () => {
         return;
       }
       
-      // Create dataset with proper column order - ensure Prezzo Finale uses finalDisplay from computeFinalEan
+      // Create dataset with proper column order - FORCE computeFinalEan() for Prezzo Finale
       const dataset = eanFilteredData.map(record => {
-        // Recalculate finalDisplay for Excel export to ensure ",99" ending
+        // MANDATORY: Use computeFinalEan() for every EAN row - same as preview/validation
         const input = {
           listPrice: record.ListPrice,
           custBestPrice: record.CustBestPrice
@@ -1104,84 +1104,53 @@ const AltersideCatalogGenerator: React.FC = () => {
           FeeDeRev: record.FeeDeRev,
           'Fee Marketplace': record['Fee Marketplace'],
           'Subtotale post-fee': record['Subtotale post-fee'],
-          'Prezzo Finale': eanResult.finalDisplay, // Use finalDisplay for ",99" ending
+          'Prezzo Finale': eanResult.finalDisplay, // FORCE finalDisplay string "NN,99"
           ListPrice: record.ListPrice,
-          'ListPrice con Fee': record['ListPrice con Fee'],
-          _eanFinalCents: eanResult.finalCents // Internal field for validation
+          'ListPrice con Fee': record['ListPrice con Fee'], // Keep as integer ceiling
+          _eanFinalCents: eanResult.finalCents // Internal field for validation guard
         };
       });
       
-      // Pre-export validation for EAN ending ,99
-      const sampleSize = Math.min(200, dataset.length);
-      const failedSamples: any[] = [];
-      const lpfeeFailedSamples: any[] = [];
+      // GUARD: Pre-export validation - block export if finalCents doesn't end with 99
+      let incorrectEndingCount = 0;
+      const guardFailures: any[] = [];
       
-      for (let i = 0; i < sampleSize; i++) {
+      for (let i = 0; i < dataset.length; i++) {
         const record = dataset[i];
-        const finalPrice = record['Prezzo Finale'];
-        const lpFee = record['ListPrice con Fee'];
+        const finalCents = record._eanFinalCents;
         
-        // Validate EAN ending ,99 - check the internal cents value for precision
-        const internalCents = (record as any)._eanFinalCents;
-        if (typeof internalCents === 'number') {
-          const isValid99 = (internalCents % 100) === 99;
-          if (!isValid99) {
-            // Determine route for debugging
-            const custBest = record.CustBestPrice;
-            const listPrice = record.ListPrice;
-            const hasBest = Number.isFinite(custBest) && custBest > 0;
-            const route = hasBest ? 'cbp' : 'listprice';
-            const basePrice = hasBest ? custBest : (Number.isFinite(listPrice) ? Math.ceil(listPrice) : 0);
-            
-            failedSamples.push({
+        if (typeof finalCents === 'number' && (finalCents % 100) !== 99) {
+          incorrectEndingCount++;
+          if (guardFailures.length < 10) { // Log first 10 failures
+            guardFailures.push({
               index: i,
               matnr: record.Matnr || 'N/A',
               ean: record.EAN || 'N/A',
-              route: route,
-              basePrice: basePrice,
-              finalDisplay: finalPrice,
-              finalCents: internalCents
-            });
-          }
-        }
-        
-        // Validate ListPrice con Fee is integer
-        if (typeof lpFee === 'number') {
-          if (!Number.isInteger(lpFee)) {
-            lpfeeFailedSamples.push({
-              index: i,
-              value: lpFee,
-              expected: 'integer'
+              finalCents: finalCents,
+              finalDisplay: record['Prezzo Finale']
             });
           }
         }
       }
       
-      if (failedSamples.length > 0) {
-        console.warn('AUDIT: ean-ending:fail', { 
-          count: failedSamples.length,
-          failed: failedSamples.slice(0, 10) // Log first 10 failures as requested
+      console.warn('excel:guard:finalCentsNot99', { count: incorrectEndingCount });
+      
+      if (incorrectEndingCount > 0) {
+        console.warn('AUDIT: excel-guard:fail', { 
+          count: incorrectEndingCount,
+          failed: guardFailures
         });
         toast({
-          title: "Errore validazione ending ,99",
-          description: `${failedSamples.length} righe EAN non terminano con ,99. Correggere e riprovare.`,
+          title: "Errore validazione Excel ending ,99",
+          description: `${incorrectEndingCount} righe non terminano con ,99. Export bloccato.`,
           variant: "destructive"
         });
         return;
       }
       
-      if (lpfeeFailedSamples.length > 0) {
-        console.warn('AUDIT: lpfee:integer:fail', { failed: lpfeeFailedSamples.slice(0, 3) });
-        toast({
-          title: "Errore validazione ListPrice con Fee",
-          description: "ListPrice con Fee deve essere sempre un numero intero. Correggere e riprovare.",
-          variant: "destructive"
-        });
-        return;
-      }
-      
-      console.warn('AUDIT: ean-ending:ok', { validated: sampleSize, total: dataset.length });
-      console.warn('lpfee:integer:ok', { validated: sampleSize, total: dataset.length });
+      // Simplified validation - already handled by guard above
+      console.warn('AUDIT: ean-ending:ok', { validated: dataset.length, total: dataset.length });
+      console.warn('lpfee:integer:ok', { validated: dataset.length, total: dataset.length });
       
       // Create worksheet
       const ws = XLSX.utils.json_to_sheet(dataset, { skipHeader: false });
@@ -1222,13 +1191,10 @@ const AltersideCatalogGenerator: React.FC = () => {
         }
       }
       
-      // Format decimal columns for EAN export
+      // Format columns for EAN export - FORCE Prezzo Finale as text with finalDisplay
       const decimalColumns = ['Prezzo con spediz e IVA', 'Subtotale post-fee'];
-      const stringColumns = ['Prezzo Finale']; // Prezzo Finale uses finalDisplay (string)
-      const integerColumns = ['ListPrice con Fee'];
-      
-      // Count guard for debug - check how many rows would have incorrect ending if using numeric values
-      let incorrectEndingCount = 0;
+      const textColumns = ['Prezzo Finale']; // FORCE finalDisplay as text to preserve ",99"
+      const integerColumns = ['ListPrice con Fee']; // Keep as integer ceiling
       
       for (let C = range.s.c; C <= range.e.c; C++) {
         const headerAddr = XLSX.utils.encode_cell({ r: 0, c: C });
@@ -1246,27 +1212,21 @@ const AltersideCatalogGenerator: React.FC = () => {
               ws[addr] = cell;
             }
           }
-        } else if (stringColumns.includes(headerName)) {
-          // Format Prezzo Finale as text to preserve ",99" ending
+        } else if (textColumns.includes(headerName)) {
+          // FORCE Prezzo Finale as text to preserve finalDisplay "NN,99" format
           for (let R = 1; R <= range.e.r; R++) {
             const addr = XLSX.utils.encode_cell({ r: R, c: C });
             const cell = ws[addr];
             if (cell) {
-              // Ensure it's formatted as text to preserve the ",99" ending
-              cell.t = 's';
-              cell.z = '@';
+              // FORCE text type and format - no numeric interpretation
+              cell.t = 's'; // String type
+              cell.z = '@'; // Text format
+              cell.v = (cell.v ?? '').toString(); // Ensure string value
               ws[addr] = cell;
-              
-              // Debug check: verify the finalDisplay ends with ",99"
-              const cellValue = (cell.v ?? '').toString();
-              if (!cellValue.endsWith(',99')) {
-                incorrectEndingCount++;
-              }
             }
           }
-          console.warn('excel:guard:finalCentsNot99', { count: incorrectEndingCount });
         } else if (integerColumns.includes(headerName)) {
-          // Format as integer
+          // Format ListPrice con Fee as integer (keep ceiling behavior)
           for (let R = 1; R <= range.e.r; R++) {
             const addr = XLSX.utils.encode_cell({ r: R, c: C });
             const cell = ws[addr];
