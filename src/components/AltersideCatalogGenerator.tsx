@@ -8,6 +8,7 @@ import { toast } from '@/hooks/use-toast';
 import { Upload, Download, FileText, CheckCircle, XCircle, AlertCircle, Clock, Activity, Info } from 'lucide-react';
 import { filterAndNormalizeForEAN, type EANStats, type DiscardedRow } from '@/utils/ean';
 import { forceEANText, exportDiscardedRowsCSV } from '@/utils/excelFormatter';
+import { toComma99Cents, validateEnding99 } from '@/utils/pricing';
 import * as XLSX from 'xlsx';
 import Papa from 'papaparse';
 
@@ -104,41 +105,6 @@ function ceilInt(x: number): number {
   return Math.ceil(x); 
 }
 
-// Ending ,99 function for EAN catalog using integer arithmetic in cents
-function toComma99(v: number): number {
-  if (!Number.isFinite(v) || v <= 0) return v;
-  
-  // Convert to cents using integer arithmetic to avoid floating point errors
-  const cents = Math.floor(v * 100 + 0.5); // +0.5 neutralizes micro binary errors
-  const euros = Math.floor(cents / 100);
-  let resultCents = euros * 100 + 99;
-  
-  // If original value in cents is higher than euros.99, move to next euro + .99
-  if (cents > resultCents) {
-    resultCents = (euros + 1) * 100 + 99;
-  }
-  
-  // Log sample for debugging (once per session)
-  if (typeof (globalThis as any).eanEndingFunctionLogged === 'undefined') {
-    console.warn('ean:ending:function=int-cents');
-    (globalThis as any).eanEndingFunctionLogged = true;
-    if (typeof (globalThis as any).eanEndingSampleCount === 'undefined') {
-      (globalThis as any).eanEndingSampleCount = 0;
-    }
-  }
-  
-  if ((globalThis as any).eanEndingSampleCount < 3) {
-    console.warn('ean:ending:sample', {
-      preFee: v.toFixed(4),
-      centsIn: cents,
-      centsOut: resultCents,
-      final: resultCents / 100
-    });
-    (globalThis as any).eanEndingSampleCount++;
-  }
-  
-  return resultCents / 100;
-}
 
 function computeFinalPrice({
   CustBestPrice, ListPrice, feeDrev, feeMkt
@@ -157,7 +123,7 @@ function computeFinalPrice({
   const postFee = subtotConIva * feeDrev * feeMkt;
 
   // Two final prices, depending on catalog
-  const prezzoFinaleEAN = toComma99(postFee);
+  const prezzoFinaleEAN = toComma99Cents(postFee);
   const prezzoFinaleMPN = ceilInt(postFee);
   
   // Log samples for debugging (static counter to avoid spam)
@@ -1073,16 +1039,17 @@ const AltersideCatalogGenerator: React.FC = () => {
         const finalPrice = record['Prezzo Finale'];
         const lpFee = record['ListPrice con Fee'];
         
-        // Validate EAN ending ,99 using integer arithmetic in cents
+        // Validate EAN ending ,99 using the same logic as toComma99Cents
         if (typeof finalPrice === 'number') {
-          const cents = Math.floor(finalPrice * 100 + 0.5); // Same logic as toComma99
-          const isValid99 = (cents % 100) === 99;
+          const isValid99 = validateEnding99(finalPrice);
           if (!isValid99) {
+            const cents = Math.floor(finalPrice * 100 + 0.5);
             failedSamples.push({
               index: i,
-              final: finalPrice,
-              cents: cents,
-              expectedEnding: '0.99'
+              matnr: record['MatNr'] || 'N/A',
+              ean: record['EAN'] || 'N/A',
+              finalEan: finalPrice,
+              cents: cents
             });
           }
         }
@@ -1100,10 +1067,13 @@ const AltersideCatalogGenerator: React.FC = () => {
       }
       
       if (failedSamples.length > 0) {
-        console.warn('AUDIT: ean-ending:fail', { failed: failedSamples.slice(0, 3) });
+        console.warn('AUDIT: ean-ending:fail', { 
+          count: failedSamples.length,
+          failed: failedSamples.slice(0, 5) 
+        });
         toast({
           title: "Errore validazione ending ,99",
-          description: "Ending ,99 non applicato a tutte le righe EAN. Correggere e riprovare.",
+          description: `${failedSamples.length} righe EAN non terminano con ,99. Correggere e riprovare.`,
           variant: "destructive"
         });
         return;
