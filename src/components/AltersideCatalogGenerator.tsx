@@ -8,7 +8,20 @@ import { toast } from '@/hooks/use-toast';
 import { Upload, Download, FileText, CheckCircle, XCircle, AlertCircle, Clock, Activity, Info } from 'lucide-react';
 import { filterAndNormalizeForEAN, type EANStats, type DiscardedRow } from '@/utils/ean';
 import { forceEANText, exportDiscardedRowsCSV } from '@/utils/excelFormatter';
-import { toComma99Cents, validateEnding99, computeFinalEan, computeFromListPrice, toCents, formatCents, applyRate } from '@/utils/pricing';
+import { 
+  toComma99Cents, 
+  validateEnding99, 
+  computeFinalEan, 
+  computeFromListPrice, 
+  toCents, 
+  formatCents, 
+  applyRate,
+  applyRateCents,
+  parsePercentToRate,
+  parseRate,
+  ceilToComma99, 
+  ceilToIntegerEuros 
+} from '@/utils/pricing';
 import * as XLSX from 'xlsx';
 import Papa from 'papaparse';
 
@@ -1077,30 +1090,41 @@ const AltersideCatalogGenerator: React.FC = () => {
         return;
       }
       
-      // Create dataset with proper column order - UNIFIED pricing via computeFinalEan() and computeFromListPrice()
-      const dataset = eanFilteredData.map(record => {
-        // MANDATORY: Use computeFinalEan() for every EAN row - unified cents-based pipeline
-        const input = {
-          listPrice: record.ListPrice,
-          custBestPrice: record.CustBestPrice
-        };
-        const fees = {
-          feeDeRev: record.FeeDeRev,  // Use exact fee values from record
-          feeMarketplace: record['Fee Marketplace']
-        };
-        
-        // Use UNIFIED pricing functions - same as preview/validation
-        const eanResult = computeFinalEan(input, fees, 6, 22);
-        const listPriceResult = computeFromListPrice(record.ListPrice, fees, 6, 22);
-        
-        // Calculate step-by-step intermediate values using cents-based pipeline
-        const usesCbp = input.custBestPrice && input.custBestPrice > 0 && Number.isFinite(input.custBestPrice);
-        const basePrice = usesCbp ? input.custBestPrice : Math.ceil(input.listPrice);
-        const baseCents = toCents(basePrice);
-        const shippingCents = toCents(6);
-        const afterShippingCents = baseCents + shippingCents;
-        const afterIvaCents = applyRate(afterShippingCents, 1.22); // 22% IVA
-        
+      // Create dataset with proper column order - UNIFIED pricing via robust IT locale parsing
+      const dataset = eanFilteredData.map((record, index) => {
+        // --- INPUTS sicuri con robust parsing ---
+        const cbpC = toCents(record.CustBestPrice);                      // CustBestPrice in cent
+        const shipC = toCents(6);                                        // shipping sempre 6€ in cent
+        const ivaR = parsePercentToRate(22, 22);                         // "22" o "22%" -> 1.22
+        const feeDR = parseRate(record.FeeDeRev, 1.05);                  // "1,05" -> 1.05
+        const feeMP = parseRate(record['Fee Marketplace'], 1.07);        // "1,07" / "1,07 0,00" -> 1.07
+        const listC = toCents(record.ListPrice);                         // ListPrice in cent
+
+        // --- SUBTOTALE DA CBP (cents-based pipeline con entrambe le fee) ---
+        const baseCents = cbpC + shipC;
+        const ivatoCents = applyRateCents(baseCents, ivaR);
+        const withFeDR = applyRateCents(ivatoCents, feeDR);
+        const subtotalCents = applyRateCents(withFeDR, feeMP);
+
+        // --- LISTPRICE CON FEE (intero per eccesso) ---
+        const baseListCents = listC + shipC;
+        const ivatoListCents = applyRateCents(baseListCents, ivaR);
+        const withFeDRList = applyRateCents(ivatoListCents, feeDR);
+        const subtotalListCents = applyRateCents(withFeDRList, feeMP);
+        const listPriceConFeeInt = ceilToIntegerEuros(subtotalListCents); // intero
+
+        // Prezzo Finale (ceil a ,99 sul subtotale corretto)
+        const prezzoFinaleCents = ceilToComma99(subtotalCents);
+
+        // Log per le prime 10 righe per verifica
+        if (index < 10) {
+          console.warn(`ean:debug:row${index}`, {
+            cbpC, shipC, ivaR, feeDR, feeMP, 
+            subtotalCents, prezzoFinaleCents, 
+            subtotalListCents, listPriceConFee: listPriceConFeeInt
+          });
+        }
+
         return {
           Matnr: record.Matnr,
           ManufPartNr: record.ManufPartNr,
@@ -1110,14 +1134,14 @@ const AltersideCatalogGenerator: React.FC = () => {
           CustBestPrice: record.CustBestPrice,
           'Costo di Spedizione': '6,00',
           IVA: '22%',
-          'Prezzo con spediz e IVA': formatCents(afterIvaCents),
+          'Prezzo con spediz e IVA': formatCents(ivatoCents),
           FeeDeRev: record.FeeDeRev,
           'Fee Marketplace': record['Fee Marketplace'],
-          'Subtotale post-fee': eanResult.subtotalDisplay, // From computeFinalEan()
-          'Prezzo Finale': eanResult.finalDisplay, // FORCE finalDisplay string "NN,99"
+          'Subtotale post-fee': formatCents(subtotalCents), // Corretta pipeline con entrambe le fee
+          'Prezzo Finale': formatCents(prezzoFinaleCents), // FORCE finalDisplay string "NN,99"
           ListPrice: record.ListPrice,
-          'ListPrice con Fee': listPriceResult.finalDisplayInt, // Integer ceiling
-          _eanFinalCents: eanResult.finalCents // Internal field for validation guard
+          'ListPrice con Fee': listPriceConFeeInt, // Integer ceiling
+          _eanFinalCents: prezzoFinaleCents // Internal field for validation guard
         };
       });
       

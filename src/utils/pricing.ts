@@ -1,5 +1,5 @@
 /**
- * Pricing utilities for catalog generation - Pure integer cents arithmetic
+ * Pricing utilities for catalog generation - Pure integer cents arithmetic with robust IT locale parsing
  */
 
 // One-time log to confirm integer-cents implementation
@@ -9,15 +9,49 @@ if (typeof (globalThis as any).eanEndingInitLogged === 'undefined') {
 }
 
 /**
+ * Robust IT locale parsing for any input (handles commas, thousand separators, percentages, dirty inputs)
+ */
+export function parseEuroLike(input: unknown): number {
+  if (typeof input === 'number' && isFinite(input)) return input;
+  let s = String(input ?? '').trim();
+  // Remove common non-numeric symbols (except . , space, - and %)
+  s = s.replace(/[^\d.,\s%\-]/g, '').trim();
+  // Take first token (e.g. "1,07 0,00" -> "1,07")
+  s = s.split(/\s+/)[0] ?? '';
+  s = s.replace(/%/g, '').trim();
+  if (!s) return NaN;
+
+  // If both . and , present, assume IT format (1.234,56)
+  if (s.includes('.') && s.includes(',')) s = s.replace(/\./g, '').replace(',', '.');
+  else s = s.replace(',', '.');
+
+  const n = parseFloat(s);
+  return Number.isFinite(n) ? n : NaN;
+}
+
+/**
  * Convert a number or string to integer cents (avoiding floating point issues)
  */
-export function toCents(x: number | string): number {
-  if (typeof x === 'string') {
-    const parsed = parseFloat(x.replace(',', '.'));
-    return Math.floor(parsed * 100 + 0.5);
-  }
-  if (!Number.isFinite(x)) return 0;
-  return Math.floor(x * 100 + 0.5);
+export function toCents(x: unknown, fallback = 0): number {
+  const n = parseEuroLike(x);
+  return Number.isFinite(n) ? Math.round(n * 100) : Math.round(fallback * 100);
+}
+
+/**
+ * Parse percentage string to rate (e.g. "22%" -> 1.22)
+ */
+export function parsePercentToRate(v: unknown, fallbackPercent = 22): number {
+  const n = parseEuroLike(v);
+  const p = Number.isFinite(n) ? n : fallbackPercent;
+  return 1 + p / 100; // 22 -> 1.22
+}
+
+/**
+ * Parse rate value with fallback
+ */
+export function parseRate(v: unknown, fallback = 1): number {
+  const n = parseEuroLike(v);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
 /**
@@ -59,8 +93,13 @@ export function roundCents(cents: number): number {
   return Math.round(cents);
 }
 
-export function applyRate(cents: number, rate: number): number {
+export function applyRateCents(cents: number, rate: number): number {
   return roundCents(cents * rate);
+}
+
+// Legacy alias for backward compatibility
+export function applyRate(cents: number, rate: number): number {
+  return applyRateCents(cents, rate);
 }
 
 export function ceilToComma99(cents: number): number {
