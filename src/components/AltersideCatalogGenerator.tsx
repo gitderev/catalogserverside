@@ -1,8 +1,12 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Checkbox } from '@/components/ui/checkbox';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { toast } from '@/hooks/use-toast';
-import { Upload, Download, FileText, CheckCircle, XCircle, AlertCircle, Clock, Activity } from 'lucide-react';
+import { Upload, Download, FileText, CheckCircle, XCircle, AlertCircle, Clock, Activity, Info } from 'lucide-react';
 import { filterAndNormalizeForEAN, type EANStats, type DiscardedRow } from '@/utils/ean';
 import { forceEANText, exportDiscardedRowsCSV } from '@/utils/excelFormatter';
 import * as XLSX from 'xlsx';
@@ -30,14 +34,19 @@ interface ProcessedRecord {
   ExistingStock: number;
   ListPrice: number;
   CustBestPrice: number;
-  IVA: string;
-  'ListPrice con IVA': number;
-  'CustBestPrice con IVA': number;
-  'Costo di spedizione': number;
-  'Fee Mediaworld': string;
-  'Fee Alterside': string;
-  'Prezzo finale': number;
-  'Prezzo finale Listino': number;
+  'Costo di Spedizione': number;
+  IVA: number;
+  'Subtotale Prezzo con Spedizione e IVA': number;
+  FeeDeRev: number;
+  'Fee Marketplace': number;
+  'Subtotale post-fee': number;
+  'IVA ': number; // Duplicated column as per spec
+  'Prezzo Finale': number;
+}
+
+interface FeeConfig {
+  feeDrev: number;   // e.g. 1.05
+  feeMkt: number;    // e.g. 1.08
 }
 
 interface LogEntry {
@@ -72,12 +81,76 @@ const OPTIONAL_HEADERS = {
   price: ['ManufPartNr']
 };
 
+const DEFAULT_FEES: FeeConfig = { feeDrev: 1.05, feeMkt: 1.08 };
+
+function loadFees(): FeeConfig {
+  try {
+    const raw = localStorage.getItem('catalog_fees_v2');
+    if (!raw) return DEFAULT_FEES;
+    const obj = JSON.parse(raw);
+    return {
+      feeDrev: Number(obj.feeDrev) || DEFAULT_FEES.feeDrev,
+      feeMkt: Number(obj.feeMkt) || DEFAULT_FEES.feeMkt,
+    };
+  } catch { 
+    return DEFAULT_FEES; 
+  }
+}
+
+function saveFees(cfg: FeeConfig) {
+  localStorage.setItem('catalog_fees_v2', JSON.stringify(cfg));
+}
+
+function ceilInt(x: number): number { 
+  return Math.ceil(x); 
+}
+
+// Round to next "x,99"
+function toComma99(val: number): number {
+  const i = Math.floor(val);
+  return (val <= i + 0.99) ? (i + 0.99) : (i + 1 + 0.99);
+}
+
+function computeFinalPrice({
+  CustBestPrice, ListPrice, feeDrev, feeMkt
+}: { CustBestPrice?: number; ListPrice?: number; feeDrev: number; feeMkt: number; }): {
+  base: number, shipping: number, iva: number, subtotConIva: number,
+  postFee: number, prezzoFinaleEAN: number, prezzoFinaleMPN: number
+} {
+  const shipping = 6.00;
+  const hasBest = Number.isFinite(CustBestPrice) && CustBestPrice! > 0;
+  const base0 = hasBest ? Number(CustBestPrice) : ceilInt(Number(ListPrice || 0));
+  const subtotBaseSped = base0 + shipping;
+  const iva = subtotBaseSped * 0.22;
+  const subtotConIva = subtotBaseSped + iva;
+
+  // Apply fees in sequence as decimal multipliers
+  const postFee = subtotConIva * feeDrev * feeMkt;
+
+  // Two final prices, depending on catalog
+  const prezzoFinaleEAN = toComma99(postFee);
+  const prezzoFinaleMPN = ceilInt(postFee);
+
+  return { base: base0, shipping, iva, subtotConIva, postFee, prezzoFinaleEAN, prezzoFinaleMPN };
+}
+
 const AltersideCatalogGenerator: React.FC = () => {
   const [files, setFiles] = useState<FileUploadState>({
     material: { file: null, status: 'empty' },
     stock: { file: null, status: 'empty' },
     price: { file: null, status: 'empty' }
   });
+
+  // Fee configuration
+  const [feeConfig, setFeeConfig] = useState<FeeConfig>(loadFees());
+  const [rememberFees, setRememberFees] = useState(false);
+
+  // Save fees when rememberFees is checked
+  useEffect(() => {
+    if (rememberFees) {
+      saveFees(feeConfig);
+    }
+  }, [feeConfig, rememberFees]);
 
   const [processingState, setProcessingState] = useState<'idle' | 'validating' | 'ready' | 'running' | 'completed' | 'failed'>('idle');
   const [currentPipeline, setCurrentPipeline] = useState<'EAN' | 'MPN' | null>(null);
@@ -593,9 +666,13 @@ const AltersideCatalogGenerator: React.FC = () => {
       const custBestPrice = parseFloat(row.CustBestPrice);
       if (!isFinite(custBestPrice)) return 0;
       
-      const withIVA = Math.ceil(custBestPrice) * 1.22;
-      const feeBest = withIVA * 1.08 * 1.05;
-      return ceilToXX99(feeBest);
+      const calc = computeFinalPrice({
+        CustBestPrice: custBestPrice,
+        ListPrice: parseFloat(row.ListPrice),
+        feeDrev: feeConfig.feeDrev,
+        feeMkt: feeConfig.feeMkt
+      });
+      return calc.prezzoFinaleEAN;
     };
 
     const finalize = () => {
@@ -748,11 +825,13 @@ const AltersideCatalogGenerator: React.FC = () => {
             return;
           }
 
-          const custBestPriceCeil = Math.ceil(custBestNumRaw);
-          const listPriceWithIVA = listPriceNum * 1.22;
-          const custBestWithIVA = custBestPriceCeil * 1.22;
-          const finalPriceBest = ceilToXX99(((custBestWithIVA + 5) * 1.08) * 1.05);
-          const finalPriceListino = Math.ceil(((listPriceWithIVA + 5) * 1.08) * 1.05);
+          // Use new fee calculation system
+          const calc = computeFinalPrice({
+            CustBestPrice: custBestNumRaw,
+            ListPrice: listPriceNum,
+            feeDrev: feeConfig.feeDrev,
+            feeMkt: feeConfig.feeMkt
+          });
 
           const base: ProcessedRecord = {
             Matnr: matnr,
@@ -761,15 +840,15 @@ const AltersideCatalogGenerator: React.FC = () => {
             ShortDescription: row.ShortDescription || '',
             ExistingStock: existingStock,
             ListPrice: listPriceNum,
-            CustBestPrice: custBestPriceCeil,
-            IVA: '22%',
-            'ListPrice con IVA': listPriceWithIVA,
-            'CustBestPrice con IVA': custBestWithIVA,
-            'Costo di spedizione': 5,
-            'Fee Mediaworld': '8%',
-            'Fee Alterside': '5%',
-            'Prezzo finale': finalPriceBest,
-            'Prezzo finale Listino': finalPriceListino
+            CustBestPrice: calc.base,
+            'Costo di Spedizione': calc.shipping,
+            IVA: calc.iva,
+            'Subtotale Prezzo con Spedizione e IVA': calc.subtotConIva,
+            FeeDeRev: feeConfig.feeDrev,
+            'Fee Marketplace': feeConfig.feeMkt,
+            'Subtotale post-fee': calc.postFee,
+            'IVA ': calc.iva, // Duplicated column as per spec
+            'Prezzo Finale': currentPipeline === 'EAN' ? calc.prezzoFinaleEAN : calc.prezzoFinaleMPN
           };
 
           if (base.EAN) {
@@ -1114,6 +1193,92 @@ const AltersideCatalogGenerator: React.FC = () => {
             optionalHeaders={OPTIONAL_HEADERS.price}
           />
         </div>
+
+        {/* Fee Configuration */}
+        {allFilesValid && (
+          <div className="card border-strong">
+            <div className="card-body">
+              <h3 className="card-title mb-6 flex items-center gap-2">
+                <Info className="h-5 w-5 icon-dark" />
+                Regole di Calcolo
+              </h3>
+              
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div className="space-y-2">
+                  <Label htmlFor="fee-derev" className="text-sm font-medium">
+                    Fee DeRev (moltiplicatore)
+                  </Label>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Input
+                        id="fee-derev"
+                        type="number"
+                        min="1.00"
+                        max="2.00"
+                        step="0.01"
+                        value={feeConfig.feeDrev}
+                        onChange={(e) => {
+                          const val = parseFloat(e.target.value);
+                          if (val >= 1.00 && val <= 2.00) {
+                            setFeeConfig(prev => ({ ...prev, feeDrev: val }));
+                          }
+                        }}
+                        className="text-center"
+                      />
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      <p>Inserisci fee come moltiplicatore: 1,05 = +5%, 1,08 = +8%.<br/>Le fee sono applicate in sequenza dopo IVA e spedizione.</p>
+                    </TooltipContent>
+                  </Tooltip>
+                </div>
+                
+                <div className="space-y-2">
+                  <Label htmlFor="fee-marketplace" className="text-sm font-medium">
+                    Fee Marketplace (moltiplicatore)
+                  </Label>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Input
+                        id="fee-marketplace"
+                        type="number"
+                        min="1.00"
+                        max="2.00"
+                        step="0.01"
+                        value={feeConfig.feeMkt}
+                        onChange={(e) => {
+                          const val = parseFloat(e.target.value);
+                          if (val >= 1.00 && val <= 2.00) {
+                            setFeeConfig(prev => ({ ...prev, feeMkt: val }));
+                          }
+                        }}
+                        className="text-center"
+                      />
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      <p>Fee marketplace applicata dopo Fee DeRev.<br/>Esempio: 1,08 = +8% commissione marketplace.</p>
+                    </TooltipContent>
+                  </Tooltip>
+                </div>
+              </div>
+              
+              <div className="mt-4 flex items-center space-x-2">
+                <Checkbox
+                  id="remember-fees"
+                  checked={rememberFees}
+                  onCheckedChange={(checked) => {
+                    setRememberFees(!!checked);
+                    if (checked) {
+                      saveFees(feeConfig);
+                    }
+                  }}
+                />
+                <Label htmlFor="remember-fees" className="text-sm">
+                  Ricorda queste impostazioni
+                </Label>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Action Buttons */}
         {allFilesValid && (
