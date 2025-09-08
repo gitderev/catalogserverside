@@ -210,6 +210,9 @@ const AltersideCatalogGenerator: React.FC = () => {
     mpn_log: false
   });
 
+  // Export state for preventing double clicks
+  const [isExportingEAN, setIsExportingEAN] = useState(false);
+
   const workerRef = useRef<Worker | null>(null);
 
   const isProcessing = processingState === 'running';
@@ -948,7 +951,160 @@ const AltersideCatalogGenerator: React.FC = () => {
     }));
   };
 
+  const onExportEAN = useCallback((event: React.MouseEvent) => {
+    event.preventDefault();
+    
+    if (isExportingEAN) {
+      toast({
+        title: "Esportazione in corso...",
+        description: "Attendere completamento dell'esportazione corrente"
+      });
+      return;
+    }
+    
+    setIsExportingEAN(true);
+    dbg('excel:write:start');
+    
+    try {
+      // Get EAN filtered data
+      const eanFilteredData = currentProcessedData.filter(record => record.EAN && record.EAN.length >= 12);
+      
+      if (eanFilteredData.length === 0) {
+        toast({
+          title: "Nessuna riga valida per EAN",
+          description: "Non ci sono record con EAN validi da esportare"
+        });
+        return;
+      }
+      
+      // Create dataset with proper column order
+      const dataset = eanFilteredData.map(record => ({
+        Matnr: record.Matnr,
+        ManufPartNr: record.ManufPartNr,
+        EAN: record.EAN,
+        ShortDescription: record.ShortDescription,
+        ExistingStock: record.ExistingStock,
+        CustBestPrice: record.CustBestPrice,
+        'Costo di Spedizione': record['Costo di Spedizione'],
+        IVA: record.IVA,
+        'Subtotale Prezzo con Spedizione e IVA': record['Subtotale Prezzo con Spedizione e IVA'],
+        FeeDeRev: record.FeeDeRev,
+        'Fee Marketplace': record['Fee Marketplace'],
+        'Subtotale post-fee': record['Subtotale post-fee'],
+        'IVA ': record['IVA '], // Duplicated column as per spec
+        'Prezzo Finale': record['Prezzo Finale'],
+        ListPrice: record.ListPrice
+      }));
+      
+      // Create worksheet
+      const ws = XLSX.utils.json_to_sheet(dataset, { skipHeader: false });
+      
+      // Ensure !ref exists
+      if (!ws['!ref']) {
+        const rows = dataset.length + 1; // +1 for header
+        const cols = Object.keys(dataset[0] || {}).length;
+        ws['!ref'] = XLSX.utils.encode_range({s:{r:0,c:0}, e:{r:rows-1,c:cols-1}});
+      }
+      
+      // Force EAN column to text format
+      const range = XLSX.utils.decode_range(ws['!ref']);
+      let eanCol = -1;
+      
+      // Find EAN column in header
+      for (let C = range.s.c; C <= range.e.c; C++) {
+        const addr = XLSX.utils.encode_cell({ r: 0, c: C });
+        const cell = ws[addr];
+        const name = (cell?.v ?? '').toString().trim().toLowerCase();
+        if (name === 'ean') { 
+          eanCol = C; 
+          break; 
+        }
+      }
+      
+      // Force EAN column cells to text format
+      if (eanCol >= 0) {
+        for (let R = 1; R <= range.e.r; R++) {
+          const addr = XLSX.utils.encode_cell({ r: R, c: eanCol });
+          const cell = ws[addr];
+          if (cell) {
+            cell.v = (cell.v ?? '').toString(); // Preserve leading zeros
+            cell.t = 's';
+            cell.z = '@';
+            ws[addr] = cell;
+          }
+        }
+      }
+      
+      // Create workbook
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "Catalogo_EAN");
+      
+      // Serialize to ArrayBuffer
+      const wbout = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+      
+      if (!wbout || wbout.length === 0) {
+        dbg('excel:write:error | empty buffer');
+        toast({
+          title: "Errore generazione file",
+          description: "Buffer vuoto durante la generazione del file Excel"
+        });
+        return;
+      }
+      
+      // Create blob and download from main thread
+      const blob = new Blob([wbout], { 
+        type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" 
+      });
+      
+      const url = URL.createObjectURL(blob);
+      
+      // Generate filename with timestamp
+      const now = new Date();
+      const timestamp = now.toISOString().slice(0,16).replace(/[-:T]/g, '').replace(/(\d{8})(\d{4})/, '$1_$2');
+      const fileName = `Catalogo_EAN_${timestamp}.xlsx`;
+      
+      // Create anchor and trigger download
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = fileName;
+      a.rel = "noopener";
+      a.style.display = "none";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      
+      // Delay URL revocation
+      setTimeout(() => URL.revokeObjectURL(url), 3000);
+      
+      dbg('excel:write:blob-size', { bytes: blob.size });
+      dbg('excel:write:done', { pipeline: 'EAN' });
+      
+      setExcelDone(true);
+      
+      toast({
+        title: "Export EAN avviato",
+        description: "Controlla i download per il file Excel"
+      });
+      
+    } catch (error) {
+      dbg('excel:write:error', { message: error instanceof Error ? error.message : 'Unknown error' });
+      toast({
+        title: "Errore durante l'export",
+        description: error instanceof Error ? error.message : "Errore sconosciuto"
+      });
+    } finally {
+      setIsExportingEAN(false);
+    }
+  }, [currentProcessedData, isExportingEAN, dbg, toast]);
+
   const downloadExcel = (type: 'ean' | 'manufpartnr') => {
+    if (type === 'ean') {
+      // Use the new onExportEAN function for EAN catalog
+      onExportEAN({ preventDefault: () => {} } as React.MouseEvent);
+      return;
+    }
+    
+    // Keep existing logic for manufpartnr
     if (currentProcessedData.length === 0) return;
     
     dbg('excel:write:start');
@@ -1485,11 +1641,13 @@ const AltersideCatalogGenerator: React.FC = () => {
             <h3 className="text-2xl font-bold mb-6">Download Pipeline {currentPipeline}</h3>
             <div className="flex flex-wrap justify-center gap-4">
               <button 
-                onClick={() => downloadExcel(currentPipeline === 'EAN' ? 'ean' : 'manufpartnr')} 
-                className="btn btn-primary text-lg px-8 py-3"
+                type="button"
+                onClick={currentPipeline === 'EAN' ? onExportEAN : () => downloadExcel('manufpartnr')} 
+                disabled={isExportingEAN && currentPipeline === 'EAN'}
+                className={`btn btn-primary text-lg px-8 py-3 ${isExportingEAN && currentPipeline === 'EAN' ? 'opacity-50 cursor-not-allowed' : ''}`}
               >
                 <Download className="mr-3 h-5 w-5" />
-                SCARICA EXCEL ({currentPipeline})
+                {isExportingEAN && currentPipeline === 'EAN' ? 'ESPORTAZIONE...' : `SCARICA EXCEL (${currentPipeline})`}
               </button>
               <button 
                 onClick={() => downloadLog(currentPipeline === 'EAN' ? 'ean' : 'manufpartnr')} 
