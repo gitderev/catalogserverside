@@ -7,8 +7,21 @@ import { Checkbox } from '@/components/ui/checkbox';
 import { toast } from '@/hooks/use-toast';
 import { Upload, Download, FileText, CheckCircle, XCircle, AlertCircle, Clock, Activity, Info, X } from 'lucide-react';
 
-// Simple hardened worker test component
-const AltersideCatalogGeneratorFixed = () => {
+// Processing states
+type ProcessingState = 'idle' | 'creating' | 'prescanning' | 'running' | 'done' | 'error';
+
+// Hardened worker test component
+const AltersideCatalogGenerator = () => {
+  const [processingState, setProcessingState] = useState<ProcessingState>('idle');
+  const [progressPct, setProgressPct] = useState(0);
+  const [lastClickTime, setLastClickTime] = useState(0);
+  
+  // Worker refs
+  const workerRef = useRef<Worker | null>(null);
+  const blobUrlRef = useRef<string | null>(null);
+  const progressTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const pingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  
   const [diagnosticState, setDiagnosticState] = useState({
     isEnabled: false,
     maxRows: 200,
@@ -41,6 +54,25 @@ const AltersideCatalogGeneratorFixed = () => {
 
   const [debugEvents, setDebugEvents] = useState<string[]>([]);
 
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (workerRef.current) {
+        workerRef.current.terminate();
+      }
+      if (blobUrlRef.current) {
+        URL.revokeObjectURL(blobUrlRef.current);
+        console.log('blob_url_revoked=true (unmount)');
+      }
+      if (progressTimerRef.current) {
+        clearTimeout(progressTimerRef.current);
+      }
+      if (pingTimeoutRef.current) {
+        clearTimeout(pingTimeoutRef.current);
+      }
+    };
+  }, []);
+
   const dbg = useCallback((event: string, data?: any) => {
     const timestamp = new Date().toLocaleTimeString('it-IT', { hour12: false });
     const logEntry = `[${timestamp}] ${event}${data ? ': ' + JSON.stringify(data) : ''}`;
@@ -59,136 +91,321 @@ const AltersideCatalogGeneratorFixed = () => {
     }));
   }, []);
 
-  // Echo Worker Test
-  const runEchoTest = useCallback(async (strategy: 'blob' | 'module' = 'blob') => {
-    setEchoTestResult('Testing...');
-    dbg('echo_test_start', { strategy });
+  // Debounced click handler
+  const handleDiagnosticClick = useCallback(() => {
+    const now = Date.now();
+    if (now - lastClickTime < 1000) {
+      dbg('click_ignored', { reason: 'debounce', timeSinceLastClick: now - lastClickTime });
+      return;
+    }
+    setLastClickTime(now);
+
+    // Check if already processing
+    if (processingState !== 'idle') {
+      dbg('click_ignored', { reason: 'state', currentState: processingState });
+      return;
+    }
+
+    dbg('click_diag');
+    createHardenedWorker();
+  }, [lastClickTime, processingState]);
+
+  // Create hardened worker with proper lifecycle
+  const createHardenedWorker = useCallback(async () => {
+    setProcessingState('creating');
     
     try {
+      // Cleanup existing worker
+      if (workerRef.current) {
+        workerRef.current.terminate();
+        workerRef.current = null;
+      }
+      if (blobUrlRef.current) {
+        URL.revokeObjectURL(blobUrlRef.current);
+        blobUrlRef.current = null;
+      }
+
+      // Generate version
+      const appVersion = '1.0.0';
+      const workerVersion = Date.now().toString(36);
+      
       let worker: Worker;
       
-      if (strategy === 'blob') {
-        // Minimal echo worker code
-        const echoWorkerCode = `
-          // Echo worker boot signal
-          self.postMessage({ type: 'worker_boot', version: 'echo-1.0' });
-          
-          self.addEventListener('error', function(e) {
-            self.postMessage({
-              type: 'worker_error',
-              where: 'boot',
-              message: e.message
-            });
-          });
-          
-          self.onmessage = function(e) {
-            try {
-              if (e.data.type === 'ping') {
-                self.postMessage({ type: 'pong' });
-              } else if (e.data.type === 'crash') {
-                throw new Error('Intentional crash');
-              }
-            } catch (error) {
-              self.postMessage({
-                type: 'worker_error',
-                where: 'runtime',
-                message: error.message
-              });
-            }
-          };
-        `;
+      if (workerStrategy === 'blob') {
+        // Create hardened blob worker with proper string concatenation
+        const workerCodeParts = [
+          'let hasReceivedInit = false;',
+          'const workerVersion = "' + workerVersion + '";',
+          '',
+          '// Worker boot signal - FIRST LINE',
+          'self.postMessage({ type: "worker_boot", version: workerVersion });',
+          '',
+          '// Test channel after brief delay if no INIT received',
+          'setTimeout(() => {',
+          '  if (!hasReceivedInit) {',
+          '    self.postMessage({',
+          '      type: "worker_ready_hint",',
+          '      note: "waiting_INIT",',
+          '      version: workerVersion',
+          '    });',
+          '  }',
+          '}, 0);',
+          '',
+          'self.addEventListener("error", function(e) {',
+          '  self.postMessage({',
+          '    type: "worker_error",',
+          '    where: "boot",',
+          '    message: e.message || "Worker error",',
+          '    detail: { filename: e.filename, lineno: e.lineno }',
+          '  });',
+          '});',
+          '',
+          'self.onmessage = function(e) {',
+          '  try {',
+          '    const { type, data } = e.data || {};',
+          '',
+          '    if (type === "INIT") {',
+          '      hasReceivedInit = true;',
+          '      self.postMessage({ type: "worker_log", msg: "init_received" });',
+          '      self.postMessage({',
+          '        type: "worker_ready",',
+          '        version: workerVersion,',
+          '        schema: 1',
+          '      });',
+          '      console.log("ready_emitted=true");',
+          '      return;',
+          '    }',
+          '',
+          '    if (type === "PRESCAN_START") {',
+          '      const materialData = data?.materialData || [];',
+          '      const total = materialData.filter(row =>',
+          '        row.ManufPartNr && String(row.ManufPartNr).trim()',
+          '      ).length;',
+          '',
+          '      self.postMessage({',
+          '        type: "prescan_progress",',
+          '        done: 0,',
+          '        total: total',
+          '      });',
+          '',
+          '      let done = 0;',
+          '      const batchSize = Math.max(1, Math.floor(total / 5));',
+          '',
+          '      const processBatch = () => {',
+          '        done = Math.min(done + batchSize, total);',
+          '',
+          '        self.postMessage({',
+          '          type: "prescan_progress",',
+          '          done: done,',
+          '          total: total',
+          '        });',
+          '',
+          '        if (done >= total) {',
+          '          self.postMessage({',
+          '            type: "prescan_done",',
+          '            counts: {',
+          '              mpnIndexed: total,',
+          '              eanIndexed: materialData.filter(row => row.EAN).length',
+          '            },',
+          '            total: total',
+          '          });',
+          '        } else {',
+          '          setTimeout(processBatch, 200);',
+          '        }',
+          '      };',
+          '',
+          '      setTimeout(processBatch, 100);',
+          '      return;',
+          '    }',
+          '',
+          '    if (type === "ping") {',
+          '      self.postMessage({ type: "pong" });',
+          '      return;',
+          '    }',
+          '',
+          '    // Unknown command',
+          '    self.postMessage({',
+          '      type: "worker_error",',
+          '      where: "boot",',
+          '      message: "unknown_command",',
+          '      detail: type',
+          '    });',
+          '',
+          '  } catch (error) {',
+          '    self.postMessage({',
+          '      type: "worker_error",',
+          '      where: "runtime",',
+          '      message: error.message,',
+          '      stack: error.stack',
+          '    });',
+          '  }',
+          '};'
+        ];
         
-        const blob = new Blob([echoWorkerCode], { type: 'text/javascript' });
+        const workerCode = workerCodeParts.join('\n');
+        const blob = new Blob([workerCode], { type: 'text/javascript' });
         const blobUrl = URL.createObjectURL(blob);
+        blobUrlRef.current = blobUrl;
         worker = new Worker(blobUrl);
-        dbg('echo_created', { type: 'blob', url: blobUrl });
         
-        // Clean up blob URL after test
-        setTimeout(() => URL.revokeObjectURL(blobUrl), 5000);
+        dbg('worker_created', { strategy: 'blob', version: workerVersion });
         
       } else {
-        // Module worker
+        // Module worker fallback
         worker = new Worker(new URL('/workers/alterside-sku-worker.js', location.origin), { type: 'module' });
-        dbg('echo_created', { type: 'module', url: '/workers/alterside-sku-worker.js' });
+        dbg('worker_created', { strategy: 'module', version: workerVersion });
       }
-      
-      // Test protocol
-      let bootReceived = false;
-      let pongReceived = false;
-      
-      const testPromise = new Promise<string>((resolve, reject) => {
-        const timeout = setTimeout(() => {
-          worker.terminate();
-          reject(new Error('Echo test timeout'));
-        }, 3000);
+
+      workerRef.current = worker;
+
+      // UI dopo worker_created: Aggancia subito worker.onmessage e worker.onerror
+      worker.onmessage = (e: MessageEvent) => {
+        const { type } = e.data;
+        addWorkerMessage(e.data);
         
-        worker.onmessage = (e) => {
-          const { type } = e.data;
-          
-          if (type === 'worker_boot') {
-            bootReceived = true;
-            dbg('echo_boot', e.data);
-            
-            // Send ping after boot
-            setTimeout(() => {
-              worker.postMessage({ type: 'ping' });
-            }, 100);
-          }
-          
-          if (type === 'pong') {
-            pongReceived = true;
-            dbg('echo_pong', e.data);
-            
-            clearTimeout(timeout);
-            worker.terminate();
-            
-            if (bootReceived && pongReceived) {
-              resolve(`✅ Echo test passed (${strategy})`);
-            } else {
-              resolve(`⚠️ Partial success (${strategy}): boot=${bootReceived}, pong=${pongReceived}`);
-            }
-          }
-          
-          if (type === 'worker_error') {
-            clearTimeout(timeout);
-            worker.terminate();
-            reject(new Error(`Echo worker error: ${e.data.message}`));
-          }
-        };
+        if (type === 'worker_boot') {
+          dbg('worker_boot', e.data);
+          // Non cambiare stato, attendi worker_ready
+          return;
+        }
         
-        worker.onerror = (error) => {
-          clearTimeout(timeout);
-          worker.terminate();
-          reject(error);
-        };
-      });
+        if (type === 'worker_ready_hint') {
+          dbg('worker_ready_hint', e.data);
+          // Channel test received but still waiting for proper worker_ready
+          return;
+        }
+        
+        if (type === 'worker_ready') {
+          dbg('worker_ready_received=true', e.data);
+          
+          // Invia PRESCAN_START dopo worker_ready
+          const materialData = Array.from({ length: 100 }, (_, i) => ({
+            ManufPartNr: `MPN${i + 1}`,
+            EAN: `12345678901${i.toString().padStart(2, '0')}`,
+            ShortDescription: `Product ${i + 1}`
+          }));
+          
+          worker.postMessage({
+            type: 'PRESCAN_START',
+            data: { materialData }
+          });
+          
+          dbg('prescan_start');
+          setProcessingState('prescanning');
+          
+          // Avvia progressTimer 1s
+          progressTimerRef.current = setTimeout(() => {
+            dbg('progress_timer_expired');
+            // Invia ping se non arriva prescan_progress(0)
+            worker.postMessage({ type: 'ping' });
+            
+            // Se entro 2s non arriva pong o progress(0), chiudi worker
+            pingTimeoutRef.current = setTimeout(() => {
+              dbg('prescan_timeout', { reason: 'no_progress_or_pong' });
+              worker.terminate();
+              setProcessingState('error');
+              toast({
+                title: "Errore Prescan",
+                description: "Prescan non inizializzato",
+                variant: "destructive"
+              });
+            }, 2000);
+          }, 1000);
+          
+          return;
+        }
+        
+        if (type === 'worker_log') {
+          dbg('worker_log', e.data);
+          return;
+        }
+        
+        if (type === 'prescan_progress') {
+          // Clear progress timer on first progress
+          if (progressTimerRef.current) {
+            clearTimeout(progressTimerRef.current);
+            progressTimerRef.current = null;
+          }
+          if (pingTimeoutRef.current) {
+            clearTimeout(pingTimeoutRef.current);
+            pingTimeoutRef.current = null;
+          }
+          
+          const progress = e.data.total > 0 ? Math.round((e.data.done / e.data.total) * 100) : 0;
+          setProgressPct(progress);
+          
+          if (e.data.done === 0) {
+            dbg('prescan_progress(0,total)', e.data);
+          } else {
+            dbg('prescan_progress', e.data);
+          }
+          return;
+        }
+        
+        if (type === 'prescan_done') {
+          dbg('prescan_done', e.data);
+          setProcessingState('done');
+          return;
+        }
+        
+        if (type === 'pong') {
+          dbg('pong_received');
+          if (pingTimeoutRef.current) {
+            clearTimeout(pingTimeoutRef.current);
+            pingTimeoutRef.current = null;
+          }
+          return;
+        }
+        
+        if (type === 'worker_error') {
+          dbg('worker_error', e.data);
+          setProcessingState('error');
+          toast({
+            title: "Errore Worker",
+            description: e.data.message || "Errore sconosciuto",
+            variant: "destructive"
+          });
+          return;
+        }
+      };
       
-      const result = await testPromise;
-      setEchoTestResult(result);
+      worker.onerror = (error: ErrorEvent) => {
+        dbg('worker_onerror', { message: error.message, filename: error.filename });
+        setProcessingState('error');
+        toast({
+          title: "Errore Worker",
+          description: error.message || "Errore worker",
+          variant: "destructive"
+        });
+      };
       
-      // If blob test fails, try module worker
-      if (strategy === 'blob' && !result.includes('✅')) {
-        dbg('echo_blob_failed', { result });
-        return await runEchoTest('module');
-      }
+      // Log handlers attached
+      console.log('handlers_attached=true');
+      dbg('handlers_attached=true');
       
-      return result;
+      // Invia subito INIT
+      const initPayload = {
+        type: 'INIT',
+        schema: 1,
+        diag: diagnosticState.isEnabled,
+        sampleSize: diagnosticState.isEnabled ? diagnosticState.maxRows : undefined,
+        version: appVersion
+      };
+      
+      worker.postMessage(initPayload);
+      console.log('init_sent=', initPayload);
+      dbg('init_sent', initPayload);
       
     } catch (error) {
-      const errorMsg = `❌ Echo test failed (${strategy}): ${error instanceof Error ? error.message : 'Unknown error'}`;
-      setEchoTestResult(errorMsg);
-      dbg('echo_test_error', { strategy, error: errorMsg });
-      
-      // If blob fails, try module worker
-      if (strategy === 'blob') {
-        dbg('echo_fallback_to_module');
-        setWorkerStrategy('module');
-        return await runEchoTest('module');
-      }
-      
-      return errorMsg;
+      dbg('worker_creation_error', { error: error instanceof Error ? error.message : error });
+      setProcessingState('error');
+      toast({
+        title: "Errore Creazione Worker",
+        description: error instanceof Error ? error.message : "Errore sconosciuto",
+        variant: "destructive"
+      });
     }
-  }, [dbg]);
+  }, [workerStrategy, diagnosticState.isEnabled, diagnosticState.maxRows, dbg, toast]);
 
   const generateDiagnosticBundle = useCallback(() => {
     const bundle = {
@@ -221,16 +438,42 @@ const AltersideCatalogGeneratorFixed = () => {
     });
   }, [diagnosticState, debugEvents, workerState.version, toast]);
 
+  // Button disabled state
+  const isButtonDisabled = processingState !== 'idle';
+
   return (
     <div className="container mx-auto p-6 space-y-8">
       <header className="text-center space-y-4">
         <h1 className="text-4xl font-bold text-foreground">
-          Alterside Catalog Generator - Worker Test
+          Alterside Catalog Generator - Hardened Worker
         </h1>
         <p className="text-lg text-muted">
-          Test hardenizzato per worker lifecycle e fallback
+          Test hardened worker lifecycle con protocollo rigido
         </p>
       </header>
+
+      {/* Processing State Display */}
+      <div className="card border-strong">
+        <div className="card-body">
+          <h3 className="card-title mb-4">Stato Processamento</h3>
+          <div className="flex items-center gap-4">
+            <div className="text-lg font-medium">
+              Stato: <span className="text-primary">{processingState}</span>
+            </div>
+            {processingState === 'prescanning' && (
+              <div className="flex items-center gap-2">
+                <div className="text-sm">Progresso: {progressPct}%</div>
+                <div className="w-32 h-2 bg-muted rounded-full">
+                  <div 
+                    className="h-full bg-primary rounded-full transition-all"
+                    style={{ width: `${progressPct}%` }}
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
 
       {/* Diagnostic Toggle */}
       <div className="card border-strong">
@@ -255,76 +498,72 @@ const AltersideCatalogGeneratorFixed = () => {
             />
           </div>
           
-          {diagnosticState.isEnabled && (
-            <div className="space-y-3">
-              <div className="flex gap-3">
-                <button
-                  onClick={() => runEchoTest()}
-                  className="btn btn-primary"
-                >
-                  Echo worker test
-                </button>
-                
-                <button
-                  onClick={generateDiagnosticBundle}
-                  className="btn btn-secondary"
-                >
-                  Copia diagnostica
-                </button>
-              </div>
+          <div className="space-y-3">
+            <div className="flex gap-3">
+              <button
+                onClick={handleDiagnosticClick}
+                disabled={isButtonDisabled}
+                className={`btn btn-primary ${isButtonDisabled ? 'opacity-50 cursor-not-allowed' : ''}`}
+              >
+                <Activity className={`mr-2 h-4 w-4 ${processingState === 'creating' || processingState === 'prescanning' ? 'animate-spin' : ''}`} />
+                {processingState === 'creating' ? 'Creando...' : 
+                 processingState === 'prescanning' ? 'Prescanning...' :
+                 'Test Worker Hardened'}
+              </button>
               
-              {echoTestResult && (
-                <div className="p-3 bg-muted rounded border">
-                  <strong>Echo Test Result:</strong> {echoTestResult}
-                </div>
-              )}
+              <button
+                onClick={generateDiagnosticBundle}
+                className="btn btn-secondary"
+              >
+                Copia diagnostica
+              </button>
             </div>
-          )}
+            
+            {echoTestResult && (
+              <div className="p-3 bg-muted rounded border">
+                <strong>Test Result:</strong> {echoTestResult}
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
       {/* Worker Messages Panel */}
-      {diagnosticState.isEnabled && (
-        <div className="card border-strong">
-          <div className="card-body">
-            <h3 className="card-title mb-4 flex items-center gap-2">
-              <AlertCircle className="h-5 w-5 icon-dark" />
-              Messaggi Worker (primi 10)
-            </h3>
-            
-            <div className="space-y-2 max-h-64 overflow-y-auto">
-              {diagnosticState.workerMessages.length === 0 ? (
-                <div className="text-sm text-muted">Nessun messaggio worker ricevuto</div>
-              ) : (
-                diagnosticState.workerMessages.map((msg, index) => (
-                  <div key={msg.id} className="p-2 bg-muted rounded text-xs">
-                    <div className="font-mono">
-                      <strong>worker_msg #{index + 1}:</strong> [{msg.timestamp}] {JSON.stringify(msg.data)}
-                    </div>
+      <div className="card border-strong">
+        <div className="card-body">
+          <h3 className="card-title mb-4 flex items-center gap-2">
+            <AlertCircle className="h-5 w-5 icon-dark" />
+            Messaggi Worker (primi 10)
+          </h3>
+          
+          <div className="space-y-2 max-h-64 overflow-y-auto">
+            {diagnosticState.workerMessages.length === 0 ? (
+              <div className="text-sm text-muted">Nessun messaggio worker ricevuto</div>
+            ) : (
+              diagnosticState.workerMessages.map((msg, index) => (
+                <div key={msg.id} className="p-2 bg-muted rounded text-xs">
+                  <div className="font-mono">
+                    <strong>worker_msg #{index + 1}:</strong> [{msg.timestamp}] {JSON.stringify(msg.data)}
                   </div>
-                ))
-              )}
-            </div>
+                </div>
+              ))
+            )}
           </div>
         </div>
-      )}
+      </div>
 
       {/* Debug Events Panel */}
       <div className="card border-strong">
         <div className="card-body">
           <h3 className="card-title mb-4 flex items-center gap-2">
             <AlertCircle className="h-5 w-5 icon-dark" />
-            Eventi Debug
+            Eventi Debug - Telemetria
           </h3>
           
-          {/* Diagnostic Toggle Debug Info */}
           <div className="mb-4 p-3 bg-blue-50 border border-blue-200 rounded-lg">
-            <h4 className="text-sm font-medium mb-2">Condizioni Toggle Diagnostica</h4>
-            <div className="grid grid-cols-2 gap-2 text-xs">
-              <div>Condizione completa: <code>diagnosticState.isEnabled</code></div>
-              <div>Risultato: <strong>{diagnosticState.isEnabled ? 'TRUE' : 'FALSE'}</strong></div>
-              <div>Worker Strategy: <strong>{workerStrategy}</strong></div>
-              <div>Echo Test: <strong>{echoTestResult || 'Not run'}</strong></div>
+            <h4 className="text-sm font-medium mb-2">Sequenza Attesa</h4>
+            <div className="text-xs font-mono">
+              click_diag → worker_created → worker_boot → init_sent → worker_ready → prescan_start → prescan_progress(0/total) → prescan_done
             </div>
           </div>
           
@@ -350,37 +589,35 @@ const AltersideCatalogGeneratorFixed = () => {
       </div>
 
       {/* Diagnostic Statistics Panel */}
-      {diagnosticState.isEnabled && (
-        <div className="card border-strong">
-          <div className="card-body">
-            <h3 className="card-title mb-4 flex items-center gap-2">
-              <Activity className="h-5 w-5 icon-dark" />
-              Statistiche Diagnostiche
-            </h3>
-            
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
-              <div className="p-3 bg-muted rounded">
-                <div className="font-medium">Worker Strategy</div>
-                <div className="text-lg">{workerStrategy}</div>
-              </div>
-              <div className="p-3 bg-muted rounded">
-                <div className="font-medium">Boot Received</div>
-                <div className="text-lg">{workerState.bootReceived ? '✅' : '❌'}</div>
-              </div>
-              <div className="p-3 bg-muted rounded">
-                <div className="font-medium">Ready Received</div>
-                <div className="text-lg">{workerState.readyReceived ? '✅' : '❌'}</div>
-              </div>
-              <div className="p-3 bg-muted rounded">
-                <div className="font-medium">Echo Test</div>
-                <div className="text-lg">{echoTestResult ? (echoTestResult.includes('✅') ? '✅' : '❌') : '⏳'}</div>
-              </div>
+      <div className="card border-strong">
+        <div className="card-body">
+          <h3 className="card-title mb-4 flex items-center gap-2">
+            <Activity className="h-5 w-5 icon-dark" />
+            Statistiche Diagnostiche
+          </h3>
+          
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+            <div className="p-3 bg-muted rounded">
+              <div className="font-medium">Worker Strategy</div>
+              <div className="text-lg">{workerStrategy}</div>
+            </div>
+            <div className="p-3 bg-muted rounded">
+              <div className="font-medium">Stato</div>
+              <div className="text-lg">{processingState}</div>
+            </div>
+            <div className="p-3 bg-muted rounded">
+              <div className="font-medium">Progresso</div>
+              <div className="text-lg">{progressPct}%</div>
+            </div>
+            <div className="p-3 bg-muted rounded">
+              <div className="font-medium">Messaggi Worker</div>
+              <div className="text-lg">{diagnosticState.workerMessages.length}</div>
             </div>
           </div>
         </div>
-      )}
+      </div>
     </div>
   );
 };
 
-export default AltersideCatalogGeneratorFixed;
+export default AltersideCatalogGenerator;
