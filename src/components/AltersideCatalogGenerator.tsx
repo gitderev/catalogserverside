@@ -1,17 +1,13 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
-import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
 import { Checkbox } from '@/components/ui/checkbox';
 import { toast } from '@/hooks/use-toast';
-import { Upload, Download, FileText, CheckCircle, XCircle, AlertCircle, Clock, Activity, Info, X } from 'lucide-react';
-import { FileUpload } from './FileUpload';
-import { MaterialFileUpload } from './MaterialFileUpload';
-import { AdditionalFilesUpload } from './AdditionalFilesUpload';
-import { ColumnMapping } from './ColumnMapping';
-import { MultiColumnMapping } from './MultiColumnMapping';
-import { DataPreview } from './DataPreview';
+import { Download, Activity, CheckCircle, XCircle, AlertCircle } from 'lucide-react';
+import { MaterialUpload } from './MaterialUpload';
+import { StockUpload } from './StockUpload';
+import { PriceUpload } from './PriceUpload';
+import { CalculationRules } from './CalculationRules';
 
 // Processing states
 type ProcessingState = 'idle' | 'creating' | 'prescanning' | 'running' | 'done' | 'error';
@@ -21,22 +17,28 @@ const AltersideCatalogGenerator = () => {
   const [progressPct, setProgressPct] = useState(0);
   const [lastClickTime, setLastClickTime] = useState(0);
   
-  
-  // Main catalog state
-  const [catalogFile, setCatalogFile] = useState<File | null>(null);
+  // File states
   const [materialFile, setMaterialFile] = useState<File | null>(null);
-  const [additionalFiles, setAdditionalFiles] = useState<(File | null)[]>([null, null, null]);
-  const [catalogData, setCatalogData] = useState<any[]>([]);
+  const [stockFile, setStockFile] = useState<File | null>(null);
+  const [priceFile, setPriceFile] = useState<File | null>(null);
+  
+  // Data states
   const [materialData, setMaterialData] = useState<any[]>([]);
-  const [file1Headers, setFile1Headers] = useState<string[]>([]);
-  const [file2Headers, setFile2Headers] = useState<string[]>([]);
-  const [skuColumn1, setSkuColumn1] = useState<string>('');
-  const [skuColumn2, setSkuColumn2] = useState<string>('');
-  const [additionalFilesData, setAdditionalFilesData] = useState<Array<{
-    headers: string[];
-    fileName: string;
-    skuColumn: string;
-  }>>([]);
+  const [stockData, setStockData] = useState<any[]>([]);
+  const [priceData, setPriceData] = useState<any[]>([]);
+  
+  // Validation states
+  const [materialValid, setMaterialValid] = useState(false);
+  const [stockValid, setStockValid] = useState(false);
+  const [priceValid, setPriceValid] = useState(false);
+  const [stockReady, setStockReady] = useState(false);
+  const [priceReady, setPriceReady] = useState(false);
+  
+  // Calculation rules
+  const [feeDeRev, setFeeDeRev] = useState(1.00);
+  const [feeMarketplace, setFeeMarketplace] = useState(1.00);
+  
+  // Diagnostic mode
   const [isDiagnosticMode, setIsDiagnosticMode] = useState(false);
   
   // Worker refs for SKU processing
@@ -46,8 +48,6 @@ const AltersideCatalogGenerator = () => {
   const pingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   
   const [diagnosticState, setDiagnosticState] = useState({
-    isEnabled: false,
-    maxRows: 200,
     workerMessages: [],
     statistics: {
       total: 0,
@@ -60,7 +60,6 @@ const AltersideCatalogGenerator = () => {
       workerError: 0,
       timeouts: 0
     },
-    testResults: [],
     lastHeartbeat: 0
   });
 
@@ -75,6 +74,15 @@ const AltersideCatalogGenerator = () => {
   });
 
   const [debugEvents, setDebugEvents] = useState<string[]>([]);
+
+  // Update ready states when data changes
+  useEffect(() => {
+    setStockReady(stockValid && stockData.length > 0);
+  }, [stockValid, stockData]);
+
+  useEffect(() => {
+    setPriceReady(priceValid && priceData.length > 0);
+  }, [priceValid, priceData]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -308,6 +316,17 @@ const AltersideCatalogGenerator = () => {
     }
   }, [dbg, addWorkerMessage, isDiagnosticMode]);
 
+  // Generate current timestamp for filename
+  const getCurrentTimestamp = () => {
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const day = String(now.getDate()).padStart(2, '0');
+    const hour = String(now.getHours()).padStart(2, '0');
+    const minute = String(now.getMinutes()).padStart(2, '0');
+    return `${year}${month}${day}_${hour}${minute}`;
+  };
+
   // Handle SKU generation
   const handleSkuGeneration = useCallback(() => {
     handleDebouncedClick(() => {
@@ -350,7 +369,34 @@ const AltersideCatalogGenerator = () => {
     });
   }, [isDiagnosticMode, handleDebouncedClick, dbg, createWorker, workerStrategy]);
 
+  // Copy diagnostic data to clipboard
+  const copyDiagnosticData = useCallback(() => {
+    const diagnosticText = [
+      '=== DIAGNOSTIC DATA ===',
+      `Timestamp: ${new Date().toISOString()}`,
+      `Worker Strategy: ${workerStrategy}`,
+      `Processing State: ${processingState}`,
+      `Progress: ${progressPct}%`,
+      '',
+      '=== DEBUG EVENTS ===',
+      ...debugEvents,
+      '',
+      '=== WORKER MESSAGES ===',
+      ...diagnosticState.workerMessages.map((msg: any) => 
+        `[${msg.timestamp}] ${JSON.stringify(msg.data)}`
+      )
+    ].join('\n');
+    
+    navigator.clipboard.writeText(diagnosticText).then(() => {
+      toast({
+        title: "Diagnostica copiata",
+        description: "Dati diagnostici copiati negli appunti",
+      });
+    });
+  }, [workerStrategy, processingState, progressPct, debugEvents, diagnosticState.workerMessages]);
+
   const isProcessing = processingState === 'creating' || processingState === 'prescanning' || processingState === 'running';
+  const allFilesValid = materialValid && stockValid && priceValid;
 
   return (
     <div className="min-h-screen bg-background">
@@ -358,8 +404,49 @@ const AltersideCatalogGenerator = () => {
         <div className="mb-8">
           <h1 className="text-3xl font-bold mb-2">Generatore Catalogo Alterside</h1>
           <p className="text-muted-foreground">
-            Carica i file CSV e genera il catalogo Excel
+            Carica i file Material, Stock e Price per generare il catalogo Excel
           </p>
+        </div>
+
+        {/* Upload Sections */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
+          <MaterialUpload
+            onFileLoaded={(data, headers, isValid) => {
+              setMaterialData(data);
+              setMaterialValid(isValid);
+              if (isValid) setMaterialFile(new File([], 'material.csv'));
+            }}
+            selectedFile={materialFile}
+            isValid={materialValid}
+          />
+          <StockUpload
+            onFileLoaded={(data, headers, isValid) => {
+              setStockData(data);
+              setStockValid(isValid);
+              if (isValid) setStockFile(new File([], 'stock.csv'));
+            }}
+            selectedFile={stockFile}
+            isValid={stockValid}
+          />
+          <PriceUpload
+            onFileLoaded={(data, headers, isValid) => {
+              setPriceData(data);
+              setPriceValid(isValid);
+              if (isValid) setPriceFile(new File([], 'price.csv'));
+            }}
+            selectedFile={priceFile}
+            isValid={priceValid}
+          />
+        </div>
+
+        {/* Calculation Rules */}
+        <div className="mb-6">
+          <CalculationRules
+            feeDeRev={feeDeRev}
+            feeMarketplace={feeMarketplace}
+            onFeeDeRevChange={setFeeDeRev}
+            onFeeMarketplaceChange={setFeeMarketplace}
+          />
         </div>
 
         {/* Diagnostic Mode Toggle */}
@@ -370,79 +457,13 @@ const AltersideCatalogGenerator = () => {
               checked={isDiagnosticMode}
               onCheckedChange={(checked) => setIsDiagnosticMode(checked === true)}
             />
-            <Label htmlFor="diagnostic-mode" className="text-sm font-medium">
+            <label htmlFor="diagnostic-mode" className="text-sm font-medium">
               Modalità diagnostica
-            </Label>
+            </label>
           </div>
         </Card>
 
-        {/* File Upload Sections */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
-          <FileUpload 
-            onFileSelect={setCatalogFile}
-            selectedFile={catalogFile}
-            title="File Catalogo"
-            accept=".txt,.csv"
-          />
-          <MaterialFileUpload 
-            onFileSelect={setMaterialFile}
-            selectedFile={materialFile}
-          />
-        </div>
-
-        <div className="mb-6">
-          <AdditionalFilesUpload 
-            files={additionalFiles}
-            onFileSelect={(index: number) => (file: File | null) => {
-              setAdditionalFiles(prev => {
-                const newFiles = [...prev];
-                newFiles[index] = file;
-                return newFiles;
-              });
-            }}
-          />
-        </div>
-
-        {file1Headers.length > 0 && file2Headers.length > 0 && (
-          <div className="mb-6">
-            <ColumnMapping 
-              file1Headers={file1Headers}
-              file2Headers={file2Headers}
-              skuColumn1={skuColumn1}
-              skuColumn2={skuColumn2}
-              onSkuColumn1Change={setSkuColumn1}
-              onSkuColumn2Change={setSkuColumn2}
-            />
-          </div>
-        )}
-
-        {additionalFilesData.length > 0 && (
-          <div className="mb-6">
-            <MultiColumnMapping 
-              materialHeaders={file2Headers}
-              additionalFiles={additionalFilesData}
-              onSkuColumnChange={(fileIndex: number, column: string) => {
-                setAdditionalFilesData(prev => {
-                  const newData = [...prev];
-                  newData[fileIndex] = { ...newData[fileIndex], skuColumn: column };
-                  return newData;
-                });
-              }}
-            />
-          </div>
-        )}
-
-        {catalogData.length > 0 && (
-          <div className="mb-6">
-            <DataPreview 
-              data={catalogData}
-              title="Anteprima Dati Catalogo"
-              maxRows={5}
-            />
-          </div>
-        )}
-
-        {/* Action Buttons */}
+        {/* Actions */}
         <Card className="mb-6 p-6">
           <div className="space-y-4">
             
@@ -463,7 +484,7 @@ const AltersideCatalogGenerator = () => {
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <Button
                 onClick={handleEanGeneration}
-                disabled={isProcessing || !catalogFile}
+                disabled={isProcessing || !allFilesValid}
                 className="h-12"
               >
                 <Download className="mr-2 h-4 w-4" />
@@ -472,7 +493,7 @@ const AltersideCatalogGenerator = () => {
 
               <Button
                 onClick={handleSkuGeneration}
-                disabled={isProcessing || !catalogFile}
+                disabled={isProcessing || !allFilesValid}
                 className="h-12"
               >
                 <Download className="mr-2 h-4 w-4" />
@@ -503,47 +524,12 @@ const AltersideCatalogGenerator = () => {
           </div>
         </Card>
 
-        {/* Diagnostic Information - Only visible with diagnostic mode ON */}
+        {/* Diagnostic Panels - Only visible with diagnostic mode ON */}
         {isDiagnosticMode && (
-          <Card className="p-6">
-            <h3 className="text-lg font-semibold mb-4">Informazioni Diagnostiche</h3>
-            
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-4">
-              <div className="p-3 bg-muted rounded">
-                <div className="font-medium">Worker Strategy</div>
-                <div className="text-lg">{workerStrategy}</div>
-              </div>
-              <div className="p-3 bg-muted rounded">
-                <div className="font-medium">Stato</div>
-                <div className="text-lg">{processingState}</div>
-              </div>
-              <div className="p-3 bg-muted rounded">
-                <div className="font-medium">Progresso</div>
-                <div className="text-lg">{progressPct}%</div>
-              </div>
-              <div className="p-3 bg-muted rounded">
-                <div className="font-medium">Messaggi Worker</div>
-                <div className="text-lg">{diagnosticState.workerMessages.length}</div>
-              </div>
-            </div>
-
-            {/* Debug Events */}
-            <div className="mb-4">
-              <h4 className="font-medium mb-2">Eventi Debug</h4>
-              <div className="bg-muted p-3 rounded max-h-32 overflow-y-auto">
-                {debugEvents.length === 0 ? (
-                  <div className="text-muted-foreground text-sm">Nessun evento registrato</div>
-                ) : (
-                  debugEvents.map((event, index) => (
-                    <div key={index} className="text-sm font-mono">{event}</div>
-                  ))
-                )}
-              </div>
-            </div>
-
+          <div className="space-y-6">
             {/* Worker Messages */}
-            <div>
-              <h4 className="font-medium mb-2">Messaggi Worker</h4>
+            <Card className="p-6">
+              <h3 className="text-lg font-semibold mb-4">Messaggi Worker</h3>
               <div className="bg-muted p-3 rounded max-h-32 overflow-y-auto">
                 {diagnosticState.workerMessages.length === 0 ? (
                   <div className="text-muted-foreground text-sm">Nessun messaggio ricevuto</div>
@@ -555,8 +541,57 @@ const AltersideCatalogGenerator = () => {
                   ))
                 )}
               </div>
-            </div>
-          </Card>
+            </Card>
+
+            {/* Statistics */}
+            <Card className="p-6">
+              <h3 className="text-lg font-semibold mb-4">Statistiche Diagnostiche</h3>
+              <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                <div className="p-3 bg-muted rounded">
+                  <div className="font-medium">Worker Strategy</div>
+                  <div className="text-lg">{workerStrategy}</div>
+                </div>
+                <div className="p-3 bg-muted rounded">
+                  <div className="font-medium">Stato</div>
+                  <div className="text-lg">{processingState}</div>
+                </div>
+                <div className="p-3 bg-muted rounded">
+                  <div className="font-medium">Progresso</div>
+                  <div className="text-lg">{progressPct}%</div>
+                </div>
+                <div className="p-3 bg-muted rounded">
+                  <div className="font-medium">Messaggi</div>
+                  <div className="text-lg">{diagnosticState.workerMessages.length}</div>
+                </div>
+              </div>
+
+              {/* Debug Events */}
+              <div className="mt-4">
+                <h4 className="font-medium mb-2">Eventi Debug</h4>
+                <div className="bg-muted p-3 rounded max-h-32 overflow-y-auto">
+                  {debugEvents.length === 0 ? (
+                    <div className="text-muted-foreground text-sm">Nessun evento registrato</div>
+                  ) : (
+                    debugEvents.map((event, index) => (
+                      <div key={index} className="text-sm font-mono">{event}</div>
+                    ))
+                  )}
+                </div>
+              </div>
+            </Card>
+
+            {/* Copy Diagnostic Data */}
+            <Card className="p-6">
+              <h3 className="text-lg font-semibold mb-4">Copia diagnostica</h3>
+              <Button
+                onClick={copyDiagnosticData}
+                variant="outline"
+                className="w-full"
+              >
+                Copia dati diagnostici negli appunti
+              </Button>
+            </Card>
+          </div>
         )}
       </div>
     </div>
