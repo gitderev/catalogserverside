@@ -111,6 +111,140 @@ export function ceilToIntegerEuros(cents: number): number {
 }
 
 /**
+ * SKU-specific fee calculation types and functions
+ */
+export type Fee = { kind: 'percent' | 'absolute'; value: number }; // percent in decimal: 0.05 = 5%
+export type SkuCfg = { fees: Fee[]; shippingEuro?: number; vatRate?: number };
+
+function applyFeesSeqCents(cents: number, fees: Fee[]): number {
+  let v = cents;
+  for (const f of fees ?? []) {
+    if (f.kind === 'percent') {
+      v = Math.round(v * (1 + f.value));
+    } else {
+      v += toCents(f.value);
+    }
+  }
+  return v;
+}
+
+export function computeFinalSkuCents(baseEuro: number, cfg: SkuCfg): number {
+  if (!isFinite(baseEuro) || baseEuro <= 0) throw new Error('Prezzo base non valido');
+  const ship = toCents(cfg.shippingEuro ?? 6);
+  const vat = cfg.vatRate ?? 0.22;
+
+  let v = toCents(baseEuro) + ship;   // + spedizione
+  v = Math.round(v * (1 + vat));      // + IVA
+  v = applyFeesSeqCents(v, cfg.fees); // + fee sequenziali
+  v = Math.ceil(v / 100) * 100;       // arrotondamento all'euro superiore
+  return v;                           // requisito: v % 100 === 0
+}
+
+// Audit: parte SEMPRE da ListPrice
+export function computeListPriceWithFeeCents(listPriceEuro: number, cfg: SkuCfg): number | null {
+  if (!isFinite(listPriceEuro) || listPriceEuro <= 0) return null;
+  const ship = toCents(cfg.shippingEuro ?? 6);
+  const vat = cfg.vatRate ?? 0.22;
+  let v = toCents(listPriceEuro) + ship;
+  v = Math.round(v * (1 + vat));
+  v = applyFeesSeqCents(v, cfg.fees);
+  return Math.ceil(v / 100) * 100; // intero
+}
+
+function pickSkuBaseEuro(row: any): number | null {
+  const cbp = Number(row.CustBestPrice ?? NaN);
+  const lp = Number(row.ListPrice ?? NaN);
+  if (isFinite(cbp) && cbp > 0) return cbp;
+  if (isFinite(lp) && lp > 0) return lp;
+  return null;
+}
+
+export function buildSkuCatalog(rows: any[], cfg: SkuCfg): any[] {
+  const out = [];
+  const rejects: {idx: number; reason: string}[] = [];
+
+  rows.forEach((r, idx) => {
+    const stock = Number(r.ExistingStock ?? NaN);
+    if (!isFinite(stock) || stock <= 1) { 
+      rejects.push({idx, reason: 'stock'}); 
+      return; 
+    }
+
+    const mpn = String(r.ManufPartNr ?? '').trim();
+    if (!mpn) { 
+      rejects.push({idx, reason: 'mpn_vuoto'}); 
+      return; 
+    }
+
+    const base = pickSkuBaseEuro(r);
+    if (base == null) { 
+      rejects.push({idx, reason: 'prezzo_base'}); 
+      return; 
+    }
+
+    const finalCents = computeFinalSkuCents(base, cfg);
+    const lpAuditCents = computeListPriceWithFeeCents(Number(r.ListPrice ?? NaN), cfg);
+
+    // Calculate pre-fee price for display
+    const ship = toCents(cfg.shippingEuro ?? 6);
+    const vat = cfg.vatRate ?? 0.22;
+    const preFeeC = Math.round((toCents(base) + ship) * (1 + vat));
+    const preFeeEuro = preFeeC / 100;
+
+    // Calculate individual fees for display
+    const baseWithShipVat = preFeeC;
+    let feeDeRevEuro = 0;
+    let feeMktEuro = 0;
+    
+    if (cfg.fees.length >= 1 && cfg.fees[0].kind === 'percent') {
+      feeDeRevEuro = (baseWithShipVat * cfg.fees[0].value) / 100;
+    } else if (cfg.fees.length >= 1 && cfg.fees[0].kind === 'absolute') {
+      feeDeRevEuro = cfg.fees[0].value;
+    }
+    
+    if (cfg.fees.length >= 2 && cfg.fees[1].kind === 'percent') {
+      const afterFirstFee = cfg.fees[0].kind === 'percent' 
+        ? baseWithShipVat * (1 + cfg.fees[0].value)
+        : baseWithShipVat + toCents(cfg.fees[0].value);
+      feeMktEuro = (afterFirstFee * cfg.fees[1].value) / 100;
+    } else if (cfg.fees.length >= 2 && cfg.fees[1].kind === 'absolute') {
+      feeMktEuro = cfg.fees[1].value;
+    }
+
+    const subtotalePostFee = preFeeEuro + feeDeRevEuro + feeMktEuro;
+
+    out.push({
+      ...r,
+      ManufPartNr: mpn,
+      Percorso: 'SKU',
+      PrezzoBasePercorso: base,
+      'Costo di Spedizione': 6.00,
+      IVA: 0.22,
+      'Prezzo con spedizione e IVA': preFeeEuro,
+      FeeDeRev: feeDeRevEuro,
+      'Fee Marketplace': feeMktEuro,
+      'Subtotale post-fee': subtotalePostFee,
+      'Prezzo Finale': finalCents / 100,
+      ...(lpAuditCents != null ? {'ListPrice con Fee': lpAuditCents / 100} : {}),
+    });
+  });
+
+  // Validazioni dure
+  out.forEach(o => {
+    const c = toCents(Number(o['Prezzo Finale']));
+    if (c % 100 !== 0) throw new Error('SKU: PrezzoFinale deve essere intero in euro');
+    if ('ListPrice con Fee' in o) {
+      const a = toCents(Number(o['ListPrice con Fee']));
+      if (a % 100 !== 0) throw new Error('SKU: ListPrice con Fee deve essere intero');
+    }
+  });
+
+  // Log rejects for debugging
+  console.debug('SKU rejects', rejects);
+  return out;
+}
+
+/**
  * Legacy functions for backward compatibility
  */
 export function roundToCents(n: number): number {

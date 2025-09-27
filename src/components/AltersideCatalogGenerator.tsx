@@ -20,7 +20,10 @@ import {
   parsePercentToRate,
   parseRate,
   ceilToComma99, 
-  ceilToIntegerEuros 
+  ceilToIntegerEuros,
+  buildSkuCatalog,
+  type Fee,
+  type SkuCfg
 } from '@/utils/pricing';
 import * as XLSX from 'xlsx';
 import Papa from 'papaparse';
@@ -311,6 +314,7 @@ const AltersideCatalogGenerator: React.FC = () => {
 
   // Export state for preventing double clicks
   const [isExportingEAN, setIsExportingEAN] = useState(false);
+  const [isExportingSKU, setIsExportingSKU] = useState(false);
 
   const workerRef = useRef<Worker | null>(null);
 
@@ -1341,6 +1345,191 @@ const AltersideCatalogGenerator: React.FC = () => {
     }
   }, [currentProcessedData, isExportingEAN, dbg, toast]);
 
+  // SKU catalog generation function
+  const onGenerateSkuCatalog = useCallback(async () => {
+    if (isExportingSKU) {
+      toast({
+        title: "Generazione in corso...",
+        description: "Attendere completamento della generazione corrente"
+      });
+      return;
+    }
+
+    setIsExportingSKU(true);
+    dbg('sku:generation:start');
+
+    try {
+      // Validate files are available
+      if (!files.material.file || !files.stock.file || !files.price.file) {
+        throw new Error('File richiesti mancanti per la generazione SKU');
+      }
+
+      // Get fee configuration from UI
+      const getFeesFromUI = (): Fee[] => {
+        const fees: Fee[] = [];
+        
+        // Convert feeConfig to SKU fee format
+        if (feeConfig.feeDrev && feeConfig.feeDrev !== 1) {
+          fees.push({ kind: 'percent', value: feeConfig.feeDrev - 1 }); // 1.05 -> 0.05
+        }
+        if (feeConfig.feeMkt && feeConfig.feeMkt !== 1) {
+          fees.push({ kind: 'percent', value: feeConfig.feeMkt - 1 }); // 1.08 -> 0.08
+        }
+        
+        return fees;
+      };
+
+      const cfg: SkuCfg = { 
+        fees: getFeesFromUI(), 
+        shippingEuro: 6, 
+        vatRate: 0.22 
+      };
+
+      // Load source data (same as EAN pipeline)
+      const materialData = files.material.file.data;
+      const stockData = files.stock.file.data;
+      const priceData = files.price.file.data;
+
+      // Create joined dataset
+      const joinedData: any[] = [];
+      materialData.forEach((material: any) => {
+        const stock = stockData.find((s: any) => s.Matnr === material.Matnr);
+        const price = priceData.find((p: any) => p.Matnr === material.Matnr);
+        
+        if (stock && price) {
+          joinedData.push({
+            ...material,
+            ...stock,
+            ...price
+          });
+        }
+      });
+
+      dbg('sku:data:joined', { total: joinedData.length });
+
+      // Build SKU catalog
+      const skuRows = buildSkuCatalog(joinedData, cfg);
+      
+      dbg('sku:catalog:built', { 
+        input: joinedData.length, 
+        output: skuRows.length,
+        rejected: joinedData.length - skuRows.length 
+      });
+
+      // Log sample for verification (first 3 rows)
+      skuRows.slice(0, 3).forEach((row, idx) => {
+        const baseCents = toCents(row.PrezzoBasePercorso);
+        const shipCents = toCents(6);
+        const preFeeC = Math.round((baseCents + shipCents) * 1.22);
+        const finalCents = toCents(row['Prezzo Finale']);
+        
+        console.warn(`sku:sample:${idx}`, {
+          base: row.PrezzoBasePercorso,
+          preFee: preFeeC / 100,
+          feeDeRev: row.FeeDeRev,
+          feeMkt: row['Fee Marketplace'],
+          final: finalCents / 100
+        });
+      });
+
+      // Prepare export data with exact column order
+      const exportData = skuRows.map(row => {
+        // Sanitize text fields
+        const sanitizeText = (value: any): string => {
+          let str = String(value ?? '');
+          if (str.startsWith('=') || str.startsWith('+') || str.startsWith('-') || str.startsWith('@')) {
+            str = "'" + str;
+          }
+          return str.replace(/[\x00-\x1F\x7F]/g, ''); // Remove control characters
+        };
+
+        return {
+          'Matnr': sanitizeText(row.Matnr),
+          'ManufPartNr': sanitizeText(row.ManufPartNr),
+          'EAN': sanitizeText(row.EAN || ''),
+          'ShortDescription': sanitizeText(row.ShortDescription),
+          'ExistingStock': Number(row.ExistingStock),
+          'CustBestPrice': Number(row.CustBestPrice || 0),
+          'Costo di Spedizione': 6.00,
+          'IVA': 0.22,
+          'Prezzo con spedizione e IVA': Number(row['Prezzo con spedizione e IVA']),
+          'FeeDeRev': Number(row.FeeDeRev),
+          'Fee Marketplace': Number(row['Fee Marketplace']),
+          'Subtotale post-fee': Number(row['Subtotale post-fee']),
+          'Prezzo Finale': Number(row['Prezzo Finale']),
+          'ListPrice': Number(row.ListPrice || 0),
+          'ListPrice con Fee': row['ListPrice con Fee'] ? Number(row['ListPrice con Fee']) : ''
+        };
+      });
+
+      // Create Excel file
+      const ws = XLSX.utils.json_to_sheet(exportData);
+      
+      // Format EAN column as text
+      forceEANText(ws, 0);
+      
+      // Set column formats
+      const range = XLSX.utils.decode_range(ws['!ref'] || 'A1');
+      for (let R = 1; R <= range.e.r; R++) {
+        // IVA as percentage
+        const ivaAddr = XLSX.utils.encode_cell({ r: R, c: 7 }); // IVA column
+        if (ws[ivaAddr]) {
+          ws[ivaAddr].z = '0%';
+        }
+        
+        // Numeric columns with 2 decimals
+        const numericCols = [5, 6, 8, 9, 10, 11, 12, 14]; // Price columns
+        numericCols.forEach(colIndex => {
+          if (colIndex <= range.e.c) {
+            const addr = XLSX.utils.encode_cell({ r: R, c: colIndex });
+            if (ws[addr] && typeof ws[addr].v === 'number') {
+              ws[addr].z = '0.00';
+            }
+          }
+        });
+      }
+
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'SKU');
+
+      // Generate filename with timezone Europe/Rome
+      const now = new Date();
+      const romeTime = new Date(now.toLocaleString("en-US", {timeZone: "Europe/Rome"}));
+      const timestamp = romeTime.toISOString().slice(0, 16).replace('T', '_').replace(/:/g, '');
+      const filename = `catalogo_sku_${timestamp}.xlsx`;
+
+      XLSX.writeFile(wb, filename);
+
+      // Log final summary
+      const totalRead = joinedData.length;
+      const totalExported = skuRows.length;
+      const totalRejected = totalRead - totalExported;
+      
+      console.warn('sku:summary', {
+        righe_lette: totalRead,
+        righe_esportate: totalExported,
+        righe_scartate: totalRejected
+      });
+
+      toast({
+        title: "Catalogo SKU generato",
+        description: `${totalExported} prodotti esportati in ${filename}`,
+        variant: "default"
+      });
+
+    } catch (error) {
+      console.error('SKU generation error:', error);
+      toast({
+        title: "Errore durante la generazione SKU",
+        description: error instanceof Error ? error.message : "Errore sconosciuto",
+        variant: "destructive"
+      });
+    } finally {
+      setIsExportingSKU(false);
+      dbg('sku:generation:end');
+    }
+  }, [files, feeConfig, isExportingSKU, dbg, toast]);
+
   const downloadExcel = (type: 'ean' | 'manufpartnr') => {
     if (type === 'ean') {
       // Use the new onExportEAN function for EAN catalog
@@ -1560,8 +1749,9 @@ const AltersideCatalogGenerator: React.FC = () => {
                   <li>• <strong>Filtri comuni:</strong> ExistingStock &gt; 1, prezzi numerici validi</li>
                   <li>• <strong>Export EAN:</strong> solo record con EAN non vuoto</li>
                   <li>• <strong>Export ManufPartNr:</strong> solo record con ManufPartNr non vuoto</li>
+                  <li>• <strong>Catalogo SKU:</strong> record con ManufPartNr non vuoto, anche senza EAN</li>
                   <li>• <strong>Prezzi:</strong> Base + spedizione (€6), IVA 22%, fee sequenziali configurabili</li>
-                  <li>• <strong>Prezzo finale EAN:</strong> ending ,99; <strong>ManufPartNr:</strong> arrotondamento intero superiore</li>
+                  <li>• <strong>Prezzo finale EAN:</strong> ending ,99; <strong>ManufPartNr:</strong> arrotondamento intero superiore; <strong>SKU:</strong> intero superiore</li>
                 </ul>
               </div>
             </div>
@@ -1709,6 +1899,23 @@ const AltersideCatalogGenerator: React.FC = () => {
                   <>
                     <Upload className="mr-3 h-5 w-5" />
                     GENERA EXCEL (ManufPartNr)
+                  </>
+                )}
+              </button>
+              <button
+                onClick={onGenerateSkuCatalog}
+                disabled={!canProcess || isExportingSKU}
+                className={`btn btn-secondary text-lg px-12 py-4 ${!canProcess || isExportingSKU ? 'is-disabled' : ''}`}
+              >
+                {isExportingSKU ? (
+                  <>
+                    <Activity className="mr-3 h-5 w-5 animate-spin" />
+                    Generazione SKU...
+                  </>
+                ) : (
+                  <>
+                    <Download className="mr-3 h-5 w-5" />
+                    Genera catalogo SKU (ManufPartNr)
                   </>
                 )}
               </button>
