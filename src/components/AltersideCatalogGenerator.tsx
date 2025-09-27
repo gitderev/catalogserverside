@@ -1591,13 +1591,21 @@ const AltersideCatalogGenerator: React.FC = () => {
   const [firstBatchTime, setFirstBatchTime] = useState<number | null>(null);
 
   // Cleanup worker on unmount
+  const [blobUrlRef, setBlobUrlRef] = useState<string | null>(null);
+  
   useEffect(() => {
     return () => {
       if (skuWorker) {
+        console.log('CLEANUP: terminating worker on unmount');
         skuWorker.terminate();
       }
+      if (blobUrlRef) {
+        console.log('CLEANUP: revoking blob URL on unmount');
+        URL.revokeObjectURL(blobUrlRef);
+        console.log('blob_url_revoked=true (unmount)');
+      }
     };
-  }, [skuWorker]);
+  }, [skuWorker, blobUrlRef]);
 
   const handleSkuComplete = (data: any) => {
     if (skuTimeout) {
@@ -2229,22 +2237,54 @@ function processSkuRow(row, feeDeRevPercent, feeMktPercent, rejects, rowIndex) {
 
     console.log('worker_created', { type: 'blob', version });
 
-    // Create blob worker
+    // Create blob worker with comprehensive logging
     const blob = new Blob([workerCode], { type: 'text/javascript' });
-    const worker = new Worker(URL.createObjectURL(blob));
+    const blobUrl = URL.createObjectURL(blob);
+    
+    // Store blob URL reference for cleanup
+    setBlobUrlRef(blobUrl);
+    
+    // Log blob URL creation
+    console.log('BLOB_URL_CREATED:', blobUrl);
+    console.log('blob_url_revoked=false');
+    
+    // Check Content-Security-Policy
+    const cspMeta = document.querySelector('meta[http-equiv="Content-Security-Policy"]');
+    const cspHeader = cspMeta ? cspMeta.getAttribute('content') : 'Not found in meta';
+    console.log('CONTENT_SECURITY_POLICY:', cspHeader);
+    
+    // Check if worker-src/child-src include blob:
+    const workerSrcAllowsBlob = !cspHeader || cspHeader === 'Not found in meta' || cspHeader.includes('worker-src') ? cspHeader.includes('blob:') || !cspHeader.includes('worker-src') : 'N/A';
+    const childSrcAllowsBlob = !cspHeader || cspHeader === 'Not found in meta' || cspHeader.includes('child-src') ? cspHeader.includes('blob:') || !cspHeader.includes('child-src') : 'N/A';
+    console.log('WORKER_SRC_ALLOWS_BLOB:', workerSrcAllowsBlob);
+    console.log('CHILD_SRC_ALLOWS_BLOB:', childSrcAllowsBlob);
+    
+    const worker = new Worker(blobUrl);
     
     // Handshake gate with 2s timeout
     let handshakeTimer: NodeJS.Timeout;
     let workerReadyReceived = false;
+    let blobUrlRevoked = false;
     
+    // Attach event handlers BEFORE sending any messages
     const waitForHandshake = new Promise<void>((resolve, reject) => {
       handshakeTimer = setTimeout(() => {
         console.log('worker_handshake_timeout');
+        if (!blobUrlRevoked) {
+          URL.revokeObjectURL(blobUrl);
+          blobUrlRevoked = true;
+          console.log('blob_url_revoked=true (timeout)');
+        }
         worker.terminate();
         reject(new Error('Worker non inizializzato'));
       }, 2000);
 
+      // Worker message handler
       const messageHandler = (e: MessageEvent) => {
+        // Log all worker messages
+        console.log('WORKER_MESSAGE_RECEIVED:', e.data);
+        addWorkerMessage(e.data);
+        
         const { type, data } = e.data;
         
         if (type === 'worker_ready' && !workerReadyReceived) {
@@ -2265,11 +2305,44 @@ function processSkuRow(row, feeDeRevPercent, feeMktPercent, rejects, rowIndex) {
 
       worker.addEventListener('message', messageHandler);
       
-      worker.onerror = (error) => {
+      // Error handlers with detailed logging
+      worker.onerror = (error: ErrorEvent) => {
         clearTimeout(handshakeTimer);
-        console.error('Worker error:', error);
+        console.error('WORKER_ERROR:', {
+          message: error.message,
+          filename: error.filename,
+          lineno: error.lineno,
+          colno: error.colno,
+          error: error.error
+        });
+        console.log('WORKER_ERROR_DETAILS:', error);
+        if (!blobUrlRevoked) {
+          URL.revokeObjectURL(blobUrl);
+          blobUrlRevoked = true;
+          console.log('blob_url_revoked=true (onerror)');
+        }
         reject(error);
       };
+      
+      worker.onmessageerror = (error: MessageEvent) => {
+        clearTimeout(handshakeTimer);
+        console.error('WORKER_MESSAGE_ERROR:', {
+          type: 'messageerror',
+          data: error.data,
+          origin: error.origin,
+          source: error.source
+        });
+        console.log('WORKER_MESSAGE_ERROR_DETAILS:', error);
+        if (!blobUrlRevoked) {
+          URL.revokeObjectURL(blobUrl);
+          blobUrlRevoked = true;
+          console.log('blob_url_revoked=true (onmessageerror)');
+        }
+        reject(new Error('Worker message error'));
+      };
+      
+      // Log that handlers are attached
+      console.log('handlers_attached=true');
     });
 
     setSkuWorker(worker);
@@ -2278,6 +2351,20 @@ function processSkuRow(row, feeDeRevPercent, feeMktPercent, rejects, rowIndex) {
     
     try {
       await waitForHandshake;
+      
+      // Send INIT message immediately after handshake
+      const initPayload = {
+        version,
+        schema: 1,
+        diag: diagnosticState.isEnabled,
+        sampleSize: diagnosticState.isEnabled ? diagnosticState.maxRows : undefined
+      };
+      
+      console.log('init_sent=true', initPayload);
+      worker.postMessage({ 
+        type: 'INIT', 
+        data: initPayload
+      });
       
       // Check if prescan is needed
       if (!debugState.materialPreScanDone) {
@@ -2396,6 +2483,14 @@ function processSkuRow(row, feeDeRevPercent, feeMktPercent, rejects, rowIndex) {
       if (skuTimeout) {
         clearTimeout(skuTimeout);
         setSkuTimeout(null);
+      }
+      
+      // Clean up blob URL when processing is complete
+      if (blobUrlRef) {
+        console.log('CLEANUP: revoking blob URL on completion');
+        URL.revokeObjectURL(blobUrlRef);
+        setBlobUrlRef(null);
+        console.log('blob_url_revoked=true (completion)');
       }
       
       // Export to Excel
