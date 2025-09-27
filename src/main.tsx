@@ -4,10 +4,8 @@ import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { Toaster } from "@/components/ui/toaster";
 import "./index.css";
 import "./custom.css";
-import "./theme-reset.css"; /* Final theme override - loads last */
 
 import Index from "./pages/Index.tsx";
-import WorkerTestPage from "./pages/WorkerTest.tsx";
 import NotFound from "./pages/NotFound.tsx";
 
 createRoot(document.getElementById("root")!).render(
@@ -15,7 +13,6 @@ createRoot(document.getElementById("root")!).render(
     <BrowserRouter>
       <Routes>
         <Route path="/" element={<Index />} />
-        <Route path="/worker-test" element={<WorkerTestPage />} />
         <Route path="*" element={<NotFound />} />
       </Routes>
       <Toaster />

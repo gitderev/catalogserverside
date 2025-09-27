@@ -4,28 +4,30 @@
 
 @layer base {
   :root {
-    /* Base theme variables - loaded once */
-    --background: 0 0% 100%;
-    --foreground: 222.2 47.4% 11.2%;
-    --card: 0 0% 100%;
-    --card-foreground: 222.2 47.4% 11.2%;
-    --muted: 210 40% 96%;
-    --muted-foreground: 215.4 16.3% 46.9%;
+    /* High contrast flat design colors */
+    --background: 250 250 250;
+    --foreground: 25 25 25;
 
-    --popover: 0 0% 100%;
-    --popover-foreground: 222.2 47.4% 11.2%;
+    --card: 255 255 255;
+    --card-foreground: 25 25 25;
+
+    --popover: 255 255 255;
+    --popover-foreground: 25 25 25;
 
     /* Primary blue for buttons and accents */
-    --primary: 221.2 83.2% 53.3%;
-    --primary-foreground: 210 40% 98%;
+    --primary: 37 99 235;
+    --primary-foreground: 255 255 255;
 
     /* Secondary gray for less important elements */
-    --secondary: 210 40% 96%;
-    --secondary-foreground: 222.2 47.4% 11.2%;
+    --secondary: 245 245 245;
+    --secondary-foreground: 60 60 60;
+
+    --muted: 245 245 245;
+    --muted-foreground: 100 100 100;
 
     /* High contrast accent colors */
-    --accent: 210 40% 96%;
-    --accent-foreground: 222.2 47.4% 11.2%;
+    --accent: 239 246 255;
+    --accent-foreground: 30 58 138;
 
     /* Success green for valid states */
     --success: 34 197 94;
@@ -38,7 +40,7 @@
     /* Strong borders for flat design */
     --border: 200 200 200;
     --input: 200 200 200;
-    --ring: 221.2 83.2% 53.3%;
+    --ring: 37 99 235;
 
     /* High contrast progress colors */
     --progress-bg: 230 230 230;
@@ -88,8 +90,7 @@
   }
 
   body {
-    background-color: hsl(var(--background));
-    color: hsl(var(--foreground));
+    @apply bg-background text-foreground;
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;
     font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
   }
