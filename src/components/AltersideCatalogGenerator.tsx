@@ -1051,16 +1051,24 @@ const AltersideCatalogGenerator: React.FC = () => {
   };
 
   const formatExcelData = (data: ProcessedRecord[]) => {
+    // Helper function for safe number conversion
+    const asNumber = (v: number | string | undefined | null) => {
+      const n = typeof v === 'string' ? parseFloat(v.replace('.', '').replace(',', '.')) : Number(v);
+      return Number.isFinite(n) ? n : 0;
+    };
+
     return data.map(record => ({
       ...record,
       ExistingStock: record.ExistingStock.toString(),
-      ListPrice: record.ListPrice.toFixed(2).replace('.', ','),
+      ListPrice: asNumber(record.ListPrice).toFixed(2).replace('.', ','),
       CustBestPrice: record.CustBestPrice.toString(),
-      'ListPrice con IVA': record['ListPrice con IVA'].toFixed(2).replace('.', ','),
-      'CustBestPrice con IVA': record['CustBestPrice con IVA'].toFixed(2).replace('.', ','),
       'Costo di spedizione': record['Costo di spedizione'].toString(),
-      'Prezzo finale': typeof record['Prezzo finale'] === 'string' ? record['Prezzo finale'] : record['Prezzo finale'].toFixed(2).replace('.', ','),
-      'Prezzo finale Listino': record['Prezzo finale Listino'].toString()
+      'Prezzo con spediz e IVA': asNumber(record['Prezzo con spediz e IVA']).toFixed(2).replace('.', ','),
+      FeeDeRev: record.FeeDeRev.toString(),
+      'Fee Marketplace': record['Fee Marketplace'].toString(),
+      'Subtotale post-fee': asNumber(record['Subtotale post-fee']).toFixed(2).replace('.', ','),
+      'Prezzo Finale': typeof record['Prezzo Finale'] === 'string' ? record['Prezzo Finale'] : asNumber(record['Prezzo Finale']).toFixed(2).replace('.', ','),
+      'ListPrice con Fee': typeof record['ListPrice con Fee'] === 'string' ? record['ListPrice con Fee'] : String(Math.ceil(asNumber(record['ListPrice con Fee'])))
     }));
   };
 
@@ -1348,31 +1356,53 @@ const AltersideCatalogGenerator: React.FC = () => {
       return;
     }
     
-    // Keep existing logic for manufpartnr
-    if (currentProcessedData.length === 0) return;
-    
-    dbg('excel:write:start');
-    
-    const { timestamp, sheetName } = getTimestamp();
-    const filename = `catalogo_${type}_${timestamp}.xlsx`;
+    // MPN export with validations
+    try {
+      // Filter MPN rows from current processed data
+      const mpnRows = currentProcessedData.filter(record => record.ManufPartNr && record.ManufPartNr.trim().length > 0);
+      
+      // Validation guard
+      if (!Array.isArray(mpnRows) || mpnRows.length === 0) {
+        console.warn('mpn:empty');
+        toast({
+          title: "Nessuna riga valida per MPN",
+          description: "Non ci sono record con ManufPartNr validi da esportare"
+        });
+        return;
+      }
+      
+      dbg('excel:write:start');
+      
+      const { timestamp, sheetName } = getTimestamp();
+      const filename = `Catalogo_MPN.xlsx`;
 
-    const excelData = formatExcelData(currentProcessedData);
-    const ws = XLSX.utils.json_to_sheet(excelData);
-    
-    // Force EAN column to text format for both pipelines
-    forceEANText(ws);
-    
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, sheetName);
-    XLSX.writeFile(wb, filename);
+      const excelData = formatExcelData(mpnRows);
+      const ws = XLSX.utils.json_to_sheet(excelData);
+      
+      // Force EAN column to text format for both pipelines
+      forceEANText(ws);
+      
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, sheetName);
+      
+      console.info('mpn:wb', mpnRows.length);
+      XLSX.writeFile(wb, filename);
 
-    setExcelDone(true);
-    dbg('excel:write:done', { pipeline: type });
+      setExcelDone(true);
+      dbg('excel:write:done', { pipeline: type });
 
-    toast({
-      title: "Excel scaricato",
-      description: `File ${filename} scaricato con successo`
-    });
+      toast({
+        title: "Excel scaricato",
+        description: `File ${filename} scaricato con successo`
+      });
+    } catch (e) {
+      console.error('mpn:export-fail', e);
+      toast({
+        title: "Errore durante l'export MPN",
+        description: e instanceof Error ? e.message : "Errore sconosciuto",
+        variant: "destructive"
+      });
+    }
   };
 
   const downloadDiscardedRows = () => {
