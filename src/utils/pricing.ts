@@ -102,8 +102,8 @@ export function computeFromListPrice(
   // Step by step calculation in cents - apply both fees as multipliers
   const afterShippingCents = baseCents + shippingCents;
   const afterIvaCents = applyRate(afterShippingCents, (100 + ivaPerc) / 100);
-  const afterFeeDeRevCents = applyRate(afterIvaCents, 1 + (fees.feeDeRev / 100));
-  const afterFeesCents = applyRate(afterFeeDeRevCents, 1 + (fees.feeMarketplace / 100));
+  const afterFeeDeRevCents = applyRate(afterIvaCents, fees.feeDeRev / 100);
+  const afterFeesCents = applyRate(afterFeeDeRevCents, fees.feeMarketplace / 100);
   
   // Ceiling to next integer (multiple of 100 cents)
   const finalInt = Math.ceil(afterFeesCents / 100) * 100;
@@ -141,8 +141,8 @@ export function computeFinalEan(
   // Step by step calculation in cents - apply both fees as multipliers
   const afterShippingCents = baseCents + shippingCents;
   const afterIvaCents = applyRate(afterShippingCents, (100 + ivaPerc) / 100);
-  const afterFeeDeRevCents = applyRate(afterIvaCents, 1 + (fees.feeDeRev / 100));
-  const afterFeesCents = applyRate(afterFeeDeRevCents, 1 + (fees.feeMarketplace / 100));
+  const afterFeeDeRevCents = applyRate(afterIvaCents, fees.feeDeRev / 100);
+  const afterFeesCents = applyRate(afterFeeDeRevCents, fees.feeMarketplace / 100);
   
   // Subtotal after fees (before ,99 ceiling)
   const subtotalCents = afterFeesCents;
