@@ -116,47 +116,36 @@ function saveFees(cfg: FeeConfig) {
 
 // Helper functions for MPN calculations
 function asNum(v: any): number {
-  if (typeof v === 'string') {
-    // Remove dots (thousands separator) and replace comma with dot for decimals
-    const cleaned = v.replace(/\./g, '').replace(',', '.');
-    const n = parseFloat(cleaned);
-    return Number.isFinite(n) ? n : 0;
-  }
-  const n = Number(v);
+  if (v == null || v === '') return 0;
+  if (typeof v === 'number') return v;
+  const s = String(v).replace(/\./g, '').replace(',', '.');
+  const n = Number(s);
   return Number.isFinite(n) ? n : 0;
 }
 
 function ceil2(v: any): number {
-  const n = asNum(v);
-  return Math.ceil(n * 100) / 100;
+  return Math.ceil(asNum(v) * 100) / 100;
 }
 
-function ceilInt(x: number): number { 
-  return Math.ceil(x); 
+function ceilInt(v: any): number {
+  return Math.ceil(asNum(v));
 }
 
 function toEnding99(v: any): number {
   const n = asNum(v);
-  const str = n.toFixed(2);
-  if (str.endsWith('.99')) {
-    return n; // Already ends with ,99
-  }
-  const floor = Math.floor(n);
-  const target99 = floor + 0.99;
-  return n <= target99 ? target99 : floor + 1.99;
+  const c = Math.round(n * 100) % 100;
+  if (c === 99) return Math.floor(n) + 0.99;
+  const f = Math.floor(n);
+  return n <= f + 0.99 ? f + 0.99 : f + 1.99;
 }
 
-function toComma(v: any): string {
-  return asNum(v).toFixed(2).replace('.', ',');
+function toComma(n: any): string {
+  return asNum(n).toFixed(2).replace('.', ',');
 }
 
-function toExcelText(v: any): string {
-  const str = String(v ?? '');
-  // Prefix with apostrophe if starts with =, +, -, @
-  if (/^[=+\-@]/.test(str)) {
-    return "'" + str;
-  }
-  return str;
+function toExcelText(s: any): string {
+  const str = String(s ?? '');
+  return /^[=+\-@]/.test(str) ? `'${str}` : str;
 }
 
 
@@ -992,7 +981,9 @@ const AltersideCatalogGenerator: React.FC = () => {
           // Enhanced validation for MPN
           if (currentPipeline === 'MPN') {
             // Check for null, empty or negative values in essential components
-            if (listPriceNum <= 0 || custBestNumRaw <= 0 || feeConfig.feeDrev <= 0 || feeConfig.feeMkt <= 0 || 6.00 <= 0) {
+            const shipping = 6.00;
+            const iva = (listPriceNum + shipping) * 0.22;
+            if (listPriceNum <= 0 || custBestNumRaw <= 0 || feeConfig.feeDrev <= 0 || feeConfig.feeMkt <= 0 || shipping <= 0) {
               const le: LogEntry = { 
                 source_file: 'MaterialFile.txt', 
                 line: processedLocal + 2, 
@@ -1014,12 +1005,12 @@ const AltersideCatalogGenerator: React.FC = () => {
             feeMkt: feeConfig.feeMkt
           });
 
-          // MPN-specific calculations using new helpers
+          // MPN-specific calculations using corrected helpers
           const subtotalePostFee = currentPipeline === 'MPN' ? ceil2(calc.postFee) : calc.postFee;
           const listPriceConFee = currentPipeline === 'MPN' && listPriceNum > 0 
-            ? ceilInt(listPriceNum + 6.00 + (listPriceNum + 6.00) * 0.22 * feeConfig.feeDrev * feeConfig.feeMkt)
+            ? ceilInt(listPriceNum + 6.00 + (listPriceNum + 6.00) * 0.22 + feeConfig.feeDrev + feeConfig.feeMkt)
             : calc.listPriceConFee;
-          const prezzoFinale = currentPipeline === 'MPN' ? toEnding99(subtotalePostFee) : calc.eanResult.finalDisplay;
+          const prezzoFinaleMPN = currentPipeline === 'MPN' ? toEnding99(subtotalePostFee) : undefined;
 
           const base: ProcessedRecord = {
             Matnr: matnr,
@@ -1034,19 +1025,11 @@ const AltersideCatalogGenerator: React.FC = () => {
             'Prezzo con spediz e IVA': calc.subtotConIva,
             FeeDeRev: feeConfig.feeDrev,
             'Fee Marketplace': feeConfig.feeMkt,
-            'Subtotale post-fee': subtotalePostFee,
-            'Prezzo Finale': currentPipeline === 'EAN' ? calc.eanResult.finalDisplay : toComma(prezzoFinale),
-            'ListPrice con Fee': listPriceConFee
+            'Subtotale post-fee': currentPipeline === 'MPN' ? subtotalePostFee : calc.postFee,
+            'Prezzo Finale': currentPipeline === 'EAN' ? calc.eanResult.finalDisplay : prezzoFinaleMPN,
+            'ListPrice con Fee': currentPipeline === 'MPN' ? listPriceConFee : calc.listPriceConFee
           };
 
-          if (base.EAN) {
-            // Add internal EAN metadata for validation
-            (base as any)._eanFinalCents = currentPipeline === 'EAN' ? calc.eanResult.finalCents : undefined;
-            processedEAN.push(base);
-          } else {
-            const le: LogEntry = { source_file: 'MaterialFile.txt', line: processedLocal + 2, Matnr: matnr, ManufPartNr: base.ManufPartNr, EAN: '', reason: 'ean_empty', details: 'EAN vuoto o mancante' };
-            logsEAN.push(le);
-          }
 
           // Only add to MPN if pipeline is MPN and ManufPartNr is not empty
           if (currentPipeline === 'MPN' && base.ManufPartNr) {
@@ -1056,9 +1039,14 @@ const AltersideCatalogGenerator: React.FC = () => {
             logsMPN.push(le);
           }
           
-          // For EAN pipeline, add only if EAN is valid
-          if (currentPipeline === 'EAN' && base.ManufPartNr) {
-            processedMPN.push(base);
+          // For EAN pipeline, add only if EAN is valid  
+          if (currentPipeline === 'EAN' && base.EAN) {
+            // Add internal EAN metadata for validation
+            (base as any)._eanFinalCents = calc.eanResult.finalCents;
+            processedEAN.push(base);
+          } else if (currentPipeline === 'EAN') {
+            const le: LogEntry = { source_file: 'MaterialFile.txt', line: processedLocal + 2, Matnr: matnr, ManufPartNr: base.ManufPartNr, EAN: '', reason: 'ean_empty', details: 'EAN vuoto o mancante' };
+            logsEAN.push(le);
           }
 
           // Progress tracking is already done above - don't double count
@@ -1145,7 +1133,7 @@ const AltersideCatalogGenerator: React.FC = () => {
         ...cleanRecord,
         Matnr: String(record.Matnr ?? ''),
         ManufPartNr: String(record.ManufPartNr ?? ''),
-        EAN: toExcelText(record.EAN ?? ''),
+        EAN: toExcelText(record.EAN),
         ShortDescription: String(record.ShortDescription ?? ''),
         ExistingStock: String(record.ExistingStock ?? ''),
         ListPrice: toComma(record.ListPrice),
@@ -1156,12 +1144,8 @@ const AltersideCatalogGenerator: React.FC = () => {
         FeeDeRev: String(record.FeeDeRev ?? ''),
         'Fee Marketplace': String(record['Fee Marketplace'] ?? ''),
         'Subtotale post-fee': toComma(ceil2(record['Subtotale post-fee'])),
-        'Prezzo Finale': (typeof record['Prezzo Finale'] === 'string')
-          ? record['Prezzo Finale']
-          : toComma(record['Prezzo Finale']),
-        'ListPrice con Fee': (typeof record['ListPrice con Fee'] === 'string')
-          ? record['ListPrice con Fee']
-          : String(ceilInt(asNum(record['ListPrice con Fee'])))
+        'Prezzo Finale': toComma(record['Prezzo Finale']),
+        'ListPrice con Fee': String(ceilInt(record['ListPrice con Fee']))
       };
     });
   };
