@@ -529,23 +529,24 @@ const AltersideCatalogGenerator: React.FC = () => {
 
   const generateDiagnosticBundle = useCallback(() => {
     const bundle = {
-      ua: navigator.userAgent,
+      userAgent: navigator.userAgent,
       url: window.location.href,
       appVersion: '1.0.0',
-      workerVersion: 'blob',
+      workerVersion: workerState.version || 'unknown',
       batchSize: diagnosticState.statistics.batchSize,
       fileCounts: {
         material: files.material.file?.data.length || 0,
         stock: files.stock.file?.data.length || 0,
         price: files.price.file?.data.length || 0
       },
-      sequenceEvents: debugEvents.slice(-20),
-      workerMessagesFirst10: diagnosticState.workerMessages.slice(0, 10),
-      workerMessagesLast5: diagnosticState.workerMessages.slice(-5),
-      stats: diagnosticState.statistics,
-      firstWorkerError: diagnosticState.workerMessages.find(msg => msg.data.type === 'worker_error')?.data || null,
+      sequenzaEventi: debugEvents.slice(-20),
+      primi10MessaggiWorker: diagnosticState.workerMessages.slice(0, 10),
+      ultimi5MessaggiWorker: diagnosticState.workerMessages.slice(-5),
+      statistiche: diagnosticState.statistics,
+      primoWorkerError: diagnosticState.workerMessages.find(msg => msg.data.type === 'worker_error')?.data || null,
       errorCounters: diagnosticState.errorCounters,
-      testResults: diagnosticState.testResults
+      testResults: diagnosticState.testResults,
+      timestamp: new Date().toISOString()
     };
 
     navigator.clipboard.writeText(JSON.stringify(bundle, null, 2)).then(() => {
@@ -561,7 +562,7 @@ const AltersideCatalogGenerator: React.FC = () => {
         variant: "destructive"
       });
     });
-  }, [diagnosticState, debugEvents, files, toast]);
+  }, [diagnosticState, debugEvents, files, workerState.version, toast]);
 
   const isProcessing = processingState === 'running';
   const isCompleted = processingState === 'done';
@@ -1761,7 +1762,7 @@ const AltersideCatalogGenerator: React.FC = () => {
     await createSkuBlobWorker(true, { materialData, stockData, priceData });
   }, [diagnosticState.isEnabled, diagnosticState.maxRows, files, dbg]);
 
-  // Create blob worker with handshake gate
+  // Note: runDiagnosticTests is defined later in the file
   const createSkuBlobWorker = useCallback(async (isDiagnostic = false, overrideData?: any) => {
     if (!isDiagnostic) {
       console.log('click_sku');
