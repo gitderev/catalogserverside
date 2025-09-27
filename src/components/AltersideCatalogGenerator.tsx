@@ -373,6 +373,13 @@ const AltersideCatalogGenerator: React.FC = () => {
 
   const workerRef = useRef<Worker | null>(null);
   
+  // Global debug function - defined first
+  const dbg = useCallback((event: string, data?: any) => {
+    const timestamp = new Date().toLocaleTimeString('it-IT', { hour12: false });
+    const message = `[${timestamp}] ${event}${data ? ' | ' + JSON.stringify(data) : ''}`;
+    setDebugEvents(prev => [...prev, message]);
+  }, []);
+
   // Diagnostic functions
   const validateWorkerMessage = useCallback((data: any) => {
     if (!data || typeof data !== 'object' || !('type' in data)) {
@@ -380,8 +387,7 @@ const AltersideCatalogGenerator: React.FC = () => {
         ...prev,
         errorCounters: { ...prev.errorCounters, msgInvalid: prev.errorCounters.msgInvalid + 1 }
       }));
-      // dbg will be defined later in the component
-      console.warn('worker_msg_invalid', { receivedKeys: Object.keys(data || {}), expectedKeys: ['type'] });
+      dbg('worker_msg_invalid', { receivedKeys: Object.keys(data || {}), expectedKeys: ['type'] });
       return false;
     }
 
@@ -403,12 +409,12 @@ const AltersideCatalogGenerator: React.FC = () => {
         ...prev,
         errorCounters: { ...prev.errorCounters, msgInvalid: prev.errorCounters.msgInvalid + 1 }
       }));
-      console.warn('worker_msg_invalid', { type, receivedKeys: Object.keys(data), expectedKeys, missingKeys });
+      dbg('worker_msg_invalid', { type, receivedKeys: Object.keys(data), expectedKeys, missingKeys });
       return false;
     }
 
     return true;
-  }, []);
+  }, [dbg]);
 
   const addWorkerMessage = useCallback((data: any) => {
     const timestamp = new Date().toLocaleTimeString('it-IT', { hour12: false });
@@ -520,14 +526,7 @@ const AltersideCatalogGenerator: React.FC = () => {
     const logEntry = `AUDIT: ${msg}${data ? ' | ' + JSON.stringify(data) : ''}`;
     console.warn(logEntry);
     dbg(logEntry);
-  }, []);
-
-  // Global debug function
-  const dbg = useCallback((event: string, data?: any) => {
-    const timestamp = new Date().toLocaleTimeString('it-IT', { hour12: false });
-    const message = `[${timestamp}] ${event}${data ? ' | ' + JSON.stringify(data) : ''}`;
-    setDebugEvents(prev => [...prev, message]);
-  }, []);
+  }, [dbg]);
   
   // Make dbg available globally for worker
   useEffect(() => {
