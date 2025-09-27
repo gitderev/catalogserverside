@@ -191,22 +191,24 @@ export function buildSkuCatalog(rows: any[], cfg: SkuCfg): any[] {
     const preFeeC = Math.round((toCents(base) + ship) * (1 + vat));
     const preFeeEuro = preFeeC / 100;
 
-    // Calculate individual fees for display
+    // Calculate individual fees for display (sequential application)
     const baseWithShipVat = preFeeC;
     let feeDeRevEuro = 0;
     let feeMktEuro = 0;
+    let runningTotal = baseWithShipVat;
     
+    // Apply FeeDeRev (first fee)
     if (cfg.fees.length >= 1 && cfg.fees[0].kind === 'percent') {
-      feeDeRevEuro = (baseWithShipVat * cfg.fees[0].value) / 100;
+      feeDeRevEuro = (runningTotal * cfg.fees[0].value) / 100;
+      runningTotal = runningTotal + Math.round(feeDeRevEuro * 100);
     } else if (cfg.fees.length >= 1 && cfg.fees[0].kind === 'absolute') {
       feeDeRevEuro = cfg.fees[0].value;
+      runningTotal = runningTotal + toCents(cfg.fees[0].value);
     }
     
+    // Apply Fee Marketplace (second fee, sequential)
     if (cfg.fees.length >= 2 && cfg.fees[1].kind === 'percent') {
-      const afterFirstFee = cfg.fees[0].kind === 'percent' 
-        ? baseWithShipVat * (1 + cfg.fees[0].value)
-        : baseWithShipVat + toCents(cfg.fees[0].value);
-      feeMktEuro = (afterFirstFee * cfg.fees[1].value) / 100;
+      feeMktEuro = (runningTotal * cfg.fees[1].value) / 100;
     } else if (cfg.fees.length >= 2 && cfg.fees[1].kind === 'absolute') {
       feeMktEuro = cfg.fees[1].value;
     }

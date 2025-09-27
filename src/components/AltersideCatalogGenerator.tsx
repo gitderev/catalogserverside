@@ -97,7 +97,7 @@ const OPTIONAL_HEADERS = {
   price: ['ManufPartNr']
 };
 
-const DEFAULT_FEES: FeeConfig = { feeDrev: 1.05, feeMkt: 1.08 };
+const DEFAULT_FEES: FeeConfig = { feeDrev: 1.00, feeMkt: 1.00 };
 
 function loadFees(): FeeConfig {
   try {
@@ -1364,25 +1364,24 @@ const AltersideCatalogGenerator: React.FC = () => {
         throw new Error('File richiesti mancanti per la generazione SKU');
       }
 
-          // Get fee configuration from UI with proper normalization
+          // Get fee configuration from UI with proper validation and normalization
           const getFeesFromUI = (): Fee[] => {
             const fees: Fee[] = [];
             
-            // Normalize fee input: if ≥ 1 interpret as multiplier, else as decimal percentage
-            const normalizeFee = (value: number): number => {
-              if (value >= 1) {
-                return value - 1; // 1.05 -> 0.05
-              } else {
-                return value; // 0.05 -> 0.05 (already decimal percentage)
-              }
-            };
-            
-            // Convert feeConfig to SKU fee format
-            if (feeConfig.feeDrev && feeConfig.feeDrev !== 1) {
-              fees.push({ kind: 'percent', value: normalizeFee(feeConfig.feeDrev) });
+            // Validate fees are ≥ 1.00
+            if (feeConfig.feeDrev < 1.00 || isNaN(feeConfig.feeDrev)) {
+              throw new Error('FeeDeRev: Inserisci un moltiplicatore ≥ 1,00');
             }
-            if (feeConfig.feeMkt && feeConfig.feeMkt !== 1) {
-              fees.push({ kind: 'percent', value: normalizeFee(feeConfig.feeMkt) });
+            if (feeConfig.feeMkt < 1.00 || isNaN(feeConfig.feeMkt)) {
+              throw new Error('Fee Marketplace: Inserisci un moltiplicatore ≥ 1,00');
+            }
+            
+            // Convert multiplier to percentage: p = multiplier - 1
+            if (feeConfig.feeDrev && feeConfig.feeDrev !== 1.00) {
+              fees.push({ kind: 'percent', value: feeConfig.feeDrev - 1.00 });
+            }
+            if (feeConfig.feeMkt && feeConfig.feeMkt !== 1.00) {
+              fees.push({ kind: 'percent', value: feeConfig.feeMkt - 1.00 });
             }
             
             return fees;
@@ -1812,10 +1811,14 @@ const AltersideCatalogGenerator: React.FC = () => {
                     min="1.00"
                     max="2.00"
                     step="0.01"
+                    placeholder="1,00"
                     value={feeConfig.feeDrev}
                     onChange={(e) => {
                       const val = parseFloat(e.target.value);
-                      if (val >= 1.00 && val <= 2.00) {
+                      if (isNaN(val) || val < 1.00) {
+                        // Allow temporary invalid input for editing, but show error
+                        setFeeConfig(prev => ({ ...prev, feeDrev: val }));
+                      } else if (val >= 1.00 && val <= 2.00) {
                         setFeeConfig(prev => ({ ...prev, feeDrev: val }));
                       }
                     }}
@@ -1823,7 +1826,11 @@ const AltersideCatalogGenerator: React.FC = () => {
                     title="Inserisci fee come moltiplicatore: 1,05 = +5%, 1,08 = +8%. Le fee sono applicate in sequenza dopo IVA e spedizione."
                   />
                   <p className="text-xs text-muted-foreground">
-                    Esempio: 1,05 = +5% commissione DeRev
+                    {feeConfig.feeDrev < 1.00 ? (
+                      <span className="text-destructive">Inserisci un moltiplicatore ≥ 1,00</span>
+                    ) : (
+                      `Esempio: 1,05 = +5% commissione DeRev`
+                    )}
                   </p>
                 </div>
                 
