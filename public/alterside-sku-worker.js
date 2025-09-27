@@ -1,4 +1,4 @@
-// alterside-sku-worker.js - Dedicated SKU processing worker
+// alterside-sku-worker.js - Self-contained SKU processing worker
 // Optimized for performance with batch processing and minimal overhead
 
 let isProcessing = false;
@@ -6,45 +6,57 @@ let shouldCancel = false;
 let indexByMPN = new Map();
 let indexByEAN = new Map();
 
-// Send ready signal
+// Send ready signal immediately on worker start
 self.postMessage({ type: 'worker_ready' });
 
+// Wrap all message handling in try/catch for error safety
 self.onmessage = function(e) {
-  const { type, data } = e.data;
-  
-  if (type === 'cancel') {
-    shouldCancel = true;
-    return;
-  }
-  
-  if (type === 'prescan') {
-    try {
-      shouldCancel = false;
-      isProcessing = true;
-      performPreScan(data);
-    } catch (error) {
-      self.postMessage({
-        type: 'error',
-        error: error instanceof Error ? error.message : 'Errore durante pre-scan'
-      });
-    } finally {
-      isProcessing = false;
+  try {
+    const { type, data } = e.data;
+    
+    if (type === 'cancel') {
+      shouldCancel = true;
+      return;
     }
-  }
-  
-  if (type === 'process') {
-    try {
-      shouldCancel = false;
-      isProcessing = true;
-      processSkuCatalog(data);
-    } catch (error) {
-      self.postMessage({
-        type: 'error',
-        error: error instanceof Error ? error.message : 'Errore sconosciuto durante l\'elaborazione SKU'
-      });
-    } finally {
-      isProcessing = false;
+    
+    if (type === 'prescan') {
+      try {
+        shouldCancel = false;
+        isProcessing = true;
+        performPreScan(data);
+      } catch (error) {
+        self.postMessage({
+          type: 'worker_error',
+          message: error instanceof Error ? error.message : 'Errore durante pre-scan',
+          stack: error instanceof Error ? error.stack : null
+        });
+      } finally {
+        isProcessing = false;
+      }
     }
+    
+    if (type === 'process') {
+      try {
+        shouldCancel = false;
+        isProcessing = true;
+        processSkuCatalog(data);
+      } catch (error) {
+        self.postMessage({
+          type: 'worker_error',
+          message: error instanceof Error ? error.message : 'Errore sconosciuto durante l\'elaborazione SKU',
+          stack: error instanceof Error ? error.stack : null
+        });
+      } finally {
+        isProcessing = false;
+      }
+    }
+  } catch (globalError) {
+    // Catch any top-level errors in message handling
+    self.postMessage({
+      type: 'worker_error',
+      message: globalError instanceof Error ? globalError.message : 'Errore critico nel worker',
+      stack: globalError instanceof Error ? globalError.stack : null
+    });
   }
 };
 
