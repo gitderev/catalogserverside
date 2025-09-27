@@ -6,6 +6,7 @@ import "./index.css";
 import "./custom.css";
 
 import Index from "./pages/Index.tsx";
+import WorkerTestPage from "./pages/WorkerTest.tsx";
 import NotFound from "./pages/NotFound.tsx";
 
 createRoot(document.getElementById("root")!).render(
@@ -13,6 +14,7 @@ createRoot(document.getElementById("root")!).render(
     <BrowserRouter>
       <Routes>
         <Route path="/" element={<Index />} />
+        <Route path="/worker-test" element={<WorkerTestPage />} />
         <Route path="*" element={<NotFound />} />
       </Routes>
       <Toaster />

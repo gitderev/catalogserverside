@@ -1,37 +1,25 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
-import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
-import { Checkbox } from '@/components/ui/checkbox';
 import { toast } from '@/hooks/use-toast';
-import { Upload, Download, FileText, CheckCircle, XCircle, AlertCircle, Clock, Activity, Info, X } from 'lucide-react';
-// Import statements will be added when components are available
+import { Activity, CheckCircle, XCircle, AlertCircle } from 'lucide-react';
 
 // Processing states
 type ProcessingState = 'idle' | 'creating' | 'prescanning' | 'running' | 'done' | 'error';
 
-const AltersideCatalogGenerator = () => {
+const WorkerTest = () => {
   const [processingState, setProcessingState] = useState<ProcessingState>('idle');
   const [progressPct, setProgressPct] = useState(0);
   const [lastClickTime, setLastClickTime] = useState(0);
   
-  // Main catalog state
-  const [catalogData, setCatalogData] = useState<any>(null);
-  const [materialData, setMaterialData] = useState<any>(null);
-  const [additionalFiles, setAdditionalFiles] = useState<any[]>([]);
-  const [columnMappings, setColumnMappings] = useState<any>({});
-  const [multiColumnMappings, setMultiColumnMappings] = useState<any>({});
-  const [isDiagnosticMode, setIsDiagnosticMode] = useState(false);
-  
-  // Worker refs for SKU processing
+  // Worker refs
   const workerRef = useRef<Worker | null>(null);
   const blobUrlRef = useRef<string | null>(null);
   const progressTimerRef = useRef<NodeJS.Timeout | null>(null);
   const pingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   
   const [diagnosticState, setDiagnosticState] = useState({
-    isEnabled: false,
+    isEnabled: true,
     maxRows: 200,
     workerMessages: [],
     statistics: {
@@ -50,6 +38,7 @@ const AltersideCatalogGenerator = () => {
   });
 
   const [workerStrategy, setWorkerStrategy] = useState<'blob' | 'module'>('blob');
+  const [echoTestResult, setEchoTestResult] = useState<string>('');
   const [workerState, setWorkerState] = useState({
     created: false,
     handlersAttached: false,
@@ -98,22 +87,127 @@ const AltersideCatalogGenerator = () => {
     }));
   }, []);
 
+  // Echo test for worker environment
+  const runEchoTest = useCallback(async (strategy: 'blob' | 'module' = 'blob') => {
+    dbg('echo_test_start', { strategy });
+    setEchoTestResult('Testing...');
+    
+    try {
+      let worker: Worker;
+      
+      if (strategy === 'blob') {
+        // Create minimal echo worker as blob
+        const echoWorkerCode = `
+          // Echo worker boot
+          postMessage({type:'worker_boot', version:'echo-1.0.0'});
+          
+          // Echo worker message handler
+          onmessage = function(e) {
+            const { type, ...data } = e.data;
+            
+            switch(type) {
+              case 'ping':
+                postMessage({type:'pong', timestamp: Date.now()});
+                break;
+              case 'crash':
+                throw new Error('Intentional crash for testing');
+              default:
+                postMessage({type:'echo', original: e.data});
+            }
+          };
+        `;
+        
+        const blob = new Blob([echoWorkerCode], { type: 'application/javascript' });
+        const blobUrl = URL.createObjectURL(blob);
+        worker = new Worker(blobUrl);
+        
+        setTimeout(() => URL.revokeObjectURL(blobUrl), 5000);
+      } else {
+        // Use module worker from public folder
+        worker = new Worker('/workers/alterside-sku-worker.js', { type: 'module' });
+      }
+      
+      let bootReceived = false;
+      let pongReceived = false;
+      
+      worker.onmessage = (e) => {
+        const { type } = e.data;
+        
+        if (type === 'worker_boot') {
+          dbg('echo_boot', e.data);
+          bootReceived = true;
+        } else if (type === 'pong') {
+          dbg('echo_pong', e.data);
+          pongReceived = true;
+        }
+      };
+      
+      worker.onerror = (error) => {
+        dbg('echo_error', { message: error.message });
+      };
+      
+      // Send ping after short delay
+      setTimeout(() => {
+        worker.postMessage({ type: 'ping' });
+      }, 100);
+      
+      // Check results after 2 seconds
+      setTimeout(() => {
+        worker.terminate();
+        
+        if (bootReceived && pongReceived) {
+          setEchoTestResult(`✅ ${strategy.toUpperCase()} OK - echo_boot, echo_pong`);
+          dbg('echo_test_success', { strategy, bootReceived, pongReceived });
+        } else {
+          setEchoTestResult(`❌ ${strategy.toUpperCase()} FAIL - boot:${bootReceived}, pong:${pongReceived}`);
+          dbg('echo_test_failed', { strategy, bootReceived, pongReceived });
+          
+          // If blob failed, try module
+          if (strategy === 'blob') {
+            setTimeout(() => runEchoTest('module'), 1000);
+          }
+        }
+      }, 2000);
+      
+    } catch (error) {
+      setEchoTestResult(`❌ ${strategy.toUpperCase()} ERROR - ${error.message}`);
+      dbg('echo_test_error', { strategy, error: error.message });
+      
+      // If blob failed, try module
+      if (strategy === 'blob') {
+        setTimeout(() => runEchoTest('module'), 1000);
+      }
+    }
+  }, [dbg]);
+
   // Debounced click handler
-  const handleDebouncedClick = useCallback((callback: () => void) => {
+  const handleDiagnosticClick = useCallback(() => {
     const now = Date.now();
     if (now - lastClickTime < 1000) {
       dbg('click_ignored', { reason: 'debounce', timeSinceLastClick: now - lastClickTime });
       return;
     }
-    
+
     if (processingState === 'creating' || processingState === 'prescanning' || processingState === 'running') {
       dbg('click_ignored', { reason: 'busy', state: processingState });
       return;
     }
 
     setLastClickTime(now);
-    callback();
-  }, [lastClickTime, processingState, dbg]);
+    dbg('click_diag');
+    setProcessingState('creating');
+    setProgressPct(0);
+    setWorkerState({
+      created: false,
+      handlersAttached: false,
+      initSent: false,
+      bootReceived: false,
+      readyReceived: false,
+      version: ''
+    });
+    
+    createWorker(workerStrategy);
+  }, [lastClickTime, processingState, dbg, workerStrategy]);
 
   // Create hardened worker with proper lifecycle
   const createWorker = useCallback(async (strategy: 'blob' | 'module' = 'blob') => {
@@ -193,37 +287,12 @@ const AltersideCatalogGenerator = () => {
             
           case 'prescan_done':
             dbg('prescan_done', data);
-            setProcessingState('running');
-            break;
-            
-          case 'sku_start':
-            dbg('sku_start', data);
-            break;
-            
-          case 'sku_progress':
-            dbg('sku_progress', { done: data.done, total: data.total });
-            const skuPct = data.total > 0 ? Math.round((data.done / data.total) * 100) : 0;
-            setProgressPct(skuPct);
-            break;
-            
-          case 'sku_done':
-            dbg('sku_done', data);
             setProcessingState('done');
             setProgressPct(100);
             
-            // Download the file
-            if (data.blob) {
-              const url = URL.createObjectURL(data.blob);
-              const link = document.createElement('a');
-              link.href = url;
-              link.download = data.filename || 'catalogo_sku.xlsx';
-              link.click();
-              URL.revokeObjectURL(url);
-            }
-            
             toast({
-              title: "Generazione completata",
-              description: `File ${data.filename || 'catalogo_sku.xlsx'} generato con successo`,
+              title: "Test completato",
+              description: "Worker test eseguito con successo",
             });
             break;
             
@@ -271,8 +340,8 @@ const AltersideCatalogGenerator = () => {
       const initPayload = {
         type: 'INIT',
         schema: 1,
-        diag: isDiagnosticMode,
-        sampleSize: isDiagnosticMode ? 200 : undefined,
+        diag: true,
+        sampleSize: 200,
         version: '1.0.0'
       };
       
@@ -291,49 +360,7 @@ const AltersideCatalogGenerator = () => {
         variant: "destructive",
       });
     }
-  }, [dbg, addWorkerMessage, isDiagnosticMode]);
-
-  // Handle SKU generation
-  const handleSkuGeneration = useCallback(() => {
-    handleDebouncedClick(() => {
-      dbg('click_sku');
-      setProcessingState('creating');
-      setProgressPct(0);
-      setWorkerState({
-        created: false,
-        handlersAttached: false,
-        initSent: false,
-        bootReceived: false,
-        readyReceived: false,
-        version: ''
-      });
-      createWorker(workerStrategy);
-    });
-  }, [handleDebouncedClick, dbg, createWorker, workerStrategy]);
-
-  // Handle EAN generation (existing functionality)
-  const handleEanGeneration = useCallback(() => {
-    handleDebouncedClick(() => {
-      dbg('click_ean');
-      // Existing EAN generation logic would go here
-      toast({
-        title: "Generazione EAN",
-        description: "Funzionalità EAN non modificata",
-      });
-    });
-  }, [handleDebouncedClick, dbg]);
-
-  // Handle diagnostic prescan
-  const handleDiagnosticPrescan = useCallback(() => {
-    if (!isDiagnosticMode) return;
-    
-    handleDebouncedClick(() => {
-      dbg('click_prescan_diag');
-      setProcessingState('creating');
-      setProgressPct(0);
-      createWorker(workerStrategy);
-    });
-  }, [isDiagnosticMode, handleDebouncedClick, dbg, createWorker, workerStrategy]);
+  }, [dbg, addWorkerMessage]);
 
   const isProcessing = processingState === 'creating' || processingState === 'prescanning' || processingState === 'running';
 
@@ -341,71 +368,51 @@ const AltersideCatalogGenerator = () => {
     <div className="min-h-screen bg-background">
       <div className="container mx-auto p-6">
         <div className="mb-8">
-          <h1 className="text-3xl font-bold mb-2">Generatore Catalogo Alterside</h1>
+          <h1 className="text-3xl font-bold mb-2">Worker Test - Hardened</h1>
           <p className="text-muted-foreground">
-            Carica i file CSV e genera il catalogo Excel
+            Test diagnostico per worker environment e lifecycle
           </p>
         </div>
 
-        {/* Diagnostic Mode Toggle */}
-        <Card className="mb-6 p-4">
-          <div className="flex items-center space-x-2">
-            <Checkbox 
-              id="diagnostic-mode"
-              checked={isDiagnosticMode}
-              onCheckedChange={(checked) => setIsDiagnosticMode(checked === true)}
-            />
-            <Label htmlFor="diagnostic-mode" className="text-sm font-medium">
-              Modalità diagnostica
-            </Label>
-          </div>
-        </Card>
-
-        {/* File Upload Sections - Placeholder */}
-        <Card className="mb-6 p-6">
-          <h3 className="text-lg font-semibold mb-4">Carica File</h3>
-          <div className="text-muted-foreground">
-            I componenti di upload file saranno ripristinati dai file esistenti del progetto.
-          </div>
-        </Card>
-
-        {/* Action Buttons */}
+        {/* Test Controls */}
         <Card className="mb-6 p-6">
           <div className="space-y-4">
-            
-            {/* Diagnostic Prescan Button - Only visible with diagnostic mode ON */}
-            {isDiagnosticMode && (
-              <Button
-                onClick={handleDiagnosticPrescan}
-                disabled={isProcessing}
-                variant="outline"
-                className="w-full"
-              >
-                <Activity className="mr-2 h-4 w-4" />
-                Diagnostica prescan
-              </Button>
-            )}
-
-            {/* Main Action Buttons */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <Button
-                onClick={handleEanGeneration}
-                disabled={isProcessing || !catalogData}
+                onClick={() => runEchoTest('blob')}
+                variant="outline"
                 className="h-12"
               >
-                <Download className="mr-2 h-4 w-4" />
-                GENERA EXCEL (EAN)
+                <Activity className="mr-2 h-4 w-4" />
+                Echo Worker Test (Blob)
               </Button>
 
               <Button
-                onClick={handleSkuGeneration}
-                disabled={isProcessing || !catalogData}
+                onClick={() => runEchoTest('module')}
+                variant="outline"
                 className="h-12"
               >
-                <Download className="mr-2 h-4 w-4" />
-                GENERA EXCEL (ManufPartNr)
+                <Activity className="mr-2 h-4 w-4" />
+                Echo Worker Test (Module)
               </Button>
             </div>
+
+            <Button
+              onClick={handleDiagnosticClick}
+              disabled={isProcessing}
+              className="w-full h-12"
+            >
+              <Activity className="mr-2 h-4 w-4" />
+              Hardened Worker Test
+            </Button>
+
+            {/* Echo Test Result */}
+            {echoTestResult && (
+              <div className="p-3 bg-muted rounded">
+                <div className="font-medium">Echo Test Result</div>
+                <div className="text-lg font-mono">{echoTestResult}</div>
+              </div>
+            )}
 
             {/* Progress Display */}
             {isProcessing && (
@@ -423,71 +430,100 @@ const AltersideCatalogGenerator = () => {
                 <div className="mt-2 text-sm text-muted-foreground">
                   Stato: {processingState === 'creating' && 'Creazione worker...'}
                   {processingState === 'prescanning' && 'Prescanning...'}
-                  {processingState === 'running' && 'Generazione in corso...'}
+                  {processingState === 'running' && 'Test in corso...'}
                 </div>
               </div>
             )}
           </div>
         </Card>
 
-        {/* Diagnostic Information - Only visible with diagnostic mode ON */}
-        {isDiagnosticMode && (
-          <Card className="p-6">
-            <h3 className="text-lg font-semibold mb-4">Informazioni Diagnostiche</h3>
-            
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-4">
-              <div className="p-3 bg-muted rounded">
-                <div className="font-medium">Worker Strategy</div>
-                <div className="text-lg">{workerStrategy}</div>
-              </div>
-              <div className="p-3 bg-muted rounded">
-                <div className="font-medium">Stato</div>
-                <div className="text-lg">{processingState}</div>
-              </div>
-              <div className="p-3 bg-muted rounded">
-                <div className="font-medium">Progresso</div>
-                <div className="text-lg">{progressPct}%</div>
-              </div>
-              <div className="p-3 bg-muted rounded">
-                <div className="font-medium">Messaggi Worker</div>
-                <div className="text-lg">{diagnosticState.workerMessages.length}</div>
-              </div>
+        {/* Worker State */}
+        <Card className="mb-6 p-6">
+          <h3 className="text-lg font-semibold mb-4">Worker State</h3>
+          <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+            <div className="flex items-center space-x-2">
+              {workerState.created ? <CheckCircle className="h-4 w-4 text-green-500" /> : <XCircle className="h-4 w-4 text-red-500" />}
+              <span className="text-sm">Created</span>
             </div>
+            <div className="flex items-center space-x-2">
+              {workerState.handlersAttached ? <CheckCircle className="h-4 w-4 text-green-500" /> : <XCircle className="h-4 w-4 text-red-500" />}
+              <span className="text-sm">Handlers</span>
+            </div>
+            <div className="flex items-center space-x-2">
+              {workerState.initSent ? <CheckCircle className="h-4 w-4 text-green-500" /> : <XCircle className="h-4 w-4 text-red-500" />}
+              <span className="text-sm">INIT Sent</span>
+            </div>
+            <div className="flex items-center space-x-2">
+              {workerState.bootReceived ? <CheckCircle className="h-4 w-4 text-green-500" /> : <XCircle className="h-4 w-4 text-red-500" />}
+              <span className="text-sm">Boot Received</span>
+            </div>
+            <div className="flex items-center space-x-2">
+              {workerState.readyReceived ? <CheckCircle className="h-4 w-4 text-green-500" /> : <XCircle className="h-4 w-4 text-red-500" />}
+              <span className="text-sm">Ready Received</span>
+            </div>
+            <div className="flex items-center space-x-2">
+              <AlertCircle className="h-4 w-4 text-blue-500" />
+              <span className="text-sm">Version: {workerState.version || 'N/A'}</span>
+            </div>
+          </div>
+        </Card>
 
-            {/* Debug Events */}
-            <div className="mb-4">
-              <h4 className="font-medium mb-2">Eventi Debug</h4>
-              <div className="bg-muted p-3 rounded max-h-32 overflow-y-auto">
-                {debugEvents.length === 0 ? (
-                  <div className="text-muted-foreground text-sm">Nessun evento registrato</div>
-                ) : (
-                  debugEvents.map((event, index) => (
-                    <div key={index} className="text-sm font-mono">{event}</div>
-                  ))
-                )}
-              </div>
+        {/* Diagnostic Information */}
+        <Card className="p-6">
+          <h3 className="text-lg font-semibold mb-4">Informazioni Diagnostiche</h3>
+          
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-4">
+            <div className="p-3 bg-muted rounded">
+              <div className="font-medium">Worker Strategy</div>
+              <div className="text-lg">{workerStrategy}</div>
             </div>
+            <div className="p-3 bg-muted rounded">
+              <div className="font-medium">Stato</div>
+              <div className="text-lg">{processingState}</div>
+            </div>
+            <div className="p-3 bg-muted rounded">
+              <div className="font-medium">Progresso</div>
+              <div className="text-lg">{progressPct}%</div>
+            </div>
+            <div className="p-3 bg-muted rounded">
+              <div className="font-medium">Messaggi Worker</div>
+              <div className="text-lg">{diagnosticState.workerMessages.length}</div>
+            </div>
+          </div>
 
-            {/* Worker Messages */}
-            <div>
-              <h4 className="font-medium mb-2">Messaggi Worker</h4>
-              <div className="bg-muted p-3 rounded max-h-32 overflow-y-auto">
-                {diagnosticState.workerMessages.length === 0 ? (
-                  <div className="text-muted-foreground text-sm">Nessun messaggio ricevuto</div>
-                ) : (
-                  diagnosticState.workerMessages.map((msg: any) => (
-                    <div key={msg.id} className="text-sm font-mono mb-1">
-                      [{msg.timestamp}] {JSON.stringify(msg.data)}
-                    </div>
-                  ))
-                )}
-              </div>
+          {/* Debug Events */}
+          <div className="mb-4">
+            <h4 className="font-medium mb-2">Eventi Debug</h4>
+            <div className="bg-muted p-3 rounded max-h-32 overflow-y-auto">
+              {debugEvents.length === 0 ? (
+                <div className="text-muted-foreground text-sm">Nessun evento registrato</div>
+              ) : (
+                debugEvents.map((event, index) => (
+                  <div key={index} className="text-sm font-mono">{event}</div>
+                ))
+              )}
             </div>
-          </Card>
-        )}
+          </div>
+
+          {/* Worker Messages */}
+          <div>
+            <h4 className="font-medium mb-2">Messaggi Worker</h4>
+            <div className="bg-muted p-3 rounded max-h-32 overflow-y-auto">
+              {diagnosticState.workerMessages.length === 0 ? (
+                <div className="text-muted-foreground text-sm">Nessun messaggio ricevuto</div>
+              ) : (
+                diagnosticState.workerMessages.map((msg: any) => (
+                  <div key={msg.id} className="text-sm font-mono mb-1">
+                    [{msg.timestamp}] {JSON.stringify(msg.data)}
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </Card>
       </div>
     </div>
   );
 };
 
-export default AltersideCatalogGenerator;
+export default WorkerTest;
