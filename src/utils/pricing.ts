@@ -53,6 +53,25 @@ export function validateEnding99Cents(cents: number): boolean {
 }
 
 /**
+ * Additional utility functions for cents-based calculations
+ */
+export function roundCents(cents: number): number {
+  return Math.round(cents);
+}
+
+export function applyRate(cents: number, rate: number): number {
+  return roundCents(cents * rate);
+}
+
+export function ceilToComma99(cents: number): number {
+  return toComma99Cents(cents);
+}
+
+export function ceilToIntegerEuros(cents: number): number {
+  return Math.ceil(cents / 100);
+}
+
+/**
  * Legacy functions for backward compatibility
  */
 export function roundToCents(n: number): number {
@@ -80,11 +99,11 @@ export function computeFromListPrice(
   const baseCents = toCents(listPrice);
   const shippingCents = toCents(shipping);
   
-  // Step by step calculation in cents
+  // Step by step calculation in cents - apply both fees as multipliers
   const afterShippingCents = baseCents + shippingCents;
-  const afterIvaCents = Math.floor((afterShippingCents * (100 + ivaPerc)) / 100);
-  const afterFeeDeRevCents = Math.floor(afterIvaCents * fees.feeDeRev);
-  const afterFeesCents = Math.floor(afterFeeDeRevCents * fees.feeMarketplace);
+  const afterIvaCents = applyRate(afterShippingCents, (100 + ivaPerc) / 100);
+  const afterFeeDeRevCents = applyRate(afterIvaCents, fees.feeDeRev / 100);
+  const afterFeesCents = applyRate(afterFeeDeRevCents, fees.feeMarketplace / 100);
   
   // Ceiling to next integer (multiple of 100 cents)
   const finalInt = Math.ceil(afterFeesCents / 100) * 100;
@@ -119,11 +138,11 @@ export function computeFinalEan(
   const baseCents = toCents(basePrice);
   const shippingCents = toCents(shipping);
   
-  // Step by step calculation in cents
+  // Step by step calculation in cents - apply both fees as multipliers
   const afterShippingCents = baseCents + shippingCents;
-  const afterIvaCents = Math.floor((afterShippingCents * (100 + ivaPerc)) / 100);
-  const afterFeeDeRevCents = Math.floor(afterIvaCents * fees.feeDeRev);
-  const afterFeesCents = Math.floor(afterFeeDeRevCents * fees.feeMarketplace);
+  const afterIvaCents = applyRate(afterShippingCents, (100 + ivaPerc) / 100);
+  const afterFeeDeRevCents = applyRate(afterIvaCents, fees.feeDeRev / 100);
+  const afterFeesCents = applyRate(afterFeeDeRevCents, fees.feeMarketplace / 100);
   
   // Subtotal after fees (before ,99 ceiling)
   const subtotalCents = afterFeesCents;

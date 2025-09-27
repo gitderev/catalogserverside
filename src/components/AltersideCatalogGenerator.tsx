@@ -8,7 +8,7 @@ import { toast } from '@/hooks/use-toast';
 import { Upload, Download, FileText, CheckCircle, XCircle, AlertCircle, Clock, Activity, Info } from 'lucide-react';
 import { filterAndNormalizeForEAN, type EANStats, type DiscardedRow } from '@/utils/ean';
 import { forceEANText, exportDiscardedRowsCSV } from '@/utils/excelFormatter';
-import { toComma99Cents, validateEnding99, computeFinalEan, computeFromListPrice, toCents, formatCents } from '@/utils/pricing';
+import { toComma99Cents, validateEnding99, computeFinalEan, computeFromListPrice, toCents, formatCents, applyRate } from '@/utils/pricing';
 import * as XLSX from 'xlsx';
 import Papa from 'papaparse';
 
@@ -105,6 +105,7 @@ function ceilInt(x: number): number {
   return Math.ceil(x); 
 }
 
+
 function computeFinalPrice({
   CustBestPrice, ListPrice, feeDrev, feeMkt
 }: { CustBestPrice?: number; ListPrice?: number; feeDrev: number; feeMkt: number; }): {
@@ -153,6 +154,41 @@ function computeFinalPrice({
   // MPN final price: use old logic (ceil to integer)
   const prezzoFinaleMPN = Math.ceil(postFee);
   
+  // Log samples for EAN route debugging (separate counters for cbp vs listprice)
+  if (baseRoute === 'cbp') {
+    if (typeof (globalThis as any).eanSampleCbpCount === 'undefined') {
+      (globalThis as any).eanSampleCbpCount = 0;
+    }
+    if ((globalThis as any).eanSampleCbpCount < 3) {
+      console.warn('ean:sample:cbp', {
+        base: base,
+        withShip: base + shipping,
+        withVat: (base + shipping) * ivaMultiplier,
+        withFeeDR: (base + shipping) * ivaMultiplier * feeDrev,
+        withFeeMkt: (base + shipping) * ivaMultiplier * feeDrev * feeMkt,
+        final: prezzoFinaleEAN
+      });
+      (globalThis as any).eanSampleCbpCount++;
+    }
+  } else if (baseRoute === 'listprice_ceiled') {
+    if (typeof (globalThis as any).eanSampleLpCount === 'undefined') {
+      (globalThis as any).eanSampleLpCount = 0;
+    }
+    if ((globalThis as any).eanSampleLpCount < 3) {
+      console.warn('ean:sample:listprice', {
+        baseSource: 'listprice_ceiled',
+        originalListPrice: ListPrice,
+        base: base,
+        withShip: base + shipping,
+        withVat: (base + shipping) * ivaMultiplier,
+        withFeeDR: (base + shipping) * ivaMultiplier * feeDrev,
+        withFeeMkt: (base + shipping) * ivaMultiplier * feeDrev * feeMkt,
+        final: prezzoFinaleEAN
+      });
+      (globalThis as any).eanSampleLpCount++;
+    }
+  }
+  
   // Calculate ListPrice con Fee - SEPARATE pipeline, independent from main calculation
   let listPriceConFee: number | string = '';
   if (hasListPrice) {
@@ -162,12 +198,28 @@ function computeFinalPrice({
     const subtotConIvaLP = subtotBasSpedLP + ivaLP;
     const postFeeLP = subtotConIvaLP * feeDrev * feeMkt;
     listPriceConFee = Math.ceil(postFeeLP); // ceil to integer for ListPrice con Fee
+    
+    // Log samples for debugging (static counter to avoid spam)
+    if (typeof (globalThis as any).lpfeeCalcSampleCount === 'undefined') {
+      (globalThis as any).lpfeeCalcSampleCount = 0;
+    }
+    if ((globalThis as any).lpfeeCalcSampleCount < 3) {
+      console.warn('lpfee:calc:sample', { 
+        listPrice: baseLP, 
+        subtot_con_iva: subtotConIvaLP.toFixed(2), 
+        feeDeRev: feeDrev, 
+        feeMarketplace: feeMkt, 
+        post_fee: postFeeLP.toFixed(4), 
+        final: listPriceConFee 
+      });
+      (globalThis as any).lpfeeCalcSampleCount++;
+    }
   }
 
   return { base, shipping, iva, subtotConIva, postFee, prezzoFinaleEAN, prezzoFinaleMPN, listPriceConFee, eanResult };
 }
 
-const AltersideCatalogGenerator = () => {
+const AltersideCatalogGenerator: React.FC = () => {
   const [files, setFiles] = useState<FileUploadState>({
     material: { file: null, status: 'empty' },
     stock: { file: null, status: 'empty' },
@@ -186,19 +238,141 @@ const AltersideCatalogGenerator = () => {
   }, [feeConfig, rememberFees]);
 
   const [processingState, setProcessingState] = useState<'idle' | 'validating' | 'ready' | 'running' | 'completed' | 'failed'>('idle');
-
+  const [currentPipeline, setCurrentPipeline] = useState<'EAN' | 'MPN' | null>(null);
+  
+  // Progress states (based on rows READ, not valid rows)
+  const [total, setTotal] = useState(0); // prescan estimate
+  const [finalTotal, setFinalTotal] = useState<number | null>(null); // actual rows read in join
+  const [processed, setProcessed] = useState(0);
+  const processedRef = useRef(0);
+  const [progressPct, setProgressPct] = useState(0);
+  
+  // Ensure no stale references to undefined variables
+  const processedRows = processed; // Alias for compatibility
+  
+  const [startTime, setStartTime] = useState<number | null>(null);
+  const [elapsedTime, setElapsedTime] = useState(0);
+  const [estimatedTime, setEstimatedTime] = useState<number | null>(null);
+  
+  // Completion gating flags
+  const [joinDone, setJoinDone] = useState(false);
+  const [excelDone, setExcelDone] = useState(false);
+  const [logDone, setLogDone] = useState(false);
+  const [eanStats, setEanStats] = useState<EANStats | null>(null);
+  const [discardedRows, setDiscardedRows] = useState<DiscardedRow[]>([]);
+  
   // Debug events
   const [debugEvents, setDebugEvents] = useState<string[]>([]);
+  const [debugState, setDebugState] = useState({
+    materialValid: false,
+    stockValid: false,
+    priceValid: false,
+    stockReady: false,
+    priceReady: false,
+    materialPreScanDone: false,
+    joinStarted: false
+  });
 
+  // Current pipeline results
+  const [currentProcessedData, setCurrentProcessedData] = useState<ProcessedRecord[]>([]);
+  const [currentLogEntries, setCurrentLogEntries] = useState<LogEntry[]>([]);
+  const [currentStats, setCurrentStats] = useState<ProcessingStats | null>(null);
+  
+  // Stats state for UI
+  const [stats, setStats] = useState({
+    totalRows: 0,
+    validEAN: 0,
+    validMPN: 0,
+    discardedEAN: 0,
+    discardedMPN: 0,
+    duplicates: 0
+  });
+  
+  // Downloaded files state for buttons
+  const [downloadReady, setDownloadReady] = useState({
+    ean_excel: false,
+    ean_log: false,
+    mpn_excel: false,
+    mpn_log: false
+  });
+
+  // Export state for preventing double clicks
+  const [isExportingEAN, setIsExportingEAN] = useState(false);
+
+  const workerRef = useRef<Worker | null>(null);
+
+  const isProcessing = processingState === 'running';
+  const isCompleted = processingState === 'completed';
+  const canProcess = processingState === 'ready';
+  
+  // Audit function for critical debugging
+  const audit = useCallback((msg: string, data?: any) => {
+    const logEntry = `AUDIT: ${msg}${data ? ' | ' + JSON.stringify(data) : ''}`;
+    console.warn(logEntry);
+    dbg(logEntry);
+  }, []);
+
+  // Global debug function
   const dbg = useCallback((event: string, data?: any) => {
     const timestamp = new Date().toLocaleTimeString('it-IT', { hour12: false });
     const message = `[${timestamp}] ${event}${data ? ' | ' + JSON.stringify(data) : ''}`;
     setDebugEvents(prev => [...prev, message]);
   }, []);
-
+  
+  // Make dbg available globally for worker
   useEffect(() => {
     (window as any).dbg = dbg;
   }, [dbg]);
+
+  // Consistency check functions with ±1 tolerance
+  const sumForPipeline = useCallback(() => {
+    if (currentPipeline === 'EAN') {
+      return (stats.validEAN ?? 0) + (stats.discardedEAN ?? 0) + (stats.duplicates ?? 0);
+    }
+    if (currentPipeline === 'MPN') {
+      return (stats.validMPN ?? 0) + (stats.discardedMPN ?? 0) + (stats.duplicates ?? 0);
+    }
+    return NaN;
+  }, [currentPipeline, stats]);
+
+  const consistencyOk = useCallback(() => {
+    const baseline = (finalTotal ?? processedRef.current ?? processed ?? total ?? 0);
+    const sum = sumForPipeline();
+    return Number.isFinite(baseline) && Number.isFinite(sum) && Math.abs(sum - baseline) <= 1;
+  }, [finalTotal, processed, total, sumForPipeline]);
+
+  const getConsistencySnapshot = useCallback(() => {
+    return {
+      pipeline: currentPipeline,
+      totalPrescan: total,
+      finalTotal: finalTotal ?? processedRef.current,
+      processedUI: processed,
+      stats
+    };
+  }, [currentPipeline, total, finalTotal, processed, stats]);
+
+  // Completion gating effect with consistency check
+  useEffect(() => {
+    if (joinDone && excelDone && logDone) {
+      if (!consistencyOk()) {
+        audit('consistency-failed', getConsistencySnapshot());
+        // fallback: accept baseline from join and continue anyway
+        // or relaunch join with worker:false, but DON'T block infinitely
+      }
+      setProgressPct(100);
+      setProcessingState('completed');
+      dbg('pipeline:completed', {
+        pipeline: currentPipeline,
+        totalPrescan: total,
+        finalTotal: finalTotal ?? processedRef.current
+      });
+    }
+  }, [joinDone, excelDone, logDone, consistencyOk, getConsistencySnapshot, currentPipeline, total, finalTotal]);
+
+  // Log state changes
+  useEffect(() => {
+    dbg('state:change', { state: processingState, ...debugState });
+  }, [processingState, debugState]);
 
   const validateHeaders = (headers: string[], requiredHeaders: string[], optionalHeaders: string[] = []): { 
     valid: boolean; 
@@ -278,6 +452,10 @@ const AltersideCatalogGenerator = () => {
         }
       }
 
+      // Create file state with diagnostics
+      const headerLine = parsed.headers.join(', ');
+      const firstDataLine = parsed.data.length > 0 ? Object.values(parsed.data[0]).slice(0, 3).join(', ') + '...' : '';
+
       const fileState = {
         name: file.name,
         data: parsed.data,
@@ -286,291 +464,1462 @@ const AltersideCatalogGenerator = () => {
         isValid: validation.valid
       };
 
-      setFiles(prev => ({
-        ...prev,
+      // Update processing state - ready when all files have valid required headers
+      const newFiles = {
+        ...files,
         [type]: {
-          ...prev[type],
+          ...files[type],
           file: fileState,
           status: fileState.isValid ? 'valid' : 'error',
-          warning
+          diagnostics: {
+            headerFound: headerLine,
+            firstDataRow: firstDataLine,
+            validation
+          }
         }
-      }));
-
-      // Check if all files are loaded with valid required headers
-      const allFilesValid = Object.values(files).every(f => f.file && f.file.isValid);
-      if (allFilesValid && fileState.isValid) {
+      };
+      
+      // Check if all files are loaded with valid required headers (warnings don't block)
+      const allRequiredHeadersValid = Object.entries(newFiles).every(([fileType, fileState]) => {
+        if (!fileState.file) return false;
+        const requiredHeaders = REQUIRED_HEADERS[fileType as keyof typeof REQUIRED_HEADERS];
+        const validation = validateHeaders(fileState.file.headers, requiredHeaders);
+        return validation.valid; // Only check required headers
+      });
+      
+      // Update debug state
+      const newDebugState = {
+        materialValid: newFiles.material.file ? validateHeaders(newFiles.material.file.headers, REQUIRED_HEADERS.material).valid : false,
+        stockValid: newFiles.stock.file ? validateHeaders(newFiles.stock.file.headers, REQUIRED_HEADERS.stock).valid : false,
+        priceValid: newFiles.price.file ? validateHeaders(newFiles.price.file.headers, REQUIRED_HEADERS.price).valid : false,
+        stockReady: !!newFiles.stock.file,
+        priceReady: !!newFiles.price.file,
+        materialPreScanDone: debugState.materialPreScanDone,
+        joinStarted: debugState.joinStarted
+      };
+      setDebugState(newDebugState);
+      dbg('state:change', newDebugState);
+      
+      if (allRequiredHeadersValid) {
         setProcessingState('ready');
       }
 
+      setFiles(newFiles);
+
+      const toastMessage = status === 'warning' 
+        ? `${file.name} - ${parsed.data.length} righe (con avviso)`
+        : `${file.name} - ${parsed.data.length} righe`;
+
       toast({
-        title: `File ${type} caricato`,
-        description: `${parsed.data.length} righe trovate${warning ? '. ' + warning : ''}`,
-        variant: warning ? "default" : "default"
+        title: "File caricato con successo",
+        description: toastMessage,
+        variant: status === 'warning' ? 'default' : 'default'
       });
 
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Errore sconosciuto';
+      const errorMsg = error instanceof Error ? error.message : 'Errore sconosciuto';
       setFiles(prev => ({
         ...prev,
-        [type]: { file: null, status: 'error', error: errorMessage }
+        [type]: { file: null, status: 'error', error: errorMsg }
       }));
       setProcessingState('idle');
       
       toast({
-        title: "Errore durante il caricamento",
-        description: errorMessage,
+        title: "Errore caricamento file",
+        description: errorMsg,
         variant: "destructive"
       });
     }
   };
 
-  const generateExcel = async (pipeline: 'EAN' | 'MPN') => {
+  const removeFile = (type: keyof FileUploadState) => {
+    setFiles(prevFiles => ({
+      ...prevFiles,
+      [type]: {
+        file: null,
+        status: 'empty',
+        diagnostics: null
+      }
+    }));
+
+    // Reset processing state if no files remain
+    const remainingFiles = Object.entries(files).filter(([key, _]) => key !== type);
+    if (remainingFiles.every(([_, file]) => !file.file)) {
+      setProcessingState('idle');
+      setProgressPct(0);
+      setStartTime(null);
+      setElapsedTime(0);
+      setEstimatedTime(null);
+      setProcessed(0);
+      setTotal(0);
+      setDebugEvents([]);
+      setDebugState({
+        materialValid: false,
+        stockValid: false,
+        priceValid: false,
+        stockReady: false,
+        priceReady: false,
+        materialPreScanDone: false,
+        joinStarted: false
+      });
+    }
+  };
+
+  const formatTime = (ms: number): string => {
+    if (!ms || ms <= 0) return '00:00';
+    const seconds = Math.floor(ms / 1000);
+    const minutes = Math.floor(seconds / 60);
+    return `${minutes.toString().padStart(2, '0')}:${(seconds % 60).toString().padStart(2, '0')}`;
+  };
+
+  // Timer effect
+  useEffect(() => {
+    let interval: NodeJS.Timeout;
+    if (processingState === 'running' && startTime) {
+      interval = setInterval(() => {
+        const elapsed = Date.now() - startTime;
+        setElapsedTime(elapsed);
+        
+        // Calculate ETA every 500ms
+        if (processed > 0 && total > 0) {
+          const rate = processed / (elapsed / 1000);
+          if (rate >= 0.1) {
+            const remaining = Math.max(0, total - processed);
+            const etaSec = remaining / rate;
+            setEstimatedTime(etaSec * 1000);
+          } else {
+            setEstimatedTime(null);
+          }
+        }
+      }, 500);
+    }
+    return () => clearInterval(interval);
+  }, [processingState, startTime, processed, total]);
+
+  const processDataPipeline = async (pipelineType: 'EAN' | 'MPN') => {
     if (!files.material.file || !files.stock.file || !files.price.file) {
       toast({
-        title: "Errore",
-        description: "Tutti i file devono essere caricati prima di procedere",
+        title: "File mancanti",
+        description: "Carica tutti e tre i file prima di procedere",
         variant: "destructive"
       });
       return;
     }
 
-    setProcessingState('running');
-    
-    try {
-      // Simple processing logic
-      const materialData = files.material.file.data;
-      const processedData: ProcessedRecord[] = [];
+    // Validate required headers only
+    const materialValidation = validateHeaders(files.material.file.headers, REQUIRED_HEADERS.material);
+    const stockValidation = validateHeaders(files.stock.file.headers, REQUIRED_HEADERS.stock);
+    const priceValidation = validateHeaders(files.price.file.headers, REQUIRED_HEADERS.price);
 
-      // Basic processing
-      materialData.forEach((row: any, index: number) => {
-        const finalPrice = computeFinalPrice({
-          CustBestPrice: parseFloat(row.CustBestPrice || '0'),
-          ListPrice: parseFloat(row.ListPrice || '0'),
-          feeDrev: feeConfig.feeDrev,
-          feeMkt: feeConfig.feeMkt
-        });
-
-        const record: ProcessedRecord = {
-          Matnr: row.Matnr || '',
-          ManufPartNr: row.ManufPartNr || '',
-          EAN: row.EAN || '',
-          ShortDescription: row.ShortDescription || '',
-          ExistingStock: parseFloat(row.ExistingStock || '0'),
-          ListPrice: parseFloat(row.ListPrice || '0'),
-          CustBestPrice: parseFloat(row.CustBestPrice || '0'),
-          'Costo di Spedizione': finalPrice.shipping,
-          IVA: finalPrice.iva,
-          'Prezzo con spediz e IVA': finalPrice.subtotConIva,
-          FeeDeRev: feeConfig.feeDrev,
-          'Fee Marketplace': feeConfig.feeMkt,
-          'Subtotale post-fee': finalPrice.postFee,
-          'Prezzo Finale': pipeline === 'EAN' ? finalPrice.prezzoFinaleEAN : finalPrice.prezzoFinaleMPN,
-          'ListPrice con Fee': finalPrice.listPriceConFee
-        };
-
-        processedData.push(record);
-      });
-
-      // Create Excel file
-      const ws = XLSX.utils.json_to_sheet(processedData);
-      const wb = XLSX.utils.book_new();
-      const sheetName = pipeline === 'EAN' ? 'EAN' : 'SKU';
-      XLSX.utils.book_append_sheet(wb, ws, sheetName);
-
-      const filename = pipeline === 'EAN' 
-        ? `catalogo_ean_${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '_')}.xlsx`
-        : `catalogo_sku_${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '_')}.xlsx`;
-
-      XLSX.writeFile(wb, filename);
-
-      setProcessingState('completed');
-      
+    if (!materialValidation.valid || !stockValidation.valid || !priceValidation.valid) {
       toast({
-        title: "Export completato",
-        description: `File ${filename} scaricato con successo`,
-        variant: "default"
-      });
-
-    } catch (error) {
-      console.error('Errore durante la generazione:', error);
-      setProcessingState('failed');
-      
-      toast({
-        title: "Errore durante la generazione",
-        description: error instanceof Error ? error.message : 'Errore sconosciuto',
+        title: "Header obbligatori mancanti",
+        description: "Verifica che tutti i file abbiano gli header richiesti",
         variant: "destructive"
       });
+      return;
+    }
+
+    // Reset all state for new pipeline
+    setCurrentPipeline(pipelineType);
+    setCurrentProcessedData([]);
+    setCurrentLogEntries([]);
+    setCurrentStats(null);
+    setFinalTotal(null);
+    setEanStats(null);
+    setDiscardedRows([]);
+    processedRef.current = 0;
+    setProcessed(0);
+    setProgressPct(0);
+    setElapsedTime(0);
+    setEstimatedTime(null);
+    setDebugEvents([]);
+    
+    // Reset completion gating flags
+    setJoinDone(false);
+    setExcelDone(false);
+    setLogDone(false);
+    setDebugState({
+      materialValid: true,
+      stockValid: true,
+      priceValid: true,
+      stockReady: false,
+      priceReady: false,
+      materialPreScanDone: false,
+      joinStarted: false
+    });
+
+    // Build maps (parse events)
+    const stockMap = new Map<string, { ExistingStock: number }>();
+    const priceMap = new Map<string, { ListPrice: number; CustBestPrice: number }>();
+    let stockDuplicates = 0;
+    let priceDuplicates = 0;
+
+    // STOCK parse (simulate chunk logging using one chunk)
+    dbg('parse:stock:start');
+    let stockRowCounter = 0;
+    files.stock.file.data.forEach((row, index) => {
+      const matnr = row.Matnr?.toString().trim();
+      if (!matnr) return;
+      stockRowCounter++;
+      if (stockMap.has(matnr)) {
+        stockDuplicates++;
+      } else {
+        stockMap.set(matnr, { ExistingStock: parseInt(row.ExistingStock) || 0 });
+      }
+    });
+    dbg('parse:stock:chunk', { chunkNumber: 1, rowsInChunk: stockRowCounter });
+    dbg('parse:stock:done', { totalRecords: stockMap.size, totalChunks: 1 });
+
+    // PRICE parse
+    dbg('parse:price:start');
+    let priceRowCounter = 0;
+    files.price.file.data.forEach((row, index) => {
+      const matnr = row.Matnr?.toString().trim();
+      if (!matnr) return;
+      priceRowCounter++;
+      if (priceMap.has(matnr)) {
+        priceDuplicates++;
+      } else {
+        priceMap.set(matnr, { ListPrice: parseFloat(row.ListPrice) || 0, CustBestPrice: parseFloat(row.CustBestPrice) || 0 });
+      }
+    });
+    dbg('parse:price:chunk', { chunkNumber: 1, rowsInChunk: priceRowCounter });
+    dbg('parse:price:done', { totalRecords: priceMap.size, totalChunks: 1 });
+
+    // Prescan Material (streaming) to count rows
+    dbg('material:prescan:start');
+    let materialRowsCount = 0;
+    await new Promise<void>((resolve, reject) => {
+      Papa.parse(files.material.file!.raw, {
+        header: true,
+        skipEmptyLines: true,
+        worker: true,
+        step: (results) => {
+          if (results && results.data) {
+            materialRowsCount++;
+            if (materialRowsCount % 500 === 0) dbg('material:prescan:chunk', { materialRowsCount });
+          }
+        },
+        complete: () => resolve(),
+        error: (err) => reject(err)
+      });
+    }).catch(() => {
+      // Fallback prescan without worker
+      materialRowsCount = 0;
+      Papa.parse(files.material.file!.raw, {
+        header: true,
+        skipEmptyLines: true,
+        worker: false,
+        step: (results) => {
+          if (results && results.data) materialRowsCount++;
+        },
+        complete: () => {},
+      });
+    });
+
+    if (materialRowsCount <= 0) {
+      dbg('material:prescan:error', { message: 'Nessuna riga valida nel Material' });
+      toast({ title: 'Errore elaborazione', description: 'Nessuna riga valida nel Material', variant: 'destructive' });
+      return;
+    }
+    dbg('material:prescan:done', { materialRowsCount });
+
+    // Init state machine and counters based on rows read
+    setProcessingState('running');
+    setTotal(materialRowsCount); // only for initial estimate/UI
+    setStartTime(Date.now());
+    setElapsedTime(0);
+    setEstimatedTime(null);
+    setDebugState(prev => ({ ...prev, stockReady: true, priceReady: true, materialPreScanDone: true }));
+
+    // Join streaming pass
+    const optionalHeadersMissing = {
+      stock: !files.stock.file.headers.includes('ManufPartNr'),
+      price: !files.price.file.headers.includes('ManufPartNr')
+    };
+
+    const processedEAN: ProcessedRecord[] = [];
+    const processedMPN: ProcessedRecord[] = [];
+    const logsEAN: LogEntry[] = [];
+    const logsMPN: LogEntry[] = [];
+
+    const ceilToXX99 = (value: number) => {
+      const integer = Math.floor(value);
+      const decimal = value - integer;
+      return decimal <= 0.99 ? integer + 0.99 : integer + 1.99;
+    };
+
+    const computeFinalPriceForEAN = (row: any): number => {
+      const custBestPrice = parseFloat(row.CustBestPrice);
+      const listPrice = parseFloat(row.ListPrice);
+      
+      // Use computeFinalEan for consistency
+      const hasBest = Number.isFinite(custBestPrice) && custBestPrice > 0;
+      const hasListPrice = Number.isFinite(listPrice) && listPrice > 0;
+      
+      if (hasBest) {
+        const result = computeFinalEan(
+          { listPrice: listPrice || 0, custBestPrice },
+          { feeDeRev: feeConfig.feeDrev, feeMarketplace: feeConfig.feeMkt }
+        );
+        return result.finalCents / 100;
+      } else if (hasListPrice) {
+        const result = computeFinalEan(
+          { listPrice },
+          { feeDeRev: feeConfig.feeDrev, feeMarketplace: feeConfig.feeMkt }
+        );
+        return result.finalCents / 100;
+      }
+      
+      return 0;
+    };
+
+    const finalize = () => {
+      dbg('excel:write:start');
+      dbg('log:write:start');
+      
+      // Session header + optional header warnings
+      const sessionRow: LogEntry = {
+        source_file: 'session',
+        line: 0,
+        Matnr: '',
+        ManufPartNr: '',
+        EAN: '',
+        reason: 'session_start',
+        details: JSON.stringify({ event: 'session_start', materialRowsCount, optionalHeadersMissing, fees: { mediaworld: 0.08, alterside: 0.05 }, timestamp: new Date().toISOString() })
+      };
+      
+      // For current pipeline, filter only relevant data
+      const currentData = pipelineType === 'EAN' ? processedEAN : processedMPN;
+      const currentLogs = pipelineType === 'EAN' ? logsEAN : logsMPN;
+      
+      currentLogs.unshift(sessionRow);
+      if (optionalHeadersMissing.stock) {
+        const r: LogEntry = { source_file: 'StockFileData_790813.txt', line: 0, Matnr: '', ManufPartNr: '', EAN: '', reason: 'header_optional_missing', details: 'ManufPartNr assente (uso ManufPartNr da Material)' };
+        currentLogs.splice(1, 0, r);
+      }
+      if (optionalHeadersMissing.price) {
+        const idx = 1 + (optionalHeadersMissing.stock ? 1 : 0);
+        const r: LogEntry = { source_file: 'pricefileData_790813.txt', line: 0, Matnr: '', ManufPartNr: '', EAN: '', reason: 'header_optional_missing', details: 'ManufPartNr assente (uso ManufPartNr da Material)' };
+        currentLogs.splice(idx, 0, r);
+      }
+
+      // Update stats for UI
+      setStats(prev => ({
+        ...prev,
+        totalRows: materialRowsCount,
+        validEAN: pipelineType === 'EAN' ? currentData.length : prev.validEAN,
+        validMPN: pipelineType === 'MPN' ? currentData.length : prev.validMPN,
+        discardedEAN: pipelineType === 'EAN' ? currentLogs.length - 1 : prev.discardedEAN,
+        discardedMPN: pipelineType === 'MPN' ? currentLogs.length - 1 : prev.discardedMPN
+      }));
+
+      // Set current pipeline results
+      setCurrentProcessedData(currentData);
+      setCurrentLogEntries(currentLogs);
+      setCurrentStats({
+        totalRecords: materialRowsCount,
+        validRecordsEAN: pipelineType === 'EAN' ? currentData.length : 0,
+        validRecordsManufPartNr: pipelineType === 'MPN' ? currentData.length : 0,
+        filteredRecordsEAN: pipelineType === 'EAN' ? currentLogs.length - 1 : 0,
+        filteredRecordsManufPartNr: pipelineType === 'MPN' ? currentLogs.length - 1 : 0,
+        stockDuplicates,
+        priceDuplicates
+      });
+
+      // Update download ready state
+      setDownloadReady(prev => ({
+        ...prev,
+        [pipelineType.toLowerCase() + '_excel']: currentData.length > 0,
+        [pipelineType.toLowerCase() + '_log']: currentLogs.length > 0
+      }));
+
+      setExcelDone(true);
+      dbg('excel:write:done', { pipeline: pipelineType });
+      
+      setLogDone(true);
+      dbg('log:write:done', { pipeline: pipelineType });
+    };
+
+    // Wait dependencies observation
+    setTimeout(() => {
+      if (total > 0 && processed === 0) {
+        toast({ title: 'Elaborazione non avviata: verifico dipendenze', description: '', variant: 'default' });
+        dbg('join_waiting_dependencies');
+      }
+    }, 2000);
+
+    const runJoin = (useWorker: boolean) => new Promise<void>((resolve, reject) => {
+      dbg('join:start', { worker: useWorker });
+      setDebugState(prev => ({ ...prev, joinStarted: true }));
+
+      let firstChunk = false;
+      let aborted = false;
+      let parserRef: any = null;
+      const fallbackTimer = setTimeout(() => {
+        if (!firstChunk && useWorker) {
+          toast({ title: 'Nessuna riga processata, fallback worker:false', description: '', variant: 'default' });
+          dbg('join:fallback', { reason: 'no_chunk_within_2s' });
+          try { parserRef && parserRef.abort && parserRef.abort(); } catch {}
+          // Relaunch without worker
+          runJoin(false).then(resolve).catch(reject);
+        }
+      }, 2000);
+
+      let processedLocal = 0;
+
+      Papa.parse(files.material.file!.raw, {
+        header: true,
+        skipEmptyLines: true,
+        worker: useWorker,
+        step: (results, parser) => {
+          if (!firstChunk) { firstChunk = true; clearTimeout(fallbackTimer); }
+          parserRef = parser;
+          
+          // CRITICAL FIX: Count ALL rows read FIRST, before any filtering
+          processedRef.current += 1;
+          
+          // Update progress based on ALL rows read every 256 rows (for performance)
+          if ((processedRef.current & 0xFF) === 0) {
+            const denom = finalTotal ?? total ?? 1;
+            setProcessed(processedRef.current);
+            setProgressPct(Math.min(99, Math.floor(processedRef.current / Math.max(1, denom) * 100)));
+            dbg('join:chunk', { processed: processedRef.current });
+          }
+          
+          const row = results.data as any;
+          const matnr = row?.Matnr?.toString().trim();
+          if (!matnr) return;
+
+          const stock = stockMap.get(matnr);
+          const price = priceMap.get(matnr);
+
+          if (!stock) {
+            const le: LogEntry = { source_file: 'MaterialFile.txt', line: processedLocal + 2, Matnr: matnr, ManufPartNr: row.ManufPartNr || '', EAN: row.EAN || '', reason: 'join_missing_stock', details: 'Nessun dato stock trovato' };
+            logsEAN.push(le); logsMPN.push(le);
+            return;
+          }
+          if (!price) {
+            const le: LogEntry = { source_file: 'MaterialFile.txt', line: processedLocal + 2, Matnr: matnr, ManufPartNr: row.ManufPartNr || '', EAN: row.EAN || '', reason: 'join_missing_price', details: 'Nessun dato prezzo trovato' };
+            logsEAN.push(le); logsMPN.push(le);
+            return;
+          }
+
+          const existingStock = parseInt(stock.ExistingStock as any) || 0;
+          const listPriceNum = Number(price.ListPrice) || 0;
+          const custBestNumRaw = Number(price.CustBestPrice) || 0;
+          if (existingStock <= 1) {
+            const le: LogEntry = { source_file: 'MaterialFile.txt', line: processedLocal + 2, Matnr: matnr, ManufPartNr: row.ManufPartNr || '', EAN: row.EAN || '', reason: 'stock_leq_1', details: `ExistingStock=${existingStock} <= 1` };
+            logsEAN.push(le); logsMPN.push(le);
+            return;
+          }
+          if (!(listPriceNum > 0)) {
+            const le: LogEntry = { source_file: 'MaterialFile.txt', line: processedLocal + 2, Matnr: matnr, ManufPartNr: row.ManufPartNr || '', EAN: row.EAN || '', reason: 'price_missing', details: `ListPrice non valido: ${listPriceNum}` };
+            logsEAN.push(le); logsMPN.push(le);
+            return;
+          }
+          if (!(custBestNumRaw > 0)) {
+            const le: LogEntry = { source_file: 'MaterialFile.txt', line: processedLocal + 2, Matnr: matnr, ManufPartNr: row.ManufPartNr || '', EAN: row.EAN || '', reason: 'custbest_missing', details: `CustBestPrice non valido: ${custBestNumRaw}` };
+            logsEAN.push(le); logsMPN.push(le);
+            return;
+          }
+
+          // Use new fee calculation system
+          const calc = computeFinalPrice({
+            CustBestPrice: custBestNumRaw,
+            ListPrice: listPriceNum,
+            feeDrev: feeConfig.feeDrev,
+            feeMkt: feeConfig.feeMkt
+          });
+
+          const base: ProcessedRecord = {
+            Matnr: matnr,
+            ManufPartNr: row.ManufPartNr || '', // always from Material
+            EAN: row.EAN?.toString().trim() || '',
+            ShortDescription: row.ShortDescription || '',
+            ExistingStock: existingStock,
+            ListPrice: listPriceNum,
+            CustBestPrice: calc.base,
+            'Costo di Spedizione': calc.shipping,
+            IVA: calc.iva,
+            'Prezzo con spediz e IVA': calc.subtotConIva,
+            FeeDeRev: feeConfig.feeDrev,
+            'Fee Marketplace': feeConfig.feeMkt,
+            'Subtotale post-fee': calc.postFee,
+            'Prezzo Finale': currentPipeline === 'EAN' ? calc.eanResult.finalDisplay : calc.prezzoFinaleMPN,
+            'ListPrice con Fee': calc.listPriceConFee
+          };
+
+          if (base.EAN) {
+            // Add internal EAN metadata for validation
+            (base as any)._eanFinalCents = currentPipeline === 'EAN' ? calc.eanResult.finalCents : undefined;
+            processedEAN.push(base);
+          } else {
+            const le: LogEntry = { source_file: 'MaterialFile.txt', line: processedLocal + 2, Matnr: matnr, ManufPartNr: base.ManufPartNr, EAN: '', reason: 'ean_empty', details: 'EAN vuoto o mancante' };
+            logsEAN.push(le);
+          }
+
+          if (base.ManufPartNr) {
+            processedMPN.push(base);
+          } else {
+            const le: LogEntry = { source_file: 'MaterialFile.txt', line: processedLocal + 2, Matnr: matnr, ManufPartNr: '', EAN: base.EAN, reason: 'manufpartnr_empty', details: 'ManufPartNr vuoto o mancante' };
+            logsMPN.push(le);
+          }
+
+          // Progress tracking is already done above - don't double count
+        },
+        complete: () => {
+        setFinalTotal(processedRef.current);
+        setProcessed(processedRef.current);
+        setProgressPct(Math.min(99, Math.floor(processedRef.current / Math.max(1, processedRef.current) * 100)));
+        
+        // Apply EAN validation and normalization for EAN pipeline
+        if (pipelineType === 'EAN') {
+          const { kept, discarded, stats } = filterAndNormalizeForEAN(processedEAN, computeFinalPriceForEAN);
+          processedEAN.length = 0; // clear original
+          processedEAN.push(...kept);
+          setEanStats(stats);
+          setDiscardedRows(discarded);
+          
+          audit('ean-validation', {
+            pipeline: pipelineType,
+            input: stats.tot_righe_input,
+            kept: kept.length,
+            discarded: discarded.length,
+            stats
+          });
+        }
+        
+        setJoinDone(true);
+        dbg('join:done', { processed: processedRef.current, totalPrescan: total, finalTotal: processedRef.current });
+          resolve();
+        },
+        error: (err) => {
+          reject(err);
+        }
+      });
+    });
+
+    try {
+      await runJoin(true);
+      finalize();
+    } catch (err) {
+      // ultimate fallback: try without worker
+      try {
+        await runJoin(false);
+        finalize();
+      } catch (e) {
+        setProcessingState('failed');
+        toast({ title: 'Errore elaborazione', description: 'Impossibile completare la join', variant: 'destructive' });
+      }
     }
   };
 
-  const handleFeeChange = (field: 'feeDrev' | 'feeMkt', value: string) => {
-    const numValue = parseFloat(value) || 1.0;
-    setFeeConfig(prev => ({
-      ...prev,
-      [field]: numValue
+  const getTimestamp = () => {
+    const now = new Date();
+    const romeTime = new Intl.DateTimeFormat('it-IT', {
+      timeZone: 'Europe/Rome',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit'
+    }).format(now);
+
+    const [date, time] = romeTime.split(', ');
+    const [day, month, year] = date.split('/');
+    const [hour, minute] = time.split(':');
+    
+    return {
+      timestamp: `${year}${month}${day}_${hour}${minute}`,
+      sheetName: `${year}-${month}-${day}`
+    };
+  };
+
+  const formatExcelData = (data: ProcessedRecord[]) => {
+    return data.map(record => ({
+      ...record,
+      ExistingStock: record.ExistingStock.toString(),
+      ListPrice: record.ListPrice.toFixed(2).replace('.', ','),
+      CustBestPrice: record.CustBestPrice.toString(),
+      'ListPrice con IVA': record['ListPrice con IVA'].toFixed(2).replace('.', ','),
+      'CustBestPrice con IVA': record['CustBestPrice con IVA'].toFixed(2).replace('.', ','),
+      'Costo di spedizione': record['Costo di spedizione'].toString(),
+      'Prezzo finale': typeof record['Prezzo finale'] === 'string' ? record['Prezzo finale'] : record['Prezzo finale'].toFixed(2).replace('.', ','),
+      'Prezzo finale Listino': record['Prezzo finale Listino'].toString()
     }));
   };
 
-  const allFilesValid = Object.values(files).every(f => f.file && f.file.isValid);
-  const isReady = processingState === 'ready' || allFilesValid;
+  const onExportEAN = useCallback((event: React.MouseEvent) => {
+    event.preventDefault();
+    
+    if (isExportingEAN) {
+      toast({
+        title: "Esportazione in corso...",
+        description: "Attendere completamento dell'esportazione corrente"
+      });
+      return;
+    }
+    
+    setIsExportingEAN(true);
+    dbg('excel:write:start');
+    
+    try {
+      // Get EAN filtered data
+      const eanFilteredData = currentProcessedData.filter(record => record.EAN && record.EAN.length >= 12);
+      
+      if (eanFilteredData.length === 0) {
+        toast({
+          title: "Nessuna riga valida per EAN",
+          description: "Non ci sono record con EAN validi da esportare"
+        });
+        return;
+      }
+      
+      // Create dataset with proper column order - UNIFIED pricing via computeFinalEan() and computeFromListPrice()
+      const dataset = eanFilteredData.map(record => {
+        // MANDATORY: Use computeFinalEan() for every EAN row - unified cents-based pipeline
+        const input = {
+          listPrice: record.ListPrice,
+          custBestPrice: record.CustBestPrice
+        };
+        const fees = {
+          feeDeRev: record.FeeDeRev,  // Use exact fee values from record
+          feeMarketplace: record['Fee Marketplace']
+        };
+        
+        // Use UNIFIED pricing functions - same as preview/validation
+        const eanResult = computeFinalEan(input, fees, 6, 22);
+        const listPriceResult = computeFromListPrice(record.ListPrice, fees, 6, 22);
+        
+        // Calculate step-by-step intermediate values using cents-based pipeline
+        const usesCbp = input.custBestPrice && input.custBestPrice > 0 && Number.isFinite(input.custBestPrice);
+        const basePrice = usesCbp ? input.custBestPrice : Math.ceil(input.listPrice);
+        const baseCents = toCents(basePrice);
+        const shippingCents = toCents(6);
+        const afterShippingCents = baseCents + shippingCents;
+        const afterIvaCents = applyRate(afterShippingCents, 1.22); // 22% IVA
+        
+        return {
+          Matnr: record.Matnr,
+          ManufPartNr: record.ManufPartNr,
+          EAN: record.EAN,
+          ShortDescription: record.ShortDescription,
+          ExistingStock: record.ExistingStock,
+          CustBestPrice: record.CustBestPrice,
+          'Costo di Spedizione': '6,00',
+          IVA: '22%',
+          'Prezzo con spediz e IVA': formatCents(afterIvaCents),
+          FeeDeRev: record.FeeDeRev,
+          'Fee Marketplace': record['Fee Marketplace'],
+          'Subtotale post-fee': eanResult.subtotalDisplay, // From computeFinalEan()
+          'Prezzo Finale': eanResult.finalDisplay, // FORCE finalDisplay string "NN,99"
+          ListPrice: record.ListPrice,
+          'ListPrice con Fee': listPriceResult.finalDisplayInt, // Integer ceiling
+          _eanFinalCents: eanResult.finalCents // Internal field for validation guard
+        };
+      });
+      
+      // GUARD: Pre-export validation - block export if finalCents doesn't end with 99
+      let incorrectEndingCount = 0;
+      const guardFailures: any[] = [];
+      
+      for (let i = 0; i < dataset.length; i++) {
+        const record = dataset[i];
+        const finalCents = record._eanFinalCents;
+        
+        if (typeof finalCents === 'number' && (finalCents % 100) !== 99) {
+          incorrectEndingCount++;
+          if (guardFailures.length < 10) { // Log first 10 failures
+            guardFailures.push({
+              index: i,
+              matnr: record.Matnr || 'N/A',
+              ean: record.EAN || 'N/A',
+              finalCents: finalCents,
+              finalDisplay: record['Prezzo Finale']
+            });
+          }
+        }
+      }
+      
+      console.warn('excel:guard:finalCentsNot99', { count: incorrectEndingCount });
+      
+      if (incorrectEndingCount > 0) {
+        console.warn('AUDIT: excel-guard:fail', { 
+          count: incorrectEndingCount,
+          failed: guardFailures
+        });
+        toast({
+          title: "Errore validazione Excel ending ,99",
+          description: `${incorrectEndingCount} righe non terminano con ,99. Export bloccato.`,
+          variant: "destructive"
+        });
+        return;
+      }
+      
+      // Simplified validation - already handled by guard above
+      console.warn('AUDIT: ean-ending:ok', { validated: dataset.length, total: dataset.length });
+      console.warn('lpfee:integer:ok', { validated: dataset.length, total: dataset.length });
+      
+      // Remove the internal validation field before export - NO "eanFinalCents" column
+      const cleanDataset = dataset.map(record => {
+        const { _eanFinalCents, ...exportRecord } = record;
+        return exportRecord;
+      });
+      
+      // Create worksheet from clean dataset
+      const ws = XLSX.utils.json_to_sheet(cleanDataset, { skipHeader: false });
+      
+      // Ensure !ref exists
+      if (!ws['!ref']) {
+        const rows = cleanDataset.length + 1; // +1 for header
+        const cols = Object.keys(cleanDataset[0] || {}).length;
+        ws['!ref'] = XLSX.utils.encode_range({s:{r:0,c:0}, e:{r:rows-1,c:cols-1}});
+      }
+      
+      // Force EAN column to text format
+      const range = XLSX.utils.decode_range(ws['!ref']);
+      let eanCol = -1;
+      
+      // Find EAN column in header
+      for (let C = range.s.c; C <= range.e.c; C++) {
+        const addr = XLSX.utils.encode_cell({ r: 0, c: C });
+        const cell = ws[addr];
+        const name = (cell?.v ?? '').toString().trim().toLowerCase();
+        if (name === 'ean') { 
+          eanCol = C; 
+          break; 
+        }
+      }
+      
+      // Force EAN column cells to text format
+      if (eanCol >= 0) {
+        for (let R = 1; R <= range.e.r; R++) {
+          const addr = XLSX.utils.encode_cell({ r: R, c: eanCol });
+          const cell = ws[addr];
+          if (cell) {
+            cell.v = (cell.v ?? '').toString(); // Preserve leading zeros
+            cell.t = 's';
+            cell.z = '@';
+            ws[addr] = cell;
+          }
+        }
+      }
+      
+      // Format columns for EAN export - FORCE Prezzo Finale as text with finalDisplay
+      const decimalColumns = ['Prezzo con spediz e IVA', 'Subtotale post-fee'];
+      const textColumns = ['Prezzo Finale']; // FORCE finalDisplay as text to preserve ",99"
+      const integerColumns = ['ListPrice con Fee']; // Keep as integer ceiling
+      
+      for (let C = range.s.c; C <= range.e.c; C++) {
+        const headerAddr = XLSX.utils.encode_cell({ r: 0, c: C });
+        const headerCell = ws[headerAddr];
+        const headerName = (headerCell?.v ?? '').toString().trim();
+        
+        if (decimalColumns.includes(headerName)) {
+          // Format as decimal with 2 places
+          for (let R = 1; R <= range.e.r; R++) {
+            const addr = XLSX.utils.encode_cell({ r: R, c: C });
+            const cell = ws[addr];
+            if (cell && typeof cell.v === 'number') {
+              cell.t = 'n';
+              cell.z = '#,##0.00';
+              ws[addr] = cell;
+            }
+          }
+        } else if (textColumns.includes(headerName)) {
+          // FORCE Prezzo Finale as text to preserve finalDisplay "NN,99" format
+          for (let R = 1; R <= range.e.r; R++) {
+            const addr = XLSX.utils.encode_cell({ r: R, c: C });
+            const cell = ws[addr];
+            if (cell) {
+              // FORCE text type and format - no numeric interpretation
+              cell.t = 's'; // String type
+              cell.z = '@'; // Text format
+              cell.v = (cell.v ?? '').toString(); // Ensure string value
+              ws[addr] = cell;
+            }
+          }
+        } else if (integerColumns.includes(headerName)) {
+          // Format ListPrice con Fee as integer (keep ceiling behavior)
+          for (let R = 1; R <= range.e.r; R++) {
+            const addr = XLSX.utils.encode_cell({ r: R, c: C });
+            const cell = ws[addr];
+            if (cell && typeof cell.v === 'number') {
+              cell.t = 'n';
+              cell.z = '0';
+              ws[addr] = cell;
+            }
+          }
+        }
+      }
+      
+      // Create workbook
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "Catalogo_EAN");
+      
+      // Serialize to ArrayBuffer
+      const wbout = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+      
+      if (!wbout || wbout.length === 0) {
+        dbg('excel:write:error | empty buffer');
+        toast({
+          title: "Errore generazione file",
+          description: "Buffer vuoto durante la generazione del file Excel"
+        });
+        return;
+      }
+      
+      // Create blob and download from main thread
+      const blob = new Blob([wbout], { 
+        type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" 
+      });
+      
+      const url = URL.createObjectURL(blob);
+      
+      // Generate filename with timestamp
+      const now = new Date();
+      const timestamp = now.toISOString().slice(0,16).replace(/[-:T]/g, '').replace(/(\d{8})(\d{4})/, '$1_$2');
+      const fileName = `Catalogo_EAN_${timestamp}.xlsx`;
+      
+      // Create anchor and trigger download
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = fileName;
+      a.rel = "noopener";
+      a.style.display = "none";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      
+      // Delay URL revocation
+      setTimeout(() => URL.revokeObjectURL(url), 3000);
+      
+      dbg('excel:write:blob-size', { bytes: blob.size });
+      dbg('excel:write:done', { pipeline: 'EAN' });
+      
+      setExcelDone(true);
+      
+      toast({
+        title: "Export EAN avviato",
+        description: "Controlla i download per il file Excel"
+      });
+      
+    } catch (error) {
+      dbg('excel:write:error', { message: error instanceof Error ? error.message : 'Unknown error' });
+      toast({
+        title: "Errore durante l'export",
+        description: error instanceof Error ? error.message : "Errore sconosciuto"
+      });
+    } finally {
+      setIsExportingEAN(false);
+    }
+  }, [currentProcessedData, isExportingEAN, dbg, toast]);
 
-  return (
-    <div className="container mx-auto p-6 space-y-6">
-      <div className="text-center mb-8">
-        <h1 className="text-3xl font-bold text-gray-900 mb-2">
-          Alterside Catalog Generator
-        </h1>
-        <p className="text-gray-600">
-          Upload Material, Stock, and Price files to generate EAN and ManufPartNr catalogs
-        </p>
-      </div>
+  const downloadExcel = (type: 'ean' | 'manufpartnr') => {
+    if (type === 'ean') {
+      // Use the new onExportEAN function for EAN catalog
+      onExportEAN({ preventDefault: () => {} } as React.MouseEvent);
+      return;
+    }
+    
+    // Keep existing logic for manufpartnr
+    if (currentProcessedData.length === 0) return;
+    
+    dbg('excel:write:start');
+    
+    const { timestamp, sheetName } = getTimestamp();
+    const filename = `catalogo_${type}_${timestamp}.xlsx`;
 
-      {/* File Upload Section */}
-      <div className="grid md:grid-cols-3 gap-6">
-        {(['material', 'stock', 'price'] as const).map((type) => (
-          <Card key={type} className="p-6">
-            <div className="space-y-4">
-              <div className="flex items-center space-x-2">
-                <FileText className="h-5 w-5 text-blue-600" />
-                <h3 className="text-lg font-semibold capitalize">{type} File</h3>
-                {files[type].status === 'valid' && (
-                  <CheckCircle className="h-5 w-5 text-green-600" />
-                )}
-                {files[type].status === 'error' && (
-                  <XCircle className="h-5 w-5 text-red-600" />
-                )}
-                {files[type].status === 'warning' && (
-                  <AlertCircle className="h-5 w-5 text-yellow-600" />
+    const excelData = formatExcelData(currentProcessedData);
+    const ws = XLSX.utils.json_to_sheet(excelData);
+    
+    // Force EAN column to text format for both pipelines
+    forceEANText(ws);
+    
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, sheetName);
+    XLSX.writeFile(wb, filename);
+
+    setExcelDone(true);
+    dbg('excel:write:done', { pipeline: type });
+
+    toast({
+      title: "Excel scaricato",
+      description: `File ${filename} scaricato con successo`
+    });
+  };
+
+  const downloadDiscardedRows = () => {
+    if (discardedRows.length === 0) return;
+    exportDiscardedRowsCSV(discardedRows, `righe_scartate_EAN_${new Date().toISOString().split('T')[0]}`);
+  };
+
+  const downloadLog = (type: 'ean' | 'manufpartnr') => {
+    if (currentLogEntries.length === 0 && !currentStats) return;
+    
+    dbg('log:write:start');
+
+    const { timestamp, sheetName } = getTimestamp();
+    const filename = `catalogo_log_${type}_${timestamp}.xlsx`;
+
+    const logData = currentLogEntries.map(entry => ({
+      'File Sorgente': entry.source_file,
+      'Riga': entry.line,
+      'Matnr': entry.Matnr,
+      'ManufPartNr': entry.ManufPartNr,
+      'EAN': entry.EAN,
+      'Motivo': entry.reason,
+      'Dettagli': entry.details
+    }));
+
+    const ws = XLSX.utils.json_to_sheet(logData);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, sheetName);
+    XLSX.writeFile(wb, filename);
+
+    setLogDone(true);
+    dbg('log:write:done', { pipeline: type });
+
+    toast({
+      title: "Log scaricato",
+      description: `File ${filename} scaricato con successo`
+    });
+  };
+
+  const FileUploadCard: React.FC<{
+    title: string;
+    description: string;
+    type: keyof FileUploadState;
+    requiredHeaders: string[];
+    optionalHeaders: string[];
+  }> = ({ title, description, type, requiredHeaders, optionalHeaders }) => {
+    const fileState = files[type];
+    
+    return (
+      <div className="card border-strong">
+        <div className="card-body">
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="card-title">{title}</h3>
+            {fileState.status === 'valid' && (
+              <div className="badge-ok">
+                <CheckCircle className="w-4 h-4" />
+                Caricato
+              </div>
+            )}
+            {fileState.status === 'warning' && (
+              <div className="badge-ok" style={{ background: '#fff3cd', color: '#856404', border: '1px solid #ffeaa7' }}>
+                <AlertCircle className="w-4 h-4" />
+                Caricato (con avviso)
+              </div>
+            )}
+            {fileState.status === 'error' && (
+              <div className="badge-err">
+                <XCircle className="w-4 h-4" />
+                Errore
+              </div>
+            )}
+          </div>
+
+          <p className="text-muted text-sm mb-4">{description}</p>
+          
+          <div className="text-xs text-muted mb-4">
+            <div><strong>Header richiesti:</strong> {requiredHeaders.join(', ')}</div>
+            {optionalHeaders.length > 0 && (
+              <div><strong>Header opzionali:</strong> {optionalHeaders.join(', ')}</div>
+            )}
+          </div>
+
+          {!fileState.file ? (
+            <div className="dropzone text-center">
+              <Upload className="mx-auto h-12 w-12 icon-dark mb-4" />
+              <div>
+                <input
+                  type="file"
+                  accept=".txt,.csv"
+                  onChange={(e) => {
+                    const selectedFile = e.target.files?.[0];
+                    if (selectedFile) {
+                      handleFileUpload(selectedFile, type);
+                    }
+                  }}
+                  className="hidden"
+                  id={`file-${type}`}
+                />
+                <label
+                  htmlFor={`file-${type}`}
+                  className="btn btn-primary cursor-pointer px-6 py-3"
+                >
+                  Carica File
+                </label>
+                <p className="text-muted text-sm mt-3">
+                  File CSV con delimitatore ; e encoding UTF-8
+                </p>
+              </div>
+            </div>
+          ) : (
+            <div className="flex items-center justify-between p-4 bg-white rounded-lg border-strong">
+              <div className="flex items-center gap-3">
+                <FileText className="h-6 w-6 icon-dark" />
+                <div>
+                  <p className="font-medium">{fileState.file.name}</p>
+                  <p className="text-sm text-muted">
+                    {fileState.file.data.length} righe
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => removeFile(type)}
+                className="btn btn-secondary text-sm px-3 py-2"
+              >
+                Rimuovi
+              </button>
+            </div>
+          )}
+
+          {fileState.status === 'error' && fileState.error && (
+            <div className="mt-4 p-3 rounded-lg border-strong" style={{ background: 'var(--error-bg)', color: 'var(--error-fg)' }}>
+              <p className="text-sm font-medium">{fileState.error}</p>
+            </div>
+          )}
+
+          {fileState.status === 'warning' && fileState.warning && (
+            <div className="mt-4 p-3 rounded-lg border-strong" style={{ background: '#fff3cd', color: '#856404' }}>
+              <p className="text-sm font-medium">{fileState.warning}</p>
+            </div>
+          )}
+
+          {fileState.file && (
+            <div className="mt-4 p-3 rounded-lg border-strong bg-gray-50">
+              <h4 className="text-sm font-medium mb-2">Diagnostica</h4>
+              <div className="text-xs text-muted">
+                <div><strong>Header rilevati:</strong> {fileState.file.headers.join(', ')}</div>
+                {fileState.file.data.length > 0 && (
+                  <div className="mt-1">
+                    <strong>Prima riga di dati:</strong> {Object.values(fileState.file.data[0]).slice(0, 3).join(', ')}...
+                  </div>
                 )}
               </div>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  };
 
-              {files[type].file ? (
-                <div className="text-sm">
-                  <p className="font-medium">{files[type].file?.name}</p>
-                  <p className="text-gray-600">{files[type].file?.data.length} rows</p>
-                </div>
-              ) : (
-                <div className="border-2 border-dashed border-gray-300 rounded-lg p-4 text-center">
-                  <Upload className="h-8 w-8 text-gray-400 mx-auto mb-2" />
-                  <p className="text-sm text-gray-600">Drop CSV file here or click to browse</p>
-                  <input
-                    type="file"
-                    accept=".csv"
+  const allFilesValid = files.material.status === 'valid' && 
+    (files.stock.status === 'valid' || files.stock.status === 'warning') && 
+    (files.price.status === 'valid' || files.price.status === 'warning');
+
+  return (
+    <div className="min-h-screen p-6" style={{ background: 'var(--bg)', color: 'var(--fg)' }}>
+      <div className="max-w-7xl mx-auto space-y-8">
+        {/* Header */}
+        <div className="text-center">
+          <h1 className="text-5xl font-bold mb-4">
+            Alterside Catalog Generator
+          </h1>
+          <p className="text-muted text-xl max-w-3xl mx-auto">
+            Genera due cataloghi Excel distinti (EAN e ManufPartNr) con calcoli avanzati di prezzo e commissioni
+          </p>
+        </div>
+
+        {/* Instructions */}
+        <div className="card border-strong">
+          <div className="card-body">
+            <div className="flex items-start gap-4">
+              <AlertCircle className="h-6 w-6 icon-dark mt-1 flex-shrink-0" />
+              <div>
+                <h3 className="card-title mb-3">Specifiche di Elaborazione</h3>
+                <ul className="text-sm text-muted space-y-2">
+                  <li>• <strong>Filtri comuni:</strong> ExistingStock &gt; 1, prezzi numerici validi</li>
+                  <li>• <strong>Export EAN:</strong> solo record con EAN non vuoto</li>
+                  <li>• <strong>Export ManufPartNr:</strong> solo record con ManufPartNr non vuoto</li>
+                  <li>• <strong>Prezzi:</strong> Base + spedizione (€6), IVA 22%, fee sequenziali configurabili</li>
+                  <li>• <strong>Prezzo finale EAN:</strong> ending ,99; <strong>ManufPartNr:</strong> arrotondamento intero superiore</li>
+                </ul>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* File Upload Cards */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          <FileUploadCard
+            title="Material File"
+            description="File principale con informazioni prodotto"
+            type="material"
+            requiredHeaders={REQUIRED_HEADERS.material}
+            optionalHeaders={OPTIONAL_HEADERS.material}
+          />
+          <FileUploadCard
+            title="Stock File Data"
+            description="Dati scorte e disponibilità"
+            type="stock"
+            requiredHeaders={REQUIRED_HEADERS.stock}
+            optionalHeaders={OPTIONAL_HEADERS.stock}
+          />
+          <FileUploadCard
+            title="Price File Data"
+            description="Listini prezzi e scontistiche"
+            type="price"
+            requiredHeaders={REQUIRED_HEADERS.price}
+            optionalHeaders={OPTIONAL_HEADERS.price}
+          />
+        </div>
+
+        {/* Fee Configuration */}
+        {allFilesValid && (
+          <div className="card border-strong">
+            <div className="card-body">
+              <h3 className="card-title mb-6 flex items-center gap-2">
+                <Info className="h-5 w-5 icon-dark" />
+                Regole di Calcolo
+              </h3>
+              
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div className="space-y-2">
+                  <Label htmlFor="fee-derev" className="text-sm font-medium">
+                    Fee DeRev (moltiplicatore)
+                  </Label>
+                  <Input
+                    id="fee-derev"
+                    type="number"
+                    min="1.00"
+                    max="2.00"
+                    step="0.01"
+                    value={feeConfig.feeDrev}
                     onChange={(e) => {
-                      const file = e.target.files?.[0];
-                      if (file) handleFileUpload(file, type);
+                      const val = parseFloat(e.target.value);
+                      if (val >= 1.00 && val <= 2.00) {
+                        setFeeConfig(prev => ({ ...prev, feeDrev: val }));
+                      }
                     }}
-                    className="mt-2 block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"
+                    className="text-center"
+                    title="Inserisci fee come moltiplicatore: 1,05 = +5%, 1,08 = +8%. Le fee sono applicate in sequenza dopo IVA e spedizione."
                   />
+                  <p className="text-xs text-muted-foreground">
+                    Esempio: 1,05 = +5% commissione DeRev
+                  </p>
                 </div>
-              )}
-
-              {files[type].error && (
-                <div className="text-sm text-red-600 bg-red-50 p-2 rounded">
-                  {files[type].error}
+                
+                <div className="space-y-2">
+                  <Label htmlFor="fee-marketplace" className="text-sm font-medium">
+                    Fee Marketplace (moltiplicatore)
+                  </Label>
+                  <Input
+                    id="fee-marketplace"
+                    type="number"
+                    min="1.00"
+                    max="2.00"
+                    step="0.01"
+                    value={feeConfig.feeMkt}
+                    onChange={(e) => {
+                      const val = parseFloat(e.target.value);
+                      if (val >= 1.00 && val <= 2.00) {
+                        setFeeConfig(prev => ({ ...prev, feeMkt: val }));
+                      }
+                    }}
+                    className="text-center"
+                    title="Fee marketplace applicata dopo Fee DeRev. Esempio: 1,08 = +8% commissione marketplace."
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Esempio: 1,08 = +8% commissione marketplace
+                  </p>
                 </div>
-              )}
+              </div>
+              
+              <div className="mt-4 flex items-center space-x-2">
+                <Checkbox
+                  id="remember-fees"
+                  checked={rememberFees}
+                  onCheckedChange={(checked) => {
+                    setRememberFees(!!checked);
+                    if (checked) {
+                      saveFees(feeConfig);
+                    }
+                  }}
+                />
+                <Label htmlFor="remember-fees" className="text-sm">
+                  Ricorda queste impostazioni
+                </Label>
+              </div>
+            </div>
+          </div>
+        )}
 
-              {files[type].warning && (
-                <div className="text-sm text-yellow-600 bg-yellow-50 p-2 rounded">
-                  {files[type].warning}
+        {/* Action Buttons */}
+        {allFilesValid && (
+          <div className="text-center">
+            <h3 className="text-2xl font-bold mb-6">Azioni</h3>
+            <div className="flex flex-wrap justify-center gap-6">
+              <button
+                onClick={() => processDataPipeline('EAN')}
+                disabled={!canProcess || isProcessing}
+                className={`btn btn-primary text-lg px-12 py-4 ${!canProcess || isProcessing ? 'is-disabled' : ''}`}
+              >
+                {isProcessing && currentPipeline === 'EAN' ? (
+                  <>
+                    <Activity className="mr-3 h-5 w-5 animate-spin" />
+                    Elaborazione EAN...
+                  </>
+                ) : (
+                  <>
+                    <Upload className="mr-3 h-5 w-5" />
+                    GENERA EXCEL (EAN)
+                  </>
+                )}
+              </button>
+              <button
+                onClick={() => processDataPipeline('MPN')}
+                disabled={!canProcess || isProcessing}
+                className={`btn btn-primary text-lg px-12 py-4 ${!canProcess || isProcessing ? 'is-disabled' : ''}`}
+              >
+                {isProcessing && currentPipeline === 'MPN' ? (
+                  <>
+                    <Activity className="mr-3 h-5 w-5 animate-spin" />
+                    Elaborazione ManufPartNr...
+                  </>
+                ) : (
+                  <>
+                    <Upload className="mr-3 h-5 w-5" />
+                    GENERA EXCEL (ManufPartNr)
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Progress Section */}
+        {(isProcessing || isCompleted) && (
+          <div className="card border-strong">
+            <div className="card-body">
+              <h3 className="card-title mb-6 flex items-center gap-2">
+                <Activity className="h-5 w-5 animate-spin icon-dark" />
+                Progresso Elaborazione
+              </h3>
+              
+              <div className="space-y-4">
+                <div className="text-sm text-muted mb-2">
+                  <strong>Stato corrente:</strong> {processingState}
+                </div>
+                
+                <div className="progress">
+                  <span style={{ width: `${progressPct}%` }} />
+                </div>
+                
+                <div className="flex justify-between text-sm">
+                  <span className="font-medium">{progressPct}%</span>
+                  <span className="font-bold">Completato</span>
+                </div>
+                
+                <div className="flex items-center gap-6 text-sm">
+                  <div className="flex items-center gap-2">
+                    <Clock className="h-4 w-4 icon-dark" />
+                    <span>Trascorso: {formatTime(elapsedTime)}</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Clock className="h-4 w-4 icon-dark" />
+                    <span>ETA: {estimatedTime ? formatTime(estimatedTime) : (processed > 0 && !isCompleted ? 'calcolo…' : '—')}</span>
+                  </div>
+                  <div className="text-sm">
+                    <span className="font-medium">Righe elaborate: {processed.toLocaleString()}</span>
+                    {(finalTotal ?? total) > 0 && <span className="text-muted"> / {(finalTotal ?? total).toLocaleString()}</span>}
+                  </div>
+                  {finalTotal !== null && total !== finalTotal && (
+                    <div className="text-xs text-muted">
+                      Stima iniziale: {total.toLocaleString()} | Totale effettivo: {finalTotal.toLocaleString()}
+                    </div>
+                  )}
+                </div>
+                
+                {/* Debug State */}
+                <div className="mt-4 p-3 bg-muted rounded-lg">
+                  <h4 className="text-sm font-medium mb-2">Stato Debug</h4>
+                  <div className="grid grid-cols-2 gap-2 text-xs">
+                    <div>materialValid: {debugState.materialValid ? '✓' : '✗'}</div>
+                    <div>stockValid: {debugState.stockValid ? '✓' : '✗'}</div>
+                    <div>priceValid: {debugState.priceValid ? '✓' : '✗'}</div>
+                    <div>stockReady: {debugState.stockReady ? '✓' : '✗'}</div>
+                    <div>priceReady: {debugState.priceReady ? '✓' : '✗'}</div>
+                    <div>materialPreScanDone: {debugState.materialPreScanDone ? '✓' : '✗'}</div>
+                    <div>joinStarted: {debugState.joinStarted ? '✓' : '✗'}</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Debug Events Panel */}
+        {(isProcessing || isCompleted || debugEvents.length > 0) && (
+          <div className="card border-strong">
+            <div className="card-body">
+              <h3 className="card-title mb-4 flex items-center gap-2">
+                <AlertCircle className="h-5 w-5 icon-dark" />
+                Eventi Debug
+              </h3>
+              
+              <textarea
+                value={debugEvents.join('\n')}
+                readOnly
+                className="w-full h-64 p-3 font-mono text-xs bg-muted border border-strong rounded-lg resize-none"
+                style={{ whiteSpace: 'pre-wrap' }}
+              />
+              
+              {debugEvents.length > 0 && (
+                <div className="mt-2 flex justify-between text-xs text-muted">
+                  <span>{debugEvents.length} eventi registrati</span>
+                  <button
+                    onClick={() => setDebugEvents([])}
+                    className="text-primary hover:text-primary-dark"
+                  >
+                    Pulisci log
+                  </button>
                 </div>
               )}
             </div>
-          </Card>
-        ))}
+          </div>
+        )}
+
+        {/* Statistics */}
+        {currentStats && (
+          <div className="card border-strong">
+            <div className="card-body">
+              <h3 className="card-title mb-6">Statistiche Elaborazione - Pipeline {currentPipeline}</h3>
+              <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+                <div className="text-center p-4 rounded-lg border-strong" style={{ background: '#f8fafc' }}>
+                  <div className="text-2xl font-bold">{currentStats.totalRecords.toLocaleString()}</div>
+                  <div className="text-sm text-muted">Righe Totali</div>
+                </div>
+                <div className="text-center p-4 rounded-lg border-strong" style={{ background: 'var(--success-bg)' }}>
+                  <div className="text-2xl font-bold" style={{ color: 'var(--success-fg)' }}>
+                    {currentPipeline === 'EAN' ? currentStats.validRecordsEAN.toLocaleString() : currentStats.validRecordsManufPartNr.toLocaleString()}
+                  </div>
+                  <div className="text-sm text-muted">Valide {currentPipeline}</div>
+                </div>
+                <div className="text-center p-4 rounded-lg border-strong" style={{ background: 'var(--error-bg)' }}>
+                  <div className="text-2xl font-bold" style={{ color: 'var(--error-fg)' }}>
+                    {currentPipeline === 'EAN' ? currentStats.filteredRecordsEAN.toLocaleString() : currentStats.filteredRecordsManufPartNr.toLocaleString()}
+                  </div>
+                  <div className="text-sm text-muted">Scartate {currentPipeline}</div>
+                </div>
+                <div className="text-center p-4 rounded-lg border-strong" style={{ background: '#fff3cd' }}>
+                  <div className="text-2xl font-bold" style={{ color: '#856404' }}>{currentStats.stockDuplicates + currentStats.priceDuplicates}</div>
+                  <div className="text-sm text-muted">Duplicati</div>
+                </div>
+              </div>
+              
+              {eanStats && currentPipeline === 'EAN' && (
+                <div className="mt-6">
+                  <h4 className="text-lg font-semibold mb-3">Validazione EAN</h4>
+                  <div className="grid grid-cols-4 gap-4 text-sm">
+                    <div className="text-center p-3 rounded-lg border" style={{ background: '#f0f9ff' }}>
+                      <div className="text-lg font-bold text-green-600">{eanStats.ean_validi_13}</div>
+                      <div className="text-muted-foreground">EAN validi (13 cifre)</div>
+                    </div>
+                    <div className="text-center p-3 rounded-lg border" style={{ background: '#eff6ff' }}>
+                      <div className="text-lg font-bold text-blue-600">{eanStats.ean_padded_12_to_13}</div>
+                      <div className="text-muted-foreground">EAN padded (12→13)</div>
+                    </div>
+                    <div className="text-center p-3 rounded-lg border" style={{ background: '#f0fdf4' }}>
+                      <div className="text-lg font-bold text-emerald-600">{eanStats.ean_trimmed_14_to_13}</div>
+                      <div className="text-muted-foreground">EAN trimmed (14→13)</div>
+                    </div>
+                    <div className="text-center p-3 rounded-lg border" style={{ background: '#fefce8' }}>
+                      <div className="text-lg font-bold text-yellow-600">{eanStats.ean_validi_14}</div>
+                      <div className="text-muted-foreground">EAN validi (14 cifre)</div>
+                    </div>
+                    <div className="text-center p-3 rounded-lg border" style={{ background: '#fff7ed' }}>
+                      <div className="text-lg font-bold text-orange-600">{eanStats.ean_duplicati_risolti}</div>
+                      <div className="text-muted-foreground">Duplicati risolti</div>
+                    </div>
+                    <div className="text-center p-3 rounded-lg border" style={{ background: '#fef2f2' }}>
+                      <div className="text-lg font-bold text-red-600">{eanStats.ean_mancanti}</div>
+                      <div className="text-muted-foreground">EAN mancanti</div>
+                    </div>
+                    <div className="text-center p-3 rounded-lg border" style={{ background: '#fef2f2' }}>
+                      <div className="text-lg font-bold text-red-600">{eanStats.ean_non_numerici}</div>
+                      <div className="text-muted-foreground">EAN non numerici</div>
+                    </div>
+                    <div className="text-center p-3 rounded-lg border" style={{ background: '#fef2f2' }}>
+                      <div className="text-lg font-bold text-red-600">{eanStats.ean_lunghezze_invalid}</div>
+                      <div className="text-muted-foreground">Lunghezze non valide</div>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Download Buttons */}
+        {isCompleted && currentProcessedData.length > 0 && (
+          <div className="text-center">
+            <h3 className="text-2xl font-bold mb-6">Download Pipeline {currentPipeline}</h3>
+            <div className="flex flex-wrap justify-center gap-4">
+              <button 
+                type="button"
+                onClick={currentPipeline === 'EAN' ? onExportEAN : () => downloadExcel('manufpartnr')} 
+                disabled={isExportingEAN && currentPipeline === 'EAN'}
+                className={`btn btn-primary text-lg px-8 py-3 ${isExportingEAN && currentPipeline === 'EAN' ? 'opacity-50 cursor-not-allowed' : ''}`}
+              >
+                <Download className="mr-3 h-5 w-5" />
+                {isExportingEAN && currentPipeline === 'EAN' ? 'ESPORTAZIONE...' : `SCARICA EXCEL (${currentPipeline})`}
+              </button>
+              <button 
+                onClick={() => downloadLog(currentPipeline === 'EAN' ? 'ean' : 'manufpartnr')} 
+                className="btn btn-secondary text-lg px-8 py-3"
+              >
+                <Download className="mr-3 h-5 w-5" />
+                SCARICA LOG ({currentPipeline})
+              </button>
+              {discardedRows.length > 0 && currentPipeline === 'EAN' && (
+                <button 
+                  onClick={downloadDiscardedRows}
+                  className="btn btn-secondary text-lg px-8 py-3"
+                >
+                  <Download className="mr-3 h-5 w-5" />
+                  SCARTI EAN ({discardedRows.length})
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Data Preview */}
+        {currentProcessedData.length > 0 && (
+          <div className="card border-strong">
+            <div className="card-body">
+              <h3 className="card-title mb-6">Anteprima Export {currentPipeline} (Prime 10 Righe)</h3>
+              <div className="overflow-x-auto">
+                <table className="table-zebra">
+                  <thead>
+                    <tr>
+                      {Object.keys(currentProcessedData[0]).map((header, index) => (
+                        <th key={index}>{header}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {currentProcessedData.slice(0, 10).map((row, rowIndex) => (
+                      <tr key={rowIndex}>
+                        {Object.values(row).map((value, colIndex) => (
+                          <td key={colIndex}>
+                            {typeof value === 'number' ? value.toLocaleString('it-IT') : String(value)}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
-
-      {/* Fee Configuration */}
-      <Card className="p-6">
-        <h3 className="text-lg font-semibold mb-4">Fee Configuration</h3>
-        <div className="grid md:grid-cols-3 gap-4 items-end">
-          <div>
-            <Label htmlFor="fee-drev">Fee DeRev</Label>
-            <Input
-              id="fee-drev"
-              type="number"
-              step="0.01"
-              min="1.00"
-              value={feeConfig.feeDrev}
-              onChange={(e) => handleFeeChange('feeDrev', e.target.value)}
-              className="border-input focus-visible:ring-ring"
-            />
-          </div>
-          <div>
-            <Label htmlFor="fee-mkt">Fee Marketplace</Label>
-            <Input
-              id="fee-mkt"
-              type="number"
-              step="0.01"
-              min="1.00"
-              value={feeConfig.feeMkt}
-              onChange={(e) => handleFeeChange('feeMkt', e.target.value)}
-              className="border-input focus-visible:ring-ring"
-            />
-          </div>
-          <div className="flex items-center space-x-2">
-            <Checkbox
-              id="remember-fees"
-              checked={rememberFees}
-              onCheckedChange={(checked) => setRememberFees(checked === true)}
-            />
-            <Label htmlFor="remember-fees" className="text-sm">
-              Remember fees
-            </Label>
-          </div>
-        </div>
-      </Card>
-
-      {/* Actions Section - Always Visible */}
-      <Card className="p-6">
-        <h3 className="text-lg font-semibold mb-4">Azioni</h3>
-        <div className="flex flex-wrap gap-4">
-          <Button
-            data-id="btn-ean"
-            variant="default"
-            onClick={() => generateExcel('EAN')}
-            disabled={!allFilesValid || processingState === 'running'}
-            className="flex items-center space-x-2"
-          >
-            <Download className="h-4 w-4" />
-            <span>GENERA EXCEL (EAN)</span>
-          </Button>
-          
-          <Button
-            data-id="btn-sku"
-            variant="default"
-            onClick={() => generateExcel('MPN')}
-            disabled={!allFilesValid || processingState === 'running'}
-            className="flex items-center space-x-2"
-          >
-            <Download className="h-4 w-4" />
-            <span>GENERA EXCEL (ManufPartNr)</span>
-          </Button>
-        </div>
-      </Card>
-
-      {/* Processing Status */}
-      {processingState === 'running' && (
-        <Card className="p-6">
-          <div className="flex items-center space-x-4">
-            <Activity className="h-5 w-5 text-blue-600 animate-spin" />
-            <span>Processing...</span>
-          </div>
-        </Card>
-      )}
-
-      {/* Debug Events */}
-      {debugEvents.length > 0 && (
-        <Card className="p-6">
-          <h3 className="text-lg font-semibold mb-4">Eventi Debug</h3>
-          <div className="bg-muted p-4 rounded text-sm font-mono max-h-60 overflow-y-auto">
-            {debugEvents.slice(-20).map((event, index) => (
-              <div key={index} className="text-foreground">{event}</div>
-            ))}
-          </div>
-        </Card>
-      )}
     </div>
   );
 };
