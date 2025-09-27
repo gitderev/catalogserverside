@@ -1,4 +1,4 @@
-import React, { useState, useRef, useCallback, useEffect } from 'react';
+import React, { useState, useRef, useCallback, useEffect, useReducer } from 'react';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Checkbox } from '@/components/ui/checkbox';
@@ -46,6 +46,9 @@ const AltersideCatalogGenerator = () => {
   const blobUrlRef = useRef<string | null>(null);
   const progressTimerRef = useRef<NodeJS.Timeout | null>(null);
   const pingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const hardTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const progressWatchdogRef = useRef<NodeJS.Timeout | null>(null);
+  const lastProgressRef = useRef<number>(0);
   
   const [diagnosticState, setDiagnosticState] = useState({
     isEnabled: false,
@@ -76,26 +79,48 @@ const AltersideCatalogGenerator = () => {
     version: ''
   });
 
-  const [debugEvents, setDebugEvents] = useState<string[]>([]);
+  // Debug events with reducer and throttling
+  const debugEventsRef = useRef<string[]>([]);
+  const [debugEvents, dispatchDebugEvent] = useReducer(
+    (state: string[], action: { type: 'ADD'; event: string } | { type: 'FLUSH'; events: string[] }) => {
+      switch (action.type) {
+        case 'ADD':
+          const timestamp = new Date().toLocaleTimeString();
+          const eventWithTime = `[${timestamp}] ${action.event}`;
+          const updated = [...debugEventsRef.current, eventWithTime];
+          debugEventsRef.current = updated.length > 200 ? updated.slice(-200) : updated;
+          return debugEventsRef.current;
+        case 'FLUSH':
+          debugEventsRef.current = action.events;
+          return action.events;
+        default:
+          return state;
+      }
+    },
+    []
+  );
 
-  // Add debug event utility
+  // Throttled debug event utility
+  const flushTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const addDebugEvent = useCallback((event: string) => {
-    const timestamp = new Date().toLocaleTimeString();
-    const eventWithTime = `[${timestamp}] ${event}`;
-    setDebugEvents(prev => {
-      const updated = [...prev, eventWithTime];
-      return updated.length > 200 ? updated.slice(-200) : updated;
-    });
+    dispatchDebugEvent({ type: 'ADD', event });
+    
+    // Throttle UI updates to max 10fps
+    if (flushTimeoutRef.current) return;
+    flushTimeoutRef.current = setTimeout(() => {
+      flushTimeoutRef.current = null;
+      dispatchDebugEvent({ type: 'FLUSH', events: debugEventsRef.current });
+    }, 100);
   }, []);
 
-  // Log gate values and CSS validation on each render
+  // One-time gate logging and CSS validation on mount only
   useEffect(() => {
     const allFilesValid = materialValid && stockValid && priceValid;
     
     // Gate visibility logging
-    addDebugEvent(`gate_log: materialValid=${materialValid}, stockValid=${stockValid}, priceValid=${priceValid}, stockReady=${stockReady}, priceReady=${priceReady}, allFilesValid=${allFilesValid}, diagnosticState.isEnabled=${diagnosticState.isEnabled}`);
+    console.log(`[GATE] materialValid=${materialValid}, stockValid=${stockValid}, priceValid=${priceValid}, stockReady=${stockReady}, priceReady=${priceReady}, allFilesValid=${allFilesValid}, diagnosticState.isEnabled=${diagnosticState.isEnabled}`);
     
-    // CSS Variables validation
+    // CSS Variables validation  
     const vars = {
       background: getComputedStyle(document.documentElement).getPropertyValue('--background').trim(),
       card: getComputedStyle(document.documentElement).getPropertyValue('--card').trim(),
@@ -109,16 +134,16 @@ const AltersideCatalogGenerator = () => {
     addDebugEvent(`css_vars: --background="${vars.background}", --card="${vars.card}", --muted="${vars.muted}", --primary="${vars.primary}", --ring="${vars.ring}", --input="${vars.input}"`);
     addDebugEvent(`body_bg: ${bodyBg}`);
     
-    // Button and input probes after render
-    setTimeout(() => {
+    // Button and input probes after mount
+    const probeElements = () => {
       // Button probes
       ['btn-ean', 'btn-sku', 'btn-diag'].forEach(btnId => {
         const btn = document.querySelector(`[data-id="${btnId}"]`) as HTMLElement;
         if (btn) {
           const styles = getComputedStyle(btn);
-          addDebugEvent(`btn_${btnId}: exists=true, display="${styles.display}", visibility="${styles.visibility}", opacity="${styles.opacity}", pointerEvents="${styles.pointerEvents}", color="${styles.color}", backgroundColor="${styles.backgroundColor}"`);
+          console.log(`[PROBE] btn_${btnId}: exists=true, display="${styles.display}", visibility="${styles.visibility}", opacity="${styles.opacity}", pointerEvents="${styles.pointerEvents}", color="${styles.color}", backgroundColor="${styles.backgroundColor}"`);
         } else {
-          addDebugEvent(`btn_${btnId}: missing_in_dom`);
+          console.log(`[PROBE] btn_${btnId}: missing_in_dom`);
         }
       });
       
@@ -127,20 +152,28 @@ const AltersideCatalogGenerator = () => {
         const input = document.querySelector(`#${inputId}`) as HTMLElement;
         if (input) {
           const styles = getComputedStyle(input);
-          addDebugEvent(`input_${inputId}: background="${styles.backgroundColor}", borderColor="${styles.borderColor}"`);
+          console.log(`[PROBE] input_${inputId}: background="${styles.backgroundColor}", borderColor="${styles.borderColor}"`);
         }
       });
-    }, 100);
-  });
+    };
+    
+    setTimeout(probeElements, 100);
+  }, []); // Empty dependency array - run once on mount only
 
-  // Update ready states when data changes
+  // Update ready states when data changes - with guards to prevent unnecessary re-renders
   useEffect(() => {
-    setStockReady(stockValid && stockData.length > 0);
-  }, [stockValid, stockData]);
+    const newStockReady = stockValid && stockData.length > 0;
+    if (stockReady !== newStockReady) {
+      setStockReady(newStockReady);
+    }
+  }, [stockValid, stockData.length, stockReady]);
 
   useEffect(() => {
-    setPriceReady(priceValid && priceData.length > 0);
-  }, [priceValid, priceData]);
+    const newPriceReady = priceValid && priceData.length > 0;
+    if (priceReady !== newPriceReady) {
+      setPriceReady(newPriceReady);
+    }
+  }, [priceValid, priceData.length, priceReady]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -158,6 +191,15 @@ const AltersideCatalogGenerator = () => {
       if (pingTimeoutRef.current) {
         clearTimeout(pingTimeoutRef.current);
       }
+      if (flushTimeoutRef.current) {
+        clearTimeout(flushTimeoutRef.current);
+      }
+      if (hardTimeoutRef.current) {
+        clearTimeout(hardTimeoutRef.current);
+      }
+      if (progressWatchdogRef.current) {
+        clearTimeout(progressWatchdogRef.current);
+      }
     };
   }, []);
 
@@ -165,18 +207,28 @@ const AltersideCatalogGenerator = () => {
     const timestamp = new Date().toLocaleTimeString('it-IT', { hour12: false });
     const logEntry = `[${timestamp}] ${event}${data ? ': ' + JSON.stringify(data) : ''}`;
     console.log(logEntry);
-    setDebugEvents(prev => [...prev.slice(-19), logEntry]);
-  }, []);
+    addDebugEvent(logEntry);
+  }, [addDebugEvent]);
 
   const addWorkerMessage = useCallback((data: any) => {
     const timestamp = new Date().toLocaleTimeString('it-IT', { hour12: false });
     const messageId = Date.now();
     
-    setDiagnosticState(prev => ({
-      ...prev,
-      workerMessages: [...prev.workerMessages.slice(-9), { id: messageId, timestamp, data }],
-      lastHeartbeat: Date.now()
-    }));
+    setDiagnosticState(prev => {
+      const newMessages = [...prev.workerMessages.slice(-9), { id: messageId, timestamp, data }];
+      const newHeartbeat = Date.now();
+      
+      // Only update if something actually changed
+      if (prev.workerMessages.length !== newMessages.length || 
+          prev.lastHeartbeat !== newHeartbeat) {
+        return {
+          ...prev,
+          workerMessages: newMessages,
+          lastHeartbeat: newHeartbeat
+        };
+      }
+      return prev;
+    });
   }, []);
 
   // Debounced click handler
@@ -239,40 +291,97 @@ const AltersideCatalogGenerator = () => {
             dbg('prescan_start');
             setProcessingState('prescanning');
             
-            // Start progress timer
+            // Start diagnostic protocol timers
+            // 1. Prescan must start within 1s
             progressTimerRef.current = setTimeout(() => {
-              dbg('progress_timeout', { note: 'no prescan_progress(0) received' });
-              worker.postMessage({ type: 'ping' });
-              
-              pingTimeoutRef.current = setTimeout(() => {
-                dbg('ping_timeout', { note: 'no pong or progress received' });
-                worker.terminate();
-                setProcessingState('error');
-                toast({
-                  title: "Errore Prescan",
-                  description: "Prescan non inizializzato",
-                  variant: "destructive",
-                });
-              }, 2000);
+              dbg('progress_timeout', { note: 'no prescan_progress(0) received within 1s' });
+              worker.terminate();
+              setProcessingState('error');
+              setDiagnosticState(prev => ({
+                ...prev,
+                errorCounters: {
+                  ...prev.errorCounters,
+                  timeouts: prev.errorCounters.timeouts + 1
+                }
+              }));
+              toast({
+                title: "Errore Prescan",
+                description: "Prescan non inizializzato",
+                variant: "destructive",
+              });
             }, 1000);
+            
+            // 2. Hard timeout after 20s
+            hardTimeoutRef.current = setTimeout(() => {
+              dbg('hard_timeout', { note: 'diagnostic prescan timeout after 20s' });
+              worker.terminate();
+              setProcessingState('error');
+              setDiagnosticState(prev => ({
+                ...prev,
+                errorCounters: {
+                  ...prev.errorCounters,
+                  timeouts: prev.errorCounters.timeouts + 1
+                }
+              }));
+              toast({
+                title: "Timeout Diagnostica",
+                description: "Diagnostica terminata per timeout (20s)",
+                variant: "destructive",
+              });
+            }, 20000);
             break;
             
           case 'prescan_progress':
-            if (pingTimeoutRef.current) {
-              clearTimeout(pingTimeoutRef.current);
-              pingTimeoutRef.current = null;
-            }
+            // Clear initial timeout on first progress
             if (progressTimerRef.current) {
               clearTimeout(progressTimerRef.current);
               progressTimerRef.current = null;
             }
             
+            // Clear any existing watchdog
+            if (progressWatchdogRef.current) {
+              clearTimeout(progressWatchdogRef.current);
+              progressWatchdogRef.current = null;
+            }
+            
             dbg('prescan_progress', { done: data.done, total: data.total });
             const prescanPct = data.total > 0 ? Math.round((data.done / data.total) * 100) : 0;
             setProgressPct(prescanPct);
+            
+            // Start progress watchdog - progress must continue within 5s
+            if (data.done < data.total) {
+              lastProgressRef.current = data.done;
+              progressWatchdogRef.current = setTimeout(() => {
+                dbg('progress_stalled', { note: 'no progress for 5s', lastProgress: lastProgressRef.current });
+                worker.terminate();
+                setProcessingState('error');
+                setDiagnosticState(prev => ({
+                  ...prev,
+                  errorCounters: {
+                    ...prev.errorCounters,
+                    timeouts: prev.errorCounters.timeouts + 1
+                  }
+                }));
+                toast({
+                  title: "Prescan Bloccato",
+                  description: "Nessun progresso per 5 secondi",
+                  variant: "destructive",
+                });
+              }, 5000);
+            }
             break;
             
           case 'prescan_done':
+            // Clear all timers on completion
+            if (progressWatchdogRef.current) {
+              clearTimeout(progressWatchdogRef.current);
+              progressWatchdogRef.current = null;
+            }
+            if (hardTimeoutRef.current) {
+              clearTimeout(hardTimeoutRef.current);
+              hardTimeoutRef.current = null;
+            }
+            
             dbg('prescan_done', data);
             setProcessingState('running');
             break;
@@ -417,15 +526,41 @@ const AltersideCatalogGenerator = () => {
 
   // Handle diagnostic prescan
   const handleDiagnosticPrescan = useCallback(() => {
-    if (!isDiagnosticMode) return;
+    if (!diagnosticState.isEnabled) return;
     
     handleDebouncedClick(() => {
-      dbg('click_prescan_diag');
+      addDebugEvent('click_diag');
       setProcessingState('creating');
       setProgressPct(0);
+      lastProgressRef.current = 0;
       createWorker(workerStrategy);
     });
-  }, [isDiagnosticMode, handleDebouncedClick, dbg, createWorker, workerStrategy]);
+  }, [diagnosticState.isEnabled, handleDebouncedClick, addDebugEvent, createWorker, workerStrategy]);
+
+  // Cancel diagnostic processing
+  const handleCancelDiagnostic = useCallback(() => {
+    if (workerRef.current) {
+      workerRef.current.terminate();
+      workerRef.current = null;
+    }
+    
+    // Clear all timers
+    [progressTimerRef, pingTimeoutRef, hardTimeoutRef, progressWatchdogRef].forEach(ref => {
+      if (ref.current) {
+        clearTimeout(ref.current);
+        ref.current = null;
+      }
+    });
+    
+    setProcessingState('idle');
+    setProgressPct(0);
+    addDebugEvent('diagnostic_cancelled');
+    
+    toast({
+      title: "Diagnostica Annullata",
+      description: "Processo diagnostico interrotto dall'utente",
+    });
+  }, [addDebugEvent]);
 
   // Copy diagnostic data to clipboard
   const copyDiagnosticData = useCallback(() => {
@@ -517,8 +652,11 @@ const AltersideCatalogGenerator = () => {
                 id="diagnostic-mode"
                 checked={diagnosticState.isEnabled}
                 onCheckedChange={(checked) => {
-                  setDiagnosticState(prev => ({ ...prev, isEnabled: checked === true }));
-                  addDebugEvent(`state:change diagnostic_mode=${checked}`);
+                  const isEnabled = checked === true;
+                  if (diagnosticState.isEnabled !== isEnabled) {
+                    setDiagnosticState(prev => ({ ...prev, isEnabled }));
+                    addDebugEvent(`state:change diagnostic_mode=${isEnabled}`);
+                  }
                 }}
               />
               <label htmlFor="diagnostic-mode" className="text-sm font-medium">
@@ -528,19 +666,30 @@ const AltersideCatalogGenerator = () => {
             
             {/* Diagnostic Prescan Button - Only exists in DOM when diagnostic mode ON */}
             {diagnosticState.isEnabled && (
-              <Button
-                onClick={() => {
-                  addDebugEvent('click_diag');
-                  handleDiagnosticPrescan();
-                }}
-                disabled={isProcessing}
-                variant="outline"
-                className="w-full"
-                data-id="btn-diag"
-              >
-                <Activity className="mr-2 h-4 w-4" />
-                Diagnostica prescan
-              </Button>
+              <div className="space-y-2">
+                <Button
+                  onClick={handleDiagnosticPrescan}
+                  disabled={isProcessing}
+                  variant="secondary"
+                  className="w-full"
+                  data-id="btn-diag"
+                >
+                  <Activity className="mr-2 h-4 w-4" />
+                  Diagnostica prescan
+                </Button>
+                
+                {/* Cancel button during processing */}
+                {isProcessing && (
+                  <Button
+                    onClick={handleCancelDiagnostic}
+                    variant="destructive"
+                    className="w-full"
+                  >
+                    <XCircle className="mr-2 h-4 w-4" />
+                    Annulla
+                  </Button>
+                )}
+              </div>
             )}
 
             {/* Main Action Buttons */}
@@ -552,7 +701,7 @@ const AltersideCatalogGenerator = () => {
                 }}
                 disabled={isProcessing || !allFilesValid}
                 variant="default"
-                className="h-12"
+                className="h-12 disabled:opacity-50 disabled:pointer-events-none"
                 data-id="btn-ean"
               >
                 <Download className="mr-2 h-4 w-4" />
@@ -566,7 +715,7 @@ const AltersideCatalogGenerator = () => {
                 }}
                 disabled={isProcessing || !allFilesValid}
                 variant="default"
-                className="h-12"
+                className="h-12 disabled:opacity-50 disabled:pointer-events-none"
                 data-id="btn-sku"
               >
                 <Download className="mr-2 h-4 w-4" />
@@ -622,23 +771,23 @@ const AltersideCatalogGenerator = () => {
                     
                     return (
                       <>
-                        <div className={bg === '0 0% 100%' ? 'text-green-600' : 'text-red-600'}>
+                        <div className={bg === '0 0% 100%' ? 'text-foreground' : 'text-destructive'}>
                           --background: "{bg}" {bg === '0 0% 100%' ? '✓' : '✗ Expected: "0 0% 100%"'}
                         </div>
-                        <div className={card === '0 0% 100%' ? 'text-green-600' : 'text-red-600'}>
+                        <div className={card === '0 0% 100%' ? 'text-foreground' : 'text-destructive'}>
                           --card: "{card}" {card === '0 0% 100%' ? '✓' : '✗ Expected: "0 0% 100%"'}
                         </div>
-                        <div className={muted === '210 40% 96%' ? 'text-green-600' : 'text-red-600'}>
+                        <div className={muted === '210 40% 96%' ? 'text-foreground' : 'text-destructive'}>
                           --muted: "{muted}" {muted === '210 40% 96%' ? '✓' : '✗ Expected: "210 40% 96%"'}
                         </div>
-                        <div className={primary === '221.2 83.2% 53.3%' ? 'text-green-600' : 'text-red-600'}>
+                        <div className={primary === '221.2 83.2% 53.3%' ? 'text-foreground' : 'text-destructive'}>
                           --primary: "{primary}" {primary === '221.2 83.2% 53.3%' ? '✓' : '✗ Expected: "221.2 83.2% 53.3%"'}
                         </div>
-                        <div className={ring === '221.2 83.2% 53.3%' ? 'text-green-600' : 'text-red-600'}>
+                        <div className={ring === '221.2 83.2% 53.3%' ? 'text-foreground' : 'text-destructive'}>
                           --ring: "{ring}" {ring === '221.2 83.2% 53.3%' ? '✓' : '✗ Expected: "221.2 83.2% 53.3%"'}
                         </div>
-                        <div className={input === '200 200 200' ? 'text-green-600' : 'text-red-600'}>
-                          --input: "{input}" {input === '200 200 200' ? '✓' : '✗ Expected: "200 200 200"'}
+                        <div className={input === '214.3 31.8% 91.4%' ? 'text-foreground' : 'text-destructive'}>
+                          --input: "{input}" {input === '214.3 31.8% 91.4%' ? '✓' : '✗ Expected: "214.3 31.8% 91.4%"'}
                         </div>
                         <div className="mt-2 text-muted-foreground">
                           body.backgroundColor: {getComputedStyle(document.body).backgroundColor}
