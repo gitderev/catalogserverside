@@ -572,11 +572,22 @@ const AltersideCatalogGenerator: React.FC = () => {
         setProgressPct((processedRef.current / materialData.length) * 80);
       }
       
-      // Filter for EAN
-      const { validRecords: eanValidRecords, discardedRows: eanDiscarded } = filterAndNormalizeForEAN(joinedData);
+      // Filter for EAN with computeFinalPrice function
+      const computePriceFn = (row: any) => {
+        const result = computeFinalPrice({
+          CustBestPrice: row.CustBestPrice,
+          ListPrice: row.ListPrice,
+          feeDrev: feeConfig.feeDrev,
+          feeMkt: feeConfig.feeMkt
+        });
+        return result.prezzoFinaleEAN;
+      };
+      
+      const { kept: eanValidRecords, discarded: eanDiscarded, stats: eanFilterStats } = filterAndNormalizeForEAN(joinedData, computePriceFn);
       
       setCurrentProcessedData(eanValidRecords);
       setDiscardedRows(eanDiscarded);
+      setEanStats(eanFilterStats);
       setFinalTotal(joinedData.length);
       
       // Update stats
