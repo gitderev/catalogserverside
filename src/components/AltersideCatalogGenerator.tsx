@@ -89,6 +89,12 @@ interface EANPrefillReports {
   errori_formali: Array<{ raw_line: string; reason: string; row_index: number }>;
 }
 
+interface PrefillState {
+  status: 'idle' | 'running' | 'done' | 'skipped';
+  counters: EANPrefillCounters | null;
+  reports: EANPrefillReports | null;
+}
+
 interface FileUploadState {
   material: { file: FileData | null; status: 'empty' | 'valid' | 'error' | 'warning'; error?: string; warning?: string; diagnostics?: any };
   stock: { file: FileData | null; status: 'empty' | 'valid' | 'error' | 'warning'; error?: string; warning?: string; diagnostics?: any };
@@ -294,12 +300,23 @@ const AltersideCatalogGenerator: React.FC = () => {
     eanMapping: { file: null, status: 'empty' }
   });
 
-  // EAN Prefill state
-  const [eanPrefillCompleted, setEanPrefillCompleted] = useState(false);
-  const [eanPrefillCounters, setEanPrefillCounters] = useState<EANPrefillCounters | null>(null);
-  const [eanPrefillReports, setEanPrefillReports] = useState<EANPrefillReports | null>(null);
-  const [isProcessingPrefill, setIsProcessingPrefill] = useState(false);
+  // State for tracking material rows and version
+  const [materialRows, setMaterialRows] = useState<any[]>([]);
+  const [materialVersion, setMaterialVersion] = useState(0);
+  
+  // Pre-fill EAN state
+  const [prefillState, setPrefillState] = useState<PrefillState>({
+    status: 'idle',
+    counters: null,
+    reports: null
+  });
   const eanPrefillWorkerRef = useRef<Worker | null>(null);
+  
+  // Legacy compatibility (can be removed after migration)
+  const eanPrefillCompleted = prefillState.status === 'done';
+  const eanPrefillCounters = prefillState.counters;
+  const eanPrefillReports = prefillState.reports;
+  const isProcessingPrefill = prefillState.status === 'running';
 
   // Fee configuration
   const [feeConfig, setFeeConfig] = useState<FeeConfig>(loadFees());
@@ -635,9 +652,14 @@ const AltersideCatalogGenerator: React.FC = () => {
 
     // Reset EAN prefill if removing mapping file
     if (type === 'eanMapping') {
-      setEanPrefillCompleted(false);
-      setEanPrefillCounters(null);
-      setEanPrefillReports(null);
+      setPrefillState({ status: 'idle', counters: null, reports: null });
+    }
+    
+    // Reset materialRows if removing material file
+    if (type === 'material') {
+      setMaterialRows([]);
+      setMaterialVersion(0);
+      setPrefillState({ status: 'idle', counters: null, reports: null });
     }
 
     // Reset processing state if no files remain
@@ -699,6 +721,16 @@ const AltersideCatalogGenerator: React.FC = () => {
       toast({
         title: "File mancanti",
         description: "Carica tutti e tre i file prima di procedere",
+        variant: "destructive"
+      });
+      return;
+    }
+    
+    // Block processing if pre-fill is running
+    if (prefillState.status === 'running') {
+      toast({
+        title: "Pre-fill in corso",
+        description: "Attendi il completamento del pre-fill EAN prima di generare il catalogo",
         variant: "destructive"
       });
       return;
@@ -785,37 +817,17 @@ const AltersideCatalogGenerator: React.FC = () => {
     dbg('parse:price:chunk', { chunkNumber: 1, rowsInChunk: priceRowCounter });
     dbg('parse:price:done', { totalRecords: priceMap.size, totalChunks: 1 });
 
-    // Prescan Material (streaming) to count rows
-    dbg('material:prescan:start');
-    let materialRowsCount = 0;
-    await new Promise<void>((resolve, reject) => {
-      Papa.parse(files.material.file!.raw, {
-        header: true,
-        skipEmptyLines: true,
-        worker: true,
-        step: (results) => {
-          if (results && results.data) {
-            materialRowsCount++;
-            if (materialRowsCount % 500 === 0) dbg('material:prescan:chunk', { materialRowsCount });
-          }
-        },
-        complete: () => resolve(),
-        error: (err) => reject(err)
-      });
-    }).catch(() => {
-      // Fallback prescan without worker
-      materialRowsCount = 0;
-      Papa.parse(files.material.file!.raw, {
-        header: true,
-        skipEmptyLines: true,
-        worker: false,
-        step: (results) => {
-          if (results && results.data) materialRowsCount++;
-        },
-        complete: () => {},
-      });
-    });
-
+    // Use updated material data (from pre-fill or original)
+    const currentMaterialData = files.material.file.data;
+    const materialRowsCount = currentMaterialData.length;
+    
+    // Diagnostic: Log EAN count before processing
+    const countEANNonVuoti_before = currentMaterialData.filter((row: any) => {
+      const ean = String(row.EAN ?? '').trim();
+      return ean.length > 0;
+    }).length;
+    console.warn('diagnostic:ean_count_before', { total: materialRowsCount, nonEmpty: countEANNonVuoti_before });
+    
     if (materialRowsCount <= 0) {
       dbg('material:prescan:error', { message: 'Nessuna riga valida nel Material' });
       toast({ title: 'Errore elaborazione', description: 'Nessuna riga valida nel Material', variant: 'destructive' });
@@ -949,177 +961,200 @@ const AltersideCatalogGenerator: React.FC = () => {
     }, 2000);
 
     const runJoin = (useWorker: boolean) => new Promise<void>((resolve, reject) => {
-      dbg('join:start', { worker: useWorker });
+      dbg('join:start', { worker: useWorker, usingUpdatedMaterial: true });
       setDebugState(prev => ({ ...prev, joinStarted: true }));
 
-      let firstChunk = false;
-      let aborted = false;
-      let parserRef: any = null;
-      const fallbackTimer = setTimeout(() => {
-        if (!firstChunk && useWorker) {
-          toast({ title: 'Nessuna riga processata, fallback worker:false', description: '', variant: 'default' });
-          dbg('join:fallback', { reason: 'no_chunk_within_2s' });
-          try { parserRef && parserRef.abort && parserRef.abort(); } catch {}
-          // Relaunch without worker
-          runJoin(false).then(resolve).catch(reject);
-        }
-      }, 2000);
-
       let processedLocal = 0;
+      
+      // CRITICAL: Use currentMaterialData (updated by pre-fill) instead of reparsing raw file
+      const processRow = (row: any, index: number) => {
+        // CRITICAL FIX: Count ALL rows read FIRST, before any filtering
+        processedRef.current += 1;
+        
+        // Update progress based on ALL rows read every 256 rows (for performance)
+        if ((processedRef.current & 0xFF) === 0) {
+          const denom = finalTotal ?? total ?? 1;
+          setProcessed(processedRef.current);
+          setProgressPct(Math.min(99, Math.floor(processedRef.current / Math.max(1, denom) * 100)));
+        }
 
-      Papa.parse(files.material.file!.raw, {
-        header: true,
-        skipEmptyLines: true,
-        worker: useWorker,
-        step: (results, parser) => {
-          if (!firstChunk) { firstChunk = true; clearTimeout(fallbackTimer); }
-          parserRef = parser;
-          
-          // CRITICAL FIX: Count ALL rows read FIRST, before any filtering
-          processedRef.current += 1;
-          
-          // Update progress based on ALL rows read every 256 rows (for performance)
-          if ((processedRef.current & 0xFF) === 0) {
-            const denom = finalTotal ?? total ?? 1;
-            setProcessed(processedRef.current);
-            setProgressPct(Math.min(99, Math.floor(processedRef.current / Math.max(1, denom) * 100)));
-            dbg('join:chunk', { processed: processedRef.current });
-          }
-          
-          const row = results.data as any;
-          const matnr = row?.Matnr?.toString().trim();
-          if (!matnr) return;
+        const matnr = String(row.Matnr ?? '').trim();
+        if (!matnr) return;
 
-          const stock = stockMap.get(matnr);
-          const price = priceMap.get(matnr);
+        processedLocal++;
+        if ((processedLocal & 0xFF) === 0) {
+          dbg('join:chunk', { localProcessed: processedLocal, globalProcessed: processedRef.current });
+        }
 
-          if (!stock) {
-            const le: LogEntry = { source_file: 'MaterialFile.txt', line: processedLocal + 2, Matnr: matnr, ManufPartNr: row.ManufPartNr || '', EAN: row.EAN || '', reason: 'join_missing_stock', details: 'Nessun dato stock trovato' };
-            logsEAN.push(le); logsMPN.push(le);
-            return;
-          }
-          if (!price) {
-            const le: LogEntry = { source_file: 'MaterialFile.txt', line: processedLocal + 2, Matnr: matnr, ManufPartNr: row.ManufPartNr || '', EAN: row.EAN || '', reason: 'join_missing_price', details: 'Nessun dato prezzo trovato' };
-            logsEAN.push(le); logsMPN.push(le);
-            return;
-          }
+        const stockData = stockMap.get(matnr);
+        const priceData = priceMap.get(matnr);
 
-          const existingStock = parseInt(stock.ExistingStock as any) || 0;
-          const listPriceNum = Number(price.ListPrice) || 0;
-          const custBestNumRaw = Number(price.CustBestPrice) || 0;
-          if (existingStock <= 1) {
-            const le: LogEntry = { source_file: 'MaterialFile.txt', line: processedLocal + 2, Matnr: matnr, ManufPartNr: row.ManufPartNr || '', EAN: row.EAN || '', reason: 'stock_leq_1', details: `ExistingStock=${existingStock} <= 1` };
-            logsEAN.push(le); logsMPN.push(le);
-            return;
-          }
-          if (!(listPriceNum > 0)) {
-            const le: LogEntry = { source_file: 'MaterialFile.txt', line: processedLocal + 2, Matnr: matnr, ManufPartNr: row.ManufPartNr || '', EAN: row.EAN || '', reason: 'price_missing', details: `ListPrice non valido: ${listPriceNum}` };
-            logsEAN.push(le); logsMPN.push(le);
-            return;
-          }
-          if (!(custBestNumRaw > 0)) {
-            const le: LogEntry = { source_file: 'MaterialFile.txt', line: processedLocal + 2, Matnr: matnr, ManufPartNr: row.ManufPartNr || '', EAN: row.EAN || '', reason: 'custbest_missing', details: `CustBestPrice non valido: ${custBestNumRaw}` };
-            logsEAN.push(le); logsMPN.push(le);
-            return;
-          }
-
-          // Use new fee calculation system
-          const calc = computeFinalPrice({
-            CustBestPrice: custBestNumRaw,
-            ListPrice: listPriceNum,
-            feeDrev: feeConfig.feeDrev,
-            feeMkt: feeConfig.feeMkt
-          });
-
-          // MPN specific calculations
-          let subtotalePostFee, listPriceConFee, prezzoFinaleMPN;
-          if (currentPipeline === 'MPN') {
-            // For MPN: use new helper functions
-            subtotalePostFee = ceil2(calc.postFee);
-            listPriceConFee = ceilInt(listPriceNum + 6.00 + (listPriceNum + 6.00) * 0.22 + feeConfig.feeDrev + feeConfig.feeMkt);
-            prezzoFinaleMPN = toEnding99(subtotalePostFee);
-          }
-          
-          // EAN specific calculation for "Subtotale post-fee" using cents arithmetic
-          let subtotalePostFeeEAN;
-          if (currentPipeline === 'EAN') {
-            const cust = asNum(custBestNumRaw);
-            const shipping = 6.00;
-            const iva = 1.22;
-            const feeDev = asNum(feeConfig.feeDrev);
-            const feeMkt = asNum(feeConfig.feeMkt);
-            const raw = (cust + shipping) * iva * feeDev * feeMkt;
-            subtotalePostFeeEAN = Math.ceil(raw * 100) / 100;
-          }
-
-          const base: ProcessedRecord = {
+        if (!stockData || !priceData) {
+          logsEAN.push({
+            source_file: 'MaterialFile',
+            line: processedRef.current,
             Matnr: matnr,
-            ManufPartNr: row.ManufPartNr || '', // always from Material
-            EAN: row.EAN?.toString().trim() || '',
-            ShortDescription: row.ShortDescription || '',
-            ExistingStock: existingStock,
-            ListPrice: listPriceNum,
-            CustBestPrice: calc.base,
-            'Costo di Spedizione': calc.shipping,
-            IVA: calc.iva,
-            'Prezzo con spediz e IVA': calc.subtotConIva,
-            FeeDeRev: feeConfig.feeDrev,
-            'Fee Marketplace': feeConfig.feeMkt,
-            'Subtotale post-fee': currentPipeline === 'MPN' ? subtotalePostFee : (currentPipeline === 'EAN' ? subtotalePostFeeEAN : calc.postFee),
-            'Prezzo Finale': currentPipeline === 'EAN'
-              ? calc.eanResult.finalDisplay
-              : prezzoFinaleMPN,
-            'ListPrice con Fee': currentPipeline === 'MPN' ? listPriceConFee : calc.listPriceConFee
-          };
+            ManufPartNr: String(row.ManufPartNr ?? ''),
+            EAN: String(row.EAN ?? ''),
+            reason: 'missing_stock_or_price',
+            details: !stockData ? 'Stock mancante' : 'Price mancante'
+          });
+          logsMPN.push({
+            source_file: 'MaterialFile',
+            line: processedRef.current,
+            Matnr: matnr,
+            ManufPartNr: String(row.ManufPartNr ?? ''),
+            EAN: String(row.EAN ?? ''),
+            reason: 'missing_stock_or_price',
+            details: !stockData ? 'Stock mancante' : 'Price mancante'
+          });
+          return;
+        }
 
-          if (base.EAN) {
-            // Add internal EAN metadata for validation
-            (base as any)._eanFinalCents = currentPipeline === 'EAN' ? calc.eanResult.finalCents : undefined;
-            processedEAN.push(base);
-          } else {
-            const le: LogEntry = { source_file: 'MaterialFile.txt', line: processedLocal + 2, Matnr: matnr, ManufPartNr: base.ManufPartNr, EAN: '', reason: 'ean_empty', details: 'EAN vuoto o mancante' };
-            logsEAN.push(le);
-          }
+        const existingStock = stockData.ExistingStock;
+        const listPrice = priceData.ListPrice;
+        const custBestPrice = priceData.CustBestPrice;
 
-          if (base.ManufPartNr) {
-            processedMPN.push(base);
-          } else {
-            const le: LogEntry = { source_file: 'MaterialFile.txt', line: processedLocal + 2, Matnr: matnr, ManufPartNr: '', EAN: base.EAN, reason: 'manufpartnr_empty', details: 'ManufPartNr vuoto o mancante' };
-            logsMPN.push(le);
-          }
+        if (existingStock < 2) {
+          logsEAN.push({
+            source_file: 'MaterialFile',
+            line: processedRef.current,
+            Matnr: matnr,
+            ManufPartNr: String(row.ManufPartNr ?? ''),
+            EAN: String(row.EAN ?? ''),
+            reason: 'stock_lt_2',
+            details: `ExistingStock=${existingStock}`
+          });
+          logsMPN.push({
+            source_file: 'MaterialFile',
+            line: processedRef.current,
+            Matnr: matnr,
+            ManufPartNr: String(row.ManufPartNr ?? ''),
+            EAN: String(row.EAN ?? ''),
+            reason: 'stock_lt_2',
+            details: `ExistingStock=${existingStock}`
+          });
+          return;
+        }
 
-          // Progress tracking is already done above - don't double count
-        },
-        complete: () => {
-        setFinalTotal(processedRef.current);
-        setProcessed(processedRef.current);
-        setProgressPct(Math.min(99, Math.floor(processedRef.current / Math.max(1, processedRef.current) * 100)));
-        
-        // Apply EAN validation and normalization for EAN pipeline
-        if (pipelineType === 'EAN') {
-          const { kept, discarded, stats } = filterAndNormalizeForEAN(processedEAN, computeFinalPriceForEAN);
-          processedEAN.length = 0; // clear original
-          processedEAN.push(...kept);
-          setEanStats(stats);
-          setDiscardedRows(discarded);
-          
-          audit('ean-validation', {
-            pipeline: pipelineType,
-            input: stats.tot_righe_input,
-            kept: kept.length,
-            discarded: discarded.length,
-            stats
+        const hasBest = Number.isFinite(custBestPrice) && custBestPrice > 0;
+        const hasListPrice = Number.isFinite(listPrice) && listPrice > 0;
+        if (!hasBest && !hasListPrice) {
+          logsEAN.push({
+            source_file: 'MaterialFile',
+            line: processedRef.current,
+            Matnr: matnr,
+            ManufPartNr: String(row.ManufPartNr ?? ''),
+            EAN: String(row.EAN ?? ''),
+            reason: 'invalid_price',
+            details: `ListPrice=${listPrice}, CustBestPrice=${custBestPrice}`
+          });
+          logsMPN.push({
+            source_file: 'MaterialFile',
+            line: processedRef.current,
+            Matnr: matnr,
+            ManufPartNr: String(row.ManufPartNr ?? ''),
+            EAN: String(row.EAN ?? ''),
+            reason: 'invalid_price',
+            details: `ListPrice=${listPrice}, CustBestPrice=${custBestPrice}`
+          });
+          return;
+        }
+
+        const calc = computeFinalPrice({
+          CustBestPrice: custBestPrice,
+          ListPrice: listPrice,
+          feeDrev: feeConfig.feeDrev,
+          feeMkt: feeConfig.feeMkt
+        });
+
+        const processedRecord: ProcessedRecord = {
+          Matnr: matnr,
+          ManufPartNr: String(row.ManufPartNr ?? ''),
+          EAN: String(row.EAN ?? ''),
+          ShortDescription: String(row.ShortDescription ?? ''),
+          ExistingStock: existingStock,
+          ListPrice: listPrice,
+          CustBestPrice: custBestPrice,
+          'Costo di Spedizione': calc.shipping,
+          IVA: calc.iva,
+          'Prezzo con spediz e IVA': calc.subtotConIva,
+          FeeDeRev: feeConfig.feeDrev,
+          'Fee Marketplace': feeConfig.feeMkt,
+          'Subtotale post-fee': calc.postFee,
+          'Prezzo Finale': 0, // Will be set by pipeline
+          'ListPrice con Fee': calc.listPriceConFee
+        };
+
+        // EAN pipeline
+        const eanTrimmed = String(row.EAN ?? '').trim();
+        if (eanTrimmed && eanTrimmed.length > 0) {
+          processedRecord['Prezzo Finale'] = calc.prezzoFinaleEAN;
+          processedEAN.push(processedRecord);
+        } else {
+          logsEAN.push({
+            source_file: 'MaterialFile',
+            line: processedRef.current,
+            Matnr: matnr,
+            ManufPartNr: String(row.ManufPartNr ?? ''),
+            EAN: String(row.EAN ?? ''),
+            reason: 'ean_empty',
+            details: 'EAN vuoto'
           });
         }
-        
-        setJoinDone(true);
-        dbg('join:done', { processed: processedRef.current, totalPrescan: total, finalTotal: processedRef.current });
-          resolve();
-        },
-        error: (err) => {
-          reject(err);
+
+        // MPN pipeline
+        const mpnTrimmed = String(row.ManufPartNr ?? '').trim();
+        if (mpnTrimmed && mpnTrimmed.length > 0) {
+          processedRecord['Prezzo Finale'] = calc.prezzoFinaleMPN;
+          processedMPN.push(processedRecord);
+        } else {
+          logsMPN.push({
+            source_file: 'MaterialFile',
+            line: processedRef.current,
+            Matnr: matnr,
+            ManufPartNr: String(row.ManufPartNr ?? ''),
+            EAN: String(row.EAN ?? ''),
+            reason: 'mpn_empty',
+            details: 'ManufPartNr vuoto'
+          });
         }
+      };
+      
+      // Process all material rows synchronously
+      currentMaterialData.forEach((row: any, index: number) => {
+        processRow(row, index);
       });
+      
+      // Finalize after processing all rows
+      setFinalTotal(processedRef.current);
+      setProcessed(processedRef.current);
+      setProgressPct(99);
+      dbg('join:done', { totalProcessed: processedRef.current, validEAN: processedEAN.length, validMPN: processedMPN.length });
+      
+      // Diagnostic: Log EAN count after processing
+      const countEANValidi = processedEAN.length;
+      console.warn('diagnostic:ean_count_after_join', { validRows: countEANValidi });
+      
+      // Apply EAN validation and normalization for EAN pipeline
+      if (pipelineType === 'EAN') {
+        const { kept, discarded, stats } = filterAndNormalizeForEAN(processedEAN, computeFinalPriceForEAN);
+        processedEAN.length = 0; // clear original
+        processedEAN.push(...kept);
+        setEanStats(stats);
+        setDiscardedRows(discarded);
+        
+        audit('ean-validation', {
+          pipeline: pipelineType,
+          input: stats.tot_righe_input,
+          kept: kept.length,
+          discarded: discarded.length,
+          stats
+        });
+      }
+      
+      setJoinDone(true);
+      resolve();
     });
 
     try {
@@ -1659,7 +1694,7 @@ const AltersideCatalogGenerator: React.FC = () => {
       return;
     }
     
-    setIsProcessingPrefill(true);
+    setPrefillState(prev => ({ ...prev, status: 'running' }));
     setFiles(prev => ({
       ...prev,
       eanMapping: { ...prev.eanMapping, status: 'processing' }
@@ -1669,15 +1704,22 @@ const AltersideCatalogGenerator: React.FC = () => {
       // Read mapping file as text
       const mappingText = await files.eanMapping.file.text();
       
-      // Validate header
+      // Validate header (case-insensitive)
       const lines = mappingText.split('\n');
-      const header = lines[0]?.trim();
+      const header = lines[0]?.trim().toLowerCase();
       
       if (header !== 'mpn;ean') {
         throw new Error('Header richiesto: mpn;ean');
       }
       
       const materialData = files.material.file.data;
+      
+      // Diagnostic: Count EAN before pre-fill
+      const countEANNonVuoti_before = materialData.filter((row: any) => {
+        const ean = String(row.EAN ?? '').trim();
+        return ean.length > 0;
+      }).length;
+      console.warn('prefill:diagnostic:before', { total: materialData.length, nonEmpty: countEANNonVuoti_before });
       
       // Use worker for large files
       if (lines.length > 100000 || materialData.length > 100000) {
@@ -1693,6 +1735,22 @@ const AltersideCatalogGenerator: React.FC = () => {
             }
             
             if (e.data.success) {
+              const updatedMaterial = e.data.updatedMaterial;
+              
+              // Diagnostic: Verify material was updated
+              const countEANNonVuoti_after = updatedMaterial.filter((row: any) => {
+                const ean = String(row.EAN ?? '').trim();
+                return ean.length > 0;
+              }).length;
+              console.warn('prefill:diagnostic:after_worker', { total: updatedMaterial.length, nonEmpty: countEANNonVuoti_after });
+              
+              if (countEANNonVuoti_after < countEANNonVuoti_before) {
+                worker.terminate();
+                eanPrefillWorkerRef.current = null;
+                reject(new Error('Material non aggiornato dopo Pre-fill'));
+                return;
+              }
+              
               // Update material file with filled EANs
               setFiles(prev => ({
                 ...prev,
@@ -1700,16 +1758,20 @@ const AltersideCatalogGenerator: React.FC = () => {
                   ...prev.material,
                   file: prev.material.file ? {
                     ...prev.material.file,
-                    data: e.data.updatedMaterial
+                    data: updatedMaterial
                   } : null
                 },
                 eanMapping: { ...prev.eanMapping, status: 'completed' }
               }));
               
-              setEanPrefillCounters(e.data.counters);
-              setEanPrefillReports(e.data.reports);
-              setEanPrefillCompleted(true);
-              setIsProcessingPrefill(false);
+              // Update state with counters and increment version
+              setPrefillState({
+                status: 'done',
+                counters: e.data.counters,
+                reports: e.data.reports
+              });
+              setMaterialRows(updatedMaterial);
+              setMaterialVersion(prev => prev + 1);
               
               toast({
                 title: "Pre-fill completato",
@@ -1732,7 +1794,7 @@ const AltersideCatalogGenerator: React.FC = () => {
             counters: {}
           });
         }).catch((error) => {
-          setIsProcessingPrefill(false);
+          setPrefillState({ status: 'idle', counters: null, reports: null });
           setFiles(prev => ({
             ...prev,
             eanMapping: { ...prev.eanMapping, status: 'error', error: error.message }
@@ -1830,11 +1892,11 @@ const AltersideCatalogGenerator: React.FC = () => {
         }
       }
       
-      // Process material rows
+      // Process material rows - CRITICAL: treat EAN as string, never use Number/parseInt
       const updatedMaterial = materialData.map((row: any) => {
         const newRow = { ...row };
-        const mpn = row.ManufPartNr?.toString().trim();
-        const currentEAN = row.EAN?.toString().trim();
+        const mpn = String(row.ManufPartNr ?? '').trim();
+        const currentEAN = String(row.EAN ?? '').trim();
         
         if (currentEAN) {
           // EAN already populated
@@ -1855,7 +1917,7 @@ const AltersideCatalogGenerator: React.FC = () => {
             });
           }
         } else if (mpn && mappingMap.has(mpn)) {
-          // EAN empty and mapping exists - fill it
+          // EAN empty and mapping exists - fill it (as string)
           const mappingEAN = mappingMap.get(mpn)!;
           newRow.EAN = mappingEAN;
           counters.filled_now++;
@@ -1875,6 +1937,17 @@ const AltersideCatalogGenerator: React.FC = () => {
         return newRow;
       });
       
+      // Diagnostic: Verify material was updated
+      const countEANNonVuoti_after = updatedMaterial.filter((row: any) => {
+        const ean = String(row.EAN ?? '').trim();
+        return ean.length > 0;
+      }).length;
+      console.warn('prefill:diagnostic:after_sync', { total: updatedMaterial.length, nonEmpty: countEANNonVuoti_after });
+      
+      if (countEANNonVuoti_after < countEANNonVuoti_before) {
+        throw new Error('Material non aggiornato dopo Pre-fill');
+      }
+      
       // Update material file with filled EANs
       setFiles(prev => ({
         ...prev,
@@ -1888,10 +1961,14 @@ const AltersideCatalogGenerator: React.FC = () => {
         eanMapping: { ...prev.eanMapping, status: 'completed' }
       }));
       
-      setEanPrefillCounters(counters);
-      setEanPrefillReports(reports);
-      setEanPrefillCompleted(true);
-      setIsProcessingPrefill(false);
+      // Update state with counters and increment version
+      setPrefillState({
+        status: 'done',
+        counters: counters,
+        reports: reports
+      });
+      setMaterialRows(updatedMaterial);
+      setMaterialVersion(prev => prev + 1);
       
       toast({
         title: "Pre-fill completato",
@@ -1900,7 +1977,7 @@ const AltersideCatalogGenerator: React.FC = () => {
       
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : 'Errore sconosciuto';
-      setIsProcessingPrefill(false);
+      setPrefillState({ status: 'idle', counters: null, reports: null });
       setFiles(prev => ({
         ...prev,
         eanMapping: { ...prev.eanMapping, status: 'error', error: errorMsg }
@@ -2263,7 +2340,7 @@ const AltersideCatalogGenerator: React.FC = () => {
                         File .csv o .txt con delimitatore ; e encoding UTF-8
                       </p>
                     </div>
-                    {!eanPrefillCompleted && (
+                    {prefillState.status === 'idle' && (
                       <div className="mt-3 p-3 rounded-lg" style={{ background: '#e3f2fd', color: '#1565c0' }}>
                         <p className="text-sm">
                           <strong>Nessun file di associazione caricato:</strong> salto pre-fill EAN
@@ -2304,15 +2381,15 @@ const AltersideCatalogGenerator: React.FC = () => {
                     <div className="flex gap-3">
                       <button
                         onClick={processEANPrefill}
-                        disabled={!files.material.file || files.eanMapping.status === 'processing' || eanPrefillCompleted}
-                        className={`btn btn-primary px-6 py-2 ${(!files.material.file || files.eanMapping.status === 'processing' || eanPrefillCompleted) ? 'is-disabled' : ''}`}
+                        disabled={!files.material.file || prefillState.status === 'running' || prefillState.status === 'done'}
+                        className={`btn btn-primary px-6 py-2 ${(!files.material.file || prefillState.status === 'running' || prefillState.status === 'done') ? 'is-disabled' : ''}`}
                       >
-                        {isProcessingPrefill ? (
+                        {prefillState.status === 'running' ? (
                           <>
                             <Activity className="mr-2 h-4 w-4 animate-spin" />
                             Elaborazione...
                           </>
-                        ) : eanPrefillCompleted ? (
+                        ) : prefillState.status === 'done' ? (
                           <>
                             <CheckCircle className="mr-2 h-4 w-4" />
                             Completato
@@ -2322,7 +2399,7 @@ const AltersideCatalogGenerator: React.FC = () => {
                         )}
                       </button>
                       
-                      {eanPrefillCompleted && (
+                      {prefillState.status === 'done' && (
                         <button
                           onClick={downloadEANPrefillReport}
                           className="btn btn-secondary px-6 py-2"
@@ -2335,7 +2412,7 @@ const AltersideCatalogGenerator: React.FC = () => {
                   </div>
                 )}
                 
-                {eanPrefillCompleted && eanPrefillCounters && (
+                {prefillState.status === 'done' && prefillState.counters && (
                   <div className="mt-4 p-4 rounded-lg border-strong" style={{ background: '#e8f5e9' }}>
                     <h4 className="text-sm font-semibold mb-3" style={{ color: '#2e7d32' }}>
                       <CheckCircle className="inline h-4 w-4 mr-1" />
@@ -2343,35 +2420,35 @@ const AltersideCatalogGenerator: React.FC = () => {
                     </h4>
                     <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
                       <div className="p-2 bg-white rounded">
-                        <div className="font-bold text-lg text-green-600">{eanPrefillCounters.filled_now}</div>
+                        <div className="font-bold text-lg text-green-600">{prefillState.counters.filled_now}</div>
                         <div className="text-muted">EAN riempiti ora</div>
                       </div>
                       <div className="p-2 bg-white rounded">
-                        <div className="font-bold text-lg">{eanPrefillCounters.already_populated}</div>
+                        <div className="font-bold text-lg">{prefillState.counters.already_populated}</div>
                         <div className="text-muted">Già popolati</div>
                       </div>
                       <div className="p-2 bg-white rounded">
-                        <div className="font-bold text-lg text-orange-600">{eanPrefillCounters.skipped_due_to_conflict}</div>
+                        <div className="font-bold text-lg text-orange-600">{prefillState.counters.skipped_due_to_conflict}</div>
                         <div className="text-muted">Conflitti</div>
                       </div>
                       <div className="p-2 bg-white rounded">
-                        <div className="font-bold text-lg text-blue-600">{eanPrefillCounters.missing_mapping_in_new_file}</div>
+                        <div className="font-bold text-lg text-blue-600">{prefillState.counters.missing_mapping_in_new_file}</div>
                         <div className="text-muted">Senza mapping</div>
                       </div>
                       <div className="p-2 bg-white rounded">
-                        <div className="font-bold text-lg text-red-600">{eanPrefillCounters.duplicate_mpn_rows}</div>
+                        <div className="font-bold text-lg text-red-600">{prefillState.counters.duplicate_mpn_rows}</div>
                         <div className="text-muted">MPN duplicati</div>
                       </div>
                       <div className="p-2 bg-white rounded">
-                        <div className="font-bold text-lg text-red-600">{eanPrefillCounters.mpn_not_in_material}</div>
+                        <div className="font-bold text-lg text-red-600">{prefillState.counters.mpn_not_in_material}</div>
                         <div className="text-muted">MPN non in Material</div>
                       </div>
                       <div className="p-2 bg-white rounded">
-                        <div className="font-bold text-lg text-yellow-600">{eanPrefillCounters.empty_ean_rows}</div>
+                        <div className="font-bold text-lg text-yellow-600">{prefillState.counters.empty_ean_rows}</div>
                         <div className="text-muted">EAN vuoti nel mapping</div>
                       </div>
                       <div className="p-2 bg-white rounded">
-                        <div className="font-bold text-lg text-gray-600">{eanPrefillCounters.errori_formali}</div>
+                        <div className="font-bold text-lg text-gray-600">{prefillState.counters.errori_formali}</div>
                         <div className="text-muted">Errori formali</div>
                       </div>
                     </div>
