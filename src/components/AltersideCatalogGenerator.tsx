@@ -1401,15 +1401,95 @@ const AltersideCatalogGenerator: React.FC = () => {
         const withFeDR = applyRateCents(ivatoCents, feeDR);
         const subtotalCents = applyRateCents(withFeDR, feeMP);
 
-        // --- LISTPRICE CON FEE (intero per eccesso) ---
+        // --- LISTPRICE CON FEE (intero per eccesso) - STANDARD CALCULATION ---
         const baseListCents = listC + shipC;
         const ivatoListCents = applyRateCents(baseListCents, ivaR);
         const withFeDRList = applyRateCents(ivatoListCents, feeDR);
         const subtotalListCents = applyRateCents(withFeDRList, feeMP);
-        const listPriceConFeeInt = ceilToIntegerEuros(subtotalListCents); // intero
+        let listPriceConFeeInt = ceilToIntegerEuros(subtotalListCents); // intero (standard)
 
         // Prezzo Finale (ceil a ,99 sul subtotale corretto)
         const prezzoFinaleCents = ceilToComma99(subtotalCents);
+
+        // --- OVERRIDE RULE FOR "ListPrice con Fee" (ULTIMO STEP) ---
+        // Normalize ListPrice for comparison
+        const normalizeNumericOverride = (val: any): number | null => {
+          if (val == null || val === '') return null;
+          const str = String(val).trim().replace(/€/g, '').replace(/\s/g, '').replace(/\u00A0/g, '');
+          const normalized = str.replace(',', '.');
+          const parsed = parseFloat(normalized);
+          return Number.isFinite(parsed) ? parsed : null;
+        };
+
+        const normListPrice = normalizeNumericOverride(record.ListPrice);
+        const normCustBestPrice = normalizeNumericOverride(record.CustBestPrice);
+        const normShipping = normalizeNumericOverride(6);
+        const normIVA = normalizeNumericOverride(22);
+        const normFeeDeRev = normalizeNumericOverride(record.FeeDeRev);
+        const normFeeMarketplace = normalizeNumericOverride(record['Fee Marketplace']);
+        const normPrezzoFinale = prezzoFinaleCents / 100; // Already calculated in cents
+
+        // Check if override rule should activate
+        const shouldOverride = normListPrice === null || 
+                               normListPrice === 0 || 
+                               (normCustBestPrice !== null && normListPrice < normCustBestPrice);
+
+        if (shouldOverride) {
+          // Validate all required inputs are available
+          if (normCustBestPrice !== null && normShipping !== null && normIVA !== null && 
+              normFeeDeRev !== null && normFeeMarketplace !== null && normPrezzoFinale !== null) {
+            
+            // Calculate override value
+            const base = normCustBestPrice * 1.25;
+            const candidato = ((base + normShipping) * (1 + normIVA / 100)) * normFeeDeRev * normFeeMarketplace;
+            
+            // Ceiling to integer (no intermediate rounding)
+            const candidato_ceil = Math.ceil(candidato);
+            
+            // Minimum constraint: 25% above Prezzo Finale, then ceiling
+            const minimo_consentito = Math.ceil(normPrezzoFinale * 1.25);
+            
+            // Final override value
+            const overrideValue = Math.max(candidato_ceil, minimo_consentito);
+            
+            // OVERRIDE: Write the new value
+            listPriceConFeeInt = overrideValue;
+            
+            // Log override activation (first 10 only)
+            if (index < 10) {
+              const reason = normListPrice === null ? 'ListPrice assente' :
+                           normListPrice === 0 ? 'ListPrice zero' :
+                           'ListPrice < CustBestPrice';
+              
+              console.warn(`lpfee:override:row${index}`, {
+                OverrideListPriceConFee: true,
+                Motivo: reason,
+                ManufPartNr: record.ManufPartNr || 'N/A',
+                CustBestPrice: normCustBestPrice,
+                ListPrice: normListPrice ?? 'N/A',
+                PrezzoFinale: normPrezzoFinale.toFixed(2),
+                base: base.toFixed(4),
+                candidato: candidato.toFixed(4),
+                candidato_ceil,
+                minimo_consentito,
+                ListPriceConFee_FINAL: overrideValue
+              });
+            }
+          } else {
+            // Invalid inputs for override calculation
+            if (index < 5) {
+              console.warn(`lpfee:override:input_non_valido:row${index}`, {
+                ManufPartNr: record.ManufPartNr || 'N/A',
+                CustBestPrice: normCustBestPrice,
+                Shipping: normShipping,
+                IVA: normIVA,
+                FeeDeRev: normFeeDeRev,
+                FeeMarketplace: normFeeMarketplace,
+                PrezzoFinale: normPrezzoFinale
+              });
+            }
+          }
+        }
 
         // Log per le prime 10 righe per verifica
         if (index < 10) {
