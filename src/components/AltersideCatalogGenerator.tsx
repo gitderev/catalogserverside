@@ -1523,7 +1523,7 @@ const AltersideCatalogGenerator: React.FC = () => {
           ShortDescription: record.ShortDescription,
           ExistingStock: record.ExistingStock,
           CustBestPrice: record.CustBestPrice,
-          'Costo di Spedizione': '6,00',
+          'Costo di Spedizione': formatCents(shipC),
           IVA: '22%',
           'Prezzo con spediz e IVA': formatCents(ivatoCents),
           FeeDeRev: record.FeeDeRev,
