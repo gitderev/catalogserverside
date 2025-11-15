@@ -1321,7 +1321,7 @@ const AltersideCatalogGenerator: React.FC = () => {
         
         // MPN specific formatting
         formatted.EAN = toExcelText(record.EAN);
-        formatted['Costo di Spedizione'] = '6,00';
+        formatted['Costo di Spedizione'] = feeConfig.shippingCost.toFixed(2).replace('.', ',');
         formatted.IVA = '22%';
         formatted['Subtotale post-fee'] = toComma(ceil2(record['Subtotale post-fee']));
         formatted['ListPrice con Fee'] = String(ceilInt(record['ListPrice con Fee']));
@@ -1357,7 +1357,7 @@ const AltersideCatalogGenerator: React.FC = () => {
         formatted.ExistingStock = String(record.ExistingStock ?? '');
         formatted.ListPrice = asNumber(record.ListPrice).toFixed(2).replace('.', ',');
         formatted.CustBestPrice = String(record.CustBestPrice ?? '');
-        formatted['Costo di Spedizione'] = String(record['Costo di Spedizione'] ?? '6,00');
+        formatted['Costo di Spedizione'] = feeConfig.shippingCost.toFixed(2).replace('.', ',');
         formatted.IVA = '22%';
         formatted['Prezzo con spediz e IVA'] = asNumber(record['Prezzo con spediz e IVA']).toFixed(2).replace('.', ',');
         formatted.FeeDeRev = String(record.FeeDeRev ?? '');
