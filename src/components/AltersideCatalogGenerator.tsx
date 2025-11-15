@@ -222,7 +222,8 @@ function computeFinalPrice({
   // EAN final price: use new computeFinalEan function (cent-precise with ending ,99)
   const eanResult = computeFinalEan(
     { listPrice: ListPrice || 0, custBestPrice: CustBestPrice > 0 ? CustBestPrice : undefined },
-    { feeDeRev: feeDrev, feeMarketplace: feeMkt }
+    { feeDeRev: feeDrev, feeMarketplace: feeMkt },
+    shippingCost
   );
   const prezzoFinaleEAN = eanResult.finalCents / 100;
   
@@ -969,13 +970,15 @@ const AltersideCatalogGenerator: React.FC = () => {
       if (hasBest) {
         const result = computeFinalEan(
           { listPrice: listPrice || 0, custBestPrice },
-          { feeDeRev: feeConfig.feeDrev, feeMarketplace: feeConfig.feeMkt }
+          { feeDeRev: feeConfig.feeDrev, feeMarketplace: feeConfig.feeMkt },
+          feeConfig.shippingCost
         );
         return result.finalCents / 100;
       } else if (hasListPrice) {
         const result = computeFinalEan(
           { listPrice },
-          { feeDeRev: feeConfig.feeDrev, feeMarketplace: feeConfig.feeMkt }
+          { feeDeRev: feeConfig.feeDrev, feeMarketplace: feeConfig.feeMkt },
+          feeConfig.shippingCost
         );
         return result.finalCents / 100;
       }
