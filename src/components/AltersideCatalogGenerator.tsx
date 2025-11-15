@@ -121,8 +121,9 @@ interface ProcessedRecord {
 }
 
 interface FeeConfig {
-  feeDrev: number;   // e.g. 1.05
-  feeMkt: number;    // e.g. 1.08
+  feeDrev: number;      // e.g. 1.05
+  feeMkt: number;       // e.g. 1.08
+  shippingCost: number; // e.g. 6.00
 }
 
 interface LogEntry {
@@ -157,7 +158,7 @@ const OPTIONAL_HEADERS = {
   price: ['ManufPartNr']
 };
 
-const DEFAULT_FEES: FeeConfig = { feeDrev: 1.05, feeMkt: 1.08 };
+const DEFAULT_FEES: FeeConfig = { feeDrev: 1.05, feeMkt: 1.08, shippingCost: 6.00 };
 
 function loadFees(): FeeConfig {
   try {
@@ -167,6 +168,7 @@ function loadFees(): FeeConfig {
     return {
       feeDrev: Number(obj.feeDrev) || DEFAULT_FEES.feeDrev,
       feeMkt: Number(obj.feeMkt) || DEFAULT_FEES.feeMkt,
+      shippingCost: Number(obj.shippingCost) || DEFAULT_FEES.shippingCost,
     };
   } catch { 
     return DEFAULT_FEES; 
@@ -180,13 +182,13 @@ function saveFees(cfg: FeeConfig) {
 
 
 function computeFinalPrice({
-  CustBestPrice, ListPrice, feeDrev, feeMkt
-}: { CustBestPrice?: number; ListPrice?: number; feeDrev: number; feeMkt: number; }): {
+  CustBestPrice, ListPrice, feeDrev, feeMkt, shippingCost
+}: { CustBestPrice?: number; ListPrice?: number; feeDrev: number; feeMkt: number; shippingCost: number; }): {
   base: number, shipping: number, iva: number, subtotConIva: number,
   postFee: number, prezzoFinaleEAN: number, prezzoFinaleMPN: number, listPriceConFee: number | string,
   eanResult: { finalCents: number; finalDisplay: string; route: string; debug: any }
 } {
-  const shipping = 6.00;
+  const shipping = shippingCost;
   const ivaMultiplier = 1.22;
   
   const hasBest = Number.isFinite(CustBestPrice) && CustBestPrice! > 0;
@@ -836,6 +838,16 @@ const AltersideCatalogGenerator: React.FC = () => {
       return;
     }
 
+    // Validate shipping cost
+    if (isNaN(feeConfig.shippingCost) || feeConfig.shippingCost < 0) {
+      toast({
+        title: "Costo di spedizione non valido",
+        description: "Il costo di spedizione deve essere un numero positivo",
+        variant: "destructive"
+      });
+      return;
+    }
+
     // Reset all state for new pipeline
     setCurrentPipeline(pipelineType);
     setCurrentProcessedData([]);
@@ -1151,7 +1163,8 @@ const AltersideCatalogGenerator: React.FC = () => {
           CustBestPrice: custBestPrice,
           ListPrice: listPrice,
           feeDrev: feeConfig.feeDrev,
-          feeMkt: feeConfig.feeMkt
+          feeMkt: feeConfig.feeMkt,
+          shippingCost: feeConfig.shippingCost
         });
 
         const processedRecord: ProcessedRecord = {
@@ -1389,7 +1402,7 @@ const AltersideCatalogGenerator: React.FC = () => {
       const dataset = eanFilteredData.map((record, index) => {
         // --- INPUTS sicuri con robust parsing ---
         const cbpC = toCents(record.CustBestPrice);                      // CustBestPrice in cent
-        const shipC = toCents(6);                                        // shipping sempre 6€ in cent
+        const shipC = toCents(feeConfig.shippingCost);                   // shipping from config in cent
         const ivaR = parsePercentToRate(22, 22);                         // "22" o "22%" -> 1.22
         const feeDR = parseRate(record.FeeDeRev, 1.05);                  // "1,05" -> 1.05
         const feeMP = parseRate(record['Fee Marketplace'], 1.07);        // "1,07" / "1,07 0,00" -> 1.07
@@ -1423,7 +1436,7 @@ const AltersideCatalogGenerator: React.FC = () => {
 
         const normListPrice = normalizeNumericOverride(record.ListPrice);
         const normCustBestPrice = normalizeNumericOverride(record.CustBestPrice);
-        const normShipping = normalizeNumericOverride(6);
+        const normShipping = normalizeNumericOverride(feeConfig.shippingCost);
         const normIVA = normalizeNumericOverride(22);
         const normFeeDeRev = normalizeNumericOverride(record.FeeDeRev);
         const normFeeMarketplace = normalizeNumericOverride(record['Fee Marketplace']);
@@ -1714,7 +1727,7 @@ const AltersideCatalogGenerator: React.FC = () => {
     } finally {
       setIsExportingEAN(false);
     }
-  }, [currentProcessedData, isExportingEAN, dbg, toast]);
+  }, [currentProcessedData, isExportingEAN, feeConfig, dbg, toast]);
 
   const downloadExcel = (type: 'ean' | 'manufpartnr') => {
     if (type === 'ean') {
@@ -1732,7 +1745,7 @@ const AltersideCatalogGenerator: React.FC = () => {
         // Additional validation for negative or null components
         if (hasManufPartNr) {
           const listPrice = asNum(record.ListPrice);
-          const shipping = 6.00;
+          const shipping = feeConfig.shippingCost;
           const iva = 0.22;
           const feeDeRev = asNum(record.FeeDeRev);
           const feeMarketplace = asNum(record['Fee Marketplace']);
@@ -2659,7 +2672,7 @@ const AltersideCatalogGenerator: React.FC = () => {
                 Regole di Calcolo
               </h3>
               
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
                 <div className="space-y-2">
                   <Label htmlFor="fee-derev" className="text-sm font-medium">
                     Fee DeRev (moltiplicatore)
@@ -2707,6 +2720,30 @@ const AltersideCatalogGenerator: React.FC = () => {
                   />
                   <p className="text-xs text-muted-foreground">
                     Esempio: 1,08 = +8% commissione marketplace
+                  </p>
+                </div>
+
+                <div className="space-y-2">
+                  <Label htmlFor="shipping-cost" className="text-sm font-medium">
+                    Costo di spedizione fisso (€)
+                  </Label>
+                  <Input
+                    id="shipping-cost"
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    value={feeConfig.shippingCost}
+                    onChange={(e) => {
+                      const val = parseFloat(e.target.value);
+                      if (!isNaN(val) && val >= 0) {
+                        setFeeConfig(prev => ({ ...prev, shippingCost: val }));
+                      }
+                    }}
+                    className="text-center"
+                    title="Costo di spedizione fisso in euro. Esempio: 6,00 = spedizione di 6 euro per ogni prodotto."
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Esempio: 6,00 = spedizione di 6 euro
                   </p>
                 </div>
               </div>
