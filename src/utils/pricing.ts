@@ -155,7 +155,7 @@ export function computeFromListPrice(
  * Unified EAN price computation in integer cents
  */
 export function computeFinalEan(
-  input: { listPrice: number; custBestPrice?: number },
+  input: { listPrice: number; custBestPrice?: number; surcharge?: number },
   fees: { feeDeRev: number; feeMarketplace: number },
   shipping: number = 6,
   ivaPerc: number = 22
@@ -168,10 +168,22 @@ export function computeFinalEan(
   debug: any 
 } {
   
+  // Ensure surcharge is valid and non-negative
+  const validSurcharge = (input.surcharge && Number.isFinite(input.surcharge) && input.surcharge >= 0) ? input.surcharge : 0;
+  
   // Select base price source
   const usesCbp = input.custBestPrice && input.custBestPrice > 0 && Number.isFinite(input.custBestPrice);
   const route = usesCbp ? 'cbp' : 'listprice';
-  const basePrice = usesCbp ? input.custBestPrice! : Math.ceil(input.listPrice);
+  
+  // Calculate basePrice according to route
+  let basePrice: number;
+  if (usesCbp) {
+    // CBP ROUTE: ALWAYS use CustBestPrice + Surcharge
+    basePrice = input.custBestPrice! + validSurcharge;
+  } else {
+    // LP ROUTE: use ListPrice only (ceiled), NO Surcharge
+    basePrice = Math.ceil(input.listPrice);
+  }
   
   // Convert to cents for all calculations
   const baseCents = toCents(basePrice);
@@ -194,6 +206,9 @@ export function computeFinalEan(
   // Debug info
   const debug = {
     route,
+    custBestPrice: input.custBestPrice,
+    surcharge: validSurcharge,
+    basePrice,
     baseCents,
     afterShippingCents,
     afterIvaCents,
@@ -208,10 +223,15 @@ export function computeFinalEan(
     (globalThis as any).eanSampleCount = 0;
   }
   if ((globalThis as any).eanSampleCount < 6) {
-    const sampleType = route === 'cbp' ? 'ean:sample:cbp' : 'ean:sample:listprice';
+    const sampleType = route === 'cbp' ? 'ean:sample:cbp:pricing' : 'ean:sample:listprice:pricing';
     console.warn(sampleType, {
       base: basePrice,
       route,
+      ...(route === 'cbp' && { 
+        custBestPrice: input.custBestPrice, 
+        surcharge: validSurcharge,
+        sumCbpSurcharge: input.custBestPrice! + validSurcharge
+      }),
       baseCents,
       subtotalCents,
       finalCents,
