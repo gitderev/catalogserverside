@@ -34,6 +34,27 @@ function asNum(v: any): number {
   return Number.isFinite(n) ? n : 0;
 }
 
+// Dedicated parsing function for distributor price file (ListPrice, CustBestPrice, Surcharge)
+function parseDistributorPrice(raw: any): number {
+  if (raw === null || raw === undefined) return 0;
+  
+  let value = String(raw).trim();
+  if (value === '') return 0;
+  
+  // Normalize decimal separator: comma → dot
+  value = value.replace(',', '.');
+  
+  // Handle case ".00" → "0.00"
+  if (value.startsWith('.')) {
+    value = '0' + value;
+  }
+  
+  const num = parseFloat(value);
+  if (isNaN(num)) return 0;
+  
+  return num;
+}
+
 function ceil2(v: any): number {
   return Math.ceil(asNum(v) * 100) / 100;
 }
@@ -110,6 +131,7 @@ interface ProcessedRecord {
   ExistingStock: number;
   ListPrice: number;
   CustBestPrice: number;
+  Surcharge: number;
   'Costo di Spedizione': number;
   IVA: number;
   'Prezzo con spediz e IVA': number;
@@ -182,8 +204,8 @@ function saveFees(cfg: FeeConfig) {
 
 
 function computeFinalPrice({
-  CustBestPrice, ListPrice, feeDrev, feeMkt, shippingCost
-}: { CustBestPrice?: number; ListPrice?: number; feeDrev: number; feeMkt: number; shippingCost: number; }): {
+  CustBestPrice, ListPrice, Surcharge, feeDrev, feeMkt, shippingCost
+}: { CustBestPrice?: number; ListPrice?: number; Surcharge?: number; feeDrev: number; feeMkt: number; shippingCost: number; }): {
   base: number, shipping: number, iva: number, subtotConIva: number,
   postFee: number, prezzoFinaleEAN: number, prezzoFinaleMPN: number, listPriceConFee: number | string,
   eanResult: { finalCents: number; finalDisplay: string; route: string; debug: any }
@@ -194,15 +216,20 @@ function computeFinalPrice({
   const hasBest = Number.isFinite(CustBestPrice) && CustBestPrice! > 0;
   const hasListPrice = Number.isFinite(ListPrice) && ListPrice! > 0;
   
+  // Ensure Surcharge is valid and non-negative
+  const validSurcharge = (Number.isFinite(Surcharge) && Surcharge! >= 0) ? Surcharge! : 0;
+  
   let base = 0;
   let baseRoute = '';
   
   // Select base price with route tracking
   if (hasBest) {
-    base = CustBestPrice!;
+    // CBP ROUTE: ALWAYS use CustBestPrice + Surcharge
+    base = CustBestPrice! + validSurcharge;
     baseRoute = 'cbp';
   } else if (hasListPrice) {
-    base = Math.ceil(ListPrice!); // ONLY ceil allowed in EAN pipeline - on ListPrice as base
+    // LP ROUTE: use ListPrice only (ceiled), NO Surcharge
+    base = Math.ceil(ListPrice!);
     baseRoute = 'listprice_ceiled';
   } else {
     // No valid price
@@ -221,7 +248,11 @@ function computeFinalPrice({
   
   // EAN final price: use new computeFinalEan function (cent-precise with ending ,99)
   const eanResult = computeFinalEan(
-    { listPrice: ListPrice || 0, custBestPrice: CustBestPrice > 0 ? CustBestPrice : undefined },
+    { 
+      listPrice: ListPrice || 0, 
+      custBestPrice: CustBestPrice && CustBestPrice > 0 ? CustBestPrice : undefined,
+      surcharge: validSurcharge
+    },
     { feeDeRev: feeDrev, feeMarketplace: feeMkt },
     shippingCost
   );
@@ -237,6 +268,8 @@ function computeFinalPrice({
     }
     if ((globalThis as any).eanSampleCbpCount < 3) {
       console.warn('ean:sample:cbp', {
+        CustBestPrice: CustBestPrice,
+        Surcharge: validSurcharge,
         base: base,
         withShip: base + shipping,
         withVat: (base + shipping) * ivaMultiplier,
@@ -255,6 +288,7 @@ function computeFinalPrice({
         baseSource: 'listprice_ceiled',
         originalListPrice: ListPrice,
         base: base,
+        Surcharge_NOT_USED: 'LP route does not use Surcharge',
         withShip: base + shipping,
         withVat: (base + shipping) * ivaMultiplier,
         withFeeDR: (base + shipping) * ivaMultiplier * feeDrev,
@@ -880,7 +914,7 @@ const AltersideCatalogGenerator: React.FC = () => {
 
     // Build maps (parse events)
     const stockMap = new Map<string, { ExistingStock: number }>();
-    const priceMap = new Map<string, { ListPrice: number; CustBestPrice: number }>();
+    const priceMap = new Map<string, { ListPrice: number; CustBestPrice: number; Surcharge: number }>();
     let stockDuplicates = 0;
     let priceDuplicates = 0;
 
@@ -910,7 +944,11 @@ const AltersideCatalogGenerator: React.FC = () => {
       if (priceMap.has(matnr)) {
         priceDuplicates++;
       } else {
-        priceMap.set(matnr, { ListPrice: parseFloat(row.ListPrice) || 0, CustBestPrice: parseFloat(row.CustBestPrice) || 0 });
+        priceMap.set(matnr, { 
+          ListPrice: parseDistributorPrice(row.ListPrice), 
+          CustBestPrice: parseDistributorPrice(row.CustBestPrice),
+          Surcharge: parseDistributorPrice(row.Surcharge)
+        });
       }
     });
     dbg('parse:price:chunk', { chunkNumber: 1, rowsInChunk: priceRowCounter });
@@ -962,6 +1000,7 @@ const AltersideCatalogGenerator: React.FC = () => {
     const computeFinalPriceForEAN = (row: any): number => {
       const custBestPrice = parseFloat(row.CustBestPrice);
       const listPrice = parseFloat(row.ListPrice);
+      const surcharge = parseFloat(row.Surcharge) || 0;
       
       // Use computeFinalEan for consistency
       const hasBest = Number.isFinite(custBestPrice) && custBestPrice > 0;
@@ -969,14 +1008,14 @@ const AltersideCatalogGenerator: React.FC = () => {
       
       if (hasBest) {
         const result = computeFinalEan(
-          { listPrice: listPrice || 0, custBestPrice },
+          { listPrice: listPrice || 0, custBestPrice, surcharge },
           { feeDeRev: feeConfig.feeDrev, feeMarketplace: feeConfig.feeMkt },
           feeConfig.shippingCost
         );
         return result.finalCents / 100;
       } else if (hasListPrice) {
         const result = computeFinalEan(
-          { listPrice },
+          { listPrice, surcharge: 0 }, // LP route does NOT use Surcharge
           { feeDeRev: feeConfig.feeDrev, feeMarketplace: feeConfig.feeMkt },
           feeConfig.shippingCost
         );
@@ -1115,6 +1154,7 @@ const AltersideCatalogGenerator: React.FC = () => {
         const existingStock = stockData.ExistingStock;
         const listPrice = priceData.ListPrice;
         const custBestPrice = priceData.CustBestPrice;
+        const surcharge = priceData.Surcharge;
 
         if (existingStock < 2) {
           logsEAN.push({
@@ -1148,7 +1188,7 @@ const AltersideCatalogGenerator: React.FC = () => {
             ManufPartNr: String(row.ManufPartNr ?? ''),
             EAN: String(row.EAN ?? ''),
             reason: 'invalid_price',
-            details: `ListPrice=${listPrice}, CustBestPrice=${custBestPrice}`
+            details: `ListPrice=${listPrice}, CustBestPrice=${custBestPrice}, Surcharge=${surcharge}`
           });
           logsMPN.push({
             source_file: 'MaterialFile',
@@ -1157,7 +1197,7 @@ const AltersideCatalogGenerator: React.FC = () => {
             ManufPartNr: String(row.ManufPartNr ?? ''),
             EAN: String(row.EAN ?? ''),
             reason: 'invalid_price',
-            details: `ListPrice=${listPrice}, CustBestPrice=${custBestPrice}`
+            details: `ListPrice=${listPrice}, CustBestPrice=${custBestPrice}, Surcharge=${surcharge}`
           });
           return;
         }
@@ -1165,6 +1205,7 @@ const AltersideCatalogGenerator: React.FC = () => {
         const calc = computeFinalPrice({
           CustBestPrice: custBestPrice,
           ListPrice: listPrice,
+          Surcharge: surcharge,
           feeDrev: feeConfig.feeDrev,
           feeMkt: feeConfig.feeMkt,
           shippingCost: feeConfig.shippingCost
@@ -1178,6 +1219,7 @@ const AltersideCatalogGenerator: React.FC = () => {
           ExistingStock: existingStock,
           ListPrice: listPrice,
           CustBestPrice: custBestPrice,
+          Surcharge: surcharge,
           'Costo di Spedizione': calc.shipping,
           IVA: calc.iva,
           'Prezzo con spediz e IVA': calc.subtotConIva,
