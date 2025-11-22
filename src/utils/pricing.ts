@@ -152,7 +152,11 @@ export function computeFromListPrice(
 }
 
 /**
- * Unified EAN price computation in integer cents
+ * @deprecated This function contains LP/CBP routing logic and should not be used.
+ * For new code, calculate basePriceCents directly using Math.round() and apply fees in cents,
+ * then use toComma99Cents() directly for the ,99 ending.
+ * 
+ * Unified EAN price computation in integer cents (LEGACY - DO NOT USE)
  */
 export function computeFinalEan(
   input: { listPrice: number; custBestPrice?: number; surcharge?: number },
