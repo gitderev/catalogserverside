@@ -1,1 +1,4 @@
 project_id = "hdcniibdblgqkhhgbqtz"
+
+[functions.import-catalog-ftp]
+verify_jwt = false
