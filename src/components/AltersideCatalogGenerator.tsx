@@ -773,8 +773,16 @@ const AltersideCatalogGenerator: React.FC = () => {
   const handleFtpImport = async () => {
     setFtpImportLoading(true);
     
+    // Helper function to fetch file from URL and convert to File object
+    const fetchFileFromUrl = async (fileUrl: string, filename: string): Promise<File> => {
+      const response = await fetch(fileUrl);
+      if (!response.ok) throw new Error(`Impossibile scaricare ${filename}`);
+      const blob = await response.blob();
+      return new File([blob], filename, { type: "text/plain" });
+    };
+    
     try {
-      // Step 1: Call edge function to download from FTP and upload to Storage
+      // Call edge function to download from FTP and upload to Storage
       const res = await fetch(
         "https://hdcniibdblgqkhhgbqtz.supabase.co/functions/v1/import-catalog-ftp",
         {
@@ -795,38 +803,30 @@ const AltersideCatalogGenerator: React.FC = () => {
         return;
       }
 
-      // Validate response contains all file URLs
+      // Extract URLs from response
       const materialUrl = data.files?.materialFile?.url;
-      const priceUrl = data.files?.priceFile?.url;
       const stockUrl = data.files?.stockFile?.url;
+      const priceUrl = data.files?.priceFile?.url;
 
-      if (!materialUrl || !priceUrl || !stockUrl) {
+      if (!materialUrl || !stockUrl || !priceUrl) {
         toast({
           title: "Errore import FTP",
-          description: "La risposta FTP non contiene tutti gli URL richiesti (Material, Price, Stock).",
+          description: "La risposta FTP non contiene gli URL per tutti i file richiesti.",
           variant: "destructive"
         });
         return;
       }
 
-      // Step 2: Fetch content from Storage URLs
-      const fetchFileContent = async (url: string, name: string): Promise<string> => {
-        const response = await fetch(url);
-        if (!response.ok) {
-          throw new Error(`Impossibile scaricare ${name} da Storage`);
-        }
-        return await response.text();
-      };
-
-      let materialContent: string;
-      let stockContent: string;
-      let priceContent: string;
+      // Fetch files from Storage URLs and convert to File objects
+      let materialVirtualFile: File;
+      let stockVirtualFile: File;
+      let priceVirtualFile: File;
 
       try {
-        [materialContent, stockContent, priceContent] = await Promise.all([
-          fetchFileContent(materialUrl, "Material"),
-          fetchFileContent(stockUrl, "Stock"),
-          fetchFileContent(priceUrl, "Price"),
+        [materialVirtualFile, stockVirtualFile, priceVirtualFile] = await Promise.all([
+          fetchFileFromUrl(materialUrl, data.files?.materialFile?.filename || "MaterialFile.txt"),
+          fetchFileFromUrl(stockUrl, data.files?.stockFile?.filename || "StockFileData.txt"),
+          fetchFileFromUrl(priceUrl, data.files?.priceFile?.filename || "pricefileData.txt"),
         ]);
       } catch (error) {
         toast({
@@ -837,26 +837,7 @@ const AltersideCatalogGenerator: React.FC = () => {
         return;
       }
 
-      // Step 3: Create virtual File objects
-      const materialVirtualFile = new File(
-        [materialContent],
-        data.files?.materialFile?.filename || "MaterialFile.txt",
-        { type: "text/plain" }
-      );
-
-      const stockVirtualFile = new File(
-        [stockContent],
-        data.files?.stockFile?.filename || "StockFileData.txt",
-        { type: "text/plain" }
-      );
-
-      const priceVirtualFile = new File(
-        [priceContent],
-        data.files?.priceFile?.filename || "pricefileData.txt",
-        { type: "text/plain" }
-      );
-
-      // Step 4: Pass to existing handleFileUpload pipeline
+      // Pass virtual files to existing handleFileUpload pipeline
       try {
         await handleFileUpload(materialVirtualFile, "material");
       } catch (error) {
