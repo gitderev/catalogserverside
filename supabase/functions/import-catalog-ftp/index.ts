@@ -16,8 +16,6 @@ interface FileResult {
 interface SuccessResponse {
   status: "ok";
   files: {
-    materialFile: FileResult;
-    priceFile: FileResult;
     stockFile: FileResult;
   };
 }
@@ -28,13 +26,10 @@ interface ErrorResponse {
   message: string;
 }
 
-const FILE_CONFIG = {
-  materialFile: { ftpName: "MaterialFile.txt", folder: "material", prefix: "MaterialFile" },
-  priceFile: { ftpName: "pricefileData_790813.txt", folder: "price", prefix: "pricefileData" },
-  stockFile: { ftpName: "StockFileData_790813.txt", folder: "stock", prefix: "StockFileData" },
-};
+// TEST: Only Stock file for now
+const STOCK_FILE = { ftpName: "StockFileData_790813.txt", folder: "stock", prefix: "StockFileData" };
 
-const TIMEOUT_MS = 300000; // 5 minutes for large files
+const TIMEOUT_MS = 300000; // 5 minutes
 const BUCKET_NAME = "ftp-import";
 
 class FTPClient {
@@ -153,7 +148,7 @@ class FTPClient {
     }
   }
 
-  async downloadFileAsStream(filename: string): Promise<{ stream: ReadableStream<Uint8Array>; dataConn: Deno.Conn }> {
+  async downloadFile(filename: string): Promise<Uint8Array> {
     console.log(`Downloading file: ${filename}`);
     
     await this.setBinaryMode();
@@ -176,15 +171,43 @@ class FTPClient {
       throw new Error(`FTP_DOWNLOAD_FAILED:${retrResp}`);
     }
     
-    return { stream: dataConn.readable, dataConn };
-  }
-
-  async waitForTransferComplete(): Promise<void> {
+    // Read data in chunks
+    const chunks: Uint8Array[] = [];
+    let totalSize = 0;
+    const reader = dataConn.readable.getReader();
+    
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        totalSize += value.length;
+      }
+    } finally {
+      reader.releaseLock();
+      dataConn.close();
+    }
+    
+    // Wait for transfer complete
     const completeResp = await this.readResponse();
     const { code: completeCode } = this.parseResponse(completeResp);
     if (completeCode !== 226 && completeCode !== 250) {
       console.warn("Unexpected transfer complete response:", completeResp);
     }
+    
+    // Combine chunks into single buffer
+    const result = new Uint8Array(totalSize);
+    let offset = 0;
+    for (const chunk of chunks) {
+      result.set(chunk, offset);
+      offset += chunk.length;
+    }
+    
+    // Clear chunks to help GC
+    chunks.length = 0;
+    
+    console.log(`Downloaded ${filename}: ${totalSize} bytes`);
+    return result;
   }
 
   async close(): Promise<void> {
@@ -192,7 +215,7 @@ class FTPClient {
       try {
         await this.sendCommand("QUIT");
       } catch (_e) {
-        // Ignore errors during quit
+        // Ignore
       }
       
       if (this.reader) {
@@ -234,36 +257,6 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, errorCode:
   }
 }
 
-async function streamToBuffer(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
-  const reader = stream.getReader();
-  const chunks: Uint8Array[] = [];
-  let totalSize = 0;
-  
-  try {
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-      totalSize += value.length;
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  
-  // Combine chunks into single buffer
-  const result = new Uint8Array(totalSize);
-  let offset = 0;
-  for (const chunk of chunks) {
-    result.set(chunk, offset);
-    offset += chunk.length;
-  }
-  
-  // Clear chunks array to help GC
-  chunks.length = 0;
-  
-  return result;
-}
-
 serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response(null, { headers: corsHeaders });
@@ -271,7 +264,7 @@ serve(async (req) => {
 
   if (req.method !== 'POST') {
     return new Response(
-      JSON.stringify({ status: "error", code: "METHOD_NOT_ALLOWED", message: "Only POST method is allowed" } as ErrorResponse),
+      JSON.stringify({ status: "error", code: "METHOD_NOT_ALLOWED", message: "Only POST" } as ErrorResponse),
       { status: 405, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   }
@@ -279,68 +272,47 @@ serve(async (req) => {
   let client: FTPClient | null = null;
 
   try {
-    // Read FTP secrets
+    // Read secrets
     const ftpHost = Deno.env.get('FTP_HOST');
     const ftpUser = Deno.env.get('FTP_USER');
     const ftpPass = Deno.env.get('FTP_PASSWORD');
     const ftpPort = parseInt(Deno.env.get('FTP_PORT') || '21');
     const ftpInputDir = Deno.env.get('FTP_INPUT_DIR') || '/';
     const ftpUseTLS = Deno.env.get('FTP_USE_TLS') === 'true';
-
-    // Read Supabase secrets
     const supabaseUrl = Deno.env.get('SUPABASE_URL');
     const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
 
-    console.log(`FTP Config: host=${ftpHost ? 'SET' : 'UNSET'}, user=${ftpUser ? 'SET' : 'UNSET'}, port=${ftpPort}, dir=${ftpInputDir}`);
+    console.log(`FTP Config: host=${ftpHost ? 'SET' : 'UNSET'}, port=${ftpPort}, dir=${ftpInputDir}`);
 
     if (!ftpHost || !ftpUser || !ftpPass) {
-      console.error("Missing required FTP configuration");
       return new Response(
-        JSON.stringify({ 
-          status: "error", 
-          code: "CONFIG_MISSING", 
-          message: "Required FTP configuration is missing (FTP_HOST, FTP_USER, FTP_PASSWORD)." 
-        } as ErrorResponse),
+        JSON.stringify({ status: "error", code: "CONFIG_MISSING", message: "FTP config missing" } as ErrorResponse),
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
 
     if (!supabaseUrl || !supabaseServiceKey) {
-      console.error("Missing Supabase configuration");
       return new Response(
-        JSON.stringify({ 
-          status: "error", 
-          code: "CONFIG_MISSING", 
-          message: "Required Supabase configuration is missing." 
-        } as ErrorResponse),
+        JSON.stringify({ status: "error", code: "CONFIG_MISSING", message: "Supabase config missing" } as ErrorResponse),
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
 
-    // Create Supabase client with service role
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
-
-    // Create FTP client
     client = new FTPClient(ftpUseTLS);
 
-    // Connect with timeout
+    // Connect
     await withTimeout(client.connect(ftpHost, ftpPort), TIMEOUT_MS, "FTP_TIMEOUT");
-
-    // Login
     await withTimeout(client.login(ftpUser, ftpPass), TIMEOUT_MS, "FTP_TIMEOUT");
 
-    // Change to input directory
+    // Change directory
     try {
       await withTimeout(client.cwd(ftpInputDir), TIMEOUT_MS, "FTP_TIMEOUT");
     } catch (e) {
       const errMsg = e instanceof Error ? e.message : String(e);
       if (errMsg.includes("CWD_FAILED") || errMsg.includes("550")) {
         return new Response(
-          JSON.stringify({ 
-            status: "error", 
-            code: "FTP_INPUT_DIR_NOT_FOUND", 
-            message: `The FTP input directory '${ftpInputDir}' does not exist.` 
-          } as ErrorResponse),
+          JSON.stringify({ status: "error", code: "FTP_DIR_NOT_FOUND", message: `Directory ${ftpInputDir} not found` } as ErrorResponse),
           { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
@@ -348,137 +320,73 @@ serve(async (req) => {
     }
 
     const timestamp = Date.now();
-    const results: { [key: string]: FileResult } = {};
 
-    // Process each file: download from FTP and upload to Storage
-    for (const [key, config] of Object.entries(FILE_CONFIG)) {
-      console.log(`Processing ${key}: ${config.ftpName}`);
-      
-      let dataConn: Deno.Conn | null = null;
-      
-      try {
-        // Download file from FTP
-        const downloadResult = await withTimeout(
-          client.downloadFileAsStream(config.ftpName),
-          TIMEOUT_MS,
-          "FTP_TIMEOUT"
+    // Download ONLY Stock file
+    console.log(`Processing ONLY Stock file: ${STOCK_FILE.ftpName}`);
+    
+    let fileBuffer: Uint8Array;
+    try {
+      fileBuffer = await withTimeout(client.downloadFile(STOCK_FILE.ftpName), TIMEOUT_MS, "FTP_TIMEOUT");
+    } catch (e) {
+      const errMsg = e instanceof Error ? e.message : String(e);
+      if (errMsg.includes("FILE_NOT_FOUND")) {
+        return new Response(
+          JSON.stringify({ status: "error", code: "FILE_NOT_FOUND", message: `File ${STOCK_FILE.ftpName} not found` } as ErrorResponse),
+          { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
-        dataConn = downloadResult.dataConn;
-        
-        // Read stream to buffer (single copy)
-        const fileBuffer = await streamToBuffer(downloadResult.stream);
-        const fileSize = fileBuffer.length;
-        
-        console.log(`Downloaded ${config.ftpName}: ${fileSize} bytes`);
-        
-        // Close data connection
-        try {
-          dataConn.close();
-        } catch (_e) {
-          // Ignore close errors
-        }
-        dataConn = null;
-        
-        // Wait for FTP transfer complete
-        await client.waitForTransferComplete();
-        
-        // Generate unique filename with timestamp
-        const newFilename = `${config.prefix}_${timestamp}.txt`;
-        const storagePath = `${config.folder}/${newFilename}`;
-        
-        console.log(`Uploading to Storage: ${storagePath}`);
-        
-        // Upload to Supabase Storage
-        const { error: uploadError } = await supabase.storage
-          .from(BUCKET_NAME)
-          .upload(storagePath, fileBuffer, {
-            contentType: "text/plain",
-            upsert: true,
-          });
-        
-        if (uploadError) {
-          console.error(`Upload error for ${storagePath}:`, uploadError);
-          throw new Error(`STORAGE_UPLOAD_FAILED:${uploadError.message}`);
-        }
-        
-        console.log(`Uploaded ${storagePath} successfully`);
-        
-        // Get public URL
-        const { data: urlData } = supabase.storage
-          .from(BUCKET_NAME)
-          .getPublicUrl(storagePath);
-        
-        results[key] = {
+      }
+      throw e;
+    }
+
+    const fileSize = fileBuffer.length;
+    console.log(`Stock file downloaded: ${fileSize} bytes`);
+
+    // Close FTP connection before upload to free resources
+    await client.close();
+    client = null;
+
+    // Upload to Storage
+    const newFilename = `${STOCK_FILE.prefix}_${timestamp}.txt`;
+    const storagePath = `${STOCK_FILE.folder}/${newFilename}`;
+    
+    console.log(`Uploading to Storage: ${storagePath}`);
+    
+    const { error: uploadError } = await supabase.storage
+      .from(BUCKET_NAME)
+      .upload(storagePath, fileBuffer, {
+        contentType: "text/plain",
+        upsert: true,
+      });
+
+    // Clear buffer after upload
+    fileBuffer = new Uint8Array(0);
+
+    if (uploadError) {
+      console.error(`Upload error:`, uploadError);
+      return new Response(
+        JSON.stringify({ status: "error", code: "STORAGE_ERROR", message: `Upload failed: ${uploadError.message}` } as ErrorResponse),
+        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
+    console.log(`Uploaded successfully`);
+
+    // Get public URL
+    const { data: urlData } = supabase.storage.from(BUCKET_NAME).getPublicUrl(storagePath);
+
+    const response: SuccessResponse = {
+      status: "ok",
+      files: {
+        stockFile: {
           filename: newFilename,
           path: storagePath,
           url: urlData.publicUrl,
           size: fileSize,
-        };
-        
-      } catch (e) {
-        // Ensure data connection is closed on error
-        if (dataConn) {
-          try {
-            dataConn.close();
-          } catch (_e) {
-            // Ignore
-          }
-        }
-        
-        const errMsg = e instanceof Error ? e.message : String(e);
-        
-        if (errMsg.includes("FILE_NOT_FOUND")) {
-          return new Response(
-            JSON.stringify({ 
-              status: "error", 
-              code: "FILE_NOT_FOUND", 
-              message: `Il file '${config.ftpName}' non è stato trovato sul server FTP.` 
-            } as ErrorResponse),
-            { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-          );
-        }
-        
-        if (errMsg.includes("FTP_TIMEOUT")) {
-          return new Response(
-            JSON.stringify({ 
-              status: "error", 
-              code: "FTP_TIMEOUT", 
-              message: `Timeout durante il download di '${config.ftpName}'.` 
-            } as ErrorResponse),
-            { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-          );
-        }
-        
-        if (errMsg.includes("STORAGE_UPLOAD_FAILED")) {
-          return new Response(
-            JSON.stringify({ 
-              status: "error", 
-              code: "STORAGE_UPLOAD_FAILED", 
-              message: `Errore durante l'upload di '${config.ftpName}' su Storage.` 
-            } as ErrorResponse),
-            { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-          );
-        }
-        
-        throw e;
-      }
-    }
-
-    // Close FTP connection
-    await client.close();
-    client = null;
-
-    // Return success response with URLs only
-    const response: SuccessResponse = {
-      status: "ok",
-      files: {
-        materialFile: results.materialFile,
-        priceFile: results.priceFile,
-        stockFile: results.stockFile,
+        },
       },
     };
 
-    console.log("Successfully processed all files");
+    console.log("Stock file processed successfully");
     
     return new Response(
       JSON.stringify(response),
@@ -486,27 +394,11 @@ serve(async (req) => {
     );
 
   } catch (e) {
-    console.error("Unexpected error:", e);
-    
+    console.error("Error:", e);
     const errMsg = e instanceof Error ? e.message : String(e);
     
-    if (errMsg.includes("FTP_TIMEOUT")) {
-      return new Response(
-        JSON.stringify({ 
-          status: "error", 
-          code: "FTP_TIMEOUT", 
-          message: "Operazione FTP scaduta." 
-        } as ErrorResponse),
-        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-    
     return new Response(
-      JSON.stringify({ 
-        status: "error", 
-        code: "FTP_RUNTIME_ERROR", 
-        message: `Errore imprevisto: ${errMsg.substring(0, 200)}` 
-      } as ErrorResponse),
+      JSON.stringify({ status: "error", code: "FTP_RUNTIME_ERROR", message: errMsg.substring(0, 200) } as ErrorResponse),
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
     
@@ -515,7 +407,7 @@ serve(async (req) => {
       try {
         await client.close();
       } catch (_e) {
-        console.error("Error closing FTP connection");
+        // Ignore
       }
     }
   }
