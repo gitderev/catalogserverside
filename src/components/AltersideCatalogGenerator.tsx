@@ -2072,8 +2072,25 @@ const AltersideCatalogGenerator: React.FC = () => {
           description: "Non ci sono record con EAN validi da esportare",
           variant: "destructive"
         });
+        setIsExportingEprice(false);
         return;
       }
+      
+      // Validate prepDays
+      if (!Number.isInteger(prepDays) || prepDays < 0 || prepDays > 30) {
+        toast({
+          title: "Errore validazione",
+          description: "I giorni di preparazione devono essere un numero intero tra 0 e 30",
+          variant: "destructive"
+        });
+        setIsExportingEprice(false);
+        return;
+      }
+      
+      // Validation arrays for tracking issues
+      const validationErrors: string[] = [];
+      const validationWarnings: string[] = [];
+      let skippedCount = 0;
       
       // Exact headers as required
       const headers = ["sku", "product-id", "product-id-type", "price", "quantity", "state", "fulfillment-latency", "logistic-class"];
@@ -2081,8 +2098,28 @@ const AltersideCatalogGenerator: React.FC = () => {
       // Build AOA (Array of Arrays) with exact headers
       const aoa: (string | number)[][] = [headers];
       
-      // Add data rows
-      eanFilteredData.forEach((record) => {
+      // Add data rows with validation
+      eanFilteredData.forEach((record, index) => {
+        const rowErrors: string[] = [];
+        
+        // Validate SKU
+        const sku = record.ManufPartNr || '';
+        if (!sku || sku.trim() === '') {
+          rowErrors.push(`Riga ${index + 1}: SKU mancante`);
+        }
+        
+        // Validate EAN (already filtered but double-check format)
+        const ean = record.EAN || '';
+        if (!/^\d{12,14}$/.test(ean)) {
+          rowErrors.push(`Riga ${index + 1}: EAN non valido (${ean})`);
+        }
+        
+        // Validate quantity
+        const quantity = record.ExistingStock ?? 0;
+        if (!Number.isFinite(quantity) || quantity < 0) {
+          rowErrors.push(`Riga ${index + 1}: Quantità non valida (${quantity})`);
+        }
+        
         // Same price calculation as onExportEAN
         const hasBest = Number.isFinite(record.CustBestPrice) && record.CustBestPrice > 0;
         const hasListPrice = Number.isFinite(record.ListPrice) && record.ListPrice > 0;
@@ -2094,6 +2131,11 @@ const AltersideCatalogGenerator: React.FC = () => {
           baseCents = Math.round((record.CustBestPrice + surchargeValue) * 100);
         } else if (hasListPrice) {
           baseCents = Math.round(record.ListPrice * 100);
+        }
+        
+        // Validate base price exists
+        if (baseCents === 0) {
+          rowErrors.push(`Riga ${index + 1}: Prezzo base mancante (SKU: ${sku})`);
         }
         
         const shipC = toCents(feeConfig.shippingCost);
@@ -2108,17 +2150,60 @@ const AltersideCatalogGenerator: React.FC = () => {
         const prezzoFinaleCents = ceilToComma99(subtotalCents);
         const prezzoFinaleFormatted = formatCents(prezzoFinaleCents);
         
+        // Validate final price format (should end with ,99)
+        if (!prezzoFinaleFormatted || !/^\d+,99$/.test(prezzoFinaleFormatted)) {
+          validationWarnings.push(`Riga ${index + 1}: Prezzo finale non termina con ,99 (${prezzoFinaleFormatted})`);
+        }
+        
+        // Validate final price is reasonable (between 1€ and 100000€)
+        if (prezzoFinaleCents < 100 || prezzoFinaleCents > 10000000) {
+          rowErrors.push(`Riga ${index + 1}: Prezzo finale fuori range (${prezzoFinaleFormatted})`);
+        }
+        
+        // If there are critical errors for this row, skip it
+        if (rowErrors.length > 0) {
+          validationErrors.push(...rowErrors);
+          skippedCount++;
+          return; // Skip this row
+        }
+        
         aoa.push([
-          record.ManufPartNr || '',           // sku
-          record.EAN || '',                   // product-id
+          sku,                                // sku
+          ean,                                // product-id
           'EAN',                              // product-id-type
           prezzoFinaleFormatted,              // price
-          record.ExistingStock ?? 0,          // quantity
+          quantity,                           // quantity
           11,                                 // state
           prepDays,                           // fulfillment-latency
           'K'                                 // logistic-class
         ]);
       });
+      
+      // Check if we have valid rows after validation
+      if (aoa.length <= 1) {
+        toast({
+          title: "Errore validazione",
+          description: `Nessuna riga valida dopo la validazione. ${validationErrors.length} errori trovati.`,
+          variant: "destructive"
+        });
+        console.error("Errori validazione ePrice:", validationErrors);
+        setIsExportingEprice(false);
+        return;
+      }
+      
+      // Show warnings if any (but continue export)
+      if (validationWarnings.length > 0) {
+        console.warn("Warning validazione ePrice:", validationWarnings);
+      }
+      
+      // Show summary if rows were skipped
+      if (skippedCount > 0) {
+        toast({
+          title: "Attenzione",
+          description: `${skippedCount} righe saltate per errori di validazione. Esportate ${aoa.length - 1} righe valide.`,
+        });
+        console.warn("Righe saltate:", validationErrors);
+      }
       
       // Create worksheet from AOA
       const ws = XLSX.utils.aoa_to_sheet(aoa);
