@@ -2075,8 +2075,14 @@ const AltersideCatalogGenerator: React.FC = () => {
         return;
       }
       
-      // Build dataset for ePrice - same calculation as onExportEAN
-      const epriceData = eanFilteredData.map((record) => {
+      // Exact headers as required
+      const headers = ["sku", "product-id", "product-id-type", "price", "quantity", "state", "fulfillment-latency", "logistic-class"];
+      
+      // Build AOA (Array of Arrays) with exact headers
+      const aoa: (string | number)[][] = [headers];
+      
+      // Add data rows
+      eanFilteredData.forEach((record) => {
         // Same price calculation as onExportEAN
         const hasBest = Number.isFinite(record.CustBestPrice) && record.CustBestPrice > 0;
         const hasListPrice = Number.isFinite(record.ListPrice) && record.ListPrice > 0;
@@ -2102,78 +2108,54 @@ const AltersideCatalogGenerator: React.FC = () => {
         const prezzoFinaleCents = ceilToComma99(subtotalCents);
         const prezzoFinaleFormatted = formatCents(prezzoFinaleCents);
         
-        return {
-          'Codice Prodotto Venditore': record.ManufPartNr || '',
-          'Codice Prodotto': record.EAN || '',
-          'Tipo Codice Prodotto': 'EAN',
-          'Prezzo': prezzoFinaleFormatted,
-          'Quantità': record.ExistingStock ?? 0,
-          'Tipo Vendita': 11,
-          'Giorni di Preparazione': prepDays,
-          'Condizione': 'K'
-        };
+        aoa.push([
+          record.ManufPartNr || '',           // sku
+          record.EAN || '',                   // product-id
+          'EAN',                              // product-id-type
+          prezzoFinaleFormatted,              // price
+          record.ExistingStock ?? 0,          // quantity
+          11,                                 // state
+          prepDays,                           // fulfillment-latency
+          'K'                                 // logistic-class
+        ]);
       });
       
-      // Create worksheet with headers
-      const ws = XLSX.utils.json_to_sheet(epriceData, { skipHeader: false });
+      // Create worksheet from AOA
+      const ws = XLSX.utils.aoa_to_sheet(aoa);
       
-      // Force "Codice Prodotto" (EAN) column to text format to preserve leading zeros
+      // Force product-id (column B) to text format to preserve leading zeros
       if (ws['!ref']) {
         const range = XLSX.utils.decode_range(ws['!ref']);
-        let eanCol = -1;
+        const eanCol = 1; // Column B (product-id)
         
-        for (let C = range.s.c; C <= range.e.c; C++) {
-          const addr = XLSX.utils.encode_cell({ r: 0, c: C });
+        for (let R = 1; R <= range.e.r; R++) {
+          const addr = XLSX.utils.encode_cell({ r: R, c: eanCol });
           const cell = ws[addr];
-          const name = (cell?.v ?? '').toString().trim();
-          if (name === 'Codice Prodotto') { 
-            eanCol = C; 
-            break; 
+          if (cell) {
+            cell.v = (cell.v ?? '').toString();
+            cell.t = 's';
+            cell.z = '@';
+            ws[addr] = cell;
           }
         }
         
-        if (eanCol >= 0) {
-          for (let R = 1; R <= range.e.r; R++) {
-            const addr = XLSX.utils.encode_cell({ r: R, c: eanCol });
-            const cell = ws[addr];
-            if (cell) {
-              cell.v = (cell.v ?? '').toString();
-              cell.t = 's';
-              cell.z = '@';
-              ws[addr] = cell;
-            }
-          }
-        }
-        
-        // Force "Prezzo" column to text format to preserve comma format
-        let prezzoCol = -1;
-        for (let C = range.s.c; C <= range.e.c; C++) {
-          const addr = XLSX.utils.encode_cell({ r: 0, c: C });
+        // Force price (column D) to text format to preserve comma format
+        const priceCol = 3; // Column D (price)
+        for (let R = 1; R <= range.e.r; R++) {
+          const addr = XLSX.utils.encode_cell({ r: R, c: priceCol });
           const cell = ws[addr];
-          const name = (cell?.v ?? '').toString().trim();
-          if (name === 'Prezzo') { 
-            prezzoCol = C; 
-            break; 
-          }
-        }
-        
-        if (prezzoCol >= 0) {
-          for (let R = 1; R <= range.e.r; R++) {
-            const addr = XLSX.utils.encode_cell({ r: R, c: prezzoCol });
-            const cell = ws[addr];
-            if (cell) {
-              cell.v = (cell.v ?? '').toString();
-              cell.t = 's';
-              cell.z = '@';
-              ws[addr] = cell;
-            }
+          if (cell) {
+            cell.v = (cell.v ?? '').toString();
+            cell.t = 's';
+            cell.z = '@';
+            ws[addr] = cell;
           }
         }
       }
       
       // Create workbook
       const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, ws, "Offerte");
+      XLSX.utils.book_append_sheet(wb, ws, "Tracciato_Inserimento_Offerte");
       
       // Serialize to ArrayBuffer
       const wbout = XLSX.write(wb, { bookType: "xlsx", type: "array" });
