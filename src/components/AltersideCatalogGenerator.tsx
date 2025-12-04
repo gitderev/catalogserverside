@@ -2811,6 +2811,21 @@ const AltersideCatalogGenerator: React.FC = () => {
                   Delimitatore <strong>;</strong> — Header richiesto: <strong>mpn;ean</strong> — Elaborato prima degli altri file
                 </p>
                 
+                {/* Always visible mapping info */}
+                <div className="mb-4 p-3 rounded-lg" style={{ background: mappingInfo ? '#e8f5e9' : '#fff3e0', color: mappingInfo ? '#2e7d32' : '#e65100' }}>
+                  <p className="text-sm">
+                    {mappingInfo ? (
+                      <>
+                        <strong>Ultimo file di associazione salvato:</strong> {mappingInfo.filename} (caricato il {new Date(mappingInfo.uploadedAt).toLocaleDateString('it-IT', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' })})
+                      </>
+                    ) : (
+                      <>
+                        <strong>Nessun file di associazione salvato:</strong> il pre-fill EAN sarà saltato finché non carichi un file mapping.
+                      </>
+                    )}
+                  </p>
+                </div>
+                
                 {!files.eanMapping.file ? (
                   <div className="mt-4">
                     <div className="dropzone text-center p-6">
@@ -2837,21 +2852,6 @@ const AltersideCatalogGenerator: React.FC = () => {
                         File .csv o .txt con delimitatore ; e encoding UTF-8
                       </p>
                     </div>
-                    {prefillState.status === 'idle' && (
-                      <div className="mt-3 p-3 rounded-lg" style={{ background: '#e3f2fd', color: '#1565c0' }}>
-                        <p className="text-sm">
-                          {mappingInfo ? (
-                            <>
-                              <strong>Ultimo file di associazione:</strong> {mappingInfo.filename} (caricato il {new Date(mappingInfo.uploadedAt).toLocaleDateString('it-IT', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' })})
-                            </>
-                          ) : (
-                            <>
-                              <strong>Nessun file di associazione caricato:</strong> salto pre-fill EAN
-                            </>
-                          )}
-                        </p>
-                      </div>
-                    )}
                   </div>
                 ) : (
                   <div className="mt-4">
