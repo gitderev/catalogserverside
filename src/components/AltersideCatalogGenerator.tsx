@@ -775,160 +775,71 @@ const AltersideCatalogGenerator: React.FC = () => {
     
     const edgeFunctionUrl = "https://hdcniibdblgqkhhgbqtz.supabase.co/functions/v1/import-catalog-ftp";
     
-    // Helper to call edge function for a single file type
-    const importSingleFile = async (fileType: "material" | "stock" | "price"): Promise<{ url: string; filename: string } | null> => {
-      console.log(`Importing ${fileType} file from FTP...`);
-      
-      const res = await fetch(edgeFunctionUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ fileType }),
-      });
-
-      const data = await res.json();
-
-      if (!res.ok || data.status !== "ok") {
-        throw new Error(data.message || `Errore import ${fileType}`);
-      }
-
-      // Get the file result based on fileType
-      const keyMap = { material: "materialFile", stock: "stockFile", price: "priceFile" } as const;
-      const fileResult = data.files?.[keyMap[fileType]];
-      
-      if (!fileResult?.url) {
-        throw new Error(`URL mancante per ${fileType}`);
-      }
-
-      return { url: fileResult.url, filename: fileResult.filename };
-    };
-
-    // Helper to fetch file from Storage URL and convert to File object
+    // Helper: download file from URL and convert to File object
     const fetchFileFromUrl = async (fileUrl: string, filename: string): Promise<File> => {
       const response = await fetch(fileUrl);
-      if (!response.ok) throw new Error(`Impossibile scaricare ${filename}`);
+      if (!response.ok) {
+        throw new Error(`Download fallito per ${filename}: ${response.status} ${response.statusText}`);
+      }
       const blob = await response.blob();
       return new File([blob], filename, { type: "text/plain" });
     };
     
+    // Helper: import a single file type from FTP
+    const importSingleFileFromFtp = async (fileType: "material" | "stock" | "price") => {
+      // Call edge function
+      let res: Response;
+      try {
+        res = await fetch(edgeFunctionUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ fileType }),
+        });
+      } catch (e) {
+        throw new Error(`Errore rete import FTP (${fileType})`);
+      }
+
+      const data = await res.json();
+
+      if (!res.ok || data.status !== "ok") {
+        throw new Error(data.message || `Import FTP fallito per ${fileType}`);
+      }
+
+      // Extract file info based on fileType
+      const keyMap = { material: "materialFile", stock: "stockFile", price: "priceFile" } as const;
+      const fileInfo = data.files?.[keyMap[fileType]];
+      
+      const url = fileInfo?.url;
+      const filename = fileInfo?.filename || `${fileType}File.txt`;
+      
+      if (!url) {
+        throw new Error(`URL mancante nella risposta per ${fileType}`);
+      }
+
+      // Download file from Storage URL
+      const file = await fetchFileFromUrl(url, filename);
+
+      // Pass to existing upload handler
+      try {
+        await handleFileUpload(file, fileType);
+      } catch (e) {
+        throw new Error(`Errore elaborazione file ${fileType}`);
+      }
+    };
+    
     try {
-      // Step 1: Import Material file from FTP
-      toast({ title: "Import FTP", description: "Scaricamento Material file in corso..." });
-      
-      let materialResult: { url: string; filename: string };
-      try {
-        const result = await importSingleFile("material");
-        if (!result) throw new Error("Material file non importato");
-        materialResult = result;
-      } catch (error) {
-        toast({
-          title: "Errore import Material",
-          description: error instanceof Error ? error.message : "Errore sconosciuto",
-          variant: "destructive"
-        });
-        return;
-      }
-
-      // Step 2: Import Stock file from FTP
-      toast({ title: "Import FTP", description: "Scaricamento Stock file in corso..." });
-      
-      let stockResult: { url: string; filename: string };
-      try {
-        const result = await importSingleFile("stock");
-        if (!result) throw new Error("Stock file non importato");
-        stockResult = result;
-      } catch (error) {
-        toast({
-          title: "Errore import Stock",
-          description: error instanceof Error ? error.message : "Errore sconosciuto",
-          variant: "destructive"
-        });
-        return;
-      }
-
-      // Step 3: Import Price file from FTP
-      toast({ title: "Import FTP", description: "Scaricamento Price file in corso..." });
-      
-      let priceResult: { url: string; filename: string };
-      try {
-        const result = await importSingleFile("price");
-        if (!result) throw new Error("Price file non importato");
-        priceResult = result;
-      } catch (error) {
-        toast({
-          title: "Errore import Price",
-          description: error instanceof Error ? error.message : "Errore sconosciuto",
-          variant: "destructive"
-        });
-        return;
-      }
-
-      // Step 4: Fetch files from Storage URLs
-      toast({ title: "Import FTP", description: "Download file da Storage..." });
-      
-      let materialVirtualFile: File;
-      let stockVirtualFile: File;
-      let priceVirtualFile: File;
-
-      try {
-        [materialVirtualFile, stockVirtualFile, priceVirtualFile] = await Promise.all([
-          fetchFileFromUrl(materialResult.url, materialResult.filename),
-          fetchFileFromUrl(stockResult.url, stockResult.filename),
-          fetchFileFromUrl(priceResult.url, priceResult.filename),
-        ]);
-      } catch (error) {
-        toast({
-          title: "Errore download file",
-          description: error instanceof Error ? error.message : "Impossibile scaricare i file da Storage.",
-          variant: "destructive"
-        });
-        return;
-      }
-
-      // Step 5: Pass virtual files to existing handleFileUpload pipeline
-      toast({ title: "Import FTP", description: "Elaborazione file..." });
-
-      try {
-        await handleFileUpload(materialVirtualFile, "material");
-      } catch (error) {
-        toast({
-          title: "Errore parsing file FTP",
-          description: `Errore durante il parsing di ${materialVirtualFile.name}`,
-          variant: "destructive"
-        });
-        return;
-      }
-
-      try {
-        await handleFileUpload(stockVirtualFile, "stock");
-      } catch (error) {
-        toast({
-          title: "Errore parsing file FTP",
-          description: `Errore durante il parsing di ${stockVirtualFile.name}`,
-          variant: "destructive"
-        });
-        return;
-      }
-
-      try {
-        await handleFileUpload(priceVirtualFile, "price");
-      } catch (error) {
-        toast({
-          title: "Errore parsing file FTP",
-          description: `Errore durante il parsing di ${priceVirtualFile.name}`,
-          variant: "destructive"
-        });
-        return;
-      }
+      await importSingleFileFromFtp("material");
+      await importSingleFileFromFtp("stock");
+      await importSingleFileFromFtp("price");
 
       toast({
         title: "Import FTP completato",
         description: "I file Material, Stock e Price sono stati importati dal server FTP."
       });
-
     } catch (error) {
       toast({
         title: "Errore import FTP",
-        description: "Impossibile contattare il servizio di import FTP.",
+        description: error instanceof Error ? error.message : "Errore sconosciuto durante l'import FTP.",
         variant: "destructive"
       });
     } finally {
