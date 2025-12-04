@@ -13,23 +13,22 @@ interface FileResult {
   size: number;
 }
 
-interface SuccessResponse {
-  status: "ok";
-  files: {
-    materialFile: FileResult;
-  };
-}
-
 interface ErrorResponse {
   status: "error";
   code: string;
   message: string;
 }
 
-// TEST: ONLY Material file (~100MB)
-const MATERIAL_FILE = { ftpName: "MaterialFile.txt", folder: "material", prefix: "MaterialFile" };
+// File configurations
+const FILE_CONFIG = {
+  material: { ftpName: "MaterialFile.txt", folder: "material", prefix: "MaterialFile", key: "materialFile" },
+  stock: { ftpName: "StockFileData_790813.txt", folder: "stock", prefix: "StockFileData", key: "stockFile" },
+  price: { ftpName: "pricefileData_790813.txt", folder: "price", prefix: "pricefileData", key: "priceFile" },
+} as const;
 
-const TIMEOUT_MS = 600000; // 10 minutes for large file
+type FileType = keyof typeof FILE_CONFIG;
+
+const TIMEOUT_MS = 600000; // 10 minutes
 const BUCKET_NAME = "ftp-import";
 
 class FTPClient {
@@ -164,35 +163,27 @@ class FTPClient {
       throw new Error(`FTP_DOWNLOAD_FAILED`);
     }
     
-    // Read data with minimal memory overhead
     const chunks: Uint8Array[] = [];
     let totalSize = 0;
     
     try {
-      const buf = new Uint8Array(131072); // 128KB buffer for faster reading
+      const buf = new Uint8Array(131072); // 128KB buffer
       while (true) {
         const n = await dataConn.read(buf);
         if (n === null) break;
         chunks.push(buf.slice(0, n));
         totalSize += n;
         
-        // Log progress every 10MB
         if (totalSize % 10485760 < 131072) {
           console.log(`Downloaded: ${Math.round(totalSize / 1048576)} MB`);
         }
       }
-    } catch (_e) {
-      // Read complete
-    }
+    } catch (_e) {}
     
     try { dataConn.close(); } catch (_) {}
     
-    // Wait for transfer complete
-    try {
-      await this.readResponse();
-    } catch (_) {}
+    try { await this.readResponse(); } catch (_) {}
     
-    // Combine chunks into single buffer
     console.log(`Combining ${chunks.length} chunks, total: ${totalSize} bytes`);
     const result = new Uint8Array(totalSize);
     let offset = 0;
@@ -200,8 +191,6 @@ class FTPClient {
       result.set(chunk, offset);
       offset += chunk.length;
     }
-    
-    // Clear chunks immediately
     chunks.length = 0;
     
     console.log(`Download complete: ${totalSize} bytes`);
@@ -236,6 +225,26 @@ serve(async (req) => {
   let client: FTPClient | null = null;
 
   try {
+    // Parse request body
+    const body = await req.json().catch(() => ({}));
+    const fileType = body.fileType as string | undefined;
+
+    // Validate fileType
+    if (!fileType || !["material", "stock", "price"].includes(fileType)) {
+      return new Response(
+        JSON.stringify({ 
+          status: "error", 
+          code: "INVALID_FILE_TYPE", 
+          message: "fileType deve essere uno tra: material, stock, price." 
+        } as ErrorResponse),
+        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
+    const config = FILE_CONFIG[fileType as FileType];
+    console.log(`Processing single file: ${fileType} -> ${config.ftpName}`);
+
+    // Read environment variables
     const ftpHost = Deno.env.get('FTP_HOST');
     const ftpUser = Deno.env.get('FTP_USER');
     const ftpPass = Deno.env.get('FTP_PASSWORD');
@@ -244,8 +253,6 @@ serve(async (req) => {
     const ftpUseTLS = Deno.env.get('FTP_USE_TLS') === 'true';
     const supabaseUrl = Deno.env.get('SUPABASE_URL');
     const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
-
-    console.log(`TEST: Material file only`);
 
     if (!ftpHost || !ftpUser || !ftpPass) {
       return new Response(
@@ -264,23 +271,22 @@ serve(async (req) => {
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
     client = new FTPClient(ftpUseTLS);
 
+    // Connect to FTP
     await client.connect(ftpHost, ftpPort);
     await client.login(ftpUser, ftpPass);
     await client.cwd(ftpInputDir);
 
     const timestamp = Date.now();
 
-    // Download Material file
-    console.log(`Processing ONLY Material file: ${MATERIAL_FILE.ftpName}`);
-    
+    // Download the requested file
     let fileBuffer: Uint8Array;
     try {
-      fileBuffer = await client.downloadFile(MATERIAL_FILE.ftpName);
+      fileBuffer = await client.downloadFile(config.ftpName);
     } catch (e) {
       const errMsg = e instanceof Error ? e.message : String(e);
       if (errMsg.includes("FILE_NOT_FOUND")) {
         return new Response(
-          JSON.stringify({ status: "error", code: "FILE_NOT_FOUND", message: `Material file not found` } as ErrorResponse),
+          JSON.stringify({ status: "error", code: "FILE_NOT_FOUND", message: `File ${config.ftpName} non trovato` } as ErrorResponse),
           { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
@@ -288,7 +294,7 @@ serve(async (req) => {
     }
 
     const fileSize = fileBuffer.length;
-    console.log(`Material file size: ${fileSize} bytes (${Math.round(fileSize / 1048576)} MB)`);
+    console.log(`File size: ${fileSize} bytes (${Math.round(fileSize / 1048576)} MB)`);
 
     // Close FTP before upload to free memory
     await client.close();
@@ -296,8 +302,8 @@ serve(async (req) => {
     console.log(`FTP connection closed`);
 
     // Upload to Storage
-    const newFilename = `${MATERIAL_FILE.prefix}_${timestamp}.txt`;
-    const storagePath = `${MATERIAL_FILE.folder}/${newFilename}`;
+    const newFilename = `${config.prefix}_${timestamp}.txt`;
+    const storagePath = `${config.folder}/${newFilename}`;
     
     console.log(`Uploading to Storage: ${storagePath}`);
     
@@ -305,7 +311,7 @@ serve(async (req) => {
       .from(BUCKET_NAME)
       .upload(storagePath, fileBuffer, { contentType: "text/plain", upsert: true });
 
-    // Clear buffer immediately after upload
+    // Clear buffer immediately
     fileBuffer = new Uint8Array(0);
 
     if (uploadError) {
@@ -321,19 +327,22 @@ serve(async (req) => {
     // Get public URL
     const { data: urlData } = supabase.storage.from(BUCKET_NAME).getPublicUrl(storagePath);
 
-    const response: SuccessResponse = {
-      status: "ok",
+    const fileResult: FileResult = {
+      filename: newFilename,
+      path: storagePath,
+      url: urlData.publicUrl,
+      size: fileSize,
+    };
+
+    // Build response with dynamic key
+    const response = {
+      status: "ok" as const,
       files: {
-        materialFile: {
-          filename: newFilename,
-          path: storagePath,
-          url: urlData.publicUrl,
-          size: fileSize,
-        },
+        [config.key]: fileResult,
       },
     };
 
-    console.log("Material file processed successfully");
+    console.log(`${fileType} file processed successfully`);
     
     return new Response(
       JSON.stringify(response),

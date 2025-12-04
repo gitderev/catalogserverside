@@ -769,11 +769,40 @@ const AltersideCatalogGenerator: React.FC = () => {
     return `${minutes.toString().padStart(2, '0')}:${(seconds % 60).toString().padStart(2, '0')}`;
   };
 
-  // FTP automatic import handler
+  // FTP automatic import handler - calls edge function 3 times sequentially
   const handleFtpImport = async () => {
     setFtpImportLoading(true);
     
-    // Helper function to fetch file from URL and convert to File object
+    const edgeFunctionUrl = "https://hdcniibdblgqkhhgbqtz.supabase.co/functions/v1/import-catalog-ftp";
+    
+    // Helper to call edge function for a single file type
+    const importSingleFile = async (fileType: "material" | "stock" | "price"): Promise<{ url: string; filename: string } | null> => {
+      console.log(`Importing ${fileType} file from FTP...`);
+      
+      const res = await fetch(edgeFunctionUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fileType }),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok || data.status !== "ok") {
+        throw new Error(data.message || `Errore import ${fileType}`);
+      }
+
+      // Get the file result based on fileType
+      const keyMap = { material: "materialFile", stock: "stockFile", price: "priceFile" } as const;
+      const fileResult = data.files?.[keyMap[fileType]];
+      
+      if (!fileResult?.url) {
+        throw new Error(`URL mancante per ${fileType}`);
+      }
+
+      return { url: fileResult.url, filename: fileResult.filename };
+    };
+
+    // Helper to fetch file from Storage URL and convert to File object
     const fetchFileFromUrl = async (fileUrl: string, filename: string): Promise<File> => {
       const response = await fetch(fileUrl);
       if (!response.ok) throw new Error(`Impossibile scaricare ${filename}`);
@@ -782,51 +811,69 @@ const AltersideCatalogGenerator: React.FC = () => {
     };
     
     try {
-      // Call edge function to download from FTP and upload to Storage
-      const res = await fetch(
-        "https://hdcniibdblgqkhhgbqtz.supabase.co/functions/v1/import-catalog-ftp",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({}),
-        }
-      );
-
-      const data = await res.json();
-
-      if (!res.ok || data.status !== "ok") {
+      // Step 1: Import Material file from FTP
+      toast({ title: "Import FTP", description: "Scaricamento Material file in corso..." });
+      
+      let materialResult: { url: string; filename: string };
+      try {
+        const result = await importSingleFile("material");
+        if (!result) throw new Error("Material file non importato");
+        materialResult = result;
+      } catch (error) {
         toast({
-          title: "Errore import FTP",
-          description: data.message || "Import FTP fallito. Verifica la configurazione dell'FTP o riprova più tardi.",
+          title: "Errore import Material",
+          description: error instanceof Error ? error.message : "Errore sconosciuto",
           variant: "destructive"
         });
         return;
       }
 
-      // Extract URLs from response
-      const materialUrl = data.files?.materialFile?.url;
-      const stockUrl = data.files?.stockFile?.url;
-      const priceUrl = data.files?.priceFile?.url;
-
-      if (!materialUrl || !stockUrl || !priceUrl) {
+      // Step 2: Import Stock file from FTP
+      toast({ title: "Import FTP", description: "Scaricamento Stock file in corso..." });
+      
+      let stockResult: { url: string; filename: string };
+      try {
+        const result = await importSingleFile("stock");
+        if (!result) throw new Error("Stock file non importato");
+        stockResult = result;
+      } catch (error) {
         toast({
-          title: "Errore import FTP",
-          description: "La risposta FTP non contiene gli URL per tutti i file richiesti.",
+          title: "Errore import Stock",
+          description: error instanceof Error ? error.message : "Errore sconosciuto",
           variant: "destructive"
         });
         return;
       }
 
-      // Fetch files from Storage URLs and convert to File objects
+      // Step 3: Import Price file from FTP
+      toast({ title: "Import FTP", description: "Scaricamento Price file in corso..." });
+      
+      let priceResult: { url: string; filename: string };
+      try {
+        const result = await importSingleFile("price");
+        if (!result) throw new Error("Price file non importato");
+        priceResult = result;
+      } catch (error) {
+        toast({
+          title: "Errore import Price",
+          description: error instanceof Error ? error.message : "Errore sconosciuto",
+          variant: "destructive"
+        });
+        return;
+      }
+
+      // Step 4: Fetch files from Storage URLs
+      toast({ title: "Import FTP", description: "Download file da Storage..." });
+      
       let materialVirtualFile: File;
       let stockVirtualFile: File;
       let priceVirtualFile: File;
 
       try {
         [materialVirtualFile, stockVirtualFile, priceVirtualFile] = await Promise.all([
-          fetchFileFromUrl(materialUrl, data.files?.materialFile?.filename || "MaterialFile.txt"),
-          fetchFileFromUrl(stockUrl, data.files?.stockFile?.filename || "StockFileData.txt"),
-          fetchFileFromUrl(priceUrl, data.files?.priceFile?.filename || "pricefileData.txt"),
+          fetchFileFromUrl(materialResult.url, materialResult.filename),
+          fetchFileFromUrl(stockResult.url, stockResult.filename),
+          fetchFileFromUrl(priceResult.url, priceResult.filename),
         ]);
       } catch (error) {
         toast({
@@ -837,7 +884,9 @@ const AltersideCatalogGenerator: React.FC = () => {
         return;
       }
 
-      // Pass virtual files to existing handleFileUpload pipeline
+      // Step 5: Pass virtual files to existing handleFileUpload pipeline
+      toast({ title: "Import FTP", description: "Elaborazione file..." });
+
       try {
         await handleFileUpload(materialVirtualFile, "material");
       } catch (error) {
