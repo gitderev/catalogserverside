@@ -1,4 +1,5 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
+import { supabase } from '@/integrations/supabase/client';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -392,6 +393,10 @@ const AltersideCatalogGenerator: React.FC = () => {
   const eanPrefillReports = prefillState.reports;
   const isProcessingPrefill = prefillState.status === 'running';
 
+  // Mapping persistence state
+  const [mappingInfo, setMappingInfo] = useState<{ filename: string; uploadedAt: string } | null>(null);
+  const mappingLoadedRef = useRef(false);
+
   // Fee configuration
   const [feeConfig, setFeeConfig] = useState<FeeConfig>(loadFees());
   const [rememberFees, setRememberFees] = useState(false);
@@ -402,6 +407,80 @@ const AltersideCatalogGenerator: React.FC = () => {
       saveFees(feeConfig);
     }
   }, [feeConfig, rememberFees]);
+
+  // Persist mapping file to Supabase Storage
+  const persistMappingFile = async (file: File) => {
+    try {
+      const { error } = await supabase.storage
+        .from('mapping-files')
+        .upload('latest/mapping_sku_ean.csv', file, { upsert: true });
+      
+      if (error) {
+        console.error('Errore upload mapping:', error);
+        toast({
+          title: "Errore salvataggio mapping",
+          description: "Impossibile salvare il file di associazione sul server.",
+          variant: "destructive"
+        });
+        return;
+      }
+      
+      setMappingInfo({
+        filename: file.name,
+        uploadedAt: new Date().toISOString()
+      });
+    } catch (err) {
+      console.error('Errore persistMappingFile:', err);
+      toast({
+        title: "Errore salvataggio mapping",
+        description: "Impossibile salvare il file di associazione sul server.",
+        variant: "destructive"
+      });
+    }
+  };
+
+  // Load mapping file from storage on mount
+  useEffect(() => {
+    if (mappingLoadedRef.current) return;
+    mappingLoadedRef.current = true;
+
+    const loadMappingFromStorage = async () => {
+      try {
+        const { data, error } = await supabase.storage
+          .from('mapping-files')
+          .download('latest/mapping_sku_ean.csv');
+        
+        if (error || !data) {
+          // File doesn't exist, nothing to do
+          console.log('Nessun file mapping salvato trovato');
+          return;
+        }
+        
+        const file = new File([data], 'mapping_sku_ean.csv', { type: 'text/plain' });
+        
+        // Update mapping info
+        setMappingInfo({
+          filename: 'mapping_sku_ean.csv',
+          uploadedAt: new Date().toISOString()
+        });
+        
+        // Load into the eanMapping state
+        setFiles(prev => ({
+          ...prev,
+          eanMapping: { file, status: 'ready' }
+        }));
+        
+        toast({
+          title: "Mapping caricato",
+          description: "File di associazione SKU↔EAN ripristinato automaticamente"
+        });
+      } catch (err) {
+        console.error('Errore caricamento mapping:', err);
+      }
+    };
+
+    loadMappingFromStorage();
+  }, []);
 
   const [processingState, setProcessingState] = useState<'idle' | 'validating' | 'ready' | 'running' | 'completed' | 'failed'>('idle');
   const [currentPipeline, setCurrentPipeline] = useState<'EAN' | 'MPN' | null>(null);
@@ -2074,7 +2153,7 @@ const AltersideCatalogGenerator: React.FC = () => {
     exportDiscardedRowsCSV(discardedRows, `righe_scartate_EAN_${new Date().toISOString().split('T')[0]}`);
   };
 
-  const handleEANMappingUpload = (file: File) => {
+  const handleEANMappingUpload = async (file: File) => {
     // Validate file extension
     const validExtensions = ['.csv', '.txt'];
     const fileExt = file.name.substring(file.name.lastIndexOf('.')).toLowerCase();
@@ -2092,6 +2171,9 @@ const AltersideCatalogGenerator: React.FC = () => {
       ...prev,
       eanMapping: { file, status: 'ready' }
     }));
+    
+    // Persist to Supabase Storage
+    await persistMappingFile(file);
     
     toast({
       title: "File caricato",
@@ -2758,7 +2840,15 @@ const AltersideCatalogGenerator: React.FC = () => {
                     {prefillState.status === 'idle' && (
                       <div className="mt-3 p-3 rounded-lg" style={{ background: '#e3f2fd', color: '#1565c0' }}>
                         <p className="text-sm">
-                          <strong>Nessun file di associazione caricato:</strong> salto pre-fill EAN
+                          {mappingInfo ? (
+                            <>
+                              <strong>Ultimo file di associazione:</strong> {mappingInfo.filename} (caricato il {new Date(mappingInfo.uploadedAt).toLocaleDateString('it-IT', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' })})
+                            </>
+                          ) : (
+                            <>
+                              <strong>Nessun file di associazione caricato:</strong> salto pre-fill EAN
+                            </>
+                          )}
                         </p>
                       </div>
                     )}
