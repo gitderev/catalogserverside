@@ -647,49 +647,51 @@ const AltersideCatalogGenerator: React.FC = () => {
         isValid: validation.valid
       };
 
-      // Update processing state - ready when all files have valid required headers
-      const newFiles = {
-        ...files,
-        [type]: {
-          ...files[type],
-          file: fileState,
-          status: fileState.isValid ? 'valid' : 'error',
-          diagnostics: {
-            headerFound: headerLine,
-            firstDataRow: firstDataLine,
-            validation
+      // Use functional update to preserve other files' state
+      setFiles(prev => {
+        const newFiles = {
+          ...prev,
+          [type]: {
+            ...prev[type],
+            file: fileState,
+            status: fileState.isValid ? 'valid' : 'error',
+            diagnostics: {
+              headerFound: headerLine,
+              firstDataRow: firstDataLine,
+              validation
+            }
           }
+        };
+        
+        // Check if all files are loaded with valid required headers (warnings don't block)
+        const allRequiredHeadersValid = Object.entries(newFiles).every(([fileType, fileState]) => {
+          if (fileType === 'eanMapping') return true; // Skip eanMapping check (optional)
+          if (!fileState.file) return false;
+          const fileData = fileState.file as FileData;
+          const requiredHeaders = REQUIRED_HEADERS[fileType as keyof typeof REQUIRED_HEADERS];
+          const val = validateHeaders(fileData.headers, requiredHeaders);
+          return val.valid; // Only check required headers
+        });
+        
+        // Update debug state
+        const newDebugState = {
+          materialValid: newFiles.material.file ? validateHeaders(newFiles.material.file.headers, REQUIRED_HEADERS.material).valid : false,
+          stockValid: newFiles.stock.file ? validateHeaders(newFiles.stock.file.headers, REQUIRED_HEADERS.stock).valid : false,
+          priceValid: newFiles.price.file ? validateHeaders(newFiles.price.file.headers, REQUIRED_HEADERS.price).valid : false,
+          stockReady: !!newFiles.stock.file,
+          priceReady: !!newFiles.price.file,
+          materialPreScanDone: debugState.materialPreScanDone,
+          joinStarted: debugState.joinStarted
+        };
+        setDebugState(newDebugState);
+        dbg('state:change', newDebugState);
+        
+        if (allRequiredHeadersValid) {
+          setProcessingState('ready');
         }
-      };
-      
-      // Check if all files are loaded with valid required headers (warnings don't block)
-      const allRequiredHeadersValid = Object.entries(newFiles).every(([fileType, fileState]) => {
-        if (fileType === 'eanMapping') return true; // Skip eanMapping check (optional)
-        if (!fileState.file) return false;
-        const fileData = fileState.file as FileData;
-        const requiredHeaders = REQUIRED_HEADERS[fileType as keyof typeof REQUIRED_HEADERS];
-        const validation = validateHeaders(fileData.headers, requiredHeaders);
-        return validation.valid; // Only check required headers
+        
+        return newFiles;
       });
-      
-      // Update debug state
-      const newDebugState = {
-        materialValid: newFiles.material.file ? validateHeaders(newFiles.material.file.headers, REQUIRED_HEADERS.material).valid : false,
-        stockValid: newFiles.stock.file ? validateHeaders(newFiles.stock.file.headers, REQUIRED_HEADERS.stock).valid : false,
-        priceValid: newFiles.price.file ? validateHeaders(newFiles.price.file.headers, REQUIRED_HEADERS.price).valid : false,
-        stockReady: !!newFiles.stock.file,
-        priceReady: !!newFiles.price.file,
-        materialPreScanDone: debugState.materialPreScanDone,
-        joinStarted: debugState.joinStarted
-      };
-      setDebugState(newDebugState);
-      dbg('state:change', newDebugState);
-      
-      if (allRequiredHeadersValid) {
-        setProcessingState('ready');
-      }
-
-      setFiles(newFiles);
 
       const toastMessage = status === 'warning' 
         ? `${file.name} - ${parsed.data.length} righe (con avviso)`
