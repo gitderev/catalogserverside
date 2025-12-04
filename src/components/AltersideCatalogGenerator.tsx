@@ -543,6 +543,10 @@ const AltersideCatalogGenerator: React.FC = () => {
 
   // Export state for preventing double clicks
   const [isExportingEAN, setIsExportingEAN] = useState(false);
+  const [isExportingEprice, setIsExportingEprice] = useState(false);
+  
+  // ePrice export configuration
+  const [prepDays, setPrepDays] = useState<number>(1);
 
   const workerRef = useRef<Worker | null>(null);
 
@@ -2044,6 +2048,181 @@ const AltersideCatalogGenerator: React.FC = () => {
     }
   }, [currentProcessedData, isExportingEAN, feeConfig, dbg, toast]);
 
+  // ePrice Export Function - reuses EAN dataset
+  const onExportEprice = useCallback((event: React.MouseEvent) => {
+    event.preventDefault();
+    
+    if (isExportingEprice) {
+      toast({
+        title: "Esportazione in corso...",
+        description: "Attendere completamento dell'esportazione ePrice"
+      });
+      return;
+    }
+    
+    setIsExportingEprice(true);
+    
+    try {
+      // Get EAN filtered data - same logic as onExportEAN
+      const eanFilteredData = currentProcessedData.filter(record => record.EAN && record.EAN.length >= 12);
+      
+      if (eanFilteredData.length === 0) {
+        toast({
+          title: "Nessuna riga valida per ePrice",
+          description: "Non ci sono record con EAN validi da esportare",
+          variant: "destructive"
+        });
+        return;
+      }
+      
+      // Build dataset for ePrice - same calculation as onExportEAN
+      const epriceData = eanFilteredData.map((record) => {
+        // Same price calculation as onExportEAN
+        const hasBest = Number.isFinite(record.CustBestPrice) && record.CustBestPrice > 0;
+        const hasListPrice = Number.isFinite(record.ListPrice) && record.ListPrice > 0;
+        const surchargeValue = (Number.isFinite(record.Surcharge) && record.Surcharge >= 0) ? record.Surcharge : 0;
+        
+        let baseCents = 0;
+        
+        if (hasBest) {
+          baseCents = Math.round((record.CustBestPrice + surchargeValue) * 100);
+        } else if (hasListPrice) {
+          baseCents = Math.round(record.ListPrice * 100);
+        }
+        
+        const shipC = toCents(feeConfig.shippingCost);
+        const ivaR = parsePercentToRate(22, 22);
+        const feeDR = parseRate(record.FeeDeRev, 1.05);
+        const feeMP = parseRate(record['Fee Marketplace'], 1.07);
+        
+        const afterShippingCents = baseCents + shipC;
+        const ivatoCents = applyRateCents(afterShippingCents, ivaR);
+        const withFeDR = applyRateCents(ivatoCents, feeDR);
+        const subtotalCents = applyRateCents(withFeDR, feeMP);
+        const prezzoFinaleCents = ceilToComma99(subtotalCents);
+        const prezzoFinaleFormatted = formatCents(prezzoFinaleCents);
+        
+        return {
+          'Codice Prodotto Venditore': record.ManufPartNr || '',
+          'Codice Prodotto': record.EAN || '',
+          'Tipo Codice Prodotto': 'EAN',
+          'Prezzo': prezzoFinaleFormatted,
+          'Quantità': record.ExistingStock ?? 0,
+          'Tipo Vendita': 11,
+          'Giorni di Preparazione': prepDays,
+          'Condizione': 'K'
+        };
+      });
+      
+      // Create worksheet with headers
+      const ws = XLSX.utils.json_to_sheet(epriceData, { skipHeader: false });
+      
+      // Force "Codice Prodotto" (EAN) column to text format to preserve leading zeros
+      if (ws['!ref']) {
+        const range = XLSX.utils.decode_range(ws['!ref']);
+        let eanCol = -1;
+        
+        for (let C = range.s.c; C <= range.e.c; C++) {
+          const addr = XLSX.utils.encode_cell({ r: 0, c: C });
+          const cell = ws[addr];
+          const name = (cell?.v ?? '').toString().trim();
+          if (name === 'Codice Prodotto') { 
+            eanCol = C; 
+            break; 
+          }
+        }
+        
+        if (eanCol >= 0) {
+          for (let R = 1; R <= range.e.r; R++) {
+            const addr = XLSX.utils.encode_cell({ r: R, c: eanCol });
+            const cell = ws[addr];
+            if (cell) {
+              cell.v = (cell.v ?? '').toString();
+              cell.t = 's';
+              cell.z = '@';
+              ws[addr] = cell;
+            }
+          }
+        }
+        
+        // Force "Prezzo" column to text format to preserve comma format
+        let prezzoCol = -1;
+        for (let C = range.s.c; C <= range.e.c; C++) {
+          const addr = XLSX.utils.encode_cell({ r: 0, c: C });
+          const cell = ws[addr];
+          const name = (cell?.v ?? '').toString().trim();
+          if (name === 'Prezzo') { 
+            prezzoCol = C; 
+            break; 
+          }
+        }
+        
+        if (prezzoCol >= 0) {
+          for (let R = 1; R <= range.e.r; R++) {
+            const addr = XLSX.utils.encode_cell({ r: R, c: prezzoCol });
+            const cell = ws[addr];
+            if (cell) {
+              cell.v = (cell.v ?? '').toString();
+              cell.t = 's';
+              cell.z = '@';
+              ws[addr] = cell;
+            }
+          }
+        }
+      }
+      
+      // Create workbook
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "Offerte");
+      
+      // Serialize to ArrayBuffer
+      const wbout = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+      
+      if (!wbout || wbout.length === 0) {
+        toast({
+          title: "Errore generazione file",
+          description: "Buffer vuoto durante la generazione del file ePrice",
+          variant: "destructive"
+        });
+        return;
+      }
+      
+      // Create blob and download
+      const blob = new Blob([wbout], { 
+        type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" 
+      });
+      
+      const url = URL.createObjectURL(blob);
+      const fileName = "Tracciato_Pubblicazione_Offerte_new.xlsx";
+      
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = fileName;
+      a.rel = "noopener";
+      a.style.display = "none";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      
+      setTimeout(() => URL.revokeObjectURL(url), 3000);
+      
+      toast({
+        title: "Export ePrice completato",
+        description: "File Tracciato_Pubblicazione_Offerte_new.xlsx generato con successo"
+      });
+      
+    } catch (error) {
+      console.error('Errore export ePrice:', error);
+      toast({
+        title: "Errore export ePrice",
+        description: error instanceof Error ? error.message : "Errore sconosciuto durante l'export",
+        variant: "destructive"
+      });
+    } finally {
+      setIsExportingEprice(false);
+    }
+  }, [currentProcessedData, isExportingEprice, feeConfig, prepDays, toast]);
+
   const downloadExcel = (type: 'ean' | 'manufpartnr') => {
     if (type === 'ean') {
       // Use the new onExportEAN function for EAN catalog
@@ -3351,6 +3530,47 @@ const AltersideCatalogGenerator: React.FC = () => {
                 </button>
               )}
             </div>
+            
+            {/* ePrice Export Section - Only for EAN pipeline */}
+            {currentPipeline === 'EAN' && (
+              <div className="mt-8 p-6 rounded-lg border" style={{ background: '#f0f9ff' }}>
+                <h4 className="text-lg font-semibold mb-4 text-blue-800">Esporta Catalogo ePrice</h4>
+                <div className="flex flex-wrap items-center justify-center gap-4">
+                  <div className="flex items-center gap-2">
+                    <Label htmlFor="prepDays" className="text-sm font-medium whitespace-nowrap">
+                      Giorni di preparazione dell'ordine:
+                    </Label>
+                    <Input
+                      id="prepDays"
+                      type="number"
+                      min={0}
+                      max={30}
+                      value={prepDays}
+                      onChange={(e) => {
+                        const val = parseInt(e.target.value, 10);
+                        if (!isNaN(val) && val >= 0 && val <= 30) {
+                          setPrepDays(val);
+                        }
+                      }}
+                      className="w-20 text-center"
+                    />
+                  </div>
+                  <button 
+                    type="button"
+                    onClick={onExportEprice}
+                    disabled={isExportingEprice}
+                    className={`btn btn-primary text-lg px-8 py-3 ${isExportingEprice ? 'opacity-50 cursor-not-allowed' : ''}`}
+                    style={{ background: '#0369a1' }}
+                  >
+                    <Download className="mr-3 h-5 w-5" />
+                    {isExportingEprice ? 'ESPORTAZIONE...' : 'Esporta catalogo ePrice'}
+                  </button>
+                </div>
+                <p className="text-xs text-muted-foreground mt-3">
+                  Genera il file "Tracciato_Pubblicazione_Offerte_new.xlsx" per ePrice
+                </p>
+              </div>
+            )}
           </div>
         )}
 
