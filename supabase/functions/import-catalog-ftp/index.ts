@@ -162,31 +162,33 @@ class FTPClient {
     const { code: retrCode } = this.parseResponse(retrResp);
     
     if (retrCode === 550) {
-      dataConn.close();
+      try { dataConn.close(); } catch (_) { /* ignore */ }
       throw new Error(`FILE_NOT_FOUND:${filename}`);
     }
     
     if (retrCode !== 125 && retrCode !== 150) {
-      dataConn.close();
+      try { dataConn.close(); } catch (_) { /* ignore */ }
       throw new Error(`FTP_DOWNLOAD_FAILED:${retrResp}`);
     }
     
-    // Read data in chunks
+    // Read all data using readAll approach
     const chunks: Uint8Array[] = [];
     let totalSize = 0;
-    const reader = dataConn.readable.getReader();
     
     try {
+      const buf = new Uint8Array(65536); // 64KB buffer
       while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-        totalSize += value.length;
+        const n = await dataConn.read(buf);
+        if (n === null) break;
+        chunks.push(buf.slice(0, n));
+        totalSize += n;
       }
-    } finally {
-      reader.releaseLock();
-      dataConn.close();
+    } catch (e) {
+      console.log(`Read completed or error: ${e}`);
     }
+    
+    // Close data connection safely
+    try { dataConn.close(); } catch (_) { /* ignore */ }
     
     // Wait for transfer complete
     const completeResp = await this.readResponse();
