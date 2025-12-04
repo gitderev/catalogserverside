@@ -16,8 +16,7 @@ interface FileResult {
 interface SuccessResponse {
   status: "ok";
   files: {
-    stockFile: FileResult;
-    priceFile: FileResult;
+    materialFile: FileResult;
   };
 }
 
@@ -27,11 +26,10 @@ interface ErrorResponse {
   message: string;
 }
 
-// TEST: Stock + Price files
-const STOCK_FILE = { ftpName: "StockFileData_790813.txt", folder: "stock", prefix: "StockFileData" };
-const PRICE_FILE = { ftpName: "pricefileData_790813.txt", folder: "price", prefix: "pricefileData" };
+// TEST: ONLY Material file (~100MB)
+const MATERIAL_FILE = { ftpName: "MaterialFile.txt", folder: "material", prefix: "MaterialFile" };
 
-const TIMEOUT_MS = 300000; // 5 minutes
+const TIMEOUT_MS = 600000; // 10 minutes for large file
 const BUCKET_NAME = "ftp-import";
 
 class FTPClient {
@@ -88,7 +86,7 @@ class FTPClient {
     
     this.reader = this.conn.readable.getReader();
     const welcome = await this.readResponse();
-    console.log("Welcome:", welcome);
+    console.log("Connected to FTP");
     
     const { code } = this.parseResponse(welcome);
     if (code !== 220) {
@@ -106,21 +104,20 @@ class FTPClient {
       const passResp = await this.sendCommand(`PASS ${pass}`);
       const { code: passCode } = this.parseResponse(passResp);
       if (passCode !== 230) {
-        throw new Error(`Login failed: ${passResp}`);
+        throw new Error(`Login failed`);
       }
     } else if (userCode !== 230) {
-      throw new Error(`Login failed: ${userResp}`);
+      throw new Error(`Login failed`);
     }
     
-    console.log("Logged in successfully");
+    console.log("Logged in");
   }
 
   async cwd(dir: string): Promise<void> {
-    console.log(`Changing directory to: ${dir}`);
     const resp = await this.sendCommand(`CWD ${dir}`);
     const { code } = this.parseResponse(resp);
     if (code !== 250) {
-      throw new Error(`CWD_FAILED:${resp}`);
+      throw new Error(`CWD_FAILED`);
     }
   }
 
@@ -128,12 +125,12 @@ class FTPClient {
     const resp = await this.sendCommand("PASV");
     const { code } = this.parseResponse(resp);
     if (code !== 227) {
-      throw new Error(`PASV failed: ${resp}`);
+      throw new Error(`PASV failed`);
     }
     
     const match = resp.match(/\((\d+),(\d+),(\d+),(\d+),(\d+),(\d+)\)/);
     if (!match) {
-      throw new Error("Could not parse PASV response");
+      throw new Error("Could not parse PASV");
     }
     
     const host = `${match[1]}.${match[2]}.${match[3]}.${match[4]}`;
@@ -143,141 +140,85 @@ class FTPClient {
   }
 
   async setBinaryMode(): Promise<void> {
-    const resp = await this.sendCommand("TYPE I");
-    const { code } = this.parseResponse(resp);
-    if (code !== 200) {
-      console.warn("Could not set binary mode:", resp);
-    }
+    await this.sendCommand("TYPE I");
   }
 
   async downloadFile(filename: string): Promise<Uint8Array> {
-    console.log(`Downloading file: ${filename}`);
+    console.log(`Downloading: ${filename}`);
     
     await this.setBinaryMode();
     
     const { host, port } = await this.setPassiveMode();
-    console.log(`Passive mode: ${host}:${port}`);
-    
     const dataConn = await Deno.connect({ hostname: host, port });
     
     const retrResp = await this.sendCommand(`RETR ${filename}`);
     const { code: retrCode } = this.parseResponse(retrResp);
     
     if (retrCode === 550) {
-      try { dataConn.close(); } catch (_) { /* ignore */ }
+      try { dataConn.close(); } catch (_) {}
       throw new Error(`FILE_NOT_FOUND:${filename}`);
     }
     
     if (retrCode !== 125 && retrCode !== 150) {
-      try { dataConn.close(); } catch (_) { /* ignore */ }
-      throw new Error(`FTP_DOWNLOAD_FAILED:${retrResp}`);
+      try { dataConn.close(); } catch (_) {}
+      throw new Error(`FTP_DOWNLOAD_FAILED`);
     }
     
-    // Read all data
+    // Read data with minimal memory overhead
     const chunks: Uint8Array[] = [];
     let totalSize = 0;
     
     try {
-      const buf = new Uint8Array(65536); // 64KB buffer
+      const buf = new Uint8Array(131072); // 128KB buffer for faster reading
       while (true) {
         const n = await dataConn.read(buf);
         if (n === null) break;
         chunks.push(buf.slice(0, n));
         totalSize += n;
+        
+        // Log progress every 10MB
+        if (totalSize % 10485760 < 131072) {
+          console.log(`Downloaded: ${Math.round(totalSize / 1048576)} MB`);
+        }
       }
-    } catch (e) {
-      console.log(`Read completed or error: ${e}`);
+    } catch (_e) {
+      // Read complete
     }
     
-    try { dataConn.close(); } catch (_) { /* ignore */ }
+    try { dataConn.close(); } catch (_) {}
     
     // Wait for transfer complete
-    const completeResp = await this.readResponse();
-    const { code: completeCode } = this.parseResponse(completeResp);
-    if (completeCode !== 226 && completeCode !== 250) {
-      console.warn("Unexpected transfer complete response:", completeResp);
-    }
+    try {
+      await this.readResponse();
+    } catch (_) {}
     
-    // Combine chunks
+    // Combine chunks into single buffer
+    console.log(`Combining ${chunks.length} chunks, total: ${totalSize} bytes`);
     const result = new Uint8Array(totalSize);
     let offset = 0;
     for (const chunk of chunks) {
       result.set(chunk, offset);
       offset += chunk.length;
     }
+    
+    // Clear chunks immediately
     chunks.length = 0;
     
-    console.log(`Downloaded ${filename}: ${totalSize} bytes`);
+    console.log(`Download complete: ${totalSize} bytes`);
     return result;
   }
 
   async close(): Promise<void> {
     if (this.conn) {
-      try { await this.sendCommand("QUIT"); } catch (_e) { /* ignore */ }
+      try { await this.sendCommand("QUIT"); } catch (_) {}
       if (this.reader) {
-        try { this.reader.releaseLock(); } catch (_e) { /* ignore */ }
+        try { this.reader.releaseLock(); } catch (_) {}
       }
-      try { this.conn.close(); } catch (_e) { /* ignore */ }
+      try { this.conn.close(); } catch (_) {}
       this.conn = null;
       this.reader = null;
     }
   }
-}
-
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, errorCode: string): Promise<T> {
-  let timeoutId: number;
-  const timeoutPromise = new Promise<never>((_, reject) => {
-    timeoutId = setTimeout(() => reject(new Error(`${errorCode}:Timeout`)), timeoutMs);
-  });
-  try {
-    const result = await Promise.race([promise, timeoutPromise]);
-    clearTimeout(timeoutId!);
-    return result;
-  } catch (e) {
-    clearTimeout(timeoutId!);
-    throw e;
-  }
-}
-
-// Helper to download and upload a single file
-async function processFile(
-  client: FTPClient,
-  supabase: ReturnType<typeof createClient>,
-  fileConfig: { ftpName: string; folder: string; prefix: string },
-  timestamp: number
-): Promise<FileResult> {
-  console.log(`Processing: ${fileConfig.ftpName}`);
-  
-  // Download from FTP
-  const fileBuffer = await withTimeout(client.downloadFile(fileConfig.ftpName), TIMEOUT_MS, "FTP_TIMEOUT");
-  const fileSize = fileBuffer.length;
-  console.log(`Downloaded: ${fileSize} bytes`);
-  
-  // Upload to Storage
-  const newFilename = `${fileConfig.prefix}_${timestamp}.txt`;
-  const storagePath = `${fileConfig.folder}/${newFilename}`;
-  
-  console.log(`Uploading to: ${storagePath}`);
-  
-  const { error: uploadError } = await supabase.storage
-    .from(BUCKET_NAME)
-    .upload(storagePath, fileBuffer, { contentType: "text/plain", upsert: true });
-  
-  if (uploadError) {
-    throw new Error(`STORAGE_ERROR:${uploadError.message}`);
-  }
-  
-  console.log(`Uploaded successfully`);
-  
-  // Get public URL
-  const { data: urlData } = supabase.storage.from(BUCKET_NAME).getPublicUrl(storagePath);
-  
-  return {
-    filename: newFilename,
-    path: storagePath,
-    url: urlData.publicUrl,
-    size: fileSize,
-  };
 }
 
 serve(async (req) => {
@@ -304,7 +245,7 @@ serve(async (req) => {
     const supabaseUrl = Deno.env.get('SUPABASE_URL');
     const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
 
-    console.log(`FTP Config: host=${ftpHost ? 'SET' : 'UNSET'}, port=${ftpPort}, dir=${ftpInputDir}`);
+    console.log(`TEST: Material file only`);
 
     if (!ftpHost || !ftpUser || !ftpPass) {
       return new Response(
@@ -323,67 +264,76 @@ serve(async (req) => {
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
     client = new FTPClient(ftpUseTLS);
 
-    await withTimeout(client.connect(ftpHost, ftpPort), TIMEOUT_MS, "FTP_TIMEOUT");
-    await withTimeout(client.login(ftpUser, ftpPass), TIMEOUT_MS, "FTP_TIMEOUT");
-
-    try {
-      await withTimeout(client.cwd(ftpInputDir), TIMEOUT_MS, "FTP_TIMEOUT");
-    } catch (e) {
-      const errMsg = e instanceof Error ? e.message : String(e);
-      if (errMsg.includes("CWD_FAILED") || errMsg.includes("550")) {
-        return new Response(
-          JSON.stringify({ status: "error", code: "FTP_DIR_NOT_FOUND", message: `Directory ${ftpInputDir} not found` } as ErrorResponse),
-          { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-      throw e;
-    }
+    await client.connect(ftpHost, ftpPort);
+    await client.login(ftpUser, ftpPass);
+    await client.cwd(ftpInputDir);
 
     const timestamp = Date.now();
 
-    // Process Stock file first (smaller ~6MB)
-    let stockResult: FileResult;
+    // Download Material file
+    console.log(`Processing ONLY Material file: ${MATERIAL_FILE.ftpName}`);
+    
+    let fileBuffer: Uint8Array;
     try {
-      stockResult = await processFile(client, supabase, STOCK_FILE, timestamp);
+      fileBuffer = await client.downloadFile(MATERIAL_FILE.ftpName);
     } catch (e) {
       const errMsg = e instanceof Error ? e.message : String(e);
       if (errMsg.includes("FILE_NOT_FOUND")) {
         return new Response(
-          JSON.stringify({ status: "error", code: "FILE_NOT_FOUND", message: `Stock file not found` } as ErrorResponse),
+          JSON.stringify({ status: "error", code: "FILE_NOT_FOUND", message: `Material file not found` } as ErrorResponse),
           { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
       throw e;
     }
 
-    // Process Price file (~50MB)
-    let priceResult: FileResult;
-    try {
-      priceResult = await processFile(client, supabase, PRICE_FILE, timestamp);
-    } catch (e) {
-      const errMsg = e instanceof Error ? e.message : String(e);
-      if (errMsg.includes("FILE_NOT_FOUND")) {
-        return new Response(
-          JSON.stringify({ status: "error", code: "FILE_NOT_FOUND", message: `Price file not found` } as ErrorResponse),
-          { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-      throw e;
-    }
+    const fileSize = fileBuffer.length;
+    console.log(`Material file size: ${fileSize} bytes (${Math.round(fileSize / 1048576)} MB)`);
 
-    // Close FTP connection
+    // Close FTP before upload to free memory
     await client.close();
     client = null;
+    console.log(`FTP connection closed`);
+
+    // Upload to Storage
+    const newFilename = `${MATERIAL_FILE.prefix}_${timestamp}.txt`;
+    const storagePath = `${MATERIAL_FILE.folder}/${newFilename}`;
+    
+    console.log(`Uploading to Storage: ${storagePath}`);
+    
+    const { error: uploadError } = await supabase.storage
+      .from(BUCKET_NAME)
+      .upload(storagePath, fileBuffer, { contentType: "text/plain", upsert: true });
+
+    // Clear buffer immediately after upload
+    fileBuffer = new Uint8Array(0);
+
+    if (uploadError) {
+      console.error(`Upload error:`, uploadError.message);
+      return new Response(
+        JSON.stringify({ status: "error", code: "STORAGE_ERROR", message: uploadError.message } as ErrorResponse),
+        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
+    console.log(`Upload complete`);
+
+    // Get public URL
+    const { data: urlData } = supabase.storage.from(BUCKET_NAME).getPublicUrl(storagePath);
 
     const response: SuccessResponse = {
       status: "ok",
       files: {
-        stockFile: stockResult,
-        priceFile: priceResult,
+        materialFile: {
+          filename: newFilename,
+          path: storagePath,
+          url: urlData.publicUrl,
+          size: fileSize,
+        },
       },
     };
 
-    console.log("All files processed successfully");
+    console.log("Material file processed successfully");
     
     return new Response(
       JSON.stringify(response),
@@ -401,7 +351,7 @@ serve(async (req) => {
     
   } finally {
     if (client) {
-      try { await client.close(); } catch (_e) { /* ignore */ }
+      try { await client.close(); } catch (_) {}
     }
   }
 });
