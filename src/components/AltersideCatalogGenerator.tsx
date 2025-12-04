@@ -774,6 +774,7 @@ const AltersideCatalogGenerator: React.FC = () => {
     setFtpImportLoading(true);
     
     try {
+      // Step 1: Call edge function to download from FTP and upload to Storage
       const res = await fetch(
         "https://hdcniibdblgqkhhgbqtz.supabase.co/functions/v1/import-catalog-ftp",
         {
@@ -794,19 +795,49 @@ const AltersideCatalogGenerator: React.FC = () => {
         return;
       }
 
-      const materialContent = data.files?.materialFile?.content;
-      const priceContent = data.files?.priceFile?.content;
-      const stockContent = data.files?.stockFile?.content;
+      // Validate response contains all file URLs
+      const materialUrl = data.files?.materialFile?.url;
+      const priceUrl = data.files?.priceFile?.url;
+      const stockUrl = data.files?.stockFile?.url;
 
-      if (!materialContent || !priceContent || !stockContent) {
+      if (!materialUrl || !priceUrl || !stockUrl) {
         toast({
           title: "Errore import FTP",
-          description: "La risposta FTP non contiene tutti i file richiesti (Material, Price, Stock).",
+          description: "La risposta FTP non contiene tutti gli URL richiesti (Material, Price, Stock).",
           variant: "destructive"
         });
         return;
       }
 
+      // Step 2: Fetch content from Storage URLs
+      const fetchFileContent = async (url: string, name: string): Promise<string> => {
+        const response = await fetch(url);
+        if (!response.ok) {
+          throw new Error(`Impossibile scaricare ${name} da Storage`);
+        }
+        return await response.text();
+      };
+
+      let materialContent: string;
+      let stockContent: string;
+      let priceContent: string;
+
+      try {
+        [materialContent, stockContent, priceContent] = await Promise.all([
+          fetchFileContent(materialUrl, "Material"),
+          fetchFileContent(stockUrl, "Stock"),
+          fetchFileContent(priceUrl, "Price"),
+        ]);
+      } catch (error) {
+        toast({
+          title: "Errore download file",
+          description: error instanceof Error ? error.message : "Impossibile scaricare i file da Storage.",
+          variant: "destructive"
+        });
+        return;
+      }
+
+      // Step 3: Create virtual File objects
       const materialVirtualFile = new File(
         [materialContent],
         data.files?.materialFile?.filename || "MaterialFile.txt",
@@ -815,16 +846,17 @@ const AltersideCatalogGenerator: React.FC = () => {
 
       const stockVirtualFile = new File(
         [stockContent],
-        data.files?.stockFile?.filename || "StockFileData_790813.txt",
+        data.files?.stockFile?.filename || "StockFileData.txt",
         { type: "text/plain" }
       );
 
       const priceVirtualFile = new File(
         [priceContent],
-        data.files?.priceFile?.filename || "pricefileData_790813.txt",
+        data.files?.priceFile?.filename || "pricefileData.txt",
         { type: "text/plain" }
       );
 
+      // Step 4: Pass to existing handleFileUpload pipeline
       try {
         await handleFileUpload(materialVirtualFile, "material");
       } catch (error) {
