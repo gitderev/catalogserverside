@@ -6,7 +6,8 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Checkbox } from '@/components/ui/checkbox';
 import { toast } from '@/hooks/use-toast';
-import { Upload, Download, FileText, CheckCircle, XCircle, AlertCircle, Clock, Activity, Info } from 'lucide-react';
+import { Upload, Download, FileText, CheckCircle, XCircle, AlertCircle, Clock, Activity, Info, LogOut } from 'lucide-react';
+import { useAuth } from '@/hooks/useAuth';
 import { filterAndNormalizeForEAN, type EANStats, type DiscardedRow } from '@/utils/ean';
 import { forceEANText, exportDiscardedRowsCSV } from '@/utils/excelFormatter';
 import { 
@@ -368,6 +369,7 @@ function computeFinalPrice({
 }
 
 const AltersideCatalogGenerator: React.FC = () => {
+  const { logout } = useAuth();
   const [files, setFiles] = useState<FileUploadState>({
     material: { file: null, status: 'empty' },
     stock: { file: null, status: 'empty' },
@@ -3018,7 +3020,16 @@ const AltersideCatalogGenerator: React.FC = () => {
     <div className="min-h-screen p-6" style={{ background: 'var(--bg)', color: 'var(--fg)' }}>
       <div className="max-w-7xl mx-auto space-y-8">
         {/* Header */}
-        <div className="text-center">
+        <div className="relative text-center">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={logout}
+            className="absolute right-0 top-0"
+          >
+            <LogOut className="h-4 w-4 mr-2" />
+            Esci
+          </Button>
           <h1 className="text-5xl font-bold mb-4">
             Alterside Catalog Generator
           </h1>

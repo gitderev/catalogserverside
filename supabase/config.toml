@@ -2,3 +2,9 @@ project_id = "hdcniibdblgqkhhgbqtz"
 
 [functions.import-catalog-ftp]
 verify_jwt = false
+
+[functions.auth-login]
+verify_jwt = false
+
+[functions.auth-validate]
+verify_jwt = false
