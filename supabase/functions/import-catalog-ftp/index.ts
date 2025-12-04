@@ -322,7 +322,7 @@ serve(async (req) => {
     // Read secrets
     const ftpHost = Deno.env.get('FTP_HOST');
     const ftpUser = Deno.env.get('FTP_USER');
-    const ftpPass = Deno.env.get('FTP_PASS');
+    const ftpPass = Deno.env.get('FTP_PASSWORD');
     const ftpPort = parseInt(Deno.env.get('FTP_PORT') || '21');
     const ftpInputDir = Deno.env.get('FTP_INPUT_DIR') || '/';
     const ftpUseTLS = Deno.env.get('FTP_USE_TLS') === 'true';
@@ -336,7 +336,7 @@ serve(async (req) => {
         JSON.stringify({ 
           status: "error", 
           code: "CONFIG_MISSING", 
-          message: "Required FTP configuration is missing. Please ensure FTP_HOST, FTP_USER, and FTP_PASS secrets are configured." 
+          message: "Required FTP configuration is missing. Please ensure FTP_HOST, FTP_USER, and FTP_PASSWORD secrets are configured." 
         } as ErrorResponse),
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
