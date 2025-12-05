@@ -2303,17 +2303,30 @@ const AltersideCatalogGenerator: React.FC = () => {
         // La conversione avviene da stringa con virgola (es. "175,99") a numero (175.99).
         // =====================================================================
         
-        // Parse price from EAN catalog "Prezzo Finale" field (string with comma -> number with dot)
+        // =====================================================================
+        // PREZZO FINALE DA CATALOGO EAN - SOLA LETTURA, NESSUN RICALCOLO
+        // Il valore viene letto ESATTAMENTE come è nel Catalogo EAN.
+        // Unica trasformazione: virgola -> punto e conversione a numero.
+        // NON usare Math.ceil, Math.floor, Math.round, toFixed, parseInt.
+        // =====================================================================
         const prezzoFinaleRaw = record['Prezzo Finale'];
-        const toPriceNumber = (raw: unknown): number | null => {
-          if (raw == null) return null;
-          const s = String(raw).trim().replace(',', '.');
-          if (!s) return null;
-          const n = Number(s);
-          return Number.isFinite(n) ? n : null;
-        };
+        let prezzoFinaleNumber: number | null = null;
         
-        const prezzoFinaleNumber = toPriceNumber(prezzoFinaleRaw);
+        if (prezzoFinaleRaw != null) {
+          // Se già numero, usalo direttamente
+          if (typeof prezzoFinaleRaw === 'number' && Number.isFinite(prezzoFinaleRaw)) {
+            prezzoFinaleNumber = prezzoFinaleRaw;
+          } else {
+            // Se stringa con virgola (es. "1238,99"), sostituisci e converti
+            const s = String(prezzoFinaleRaw).trim().replace(',', '.');
+            if (s) {
+              const n = parseFloat(s);
+              if (Number.isFinite(n)) {
+                prezzoFinaleNumber = n;
+              }
+            }
+          }
+        }
         
         // Validate price exists and is valid
         if (prezzoFinaleNumber === null || prezzoFinaleNumber <= 0) {
