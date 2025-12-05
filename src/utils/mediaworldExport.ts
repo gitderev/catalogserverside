@@ -12,31 +12,72 @@ import * as XLSX from 'xlsx';
  * si riflette automaticamente anche nell'export Mediaworld.
  */
 
-// Mediaworld template column structure - Italian headers only (exact order from template)
-const MEDIAWORLD_HEADERS_ITALIAN = [
-  'SKU offerta',
-  'ID Prodotto',
-  'Tipo ID prodotto',
-  'Descrizione offerta',
-  'Descrizione interna offerta',
-  "Prezzo dell'offerta",
-  'Info aggiuntive prezzo offerta',
-  "Quantità dell'offerta",
-  'Avviso quantità minima',
-  "Stato dell'offerta",
-  'Data di inizio della disponibilità',
-  'Data di conclusione della disponibilità',
-  'Classe logistica',
-  'Prezzo scontato',
-  'Data di inizio dello sconto',
-  'Data di termine dello sconto',
-  'Tempo di preparazione della spedizione (in giorni)',
-  'Aggiorna/Cancella',
-  'Tipo di prezzo che verrà barrato quando verrà definito un prezzo scontato.',
-  'Obbligo di ritiro RAEE',
-  'Orario di cut-off (solo se la consegna il giorno successivo è abilitata)',
-  'VAT Rate % (Turkey only)'
-];
+// =====================================================================
+// TEMPLATE MEDIAWORLD UFFICIALE: Struttura e validazione
+// Questi valori devono corrispondere esattamente al template ufficiale
+// "mediaworld-template.xlsx"
+// =====================================================================
+const MEDIAWORLD_TEMPLATE = {
+  sheetName: "Data",
+  headers: [
+    'SKU offerta',
+    'ID Prodotto',
+    'Tipo ID prodotto',
+    'Descrizione offerta',
+    'Descrizione interna offerta',
+    "Prezzo dell'offerta",
+    'Info aggiuntive prezzo offerta',
+    "Quantità dell'offerta",
+    'Avviso quantità minima',
+    "Stato dell'offerta",
+    'Data di inizio della disponibilità',
+    'Data di conclusione della disponibilità',
+    'Classe logistica',
+    'Prezzo scontato',
+    'Data di inizio dello sconto',
+    'Data di termine dello sconto',
+    'Tempo di preparazione della spedizione (in giorni)',
+    'Aggiorna/Cancella',
+    'Tipo di prezzo che verrà barrato quando verrà definito un prezzo scontato.',
+    'Obbligo di ritiro RAEE',
+    'Orario di cut-off (solo se la consegna il giorno successivo è abilitata)',
+    'VAT Rate % (Turkey only)'
+  ],
+  columnCount: 22,
+  fixedValues: {
+    "Tipo ID prodotto": "EAN",
+    "Stato dell'offerta": "Nuovo",
+    "Classe logistica": "Consegna gratuita",
+    "Tipo di prezzo che verrà barrato quando verrà definito un prezzo scontato.": "recommended-retail-price"
+  },
+  validations: {
+    'SKU offerta': { type: "string", required: true, minLength: 1, maxLength: 40 },
+    'ID Prodotto': { type: "string", required: true, pattern: /^\d{12,14}$/ },
+    'Tipo ID prodotto': { type: "string", required: true, value: "EAN" },
+    'Descrizione offerta': { type: "string", required: false },
+    'Descrizione interna offerta': { type: "string", required: false },
+    "Prezzo dell'offerta": { type: "number", required: true, min: 1, max: 100000, decimals: 2 },
+    'Info aggiuntive prezzo offerta': { type: "string", required: false },
+    "Quantità dell'offerta": { type: "integer", required: true, min: 1 },
+    'Avviso quantità minima': { type: "string", required: false },
+    "Stato dell'offerta": { type: "string", required: true, value: "Nuovo" },
+    'Data di inizio della disponibilità': { type: "string", required: false },
+    'Data di conclusione della disponibilità': { type: "string", required: false },
+    'Classe logistica': { type: "string", required: true, value: "Consegna gratuita" },
+    'Prezzo scontato': { type: "number", required: true, min: 1, max: 100000, decimals: 2 },
+    'Data di inizio dello sconto': { type: "string", required: false },
+    'Data di termine dello sconto': { type: "string", required: false },
+    'Tempo di preparazione della spedizione (in giorni)': { type: "integer", required: true, min: 0, max: 365 },
+    'Aggiorna/Cancella': { type: "string", required: false },
+    'Tipo di prezzo che verrà barrato quando verrà definito un prezzo scontato.': { type: "string", required: true, value: "recommended-retail-price" },
+    'Obbligo di ritiro RAEE': { type: "string", required: false },
+    'Orario di cut-off (solo se la consegna il giorno successivo è abilitata)': { type: "string", required: false },
+    'VAT Rate % (Turkey only)': { type: "string", required: false }
+  }
+};
+
+// Keep MEDIAWORLD_HEADERS_ITALIAN for backward compatibility
+const MEDIAWORLD_HEADERS_ITALIAN = MEDIAWORLD_TEMPLATE.headers;
 
 interface MediaworldExportParams {
   processedData: any[];
@@ -53,6 +94,166 @@ interface ValidationError {
   sku: string;
   field: string;
   reason: string;
+}
+
+interface TemplateValidation {
+  type: "string" | "number" | "integer";
+  required: boolean;
+  minLength?: number;
+  maxLength?: number;
+  pattern?: RegExp;
+  value?: string | number;
+  min?: number;
+  max?: number;
+  decimals?: number;
+}
+
+/**
+ * Validate Mediaworld file structure against official template
+ */
+function validateMediaworldStructure(
+  ws: XLSX.WorkSheet,
+  sheetName: string
+): { isValid: boolean; errors: string[]; warnings: string[] } {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+
+  // 1. Validate sheet name
+  if (sheetName !== MEDIAWORLD_TEMPLATE.sheetName) {
+    warnings.push(`Nome foglio: "${sheetName}" invece di "${MEDIAWORLD_TEMPLATE.sheetName}"`);
+  }
+
+  // 2. Validate sheet exists and has data
+  if (!ws['!ref']) {
+    errors.push("Foglio vuoto o non valido");
+    return { isValid: false, errors, warnings };
+  }
+
+  const range = XLSX.utils.decode_range(ws['!ref']);
+  
+  // 3. Validate column count
+  const actualColumnCount = range.e.c - range.s.c + 1;
+  if (actualColumnCount !== MEDIAWORLD_TEMPLATE.columnCount) {
+    errors.push(`Numero colonne: ${actualColumnCount} invece di ${MEDIAWORLD_TEMPLATE.columnCount}`);
+  }
+
+  // 4. Validate headers (row 0)
+  const actualHeaders: string[] = [];
+  for (let C = range.s.c; C <= range.e.c; C++) {
+    const addr = XLSX.utils.encode_cell({ r: 0, c: C });
+    const cell = ws[addr];
+    actualHeaders.push(cell?.v?.toString() || '');
+  }
+
+  // Check header order and names
+  for (let i = 0; i < MEDIAWORLD_TEMPLATE.headers.length; i++) {
+    const expected = MEDIAWORLD_TEMPLATE.headers[i];
+    const actual = actualHeaders[i] || '';
+    if (actual !== expected) {
+      errors.push(`Header colonna ${i + 1}: "${actual}" invece di "${expected}"`);
+    }
+  }
+
+  // 5. Validate data rows
+  const rowCount = range.e.r - range.s.r; // excluding header
+  if (rowCount === 0) {
+    errors.push("Nessuna riga dati presente");
+    return { isValid: false, errors, warnings };
+  }
+
+  // Sample validation of first 5 data rows
+  const sampleSize = Math.min(5, rowCount);
+  for (let R = 1; R <= sampleSize; R++) {
+    const rowNum = R + 1; // Excel row number (1-indexed + header)
+    
+    // Validate each column
+    for (let C = 0; C < MEDIAWORLD_TEMPLATE.headers.length; C++) {
+      const colName = MEDIAWORLD_TEMPLATE.headers[C];
+      const addr = XLSX.utils.encode_cell({ r: R, c: C });
+      const cell = ws[addr];
+      const validation = MEDIAWORLD_TEMPLATE.validations[colName as keyof typeof MEDIAWORLD_TEMPLATE.validations] as TemplateValidation | undefined;
+      
+      if (!validation) continue;
+
+      const value = cell?.v;
+
+      // Required check
+      if (validation.required && (value === undefined || value === null || value === '')) {
+        errors.push(`Riga ${rowNum}, ${colName}: valore mancante`);
+        continue;
+      }
+
+      // Skip validation for empty non-required fields
+      if (!validation.required && (value === undefined || value === null || value === '')) {
+        continue;
+      }
+
+      // Type validation
+      if (validation.type === 'number') {
+        if (typeof value !== 'number' || !Number.isFinite(value)) {
+          errors.push(`Riga ${rowNum}, ${colName}: deve essere un numero (trovato: ${typeof value})`);
+        } else {
+          if (validation.min !== undefined && value < validation.min) {
+            errors.push(`Riga ${rowNum}, ${colName}: valore ${value} sotto il minimo ${validation.min}`);
+          }
+          if (validation.max !== undefined && value > validation.max) {
+            errors.push(`Riga ${rowNum}, ${colName}: valore ${value} sopra il massimo ${validation.max}`);
+          }
+        }
+      } else if (validation.type === 'integer') {
+        if (typeof value !== 'number' || !Number.isInteger(value)) {
+          errors.push(`Riga ${rowNum}, ${colName}: deve essere un intero (trovato: ${value})`);
+        } else {
+          if (validation.min !== undefined && value < validation.min) {
+            errors.push(`Riga ${rowNum}, ${colName}: valore ${value} sotto il minimo ${validation.min}`);
+          }
+          if (validation.max !== undefined && value > validation.max) {
+            errors.push(`Riga ${rowNum}, ${colName}: valore ${value} sopra il massimo ${validation.max}`);
+          }
+        }
+      } else if (validation.type === 'string') {
+        if (validation.pattern && typeof value === 'string') {
+          if (!validation.pattern.test(value)) {
+            errors.push(`Riga ${rowNum}, ${colName}: formato non valido (${value})`);
+          }
+        }
+        if (validation.maxLength !== undefined && typeof value === 'string' && value.length > validation.maxLength) {
+          errors.push(`Riga ${rowNum}, ${colName}: lunghezza ${value.length} supera il massimo ${validation.maxLength}`);
+        }
+      }
+
+      // Fixed value validation
+      if (validation.value !== undefined) {
+        if (value !== validation.value) {
+          errors.push(`Riga ${rowNum}, ${colName}: valore "${value}" invece di "${validation.value}"`);
+        }
+      }
+    }
+  }
+
+  // 6. Check price columns format (should be number with 2 decimals)
+  const priceColumns = ["Prezzo dell'offerta", "Prezzo scontato"];
+  for (const priceCol of priceColumns) {
+    const priceColIndex = MEDIAWORLD_TEMPLATE.headers.indexOf(priceCol);
+    if (priceColIndex >= 0) {
+      for (let R = 1; R <= Math.min(3, rowCount); R++) {
+        const addr = XLSX.utils.encode_cell({ r: R, c: priceColIndex });
+        const cell = ws[addr];
+        if (cell && cell.t !== 'n') {
+          warnings.push(`Riga ${R + 1}, ${priceCol}: tipo cella "${cell.t}" invece di "n" (numero)`);
+        }
+        if (cell && cell.z !== '0.00') {
+          warnings.push(`Riga ${R + 1}, ${priceCol}: formato "${cell.z || 'default'}" invece di "0.00"`);
+        }
+      }
+    }
+  }
+
+  return {
+    isValid: errors.length === 0,
+    errors,
+    warnings
+  };
 }
 
 /**
@@ -316,6 +517,26 @@ export async function exportMediaworldCatalog({
     }
     
     XLSX.utils.book_append_sheet(wb, dataSheet, 'Data');
+    
+    // =====================================================================
+    // VALIDAZIONE AUTOMATICA: Verifica struttura conforme al template
+    // ufficiale Mediaworld prima del download
+    // =====================================================================
+    const structureValidation = validateMediaworldStructure(dataSheet, 'Data');
+    
+    if (!structureValidation.isValid) {
+      console.error('Mediaworld template validation FAILED:', structureValidation.errors);
+      return {
+        success: false,
+        error: `File non conforme al template Mediaworld: ${structureValidation.errors.join('; ')}`,
+        validationErrors,
+        skippedCount
+      };
+    }
+    
+    if (structureValidation.warnings.length > 0) {
+      console.warn('Mediaworld template validation warnings:', structureValidation.warnings);
+    }
     
     // Sheet 2: ReferenceData (copy from template exactly as-is)
     if (referenceDataSheet) {
