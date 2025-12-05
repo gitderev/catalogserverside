@@ -64,7 +64,7 @@ const MEDIAWORLD_TEMPLATE = {
     'Data di inizio della disponibilità': { type: "string", required: false },
     'Data di conclusione della disponibilità': { type: "string", required: false },
     'Classe logistica': { type: "string", required: true, value: "Consegna gratuita" },
-    'Prezzo scontato': { type: "number", required: true, min: 1, max: 100000, decimals: 2 },
+    'Prezzo scontato': { type: "number", required: true, min: 1, decimals: 2 },
     'Data di inizio dello sconto': { type: "string", required: false },
     'Data di termine dello sconto': { type: "string", required: false },
     'Tempo di preparazione della spedizione (in giorni)': { type: "integer", required: true, min: 0, max: 365 },
@@ -402,17 +402,8 @@ export async function exportMediaworldCatalog({
         return;
       }
       
-      // Price range validation (between 1€ and 100000€)
-      if (prezzoFinale < 1 || prezzoFinale > 100000) {
-        validationErrors.push({
-          row: index + 1,
-          sku,
-          field: 'Prezzo scontato',
-          reason: `Prezzo finale fuori range (${prezzoFinale}): deve essere tra 1€ e 100000€`
-        });
-        skippedCount++;
-        return;
-      }
+      // Nota: Il limite superiore di 100000€ è stato rimosso.
+      // Il controllo prezzoFinale <= 0 è già coperto sopra (linee 394-403).
       
       // Build row according to Mediaworld template mapping
       // All 22 columns in exact order, empty strings for unused fields
