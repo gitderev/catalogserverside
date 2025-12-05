@@ -56,36 +56,26 @@ interface ValidationError {
 }
 
 /**
- * Parse "Prezzo Finale" from EAN catalog format to number
- * Handles both string format "34,99" and numeric format 34.99
+ * Parse price from EAN catalog format to number
+ * Handles both string format "34,99" (with comma) and numeric format 34.99
+ * 
+ * IMPORTANTE: NON arrotonda a interi. Mantiene i decimali originali.
+ * I prezzi Mediaworld devono avere sempre due decimali (es. 175.99, non 176).
  */
-function parsePrezzoFinale(value: any): number | null {
-  if (value === null || value === undefined || value === '') return null;
+function parsePrice(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
   
+  // If already a finite number, return as-is
   if (typeof value === 'number' && Number.isFinite(value)) {
     return value;
   }
   
-  // Handle string format "34,99" -> 34.99
+  // Handle string format: replace comma with dot, then parse
   const str = String(value).trim().replace(',', '.');
+  if (!str) return null;
+  
   const num = parseFloat(str);
   return Number.isFinite(num) ? num : null;
-}
-
-/**
- * Parse "ListPrice con Fee" from EAN catalog
- * This should already be an integer from EAN export
- */
-function parseListPriceConFee(value: any): number | null {
-  if (value === null || value === undefined || value === '') return null;
-  
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    return Math.round(value); // Ensure integer
-  }
-  
-  const str = String(value).trim().replace(',', '.');
-  const num = parseFloat(str);
-  return Number.isFinite(num) ? Math.round(num) : null;
 }
 
 export async function exportMediaworldCatalog({
@@ -187,13 +177,15 @@ export async function exportMediaworldCatalog({
       }
       
       // === GET PRICES FROM ALREADY CALCULATED EAN DATA ===
-      // IMPORTANTE: NON ricalcoliamo i prezzi, usiamo quelli già calcolati
+      // IMPORTANTE: NON ricalcoliamo i prezzi, usiamo DIRETTAMENTE quelli già calcolati nel catalogo EAN.
+      // I prezzi vengono letti come stringhe con virgola (es. "175,99") e convertiti in numeri (175.99).
+      // NON viene applicato alcun arrotondamento a interi.
       
       // "ListPrice con Fee" - already calculated in EAN pipeline
-      const listPriceConFee = parseListPriceConFee(record['ListPrice con Fee']);
+      const listPriceConFee = parsePrice(record['ListPrice con Fee']);
       
       // "Prezzo Finale" - already calculated in EAN pipeline (format "NN,99" or number)
-      const prezzoFinale = parsePrezzoFinale(record['Prezzo Finale']);
+      const prezzoFinale = parsePrice(record['Prezzo Finale']);
       
       // Validate prices are available
       if (listPriceConFee === null || listPriceConFee <= 0) {
@@ -306,9 +298,21 @@ export async function exportMediaworldCatalog({
         }
       }
       
-      // NOTE: Prezzo dell'offerta (col 5) and Prezzo scontato (col 13) 
-      // are kept as NUMBERS, not formatted as text
-      // This ensures Excel treats them as numeric values with decimal points
+      // Format price columns with "0.00" to ensure two decimal places
+      // Column indices: Prezzo dell'offerta (5) and Prezzo scontato (13)
+      const priceCols = [5, 13];
+      
+      for (let R = 1; R <= range.e.r; R++) {
+        for (const C of priceCols) {
+          const addr = XLSX.utils.encode_cell({ r: R, c: C });
+          const cell = dataSheet[addr];
+          if (cell && typeof cell.v === 'number') {
+            cell.t = 'n'; // number type
+            cell.z = '0.00'; // format with 2 decimal places
+            dataSheet[addr] = cell;
+          }
+        }
+      }
     }
     
     XLSX.utils.book_append_sheet(wb, dataSheet, 'Data');
