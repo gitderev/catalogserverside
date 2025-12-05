@@ -1935,7 +1935,23 @@ const AltersideCatalogGenerator: React.FC = () => {
       // come UNICA FONTE DI VERITÀ per tutti gli export.
       // =====================================================================
       setEanCatalogDataset(cleanDataset);
+      
+      // LOG CRITICO: verifica che i dati salvati siano nel formato corretto
+      console.warn('=== EAN CATALOG DATASET SALVATO ===');
       console.warn('eanCatalogDataset:saved', { rows: cleanDataset.length });
+      
+      // Log primi 10 record per verifica formato prezzi
+      cleanDataset.slice(0, 10).forEach((record: any, idx: number) => {
+        console.warn(`eanCatalogDataset:saved:row${idx}`, {
+          EAN: record.EAN,
+          ManufPartNr: record.ManufPartNr,
+          'Prezzo Finale': record['Prezzo Finale'],
+          'Prezzo Finale type': typeof record['Prezzo Finale'],
+          'ListPrice con Fee': record['ListPrice con Fee'],
+          'ListPrice con Fee type': typeof record['ListPrice con Fee'],
+          ExistingStock: record.ExistingStock
+        });
+      });
       
       // Create worksheet from clean dataset
       const ws = XLSX.utils.json_to_sheet(cleanDataset, { skipHeader: false });
@@ -2273,20 +2289,40 @@ const AltersideCatalogGenerator: React.FC = () => {
         return;
       }
       
-      // Usa direttamente il dataset del Catalogo EAN (già filtrato per EAN validi)
-      const eanFilteredData = eanCatalogDataset.filter((record: any) => record.EAN && String(record.EAN).length >= 12);
+      // =====================================================================
+      // USA DIRETTAMENTE eanCatalogDataset SENZA ULTERIORI FILTRI
+      // Questo dataset è già filtrato durante la generazione del Catalogo EAN.
+      // NON usare currentProcessedData o altre fonti dati.
+      // =====================================================================
       
-      // Log di debug per verificare la fonte dati
-      console.warn('eprice:source', { 
-        usingEanCatalogDataset: true, 
-        totalRows: eanCatalogDataset.length,
-        filteredRows: eanFilteredData.length 
+      // CRITICAL LOG: Verifica la fonte dati
+      console.warn('=== EPRICE EXPORT: VERIFICA FONTE DATI ===');
+      console.warn('eprice:source:check', { 
+        eanCatalogDataset_length: eanCatalogDataset.length,
+        eanCatalogDataset_exists: !!eanCatalogDataset,
+        eanCatalogDataset_isArray: Array.isArray(eanCatalogDataset)
       });
+      
+      // Log primi 3 record per debug
+      eanCatalogDataset.slice(0, 3).forEach((record: any, idx: number) => {
+        console.warn(`eprice:source:sample${idx}`, {
+          EAN: record.EAN,
+          ManufPartNr: record.ManufPartNr,
+          'Prezzo Finale': record['Prezzo Finale'],
+          'Prezzo Finale type': typeof record['Prezzo Finale'],
+          ExistingStock: record.ExistingStock
+        });
+      });
+      
+      // USA DIRETTAMENTE IL DATASET - già filtrato in onExportEAN
+      const eanFilteredData = eanCatalogDataset;
+      
+      console.warn('eprice:rows_to_export', { count: eanFilteredData.length });
       
       if (eanFilteredData.length === 0) {
         toast({
           title: "Nessuna riga valida per ePrice",
-          description: "Non ci sono record con EAN validi da esportare",
+          description: "Non ci sono record con EAN validi da esportare. Genera prima il Catalogo EAN.",
           variant: "destructive"
         });
         setIsExportingEprice(false);
@@ -2368,13 +2404,15 @@ const AltersideCatalogGenerator: React.FC = () => {
           }
         }
         
-        // LOG DI DEBUG per i primi 5 record - verifica coerenza prezzi
-        if (index < 5) {
-          console.warn(`eprice:debug:row${index}`, {
+        // LOG DI DEBUG per i primi 10 record - verifica COMPLETA coerenza prezzi
+        if (index < 10) {
+          console.warn(`eprice:export:row${index}`, {
             EAN: ean,
             SKU: sku,
-            'Prezzo Finale RAW (from eanCatalogDataset)': prezzoFinaleRaw,
-            'Prezzo Finale NUMBER (after conversion)': prezzoFinaleNumber,
+            'Prezzo Finale RAW': prezzoFinaleRaw,
+            'Prezzo Finale RAW type': typeof prezzoFinaleRaw,
+            'Prezzo Finale NUMBER': prezzoFinaleNumber,
+            'Prezzo Finale NUMBER toFixed(2)': prezzoFinaleNumber?.toFixed(2),
             ExistingStock: quantity
           });
         }
@@ -2384,16 +2422,25 @@ const AltersideCatalogGenerator: React.FC = () => {
           rowErrors.push(`Riga ${index + 1}: Prezzo Finale mancante o non valido (SKU: ${sku}, raw: ${prezzoFinaleRaw})`);
         }
         
-        // Warning per prezzi molto alti (informativo, non bloccante)
-        if (prezzoFinaleNumber !== null && prezzoFinaleNumber > 100000) {
-          validationWarnings.push(`Riga ${index + 1}: Prezzo finale molto alto (${prezzoFinaleNumber}€) - verificare correttezza`);
-        }
-        
         // If there are critical errors for this row, skip it
         if (rowErrors.length > 0) {
           validationErrors.push(...rowErrors);
           skippedCount++;
           return; // Skip this row
+        }
+        
+        // VERIFICA FINALE: il prezzo deve terminare con .99
+        if (prezzoFinaleNumber !== null) {
+          const cents = Math.round(prezzoFinaleNumber * 100) % 100;
+          if (cents !== 99 && index < 20) {
+            console.warn(`eprice:warning:not99`, {
+              row: index,
+              EAN: ean,
+              prezzoFinale: prezzoFinaleNumber,
+              cents: cents,
+              raw: prezzoFinaleRaw
+            });
+          }
         }
         
         // Build row with exact template structure and fixed values
@@ -2402,7 +2449,7 @@ const AltersideCatalogGenerator: React.FC = () => {
           ean,                                        // product-id
           EPRICE_TEMPLATE.fixedValues["product-id-type"], // product-id-type = "EAN"
           prezzoFinaleNumber ?? 0,                    // price (NUMBER with dot, e.g., 175.99)
-          quantity,                                   // quantity
+          quantity,                                   // quantity - ESATTO dal Catalogo EAN
           EPRICE_TEMPLATE.fixedValues["state"],       // state = 11
           prepDays,                                   // fulfillment-latency
           EPRICE_TEMPLATE.fixedValues["logistic-class"] // logistic-class = "K"
@@ -2478,18 +2525,27 @@ const AltersideCatalogGenerator: React.FC = () => {
       // =====================================================================
       const validationResult = validateEpriceStructure(ws, EPRICE_TEMPLATE.sheetName);
       
-      // Build validation report for UI
+      // Build validation report for UI - USA eanCatalogDataset NON currentProcessedData
       const validationReport: ExportValidationResult = {
         exportType: 'ePrice',
         timestamp: new Date(),
         success: validationResult.isValid,
-        totalRows: currentProcessedData.length,
+        totalRows: eanCatalogDataset.length, // CORRETTO: usa eanCatalogDataset
         validRows: aoa.length - 1,
         skippedRows: skippedCount,
         errors: validationErrors.map(e => ({ row: 0, field: '', reason: e })),
         warnings: [...validationWarnings, ...validationResult.warnings],
         structureErrors: validationResult.errors
       };
+      
+      // LOG FINALE: riepilogo export
+      console.warn('=== EPRICE EXPORT COMPLETATO ===');
+      console.warn('eprice:export:summary', {
+        sourceDataset: 'eanCatalogDataset',
+        sourceRows: eanCatalogDataset.length,
+        exportedRows: aoa.length - 1,
+        skippedRows: skippedCount
+      });
       
       if (!validationResult.isValid) {
         console.error("Errori struttura template ePrice:", validationResult.errors);
@@ -2585,19 +2641,26 @@ const AltersideCatalogGenerator: React.FC = () => {
       return;
     }
     
-    // Log di debug per verificare la fonte dati
-    console.warn('mediaworld:source', { 
-      usingEanCatalogDataset: true, 
-      totalRows: eanCatalogDataset.length 
+    // CRITICAL LOG: Verifica COMPLETA della fonte dati
+    console.warn('=== MEDIAWORLD EXPORT: VERIFICA FONTE DATI ===');
+    console.warn('mediaworld:source:check', { 
+      eanCatalogDataset_length: eanCatalogDataset.length,
+      eanCatalogDataset_exists: !!eanCatalogDataset,
+      eanCatalogDataset_isArray: Array.isArray(eanCatalogDataset)
     });
     
-    // Log di debug per i primi 5 record
-    eanCatalogDataset.slice(0, 5).forEach((record: any, idx: number) => {
-      console.warn(`mediaworld:debug:row${idx}`, {
+    // Log primi 10 record per debug COMPLETO
+    eanCatalogDataset.slice(0, 10).forEach((record: any, idx: number) => {
+      const prezzoFinaleRaw = record['Prezzo Finale'];
+      const listPriceConFeeRaw = record['ListPrice con Fee'];
+      
+      console.warn(`mediaworld:source:row${idx}`, {
         EAN: record.EAN,
         SKU: record.ManufPartNr,
-        'Prezzo Finale RAW': record['Prezzo Finale'],
-        'ListPrice con Fee RAW': record['ListPrice con Fee'],
+        'Prezzo Finale RAW': prezzoFinaleRaw,
+        'Prezzo Finale type': typeof prezzoFinaleRaw,
+        'ListPrice con Fee RAW': listPriceConFeeRaw,
+        'ListPrice con Fee type': typeof listPriceConFeeRaw,
         ExistingStock: record.ExistingStock
       });
     });
@@ -2615,11 +2678,23 @@ const AltersideCatalogGenerator: React.FC = () => {
     setIsExportingMediaworld(true);
     
     try {
-      // USA eanCatalogDataset come fonte unica invece di currentProcessedData
+      // USA eanCatalogDataset come fonte unica
+      console.warn('mediaworld:export:start', { rows: eanCatalogDataset.length });
+      
       const result = await exportMediaworldCatalog({
         processedData: eanCatalogDataset,
         feeConfig,
         prepDays: prepDaysMediaworld
+      });
+      
+      // LOG FINALE: riepilogo export
+      console.warn('=== MEDIAWORLD EXPORT COMPLETATO ===');
+      console.warn('mediaworld:export:summary', {
+        sourceDataset: 'eanCatalogDataset',
+        sourceRows: eanCatalogDataset.length,
+        exportedRows: result.rowCount ?? 0,
+        skippedRows: result.skippedCount ?? 0,
+        success: result.success
       });
       
       // Build validation report for UI

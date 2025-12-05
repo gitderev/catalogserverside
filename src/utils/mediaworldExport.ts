@@ -312,6 +312,9 @@ export async function exportMediaworldCatalog({
     // Row 1: Italian headers ONLY (no technical codes row)
     const dataRows: (string | number)[][] = [MEDIAWORLD_HEADERS_ITALIAN];
     
+    // Log per debug: tracciamento conversione prezzi
+    let debugLogCount = 0;
+    
     // Process each record from EAN catalog data
     processedData.forEach((record, index) => {
       const sku = record.ManufPartNr || '';
@@ -374,10 +377,29 @@ export async function exportMediaworldCatalog({
       // NON viene applicato alcun arrotondamento a interi.
       
       // "ListPrice con Fee" - already calculated in EAN pipeline
-      const listPriceConFee = parsePrice(record['ListPrice con Fee']);
+      const listPriceConFeeRaw = record['ListPrice con Fee'];
+      const listPriceConFee = parsePrice(listPriceConFeeRaw);
       
       // "Prezzo Finale" - already calculated in EAN pipeline (format "NN,99" or number)
-      const prezzoFinale = parsePrice(record['Prezzo Finale']);
+      const prezzoFinaleRaw = record['Prezzo Finale'];
+      const prezzoFinale = parsePrice(prezzoFinaleRaw);
+      
+      // LOG DI DEBUG per i primi 10 record - traccia COMPLETA della conversione
+      if (debugLogCount < 10) {
+        console.warn(`mediaworld:price:conversion:row${index}`, {
+          EAN: ean,
+          SKU: sku,
+          'Prezzo Finale RAW': prezzoFinaleRaw,
+          'Prezzo Finale RAW type': typeof prezzoFinaleRaw,
+          'Prezzo Finale PARSED': prezzoFinale,
+          'Prezzo Finale PARSED toFixed(2)': prezzoFinale?.toFixed(2),
+          'ListPrice con Fee RAW': listPriceConFeeRaw,
+          'ListPrice con Fee RAW type': typeof listPriceConFeeRaw,
+          'ListPrice con Fee PARSED': listPriceConFee,
+          ExistingStock: existingStock
+        });
+        debugLogCount++;
+      }
       
       // Validate prices are available
       if (listPriceConFee === null || listPriceConFee <= 0) {
@@ -415,13 +437,13 @@ export async function exportMediaworldCatalog({
         '',                                          // Col 5: Descrizione interna offerta → vuoto
         listPriceConFee,                             // Col 6: Prezzo dell'offerta → ListPrice con Fee (NUMBER)
         '',                                          // Col 7: Info aggiuntive prezzo offerta → vuoto
-        stockValue,                                  // Col 8: Quantità dell'offerta → ExistingStock (valore esatto dal Catalogo EAN)
+        stockValue,                                  // Col 8: Quantità dell'offerta → ExistingStock ESATTO
         '',                                          // Col 9: Avviso quantità minima → vuoto
         'Nuovo',                                     // Col 10: Stato dell'offerta → "Nuovo" (fixed)
         '',                                          // Col 11: Data di inizio disponibilità → vuoto
         '',                                          // Col 12: Data di conclusione disponibilità → vuoto
         'Consegna gratuita',                         // Col 13: Classe logistica → "Consegna gratuita"
-        prezzoFinale,                                // Col 14: Prezzo scontato → Prezzo Finale (NUMBER)
+        prezzoFinale,                                // Col 14: Prezzo scontato → Prezzo Finale ESATTO (NUMBER)
         '',                                          // Col 15: Data di inizio dello sconto → vuoto
         '',                                          // Col 16: Data di termine dello sconto → vuoto
         prepDays,                                    // Col 17: Tempo preparazione spedizione (INTEGER)
@@ -431,6 +453,20 @@ export async function exportMediaworldCatalog({
         '',                                          // Col 21: Orario di cut-off → vuoto
         ''                                           // Col 22: VAT Rate % (Turkey only) → vuoto
       ];
+      
+      // VERIFICA FINALE: il prezzo scontato deve terminare con .99
+      if (prezzoFinale !== null) {
+        const cents = Math.round(prezzoFinale * 100) % 100;
+        if (cents !== 99 && debugLogCount < 25) {
+          console.warn(`mediaworld:warning:not99`, {
+            row: index,
+            EAN: ean,
+            prezzoFinale: prezzoFinale,
+            cents: cents,
+            raw: prezzoFinaleRaw
+          });
+        }
+      }
       
       dataRows.push(row);
     });
