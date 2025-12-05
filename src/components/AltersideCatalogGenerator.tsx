@@ -2055,6 +2055,161 @@ const AltersideCatalogGenerator: React.FC = () => {
     }
   }, [currentProcessedData, isExportingEAN, feeConfig, dbg, toast]);
 
+  // =====================================================================
+  // TEMPLATE EPRICE UFFICIALE: Struttura e validazione
+  // Questi valori devono corrispondere esattamente al template ufficiale
+  // "Tracciato_Pubblicazione_Offerte.xlsx"
+  // =====================================================================
+  const EPRICE_TEMPLATE = {
+    sheetName: "Tracciato_Inserimento_Offerte",
+    headers: ["sku", "product-id", "product-id-type", "price", "quantity", "state", "fulfillment-latency", "logistic-class"],
+    columnCount: 8,
+    fixedValues: {
+      "product-id-type": "EAN",
+      "state": 11,
+      "logistic-class": "K"
+    },
+    validations: {
+      sku: { type: "string", required: true, minLength: 1 },
+      "product-id": { type: "string", required: true, pattern: /^\d{12,14}$/ },
+      "product-id-type": { type: "string", required: true, value: "EAN" },
+      price: { type: "number", required: true, min: 0.01, max: 100000, decimals: 2 },
+      quantity: { type: "integer", required: true, min: 0 },
+      state: { type: "integer", required: true, value: 11 },
+      "fulfillment-latency": { type: "integer", required: true, min: 0, max: 365 },
+      "logistic-class": { type: "string", required: true, value: "K" }
+    }
+  };
+
+  // Validate ePrice file structure against official template
+  const validateEpriceStructure = useCallback((
+    ws: XLSX.WorkSheet,
+    sheetName: string
+  ): { isValid: boolean; errors: string[]; warnings: string[] } => {
+    const errors: string[] = [];
+    const warnings: string[] = [];
+
+    // 1. Validate sheet name
+    if (sheetName !== EPRICE_TEMPLATE.sheetName) {
+      warnings.push(`Nome foglio: "${sheetName}" invece di "${EPRICE_TEMPLATE.sheetName}"`);
+    }
+
+    // 2. Validate sheet exists and has data
+    if (!ws['!ref']) {
+      errors.push("Foglio vuoto o non valido");
+      return { isValid: false, errors, warnings };
+    }
+
+    const range = XLSX.utils.decode_range(ws['!ref']);
+    
+    // 3. Validate column count
+    const actualColumnCount = range.e.c - range.s.c + 1;
+    if (actualColumnCount !== EPRICE_TEMPLATE.columnCount) {
+      errors.push(`Numero colonne: ${actualColumnCount} invece di ${EPRICE_TEMPLATE.columnCount}`);
+    }
+
+    // 4. Validate headers (row 0)
+    const actualHeaders: string[] = [];
+    for (let C = range.s.c; C <= range.e.c; C++) {
+      const addr = XLSX.utils.encode_cell({ r: 0, c: C });
+      const cell = ws[addr];
+      actualHeaders.push(cell?.v?.toString() || '');
+    }
+
+    // Check header order and names
+    for (let i = 0; i < EPRICE_TEMPLATE.headers.length; i++) {
+      const expected = EPRICE_TEMPLATE.headers[i];
+      const actual = actualHeaders[i] || '';
+      if (actual !== expected) {
+        errors.push(`Header colonna ${i + 1}: "${actual}" invece di "${expected}"`);
+      }
+    }
+
+    // 5. Validate data rows
+    const rowCount = range.e.r - range.s.r; // excluding header
+    if (rowCount === 0) {
+      errors.push("Nessuna riga dati presente");
+      return { isValid: false, errors, warnings };
+    }
+
+    // Sample validation of first 5 data rows
+    const sampleSize = Math.min(5, rowCount);
+    for (let R = 1; R <= sampleSize; R++) {
+      const rowNum = R + 1; // Excel row number (1-indexed + header)
+      
+      // Validate each column
+      for (let C = 0; C < EPRICE_TEMPLATE.headers.length; C++) {
+        const colName = EPRICE_TEMPLATE.headers[C];
+        const addr = XLSX.utils.encode_cell({ r: R, c: C });
+        const cell = ws[addr];
+        const validation = EPRICE_TEMPLATE.validations[colName as keyof typeof EPRICE_TEMPLATE.validations];
+        
+        if (!validation) continue;
+
+        const value = cell?.v;
+        const cellType = cell?.t;
+
+        // Required check
+        if (validation.required && (value === undefined || value === null || value === '')) {
+          errors.push(`Riga ${rowNum}, ${colName}: valore mancante`);
+          continue;
+        }
+
+        // Type validation
+        if (validation.type === 'number') {
+          if (typeof value !== 'number' || !Number.isFinite(value)) {
+            errors.push(`Riga ${rowNum}, ${colName}: deve essere un numero (trovato: ${typeof value})`);
+          } else {
+            if ('min' in validation && value < validation.min!) {
+              errors.push(`Riga ${rowNum}, ${colName}: valore ${value} sotto il minimo ${validation.min}`);
+            }
+            if ('max' in validation && value > validation.max!) {
+              errors.push(`Riga ${rowNum}, ${colName}: valore ${value} sopra il massimo ${validation.max}`);
+            }
+          }
+        } else if (validation.type === 'integer') {
+          if (typeof value !== 'number' || !Number.isInteger(value)) {
+            errors.push(`Riga ${rowNum}, ${colName}: deve essere un intero (trovato: ${value})`);
+          }
+        } else if (validation.type === 'string') {
+          if ('pattern' in validation && validation.pattern && typeof value === 'string') {
+            if (!validation.pattern.test(value)) {
+              errors.push(`Riga ${rowNum}, ${colName}: formato non valido (${value})`);
+            }
+          }
+        }
+
+        // Fixed value validation
+        if ('value' in validation && validation.value !== undefined) {
+          if (value !== validation.value) {
+            errors.push(`Riga ${rowNum}, ${colName}: valore "${value}" invece di "${validation.value}"`);
+          }
+        }
+      }
+    }
+
+    // 6. Check price column format (should be number with 2 decimals)
+    const priceColIndex = EPRICE_TEMPLATE.headers.indexOf('price');
+    if (priceColIndex >= 0) {
+      for (let R = 1; R <= Math.min(3, rowCount); R++) {
+        const addr = XLSX.utils.encode_cell({ r: R, c: priceColIndex });
+        const cell = ws[addr];
+        if (cell && cell.t !== 'n') {
+          warnings.push(`Riga ${R + 1}, price: tipo cella "${cell.t}" invece di "n" (numero)`);
+        }
+        if (cell && cell.z !== '0.00') {
+          warnings.push(`Riga ${R + 1}, price: formato "${cell.z || 'default'}" invece di "0.00"`);
+        }
+      }
+    }
+
+    return {
+      isValid: errors.length === 0,
+      errors,
+      warnings
+    };
+  }, []);
+
   // ePrice Export Function - reuses EAN dataset
   const onExportEprice = useCallback((event: React.MouseEvent) => {
     event.preventDefault();
@@ -2099,8 +2254,8 @@ const AltersideCatalogGenerator: React.FC = () => {
       const validationWarnings: string[] = [];
       let skippedCount = 0;
       
-      // Exact headers as required
-      const headers = ["sku", "product-id", "product-id-type", "price", "quantity", "state", "fulfillment-latency", "logistic-class"];
+      // Use template headers
+      const headers = [...EPRICE_TEMPLATE.headers];
       
       // Build AOA (Array of Arrays) with exact headers
       const aoa: (string | number)[][] = [headers];
@@ -2162,15 +2317,16 @@ const AltersideCatalogGenerator: React.FC = () => {
           return; // Skip this row
         }
         
+        // Build row with exact template structure and fixed values
         aoa.push([
-          sku,                                // sku
-          ean,                                // product-id
-          'EAN',                              // product-id-type
-          prezzoFinaleNumber ?? 0,            // price (NUMBER with dot, e.g., 175.99)
-          quantity,                           // quantity
-          11,                                 // state
-          prepDays,                           // fulfillment-latency
-          'K'                                 // logistic-class
+          sku,                                        // sku
+          ean,                                        // product-id
+          EPRICE_TEMPLATE.fixedValues["product-id-type"], // product-id-type = "EAN"
+          prezzoFinaleNumber ?? 0,                    // price (NUMBER with dot, e.g., 175.99)
+          quantity,                                   // quantity
+          EPRICE_TEMPLATE.fixedValues["state"],       // state = 11
+          prepDays,                                   // fulfillment-latency
+          EPRICE_TEMPLATE.fixedValues["logistic-class"] // logistic-class = "K"
         ]);
       });
       
@@ -2233,9 +2389,30 @@ const AltersideCatalogGenerator: React.FC = () => {
         }
       }
       
-      // Create workbook
+      // Create workbook with official sheet name
       const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, ws, "Tracciato_Inserimento_Offerte");
+      XLSX.utils.book_append_sheet(wb, ws, EPRICE_TEMPLATE.sheetName);
+      
+      // =====================================================================
+      // VALIDAZIONE STRUTTURA: Verifica che il file generato sia conforme
+      // al template ufficiale prima del download
+      // =====================================================================
+      const validationResult = validateEpriceStructure(ws, EPRICE_TEMPLATE.sheetName);
+      
+      if (!validationResult.isValid) {
+        console.error("Errori struttura template ePrice:", validationResult.errors);
+        toast({
+          title: "Errore struttura file",
+          description: `Il file generato non è conforme al template: ${validationResult.errors.slice(0, 3).join('; ')}`,
+          variant: "destructive"
+        });
+        setIsExportingEprice(false);
+        return;
+      }
+      
+      if (validationResult.warnings.length > 0) {
+        console.warn("Warning struttura template ePrice:", validationResult.warnings);
+      }
       
       // Serialize to ArrayBuffer
       const wbout = XLSX.write(wb, { bookType: "xlsx", type: "array" });
@@ -2270,7 +2447,7 @@ const AltersideCatalogGenerator: React.FC = () => {
       
       toast({
         title: "Export ePrice completato",
-        description: "File Tracciato_Pubblicazione_Offerte_new.xlsx generato con successo"
+        description: `File generato con ${aoa.length - 1} righe, conforme al template ufficiale`
       });
       
     } catch (error) {
@@ -2283,7 +2460,7 @@ const AltersideCatalogGenerator: React.FC = () => {
     } finally {
       setIsExportingEprice(false);
     }
-  }, [currentProcessedData, isExportingEprice, feeConfig, prepDays, toast]);
+  }, [currentProcessedData, isExportingEprice, feeConfig, prepDays, toast, validateEpriceStructure]);
 
   // Mediaworld Export Function - reuses EAN dataset
   const onExportMediaworld = useCallback(async (event: React.MouseEvent) => {
