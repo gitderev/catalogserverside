@@ -1,7 +1,18 @@
 import * as XLSX from 'xlsx';
-import { formatCents, toCents, parsePercentToRate, parseRate, applyRateCents, ceilToComma99 } from './pricing';
 
-// Mediaworld template column structure (exact order from template)
+/**
+ * Mediaworld Export Utility
+ * 
+ * IMPORTANTE: Questo modulo NON ricalcola i prezzi.
+ * Usa DIRETTAMENTE i valori già calcolati nel catalogo EAN:
+ * - "ListPrice con Fee" → Prezzo dell'offerta
+ * - "Prezzo Finale" → Prezzo scontato
+ * 
+ * Ogni modifica alla logica di pricing nel Catalog Generator
+ * si riflette automaticamente anche nell'export Mediaworld.
+ */
+
+// Mediaworld template column structure - Italian headers only (exact order from template)
 const MEDIAWORLD_HEADERS_ITALIAN = [
   'SKU offerta',
   'ID Prodotto',
@@ -27,31 +38,6 @@ const MEDIAWORLD_HEADERS_ITALIAN = [
   'VAT Rate % (Turkey only)'
 ];
 
-const MEDIAWORLD_HEADERS_TECHNICAL = [
-  'sku',
-  'product-id',
-  'product-id-type',
-  'description',
-  'internal-description',
-  'price',
-  'price-additional-info',
-  'quantity',
-  'min-quantity-alert',
-  'state',
-  'available-start-date',
-  'available-end-date',
-  'logistic-class',
-  'discount-price',
-  'discount-start-date',
-  'discount-end-date',
-  'leadtime-to-ship',
-  'update-delete',
-  'strike-price-type',
-  'mms-weee-take-back-obligation',
-  'cut-off-time',
-  'vat-rate'
-];
-
 interface MediaworldExportParams {
   processedData: any[];
   feeConfig: {
@@ -69,6 +55,39 @@ interface ValidationError {
   reason: string;
 }
 
+/**
+ * Parse "Prezzo Finale" from EAN catalog format to number
+ * Handles both string format "34,99" and numeric format 34.99
+ */
+function parsePrezzoFinale(value: any): number | null {
+  if (value === null || value === undefined || value === '') return null;
+  
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+  
+  // Handle string format "34,99" -> 34.99
+  const str = String(value).trim().replace(',', '.');
+  const num = parseFloat(str);
+  return Number.isFinite(num) ? num : null;
+}
+
+/**
+ * Parse "ListPrice con Fee" from EAN catalog
+ * This should already be an integer from EAN export
+ */
+function parseListPriceConFee(value: any): number | null {
+  if (value === null || value === undefined || value === '') return null;
+  
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return Math.round(value); // Ensure integer
+  }
+  
+  const str = String(value).trim().replace(',', '.');
+  const num = parseFloat(str);
+  return Number.isFinite(num) ? Math.round(num) : null;
+}
+
 export async function exportMediaworldCatalog({
   processedData,
   feeConfig,
@@ -81,17 +100,10 @@ export async function exportMediaworldCatalog({
   skippedCount?: number;
 }> {
   try {
-    // Filter EAN data - same logic as EAN export
-    const eanFilteredData = processedData.filter(record => record.EAN && record.EAN.length >= 12);
-    
-    if (eanFilteredData.length === 0) {
-      return { success: false, error: 'Nessuna riga valida con EAN da esportare' };
-    }
-    
     // Validation arrays
     const validationErrors: ValidationError[] = [];
     let skippedCount = 0;
-
+    
     // Load template from public folder
     const templateResponse = await fetch('/mediaworld-template.xlsx');
     if (!templateResponse.ok) {
@@ -101,222 +113,155 @@ export async function exportMediaworldCatalog({
     const templateBuffer = await templateResponse.arrayBuffer();
     const templateWb = XLSX.read(templateBuffer, { type: 'array' });
     
-    // Extract ReferenceData and Columns sheets from template
+    // Extract ReferenceData and Columns sheets from template (copy exactly as-is)
     const referenceDataSheet = templateWb.Sheets['ReferenceData'];
     const columnsSheet = templateWb.Sheets['Columns'];
     
     // Build data rows with mapping
-    const dataRows: (string | number)[][] = [];
+    // Row 1: Italian headers ONLY (no technical codes row)
+    const dataRows: (string | number)[][] = [MEDIAWORLD_HEADERS_ITALIAN];
     
-    // Row 1: Italian headers
-    dataRows.push(MEDIAWORLD_HEADERS_ITALIAN);
-    
-    // Row 2: Technical codes
-    dataRows.push(MEDIAWORLD_HEADERS_TECHNICAL);
-    
-    // Data rows with product mapping
-    eanFilteredData.forEach((record, index) => {
-      const rowErrors: string[] = [];
+    // Process each record from EAN catalog data
+    processedData.forEach((record, index) => {
       const sku = record.ManufPartNr || '';
       const ean = record.EAN || '';
+      const existingStock = record.ExistingStock;
       
-      // === VALIDATION: Required fields ===
-      
-      // 1. SKU offerta (ManufPartNr) - Required
-      if (!sku || sku.trim() === '') {
+      // === FILTER 1: Skip products without valid EAN ===
+      if (!ean || ean.trim() === '' || ean.length < 12) {
         validationErrors.push({
           row: index + 1,
           sku: sku || 'N/A',
+          field: 'ID Prodotto',
+          reason: `EAN mancante o non valido: "${ean}"`
+        });
+        skippedCount++;
+        return;
+      }
+      
+      // === FILTER 2: Skip products with stock <= 0 ===
+      const stockValue = Number(existingStock);
+      if (!Number.isFinite(stockValue) || stockValue <= 0) {
+        validationErrors.push({
+          row: index + 1,
+          sku,
+          field: 'Quantità',
+          reason: `ExistingStock assente o <= 0: ${existingStock}`
+        });
+        skippedCount++;
+        return;
+      }
+      
+      // === VALIDATION: SKU offerta ===
+      if (!sku || sku.trim() === '') {
+        validationErrors.push({
+          row: index + 1,
+          sku: 'N/A',
           field: 'SKU offerta',
           reason: 'ManufPartNr mancante o vuoto'
         });
-        rowErrors.push('SKU mancante');
-      } else if (sku.length > 40) {
+        skippedCount++;
+        return;
+      }
+      
+      if (sku.length > 40) {
         validationErrors.push({
           row: index + 1,
           sku,
           field: 'SKU offerta',
           reason: `SKU troppo lungo (${sku.length} caratteri, max 40)`
         });
-        rowErrors.push('SKU troppo lungo');
-      } else if (sku.includes('/')) {
+        skippedCount++;
+        return;
+      }
+      
+      if (sku.includes('/')) {
         validationErrors.push({
           row: index + 1,
           sku,
           field: 'SKU offerta',
           reason: 'SKU contiene carattere "/" non accettato'
         });
-        rowErrors.push('SKU contiene /');
-      }
-      
-      // 2. ID Prodotto (EAN) - Required, must be 12-14 digits
-      if (!ean || ean.trim() === '') {
-        validationErrors.push({
-          row: index + 1,
-          sku,
-          field: 'ID Prodotto',
-          reason: 'EAN mancante o vuoto'
-        });
-        rowErrors.push('EAN mancante');
-      } else if (!/^\d{12,14}$/.test(ean)) {
-        validationErrors.push({
-          row: index + 1,
-          sku,
-          field: 'ID Prodotto',
-          reason: `EAN non valido: "${ean}" (deve essere 12-14 cifre)`
-        });
-        rowErrors.push('EAN non valido');
-      }
-      
-      // Calculate prices using the same logic as EAN export
-      const hasBest = Number.isFinite(record.CustBestPrice) && record.CustBestPrice > 0;
-      const hasListPrice = Number.isFinite(record.ListPrice) && record.ListPrice > 0;
-      const surchargeValue = (Number.isFinite(record.Surcharge) && record.Surcharge >= 0) ? record.Surcharge : 0;
-      
-      let baseCents = 0;
-      
-      if (hasBest) {
-        baseCents = Math.round((record.CustBestPrice + surchargeValue) * 100);
-      } else if (hasListPrice) {
-        baseCents = Math.round(record.ListPrice * 100);
-      }
-      
-      // 3. Price validation - must have valid base price
-      if (baseCents === 0) {
-        validationErrors.push({
-          row: index + 1,
-          sku,
-          field: 'Prezzo',
-          reason: 'Nessun prezzo valido (CustBestPrice o ListPrice)'
-        });
-        rowErrors.push('Prezzo mancante');
-      }
-      
-      // 4. Quantity validation - must be positive integer
-      const quantity = record.ExistingStock;
-      if (!Number.isFinite(quantity) || quantity < 0) {
-        validationErrors.push({
-          row: index + 1,
-          sku,
-          field: 'Quantità',
-          reason: `Quantità non valida: ${quantity}`
-        });
-        rowErrors.push('Quantità non valida');
-      }
-      
-      // Skip rows with critical errors
-      if (rowErrors.length > 0) {
         skippedCount++;
         return;
       }
       
-      const shipC = toCents(feeConfig.shippingCost);
-      const ivaR = parsePercentToRate(22, 22);
-      const feeDR = parseRate(record.FeeDeRev, 1.05);
-      const feeMP = parseRate(record['Fee Marketplace'], 1.07);
+      // === GET PRICES FROM ALREADY CALCULATED EAN DATA ===
+      // IMPORTANTE: NON ricalcoliamo i prezzi, usiamo quelli già calcolati
       
-      const afterShippingCents = baseCents + shipC;
-      const ivatoCents = applyRateCents(afterShippingCents, ivaR);
-      const withFeDR = applyRateCents(ivatoCents, feeDR);
-      const subtotalCents = applyRateCents(withFeDR, feeMP);
-      const prezzoFinaleCents = ceilToComma99(subtotalCents);
+      // "ListPrice con Fee" - already calculated in EAN pipeline
+      const listPriceConFee = parseListPriceConFee(record['ListPrice con Fee']);
       
-      // Calculate ListPrice con Fee (same logic)
-      const listC = toCents(record.ListPrice);
-      const baseListCents = listC + shipC;
-      const ivatoListCents = applyRateCents(baseListCents, ivaR);
-      const withFeDRList = applyRateCents(ivatoListCents, feeDR);
-      const subtotalListCents = applyRateCents(withFeDRList, feeMP);
-      let listPriceConFeeInt = Math.ceil(subtotalListCents / 100);
+      // "Prezzo Finale" - already calculated in EAN pipeline (format "NN,99" or number)
+      const prezzoFinale = parsePrezzoFinale(record['Prezzo Finale']);
       
-      // Override rule for ListPrice con Fee
-      const normListPrice = record.ListPrice !== null && record.ListPrice !== undefined && record.ListPrice !== '' 
-        ? parseFloat(String(record.ListPrice).replace(',', '.')) 
-        : null;
-      const normCustBestPrice = record.CustBestPrice !== null && record.CustBestPrice !== undefined 
-        ? parseFloat(String(record.CustBestPrice).replace(',', '.')) 
-        : null;
-      
-      const shouldOverride = normListPrice === null || 
-                             normListPrice === 0 || 
-                             isNaN(normListPrice) ||
-                             (normCustBestPrice !== null && !isNaN(normCustBestPrice) && normListPrice < normCustBestPrice);
-      
-      if (shouldOverride && normCustBestPrice !== null && !isNaN(normCustBestPrice)) {
-        const base = normCustBestPrice * 1.25;
-        const candidato = ((base + feeConfig.shippingCost) * 1.22) * feeConfig.feeDrev * feeConfig.feeMkt;
-        const candidato_ceil = Math.ceil(candidato);
-        const minimo_consentito = Math.ceil((prezzoFinaleCents / 100) * 1.25);
-        listPriceConFeeInt = Math.max(candidato_ceil, minimo_consentito);
-      }
-      
-      // 5. Final price validation - must end with ,99
-      const prezzoFinaleFormatted = formatCents(prezzoFinaleCents);
-      if (!/^\d+,99$/.test(prezzoFinaleFormatted)) {
-        validationErrors.push({
-          row: index + 1,
-          sku,
-          field: 'Prezzo scontato',
-          reason: `Prezzo finale non termina con ,99: "${prezzoFinaleFormatted}"`
-        });
-        // This is a warning, don't skip the row
-      }
-      
-      // 6. ListPrice con Fee validation - must be positive
-      if (!Number.isFinite(listPriceConFeeInt) || listPriceConFeeInt <= 0) {
+      // Validate prices are available
+      if (listPriceConFee === null || listPriceConFee <= 0) {
         validationErrors.push({
           row: index + 1,
           sku,
           field: "Prezzo dell'offerta",
-          reason: `ListPrice con Fee non valido: ${listPriceConFeeInt}`
+          reason: `ListPrice con Fee non valido: ${record['ListPrice con Fee']}`
         });
         skippedCount++;
         return;
       }
       
-      // 7. Price range validation (between 1€ and 100000€)
-      if (prezzoFinaleCents < 100 || prezzoFinaleCents > 10000000) {
+      if (prezzoFinale === null || prezzoFinale <= 0) {
         validationErrors.push({
           row: index + 1,
           sku,
           field: 'Prezzo scontato',
-          reason: `Prezzo finale fuori range (${prezzoFinaleFormatted}): deve essere tra 1€ e 100000€`
+          reason: `Prezzo Finale non valido: ${record['Prezzo Finale']}`
         });
         skippedCount++;
         return;
       }
       
-      // Build row according to mapping
+      // Price range validation (between 1€ and 100000€)
+      if (prezzoFinale < 1 || prezzoFinale > 100000) {
+        validationErrors.push({
+          row: index + 1,
+          sku,
+          field: 'Prezzo scontato',
+          reason: `Prezzo finale fuori range (${prezzoFinale}): deve essere tra 1€ e 100000€`
+        });
+        skippedCount++;
+        return;
+      }
+      
+      // Build row according to Mediaworld template mapping
+      // All 22 columns in exact order, empty strings for unused fields
       const row: (string | number)[] = [
-        record.ManufPartNr || '',                    // SKU offerta → ManufPartNr
-        record.EAN || '',                            // ID Prodotto → EAN normalizzato
-        'EAN',                                       // Tipo ID prodotto → "EAN" (fixed)
-        record.ShortDescription || '',               // Descrizione offerta → ShortDescription
-        '',                                          // Descrizione interna offerta → vuoto
-        listPriceConFeeInt,                          // Prezzo dell'offerta → "ListPrice con Fee"
-        '',                                          // Info aggiuntive prezzo offerta → vuoto
-        record.ExistingStock || 0,                   // Quantità dell'offerta → ExistingStock
-        '',                                          // Avviso quantità minima → vuoto
-        'Nuovo',                                     // Stato dell'offerta → "Nuovo" (fixed)
-        '',                                          // Data inizio disponibilità → vuoto
-        '',                                          // Data fine disponibilità → vuoto
-        'Consegna gratuita',                         // Classe logistica → "Consegna gratuita"
-        prezzoFinaleFormatted,                       // Prezzo scontato → "Prezzo Finale"
-        '',                                          // Data inizio sconto → vuoto
-        '',                                          // Data fine sconto → vuoto
-        prepDays,                                    // Tempo di preparazione spedizione → user input
-        '',                                          // Aggiorna/Cancella → vuoto
-        'recommended-retail-price',                  // Tipo prezzo barrato → "recommended-retail-price" (fixed)
-        '',                                          // Obbligo ritiro RAEE → vuoto
-        '',                                          // Orario cut-off → vuoto
-        ''                                           // VAT Rate % (Turkey only) → vuoto
+        sku,                                         // Col 1: SKU offerta → ManufPartNr
+        ean,                                         // Col 2: ID Prodotto → EAN normalizzato
+        'EAN',                                       // Col 3: Tipo ID prodotto → "EAN" (fixed)
+        record.ShortDescription || '',               // Col 4: Descrizione offerta → ShortDescription
+        '',                                          // Col 5: Descrizione interna offerta → vuoto
+        listPriceConFee,                             // Col 6: Prezzo dell'offerta → ListPrice con Fee (NUMBER)
+        '',                                          // Col 7: Info aggiuntive prezzo offerta → vuoto
+        Math.floor(stockValue),                      // Col 8: Quantità dell'offerta → ExistingStock (INTEGER)
+        '',                                          // Col 9: Avviso quantità minima → vuoto
+        'Nuovo',                                     // Col 10: Stato dell'offerta → "Nuovo" (fixed)
+        '',                                          // Col 11: Data di inizio disponibilità → vuoto
+        '',                                          // Col 12: Data di conclusione disponibilità → vuoto
+        'Consegna gratuita',                         // Col 13: Classe logistica → "Consegna gratuita"
+        prezzoFinale,                                // Col 14: Prezzo scontato → Prezzo Finale (NUMBER)
+        '',                                          // Col 15: Data di inizio dello sconto → vuoto
+        '',                                          // Col 16: Data di termine dello sconto → vuoto
+        prepDays,                                    // Col 17: Tempo preparazione spedizione (INTEGER)
+        '',                                          // Col 18: Aggiorna/Cancella → vuoto
+        'recommended-retail-price',                  // Col 19: Tipo prezzo barrato → fixed
+        '',                                          // Col 20: Obbligo di ritiro RAEE → vuoto
+        '',                                          // Col 21: Orario di cut-off → vuoto
+        ''                                           // Col 22: VAT Rate % (Turkey only) → vuoto
       ];
       
       dataRows.push(row);
     });
     
     // Check if we have valid data rows after validation
-    const validRowCount = dataRows.length - 2; // Exclude header rows
+    const validRowCount = dataRows.length - 1; // Exclude header row
     
     if (validRowCount === 0) {
       return { 
@@ -330,7 +275,7 @@ export async function exportMediaworldCatalog({
     // Log validation summary
     if (validationErrors.length > 0) {
       console.warn('Mediaworld export validation:', {
-        totalInput: eanFilteredData.length,
+        totalInput: processedData.length,
         validOutput: validRowCount,
         skipped: skippedCount,
         errors: validationErrors.length
@@ -343,12 +288,14 @@ export async function exportMediaworldCatalog({
     // Sheet 1: Data
     const dataSheet = XLSX.utils.aoa_to_sheet(dataRows);
     
-    // Force ID Prodotto (column B) to text format to preserve leading zeros
+    // Force ID Prodotto (column B, index 1) to text format to preserve leading zeros
+    // Data rows start at row 2 (index 1) since row 1 is headers
     if (dataSheet['!ref']) {
       const range = XLSX.utils.decode_range(dataSheet['!ref']);
       const eanCol = 1; // Column B (ID Prodotto)
       
-      for (let R = 2; R <= range.e.r; R++) { // Start from row 3 (index 2)
+      // Start from R=1 (first data row after header)
+      for (let R = 1; R <= range.e.r; R++) {
         const addr = XLSX.utils.encode_cell({ r: R, c: eanCol });
         const cell = dataSheet[addr];
         if (cell) {
@@ -359,36 +306,25 @@ export async function exportMediaworldCatalog({
         }
       }
       
-      // Force Prezzo scontato (column N, index 13) to text format
-      const prezzoScontatoCol = 13;
-      for (let R = 2; R <= range.e.r; R++) {
-        const addr = XLSX.utils.encode_cell({ r: R, c: prezzoScontatoCol });
-        const cell = dataSheet[addr];
-        if (cell) {
-          cell.v = (cell.v ?? '').toString();
-          cell.t = 's';
-          cell.z = '@';
-          dataSheet[addr] = cell;
-        }
-      }
+      // NOTE: Prezzo dell'offerta (col 5) and Prezzo scontato (col 13) 
+      // are kept as NUMBERS, not formatted as text
+      // This ensures Excel treats them as numeric values with decimal points
     }
     
     XLSX.utils.book_append_sheet(wb, dataSheet, 'Data');
     
-    // Sheet 2: ReferenceData (copy from template)
+    // Sheet 2: ReferenceData (copy from template exactly as-is)
     if (referenceDataSheet) {
       XLSX.utils.book_append_sheet(wb, referenceDataSheet, 'ReferenceData');
     } else {
-      // Create empty ReferenceData if not found
       const emptyRefSheet = XLSX.utils.aoa_to_sheet([['ReferenceData']]);
       XLSX.utils.book_append_sheet(wb, emptyRefSheet, 'ReferenceData');
     }
     
-    // Sheet 3: Columns (copy from template)
+    // Sheet 3: Columns (copy from template exactly as-is)
     if (columnsSheet) {
       XLSX.utils.book_append_sheet(wb, columnsSheet, 'Columns');
     } else {
-      // Create empty Columns if not found
       const emptyColSheet = XLSX.utils.aoa_to_sheet([['Columns']]);
       XLSX.utils.book_append_sheet(wb, emptyColSheet, 'Columns');
     }
