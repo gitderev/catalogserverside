@@ -548,6 +548,21 @@ const AltersideCatalogGenerator: React.FC = () => {
   const [isExportingEAN, setIsExportingEAN] = useState(false);
   const [isExportingEprice, setIsExportingEprice] = useState(false);
   const [isExportingMediaworld, setIsExportingMediaworld] = useState(false);
+
+  // Validation results state for visual summary
+  interface ExportValidationResult {
+    exportType: 'ePrice' | 'Mediaworld';
+    timestamp: Date;
+    success: boolean;
+    totalRows: number;
+    validRows: number;
+    skippedRows: number;
+    errors: Array<{ row: number; field: string; reason: string; sku?: string }>;
+    warnings: string[];
+    structureErrors: string[];
+  }
+  const [lastEpriceValidation, setLastEpriceValidation] = useState<ExportValidationResult | null>(null);
+  const [lastMediaworldValidation, setLastMediaworldValidation] = useState<ExportValidationResult | null>(null);
   
   // ePrice export configuration
   const [prepDays, setPrepDays] = useState<number>(1);
@@ -2399,8 +2414,23 @@ const AltersideCatalogGenerator: React.FC = () => {
       // =====================================================================
       const validationResult = validateEpriceStructure(ws, EPRICE_TEMPLATE.sheetName);
       
+      // Build validation report for UI
+      const validationReport: ExportValidationResult = {
+        exportType: 'ePrice',
+        timestamp: new Date(),
+        success: validationResult.isValid,
+        totalRows: currentProcessedData.length,
+        validRows: aoa.length - 1,
+        skippedRows: skippedCount,
+        errors: validationErrors.map(e => ({ row: 0, field: '', reason: e })),
+        warnings: [...validationWarnings, ...validationResult.warnings],
+        structureErrors: validationResult.errors
+      };
+      
       if (!validationResult.isValid) {
         console.error("Errori struttura template ePrice:", validationResult.errors);
+        validationReport.success = false;
+        setLastEpriceValidation(validationReport);
         toast({
           title: "Errore struttura file",
           description: `Il file generato non è conforme al template: ${validationResult.errors.slice(0, 3).join('; ')}`,
@@ -2444,6 +2474,9 @@ const AltersideCatalogGenerator: React.FC = () => {
       document.body.removeChild(a);
       
       setTimeout(() => URL.revokeObjectURL(url), 3000);
+      
+      // Save validation report for UI
+      setLastEpriceValidation(validationReport);
       
       toast({
         title: "Export ePrice completato",
@@ -2493,6 +2526,24 @@ const AltersideCatalogGenerator: React.FC = () => {
         prepDays: prepDaysMediaworld
       });
       
+      // Build validation report for UI
+      const mediaworldValidationReport: ExportValidationResult = {
+        exportType: 'Mediaworld',
+        timestamp: new Date(),
+        success: result.success ?? false,
+        totalRows: currentProcessedData.length,
+        validRows: result.rowCount ?? 0,
+        skippedRows: result.skippedCount ?? 0,
+        errors: (result.validationErrors ?? []).map(e => ({
+          row: e.row,
+          field: e.field,
+          reason: e.reason,
+          sku: e.sku
+        })),
+        warnings: [],
+        structureErrors: []
+      };
+      
       if (result.success) {
         // Show success with validation summary if there were skipped rows
         if (result.skippedCount && result.skippedCount > 0) {
@@ -2529,6 +2580,9 @@ const AltersideCatalogGenerator: React.FC = () => {
           variant: "destructive"
         });
       }
+      
+      // Save validation report for UI
+      setLastMediaworldValidation(mediaworldValidationReport);
     } catch (error) {
       console.error('Errore export Mediaworld:', error);
       toast({
@@ -3939,6 +3993,170 @@ const AltersideCatalogGenerator: React.FC = () => {
                 </p>
               </div>
             )}
+          </div>
+        )}
+
+        {/* Validation Summary Section */}
+        {(lastEpriceValidation || lastMediaworldValidation) && currentPipeline === 'EAN' && (
+          <div className="card border-strong">
+            <div className="card-body">
+              <h3 className="card-title mb-6 flex items-center gap-2">
+                <FileText className="h-5 w-5" />
+                Riepilogo Validazione Export
+              </h3>
+              
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                {/* ePrice Validation Summary */}
+                {lastEpriceValidation && (
+                  <div className={`p-4 rounded-lg border-2 ${lastEpriceValidation.success ? 'border-green-500 bg-green-50' : 'border-red-500 bg-red-50'}`}>
+                    <div className="flex items-center justify-between mb-3">
+                      <h4 className="font-semibold text-lg flex items-center gap-2">
+                        {lastEpriceValidation.success ? (
+                          <CheckCircle className="h-5 w-5 text-green-600" />
+                        ) : (
+                          <XCircle className="h-5 w-5 text-red-600" />
+                        )}
+                        ePrice
+                      </h4>
+                      <span className="text-xs text-muted-foreground">
+                        {lastEpriceValidation.timestamp.toLocaleTimeString('it-IT')}
+                      </span>
+                    </div>
+                    
+                    <div className="grid grid-cols-3 gap-3 mb-3">
+                      <div className="text-center p-2 bg-white rounded border">
+                        <div className="text-lg font-bold text-blue-600">{lastEpriceValidation.totalRows}</div>
+                        <div className="text-xs text-muted-foreground">Totali</div>
+                      </div>
+                      <div className="text-center p-2 bg-white rounded border">
+                        <div className="text-lg font-bold text-green-600">{lastEpriceValidation.validRows}</div>
+                        <div className="text-xs text-muted-foreground">Valide</div>
+                      </div>
+                      <div className="text-center p-2 bg-white rounded border">
+                        <div className="text-lg font-bold text-red-600">{lastEpriceValidation.skippedRows}</div>
+                        <div className="text-xs text-muted-foreground">Scartate</div>
+                      </div>
+                    </div>
+                    
+                    {lastEpriceValidation.structureErrors.length > 0 && (
+                      <div className="mb-2">
+                        <div className="text-sm font-medium text-red-700 mb-1">Errori struttura:</div>
+                        <ul className="text-xs text-red-600 list-disc list-inside max-h-24 overflow-y-auto">
+                          {lastEpriceValidation.structureErrors.slice(0, 5).map((err, i) => (
+                            <li key={i}>{err}</li>
+                          ))}
+                          {lastEpriceValidation.structureErrors.length > 5 && (
+                            <li className="text-muted-foreground">...e altri {lastEpriceValidation.structureErrors.length - 5} errori</li>
+                          )}
+                        </ul>
+                      </div>
+                    )}
+                    
+                    {lastEpriceValidation.errors.length > 0 && (
+                      <div className="mb-2">
+                        <div className="text-sm font-medium text-orange-700 mb-1">Righe scartate:</div>
+                        <ul className="text-xs text-orange-600 list-disc list-inside max-h-24 overflow-y-auto">
+                          {lastEpriceValidation.errors.slice(0, 5).map((err, i) => (
+                            <li key={i}>{err.reason}</li>
+                          ))}
+                          {lastEpriceValidation.errors.length > 5 && (
+                            <li className="text-muted-foreground">...e altri {lastEpriceValidation.errors.length - 5} problemi</li>
+                          )}
+                        </ul>
+                      </div>
+                    )}
+                    
+                    {lastEpriceValidation.warnings.length > 0 && (
+                      <div>
+                        <div className="text-sm font-medium text-yellow-700 mb-1">Avvisi:</div>
+                        <ul className="text-xs text-yellow-600 list-disc list-inside max-h-20 overflow-y-auto">
+                          {lastEpriceValidation.warnings.slice(0, 3).map((warn, i) => (
+                            <li key={i}>{warn}</li>
+                          ))}
+                          {lastEpriceValidation.warnings.length > 3 && (
+                            <li className="text-muted-foreground">...e altri {lastEpriceValidation.warnings.length - 3} avvisi</li>
+                          )}
+                        </ul>
+                      </div>
+                    )}
+                  </div>
+                )}
+                
+                {/* Mediaworld Validation Summary */}
+                {lastMediaworldValidation && (
+                  <div className={`p-4 rounded-lg border-2 ${lastMediaworldValidation.success ? 'border-green-500 bg-green-50' : 'border-red-500 bg-red-50'}`}>
+                    <div className="flex items-center justify-between mb-3">
+                      <h4 className="font-semibold text-lg flex items-center gap-2">
+                        {lastMediaworldValidation.success ? (
+                          <CheckCircle className="h-5 w-5 text-green-600" />
+                        ) : (
+                          <XCircle className="h-5 w-5 text-red-600" />
+                        )}
+                        Mediaworld
+                      </h4>
+                      <span className="text-xs text-muted-foreground">
+                        {lastMediaworldValidation.timestamp.toLocaleTimeString('it-IT')}
+                      </span>
+                    </div>
+                    
+                    <div className="grid grid-cols-3 gap-3 mb-3">
+                      <div className="text-center p-2 bg-white rounded border">
+                        <div className="text-lg font-bold text-blue-600">{lastMediaworldValidation.totalRows}</div>
+                        <div className="text-xs text-muted-foreground">Totali</div>
+                      </div>
+                      <div className="text-center p-2 bg-white rounded border">
+                        <div className="text-lg font-bold text-green-600">{lastMediaworldValidation.validRows}</div>
+                        <div className="text-xs text-muted-foreground">Valide</div>
+                      </div>
+                      <div className="text-center p-2 bg-white rounded border">
+                        <div className="text-lg font-bold text-red-600">{lastMediaworldValidation.skippedRows}</div>
+                        <div className="text-xs text-muted-foreground">Scartate</div>
+                      </div>
+                    </div>
+                    
+                    {lastMediaworldValidation.errors.length > 0 && (
+                      <div className="mb-2">
+                        <div className="text-sm font-medium text-red-700 mb-1">Errori validazione ({lastMediaworldValidation.errors.length}):</div>
+                        <ul className="text-xs text-red-600 list-disc list-inside max-h-32 overflow-y-auto">
+                          {lastMediaworldValidation.errors.slice(0, 8).map((err, i) => (
+                            <li key={i}>
+                              Riga {err.row}: <strong>{err.field}</strong> - {err.reason}
+                              {err.sku && <span className="text-muted-foreground"> (SKU: {err.sku})</span>}
+                            </li>
+                          ))}
+                          {lastMediaworldValidation.errors.length > 8 && (
+                            <li className="text-muted-foreground font-medium">
+                              ...e altri {lastMediaworldValidation.errors.length - 8} errori
+                            </li>
+                          )}
+                        </ul>
+                      </div>
+                    )}
+                    
+                    {lastMediaworldValidation.success && lastMediaworldValidation.errors.length === 0 && (
+                      <div className="text-sm text-green-700 flex items-center gap-2">
+                        <CheckCircle className="h-4 w-4" />
+                        Tutte le righe sono conformi al template ufficiale
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+              
+              {/* Clear validation button */}
+              <div className="mt-4 flex justify-end">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setLastEpriceValidation(null);
+                    setLastMediaworldValidation(null);
+                  }}
+                  className="text-sm text-muted-foreground hover:text-foreground"
+                >
+                  Pulisci riepilogo
+                </button>
+              </div>
+            </div>
           </div>
         )}
 
