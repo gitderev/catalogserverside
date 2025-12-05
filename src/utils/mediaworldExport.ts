@@ -315,6 +315,13 @@ export async function exportMediaworldCatalog({
     // Log per debug: tracciamento conversione prezzi
     let debugLogCount = 0;
     
+    // === LOG ESTESO: EXPORT MEDIAWORLD - CONTEGGI ===
+    console.log('%c[Mediaworld:counts] === INIZIO EXPORT MEDIAWORLD ===', 'color: #00BCD4; font-weight: bold; font-size: 14px;');
+    console.log(`%c[Mediaworld:counts]`, 'color: #00BCD4;', { 
+      'prodotti in input (eanCatalogDataset)': processedData.length,
+      timestamp: new Date().toISOString()
+    });
+    
     // Process each record from EAN catalog data
     processedData.forEach((record, index) => {
       const sku = record.ManufPartNr || '';
@@ -384,20 +391,34 @@ export async function exportMediaworldCatalog({
       const prezzoFinaleRaw = record['Prezzo Finale'];
       const prezzoFinale = parsePrice(prezzoFinaleRaw);
       
-      // LOG DI DEBUG per i primi 10 record - traccia COMPLETA della conversione
+      // LOG ESTESO per i primi 10 record - traccia COMPLETA della conversione
       if (debugLogCount < 10) {
-        console.warn(`mediaworld:price:conversion:row${index}`, {
+        const terminaCon99 = prezzoFinale !== null && (Math.round(prezzoFinale * 100) % 100) === 99;
+        
+        console.log(`%c[Mediaworld:export:row${index}]`, 'color: #00BCD4;', {
           EAN: ean,
           SKU: sku,
-          'Prezzo Finale RAW': prezzoFinaleRaw,
+          'Prezzo Finale RAW (fonte Catalogo EAN)': prezzoFinaleRaw,
           'Prezzo Finale RAW type': typeof prezzoFinaleRaw,
-          'Prezzo Finale PARSED': prezzoFinale,
-          'Prezzo Finale PARSED toFixed(2)': prezzoFinale?.toFixed(2),
+          'parseFloat result': prezzoFinale,
+          'valore finale in Prezzo scontato': prezzoFinale,
+          'termina_con_99': terminaCon99,
           'ListPrice con Fee RAW': listPriceConFeeRaw,
           'ListPrice con Fee RAW type': typeof listPriceConFeeRaw,
-          'ListPrice con Fee PARSED': listPriceConFee,
-          ExistingStock: existingStock
+          'valore in Prezzo offerta': listPriceConFee,
+          'ExistingStock RAW': existingStock,
+          'quantità esportata': stockValue
         });
+        
+        // ALERT se mismatch
+        if (!terminaCon99 && prezzoFinale !== null) {
+          console.error(`%c[Mediaworld:warning:price-mismatch:row${index}] PREZZO NON TERMINA CON .99!`, 'color: red; font-weight: bold;', {
+            EAN: ean,
+            prezzoFinale: prezzoFinale,
+            raw: prezzoFinaleRaw
+          });
+        }
+        
         debugLogCount++;
       }
       
@@ -457,9 +478,8 @@ export async function exportMediaworldCatalog({
       // VERIFICA FINALE: il prezzo scontato deve terminare con .99
       if (prezzoFinale !== null) {
         const cents = Math.round(prezzoFinale * 100) % 100;
-        if (cents !== 99 && debugLogCount < 25) {
-          console.warn(`mediaworld:warning:not99`, {
-            row: index,
+        if (cents !== 99) {
+          console.error(`%c[Mediaworld:warning:not99:row${index}] PREZZO NON TERMINA CON .99!`, 'color: red; font-weight: bold;', {
             EAN: ean,
             prezzoFinale: prezzoFinale,
             cents: cents,
@@ -473,6 +493,23 @@ export async function exportMediaworldCatalog({
     
     // Check if we have valid data rows after validation
     const validRowCount = dataRows.length - 1; // Exclude header row
+    
+    // === LOG ESTESO: RIEPILOGO EXPORT MEDIAWORLD ===
+    console.log('%c[Mediaworld:export:summary] === EXPORT COMPLETATO ===', 'color: #00BCD4; font-weight: bold;');
+    console.log(`%c[Mediaworld:export:summary]`, 'color: #00BCD4;', {
+      'righe sorgente': processedData.length,
+      'righe esportate': validRowCount,
+      'righe saltate': skippedCount,
+      'differenza': processedData.length - validRowCount - skippedCount
+    });
+    
+    // === LOG VERIFICA INCROCIATA POST-EXPORT ===
+    console.log('%c[check:comparison-summary:Mediaworld]', 'color: #E91E63; font-weight: bold;', {
+      'prodotti_input (eanCatalogDataset)': processedData.length,
+      'prodotti_Mediaworld_export': validRowCount,
+      'prodotti_scartati': skippedCount,
+      'allineamento_set': processedData.length === (validRowCount + skippedCount) ? 'OK' : 'MISMATCH'
+    });
     
     if (validRowCount === 0) {
       return { 

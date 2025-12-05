@@ -1861,6 +1861,42 @@ const AltersideCatalogGenerator: React.FC = () => {
           });
         }
 
+        // Genera il prezzo finale formattato come stringa "NN,99"
+        const prezzoFinaleFormatted = formatCents(prezzoFinaleCents);
+        
+        // === LOG ESTESO: GENERAZIONE CATALOGO EAN ===
+        if (index < 5) {
+          console.log(`%c[EAN:generated:row${index}]`, 'color: #4CAF50; font-weight: bold;', {
+            indice_riga: index,
+            EAN: record.EAN,
+            SKU: record.ManufPartNr,
+            'Prezzo Finale RAW': prezzoFinaleFormatted,
+            'Prezzo Finale RAW type': typeof prezzoFinaleFormatted,
+            'prezzoFinaleCents (sorgente)': prezzoFinaleCents,
+            'ListPrice con Fee RAW': listPriceConFeeInt,
+            'ListPrice con Fee RAW type': typeof listPriceConFeeInt,
+            'ExistingStock RAW': record.ExistingStock,
+            'termina_con_99': prezzoFinaleFormatted.endsWith(',99')
+          });
+        }
+        
+        // Per i primi 2 prodotti, logga struttura completa
+        if (index < 2) {
+          console.log(`%c[EAN:generated:row${index}:FULL]`, 'color: #2196F3; font-weight: bold;', {
+            record_completo: {
+              Matnr: record.Matnr,
+              ManufPartNr: record.ManufPartNr,
+              EAN: record.EAN,
+              ShortDescription: record.ShortDescription,
+              ExistingStock: record.ExistingStock,
+              CustBestPrice: record.CustBestPrice,
+              ListPrice: record.ListPrice,
+              prezzoFinaleCents: prezzoFinaleCents,
+              listPriceConFeeInt: listPriceConFeeInt
+            }
+          });
+        }
+        
         return {
           Matnr: record.Matnr,
           ManufPartNr: record.ManufPartNr,
@@ -1875,7 +1911,7 @@ const AltersideCatalogGenerator: React.FC = () => {
           FeeDeRev: record.FeeDeRev,
           'Fee Marketplace': record['Fee Marketplace'],
           'Subtotale post-fee': formatCents(subtotalCents), // Corretta pipeline con entrambe le fee
-          'Prezzo Finale': formatCents(prezzoFinaleCents), // FORCE finalDisplay string "NN,99"
+          'Prezzo Finale': prezzoFinaleFormatted, // FORCE finalDisplay string "NN,99"
           ListPrice: record.ListPrice,
           'ListPrice con Fee': listPriceConFeeInt, // Integer ceiling
           _eanFinalCents: prezzoFinaleCents // Internal field for validation guard
@@ -1936,21 +1972,39 @@ const AltersideCatalogGenerator: React.FC = () => {
       // =====================================================================
       setEanCatalogDataset(cleanDataset);
       
-      // LOG CRITICO: verifica che i dati salvati siano nel formato corretto
-      console.warn('=== EAN CATALOG DATASET SALVATO ===');
-      console.warn('eanCatalogDataset:saved', { rows: cleanDataset.length });
+      // =====================================================================
+      // LOG ESTESO: SALVATAGGIO eanCatalogDataset
+      // =====================================================================
+      console.log('%c[eanCatalogDataset:saved] === DATASET SALVATO ===', 'color: #FF9800; font-weight: bold; font-size: 14px;');
+      console.log(`%c[eanCatalogDataset:saved]`, 'color: #FF9800;', { 
+        numero_totale_record: cleanDataset.length,
+        timestamp: new Date().toISOString()
+      });
       
-      // Log primi 10 record per verifica formato prezzi
-      cleanDataset.slice(0, 10).forEach((record: any, idx: number) => {
-        console.warn(`eanCatalogDataset:saved:row${idx}`, {
+      // Log primi 5 record per verifica formato prezzi con confronto
+      cleanDataset.slice(0, 5).forEach((record: any, idx: number) => {
+        const prezzoFinale = record['Prezzo Finale'];
+        const terminaCon99 = typeof prezzoFinale === 'string' && prezzoFinale.endsWith(',99');
+        
+        console.log(`%c[eanCatalogDataset:saved:row${idx}]`, 'color: #FF9800;', {
           EAN: record.EAN,
-          ManufPartNr: record.ManufPartNr,
-          'Prezzo Finale': record['Prezzo Finale'],
-          'Prezzo Finale type': typeof record['Prezzo Finale'],
-          'ListPrice con Fee': record['ListPrice con Fee'],
-          'ListPrice con Fee type': typeof record['ListPrice con Fee'],
-          ExistingStock: record.ExistingStock
+          SKU: record.ManufPartNr,
+          'Prezzo Finale RAW': prezzoFinale,
+          'Prezzo Finale RAW type': typeof prezzoFinale,
+          'termina_con_99': terminaCon99,
+          'ListPrice con Fee RAW': record['ListPrice con Fee'],
+          'ListPrice con Fee RAW type': typeof record['ListPrice con Fee'],
+          'ExistingStock RAW': record.ExistingStock
         });
+        
+        // ALERT se il prezzo NON termina con ,99
+        if (!terminaCon99) {
+          console.error(`%c[eanCatalogDataset:ERROR:row${idx}] PREZZO NON TERMINA CON ,99!`, 'color: red; font-weight: bold;', {
+            EAN: record.EAN,
+            prezzoFinale: prezzoFinale,
+            type: typeof prezzoFinale
+          });
+        }
       });
       
       // Create worksheet from clean dataset
@@ -2085,6 +2139,27 @@ const AltersideCatalogGenerator: React.FC = () => {
       dbg('excel:write:done', { pipeline: 'EAN' });
       
       setExcelDone(true);
+      
+      // === LOG ESTESO: RIEPILOGO FINALE CATALOGO EAN ===
+      console.log('%c[EAN:generation:complete] === CATALOGO EAN GENERATO ===', 'color: #4CAF50; font-weight: bold; font-size: 14px;');
+      console.log(`%c[EAN:generation:complete]`, 'color: #4CAF50;', {
+        'totale_prodotti_generati': cleanDataset.length,
+        'dataset_salvato_in_eanCatalogDataset': eanCatalogDataset.length,
+        'allineamento': cleanDataset.length === eanCatalogDataset.length ? 'OK' : 'MISMATCH',
+        'pronto_per_ePrice': true,
+        'pronto_per_Mediaworld': true,
+        timestamp: new Date().toISOString()
+      });
+      
+      // Log riepilogo per verifica cross-export
+      console.log('%c[check:ready-for-exports]', 'color: #E91E63; font-weight: bold;', {
+        'eanCatalogDataset_rows': eanCatalogDataset.length,
+        'primo_record': eanCatalogDataset.length > 0 ? {
+          EAN: eanCatalogDataset[0]?.EAN,
+          'Prezzo Finale': eanCatalogDataset[0]?.['Prezzo Finale'],
+          'Prezzo Finale type': typeof eanCatalogDataset[0]?.['Prezzo Finale']
+        } : null
+      });
       
       toast({
         title: "Export EAN avviato",
@@ -2295,22 +2370,25 @@ const AltersideCatalogGenerator: React.FC = () => {
       // NON usare currentProcessedData o altre fonti dati.
       // =====================================================================
       
-      // CRITICAL LOG: Verifica la fonte dati
-      console.warn('=== EPRICE EXPORT: VERIFICA FONTE DATI ===');
-      console.warn('eprice:source:check', { 
-        eanCatalogDataset_length: eanCatalogDataset.length,
-        eanCatalogDataset_exists: !!eanCatalogDataset,
-        eanCatalogDataset_isArray: Array.isArray(eanCatalogDataset)
+      // =====================================================================
+      // LOG ESTESO: EXPORT ePRICE - CONTEGGI E CONFRONTI
+      // =====================================================================
+      console.log('%c[ePrice:counts] === INIZIO EXPORT ePRICE ===', 'color: #9C27B0; font-weight: bold; font-size: 14px;');
+      console.log(`%c[ePrice:counts]`, 'color: #9C27B0;', { 
+        'prodotti in eanCatalogDataset': eanCatalogDataset.length,
+        'prodotti da esportare': eanCatalogDataset.length,
+        'differenza (dovrebbe essere 0)': 0,
+        timestamp: new Date().toISOString()
       });
       
-      // Log primi 3 record per debug
-      eanCatalogDataset.slice(0, 3).forEach((record: any, idx: number) => {
-        console.warn(`eprice:source:sample${idx}`, {
+      // Log primi 5 record dalla sorgente
+      eanCatalogDataset.slice(0, 5).forEach((record: any, idx: number) => {
+        console.log(`%c[ePrice:source:row${idx}]`, 'color: #9C27B0;', {
           EAN: record.EAN,
-          ManufPartNr: record.ManufPartNr,
-          'Prezzo Finale': record['Prezzo Finale'],
-          'Prezzo Finale type': typeof record['Prezzo Finale'],
-          ExistingStock: record.ExistingStock
+          SKU: record.ManufPartNr,
+          'Prezzo Finale RAW (da Catalogo EAN)': record['Prezzo Finale'],
+          'Prezzo Finale RAW type': typeof record['Prezzo Finale'],
+          'ExistingStock RAW': record.ExistingStock
         });
       });
       
@@ -2404,17 +2482,33 @@ const AltersideCatalogGenerator: React.FC = () => {
           }
         }
         
-        // LOG DI DEBUG per i primi 10 record - verifica COMPLETA coerenza prezzi
+        // LOG ESTESO per i primi 10 record - verifica COMPLETA coerenza prezzi
         if (index < 10) {
-          console.warn(`eprice:export:row${index}`, {
+          const rawValue = prezzoFinaleRaw;
+          const afterReplace = typeof rawValue === 'string' ? rawValue.replace(',', '.') : String(rawValue);
+          const terminaCon99 = prezzoFinaleNumber !== null && (Math.round(prezzoFinaleNumber * 100) % 100) === 99;
+          
+          console.log(`%c[ePrice:export:row${index}]`, 'color: #9C27B0;', {
             EAN: ean,
             SKU: sku,
-            'Prezzo Finale RAW': prezzoFinaleRaw,
-            'Prezzo Finale RAW type': typeof prezzoFinaleRaw,
-            'Prezzo Finale NUMBER': prezzoFinaleNumber,
-            'Prezzo Finale NUMBER toFixed(2)': prezzoFinaleNumber?.toFixed(2),
-            ExistingStock: quantity
+            'RAW Prezzo Finale (da eanCatalogDataset)': rawValue,
+            'RAW type': typeof rawValue,
+            'dopo replace virgola': afterReplace,
+            'parseFloat result': prezzoFinaleNumber,
+            'valore scritto in Excel': prezzoFinaleNumber,
+            'termina_con_99': terminaCon99,
+            'ExistingStock RAW': record.ExistingStock,
+            'quantity esportato': quantity
           });
+          
+          // ALERT se il prezzo non termina con .99
+          if (!terminaCon99 && prezzoFinaleNumber !== null) {
+            console.error(`%c[ePrice:warning:price-mismatch:row${index}] PREZZO NON TERMINA CON .99!`, 'color: red; font-weight: bold;', {
+              EAN: ean,
+              prezzoFinale: prezzoFinaleNumber,
+              raw: rawValue
+            });
+          }
         }
         
         // Validate price exists and is valid
@@ -2432,9 +2526,8 @@ const AltersideCatalogGenerator: React.FC = () => {
         // VERIFICA FINALE: il prezzo deve terminare con .99
         if (prezzoFinaleNumber !== null) {
           const cents = Math.round(prezzoFinaleNumber * 100) % 100;
-          if (cents !== 99 && index < 20) {
-            console.warn(`eprice:warning:not99`, {
-              row: index,
+          if (cents !== 99) {
+            console.error(`%c[ePrice:warning:not99:row${index}] PREZZO NON TERMINA CON .99!`, 'color: red; font-weight: bold;', {
               EAN: ean,
               prezzoFinale: prezzoFinaleNumber,
               cents: cents,
@@ -2538,13 +2631,22 @@ const AltersideCatalogGenerator: React.FC = () => {
         structureErrors: validationResult.errors
       };
       
-      // LOG FINALE: riepilogo export
-      console.warn('=== EPRICE EXPORT COMPLETATO ===');
-      console.warn('eprice:export:summary', {
+      // LOG ESTESO: riepilogo export ePRICE
+      console.log('%c[ePrice:export:summary] === EXPORT COMPLETATO ===', 'color: #9C27B0; font-weight: bold;');
+      console.log(`%c[ePrice:export:summary]`, 'color: #9C27B0;', {
         sourceDataset: 'eanCatalogDataset',
-        sourceRows: eanCatalogDataset.length,
-        exportedRows: aoa.length - 1,
-        skippedRows: skippedCount
+        'righe sorgente': eanCatalogDataset.length,
+        'righe esportate': aoa.length - 1,
+        'righe saltate': skippedCount,
+        'differenza': eanCatalogDataset.length - (aoa.length - 1) - skippedCount
+      });
+      
+      // === LOG VERIFICA INCROCIATA POST-EXPORT ===
+      console.log('%c[check:comparison-summary:ePrice]', 'color: #E91E63; font-weight: bold;', {
+        'prodotti_Catalogo_EAN': eanCatalogDataset.length,
+        'prodotti_ePrice_export': aoa.length - 1,
+        'prodotti_presenti_nel_Catalogo_ma_non_export': skippedCount,
+        'allineamento_set': eanCatalogDataset.length === (aoa.length - 1 + skippedCount) ? 'OK' : 'MISMATCH'
       });
       
       if (!validationResult.isValid) {
@@ -2641,28 +2743,40 @@ const AltersideCatalogGenerator: React.FC = () => {
       return;
     }
     
-    // CRITICAL LOG: Verifica COMPLETA della fonte dati
-    console.warn('=== MEDIAWORLD EXPORT: VERIFICA FONTE DATI ===');
-    console.warn('mediaworld:source:check', { 
-      eanCatalogDataset_length: eanCatalogDataset.length,
-      eanCatalogDataset_exists: !!eanCatalogDataset,
-      eanCatalogDataset_isArray: Array.isArray(eanCatalogDataset)
+    // === LOG ESTESO: VERIFICA FONTE DATI MEDIAWORLD ===
+    console.log('%c[Mediaworld:source:check] === VERIFICA FONTE DATI ===', 'color: #00BCD4; font-weight: bold; font-size: 14px;');
+    console.log(`%c[Mediaworld:source:check]`, 'color: #00BCD4;', { 
+      'eanCatalogDataset length': eanCatalogDataset.length,
+      'exists': !!eanCatalogDataset,
+      'isArray': Array.isArray(eanCatalogDataset),
+      timestamp: new Date().toISOString()
     });
     
-    // Log primi 10 record per debug COMPLETO
-    eanCatalogDataset.slice(0, 10).forEach((record: any, idx: number) => {
+    // Log primi 5 record per debug COMPLETO
+    eanCatalogDataset.slice(0, 5).forEach((record: any, idx: number) => {
       const prezzoFinaleRaw = record['Prezzo Finale'];
       const listPriceConFeeRaw = record['ListPrice con Fee'];
+      const terminaCon99 = typeof prezzoFinaleRaw === 'string' && prezzoFinaleRaw.endsWith(',99');
       
-      console.warn(`mediaworld:source:row${idx}`, {
+      console.log(`%c[Mediaworld:source:row${idx}]`, 'color: #00BCD4;', {
         EAN: record.EAN,
         SKU: record.ManufPartNr,
         'Prezzo Finale RAW': prezzoFinaleRaw,
         'Prezzo Finale type': typeof prezzoFinaleRaw,
+        'termina_con_99': terminaCon99,
         'ListPrice con Fee RAW': listPriceConFeeRaw,
         'ListPrice con Fee type': typeof listPriceConFeeRaw,
-        ExistingStock: record.ExistingStock
+        'ExistingStock': record.ExistingStock
       });
+      
+      // ALERT se il prezzo NON termina con ,99
+      if (!terminaCon99) {
+        console.error(`%c[Mediaworld:source:ERROR:row${idx}] PREZZO NON TERMINA CON ,99!`, 'color: red; font-weight: bold;', {
+          EAN: record.EAN,
+          prezzoFinale: prezzoFinaleRaw,
+          type: typeof prezzoFinaleRaw
+        });
+      }
     });
     
     // Validate prepDaysMediaworld
@@ -2687,14 +2801,23 @@ const AltersideCatalogGenerator: React.FC = () => {
         prepDays: prepDaysMediaworld
       });
       
-      // LOG FINALE: riepilogo export
-      console.warn('=== MEDIAWORLD EXPORT COMPLETATO ===');
-      console.warn('mediaworld:export:summary', {
+      // === LOG ESTESO: RIEPILOGO EXPORT MEDIAWORLD ===
+      console.log('%c[Mediaworld:final:summary] === EXPORT MEDIAWORLD COMPLETATO ===', 'color: #00BCD4; font-weight: bold;');
+      console.log(`%c[Mediaworld:final:summary]`, 'color: #00BCD4;', {
         sourceDataset: 'eanCatalogDataset',
-        sourceRows: eanCatalogDataset.length,
-        exportedRows: result.rowCount ?? 0,
-        skippedRows: result.skippedCount ?? 0,
-        success: result.success
+        'righe sorgente': eanCatalogDataset.length,
+        'righe esportate': result.rowCount ?? 0,
+        'righe saltate': result.skippedCount ?? 0,
+        'success': result.success
+      });
+      
+      // === LOG VERIFICA INCROCIATA FINALE ===
+      console.log('%c[check:final-comparison:Mediaworld]', 'color: #E91E63; font-weight: bold;', {
+        'Catalogo_EAN_rows': eanCatalogDataset.length,
+        'Mediaworld_exported_rows': result.rowCount ?? 0,
+        'Mediaworld_skipped_rows': result.skippedCount ?? 0,
+        'totale_elaborato': (result.rowCount ?? 0) + (result.skippedCount ?? 0),
+        'allineamento': eanCatalogDataset.length === ((result.rowCount ?? 0) + (result.skippedCount ?? 0)) ? 'OK' : 'MISMATCH'
       });
       
       // Build validation report for UI
