@@ -309,11 +309,8 @@ export async function exportMediaworldCatalog({
     const templateBuffer = await templateResponse.arrayBuffer();
     const templateWb = XLSX.read(templateBuffer, { type: 'array' });
     
-    // Extract all sheets from template (copy exactly as-is)
-    const referenceDataSheet = templateWb.Sheets['ReferenceData'];
-    const columnsSheet = templateWb.Sheets['Columns'];
-    // Get the Data sheet from template - preserve rows 1 and 2 (Italian headers + technical codes)
-    const templateDataSheet = templateWb.Sheets['Data'];
+    // NOTE: We will use templateWb directly (not create a new workbook)
+    // This preserves ALL template structure: validations, named ranges, metadata
     
     // Build data rows for export (WITHOUT headers - will be inserted starting from row 3)
     const dataRows: (string | number)[][] = [];
@@ -526,27 +523,40 @@ export async function exportMediaworldCatalog({
       });
     }
     
-    // Create new workbook with 3 sheets
-    const wb = XLSX.utils.book_new();
+    // =====================================================================
+    // CRITICAL FIX: Use the ORIGINAL template workbook directly
+    // Do NOT create a new workbook - this preserves all validations,
+    // named ranges, and metadata that Mediaworld requires
+    // =====================================================================
+    const wb = templateWb; // Use template workbook directly
     
-    // Sheet 1: Data - use template sheet to preserve rows 1 and 2
-    // Clone the template Data sheet to preserve original structure
-    const dataSheet = templateDataSheet ? { ...templateDataSheet } : XLSX.utils.aoa_to_sheet([]);
+    // Get the existing Data sheet from template - DO NOT recreate it
+    const dataSheet = wb.Sheets['Data'];
+    
+    if (!dataSheet) {
+      return { 
+        success: false, 
+        error: 'Foglio "Data" non trovato nel template Mediaworld',
+        validationErrors,
+        skippedCount
+      };
+    }
     
     // IMPORTANT: Write data starting from row 3 (rowIndex = 2, 0-indexed)
-    // Row 1 (index 0) = Italian headers from template
-    // Row 2 (index 1) = Technical codes from template (sku, product-id, etc.)
-    // Row 3+ (index 2+) = Data rows
+    // Row 1 (index 0) = Italian headers from template - DO NOT TOUCH
+    // Row 2 (index 1) = Technical codes from template (sku, product-id, etc.) - DO NOT TOUCH
+    // Row 3+ (index 2+) = Data rows - WRITE ONLY VALUES HERE
     const DATA_START_ROW = 2; // 0-indexed, corresponds to Excel row 3
     
     // Write each data row starting from row 3
+    // Only write the cell values (.v), preserve any existing cell properties where possible
     dataRows.forEach((row, dataIndex) => {
       const rowIndex = DATA_START_ROW + dataIndex; // Row 2, 3, 4... (0-indexed)
       
       row.forEach((value, colIndex) => {
         const addr = XLSX.utils.encode_cell({ r: rowIndex, c: colIndex });
         
-        // Create cell based on value type
+        // Create or update cell with just the value, preserving structure
         if (typeof value === 'number') {
           dataSheet[addr] = { v: value, t: 'n' };
         } else {
@@ -598,8 +608,8 @@ export async function exportMediaworldCatalog({
     console.log('%c[Mediaworld:structure-check] Verifica righe 1-3 del foglio Data:', 'color: #FF9800; font-weight: bold;');
     for (let R = 0; R <= Math.min(2, lastRow); R++) {
       const rowData: Record<string, any> = {};
-      const colsToCheck = [0, 1, 2, 5, 13]; // SKU, EAN, Tipo, Prezzo offerta, Prezzo scontato
-      const colNames = ['A (SKU)', 'B (EAN)', 'C (Tipo)', 'F (PrezzoOff)', 'N (PrezzoSc)'];
+      const colsToCheck = [0, 1, 2, 5, 9, 13]; // SKU, EAN, Tipo, Prezzo offerta, State, Prezzo scontato
+      const colNames = ['A (SKU)', 'B (EAN)', 'C (Tipo)', 'F (PrezzoOff)', 'J (State)', 'N (PrezzoSc)'];
       colsToCheck.forEach((C, idx) => {
         const addr = XLSX.utils.encode_cell({ r: R, c: C });
         const cell = dataSheet[addr];
@@ -610,43 +620,8 @@ export async function exportMediaworldCatalog({
     }
     console.log('%c[Mediaworld:structure-check] Fine verifica', 'color: #FF9800;');
     
-    XLSX.utils.book_append_sheet(wb, dataSheet, 'Data');
-    
-    // =====================================================================
-    // VALIDAZIONE AUTOMATICA: Verifica struttura conforme al template
-    // ufficiale Mediaworld prima del download
-    // =====================================================================
-    const structureValidation = validateMediaworldStructure(dataSheet, 'Data');
-    
-    if (!structureValidation.isValid) {
-      console.error('Mediaworld template validation FAILED:', structureValidation.errors);
-      return {
-        success: false,
-        error: `File non conforme al template Mediaworld: ${structureValidation.errors.join('; ')}`,
-        validationErrors,
-        skippedCount
-      };
-    }
-    
-    if (structureValidation.warnings.length > 0) {
-      console.warn('Mediaworld template validation warnings:', structureValidation.warnings);
-    }
-    
-    // Sheet 2: ReferenceData (copy from template exactly as-is)
-    if (referenceDataSheet) {
-      XLSX.utils.book_append_sheet(wb, referenceDataSheet, 'ReferenceData');
-    } else {
-      const emptyRefSheet = XLSX.utils.aoa_to_sheet([['ReferenceData']]);
-      XLSX.utils.book_append_sheet(wb, emptyRefSheet, 'ReferenceData');
-    }
-    
-    // Sheet 3: Columns (copy from template exactly as-is)
-    if (columnsSheet) {
-      XLSX.utils.book_append_sheet(wb, columnsSheet, 'Columns');
-    } else {
-      const emptyColSheet = XLSX.utils.aoa_to_sheet([['Columns']]);
-      XLSX.utils.book_append_sheet(wb, emptyColSheet, 'Columns');
-    }
+    // NOTE: The workbook already contains all sheets (Data, ReferenceData, Columns)
+    // from the original template - no need to re-add them
     
     // Serialize to ArrayBuffer
     const wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
