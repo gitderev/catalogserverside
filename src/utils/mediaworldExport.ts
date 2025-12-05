@@ -594,6 +594,22 @@ export async function exportMediaworldCatalog({
       }
     }
     
+    // === LOG DIAGNOSTICO: Verifica struttura prime 3 righe del foglio Data ===
+    console.log('%c[Mediaworld:structure-check] Verifica righe 1-3 del foglio Data:', 'color: #FF9800; font-weight: bold;');
+    for (let R = 0; R <= Math.min(2, lastRow); R++) {
+      const rowData: Record<string, any> = {};
+      const colsToCheck = [0, 1, 2, 5, 13]; // SKU, EAN, Tipo, Prezzo offerta, Prezzo scontato
+      const colNames = ['A (SKU)', 'B (EAN)', 'C (Tipo)', 'F (PrezzoOff)', 'N (PrezzoSc)'];
+      colsToCheck.forEach((C, idx) => {
+        const addr = XLSX.utils.encode_cell({ r: R, c: C });
+        const cell = dataSheet[addr];
+        rowData[colNames[idx]] = cell ? cell.v : '(vuoto)';
+      });
+      const rowLabel = R === 0 ? 'Riga 1 (intestazioni IT)' : R === 1 ? 'Riga 2 (codici tecnici)' : 'Riga 3 (primo dato)';
+      console.log(`  ${rowLabel}:`, rowData);
+    }
+    console.log('%c[Mediaworld:structure-check] Fine verifica', 'color: #FF9800;');
+    
     XLSX.utils.book_append_sheet(wb, dataSheet, 'Data');
     
     // =====================================================================
