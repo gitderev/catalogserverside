@@ -155,16 +155,19 @@ function validateMediaworldStructure(
   }
 
   // 5. Validate data rows
-  const rowCount = range.e.r - range.s.r; // excluding header
-  if (rowCount === 0) {
+  // Data starts at row 3 (index 2), after Italian headers (row 1) and technical codes (row 2)
+  const DATA_START_ROW = 2;
+  const dataRowCount = range.e.r - DATA_START_ROW + 1; // Number of data rows
+  if (dataRowCount <= 0) {
     errors.push("Nessuna riga dati presente");
     return { isValid: false, errors, warnings };
   }
 
   // Sample validation of first 5 data rows
-  const sampleSize = Math.min(5, rowCount);
-  for (let R = 1; R <= sampleSize; R++) {
-    const rowNum = R + 1; // Excel row number (1-indexed + header)
+  const sampleSize = Math.min(5, dataRowCount);
+  for (let i = 0; i < sampleSize; i++) {
+    const R = DATA_START_ROW + i; // Actual row index (starting from 2)
+    const rowNum = R + 1; // Excel row number (1-indexed)
     
     // Validate each column
     for (let C = 0; C < MEDIAWORLD_TEMPLATE.headers.length; C++) {
@@ -236,7 +239,9 @@ function validateMediaworldStructure(
   for (const priceCol of priceColumns) {
     const priceColIndex = MEDIAWORLD_TEMPLATE.headers.indexOf(priceCol);
     if (priceColIndex >= 0) {
-      for (let R = 1; R <= Math.min(3, rowCount); R++) {
+      // Check first 3 data rows (starting from row 3, index 2)
+      for (let i = 0; i < Math.min(3, dataRowCount); i++) {
+        const R = DATA_START_ROW + i;
         const addr = XLSX.utils.encode_cell({ r: R, c: priceColIndex });
         const cell = ws[addr];
         if (cell && cell.t !== 'n') {
@@ -304,13 +309,14 @@ export async function exportMediaworldCatalog({
     const templateBuffer = await templateResponse.arrayBuffer();
     const templateWb = XLSX.read(templateBuffer, { type: 'array' });
     
-    // Extract ReferenceData and Columns sheets from template (copy exactly as-is)
+    // Extract all sheets from template (copy exactly as-is)
     const referenceDataSheet = templateWb.Sheets['ReferenceData'];
     const columnsSheet = templateWb.Sheets['Columns'];
+    // Get the Data sheet from template - preserve rows 1 and 2 (Italian headers + technical codes)
+    const templateDataSheet = templateWb.Sheets['Data'];
     
-    // Build data rows with mapping
-    // Row 1: Italian headers ONLY (no technical codes row)
-    const dataRows: (string | number)[][] = [MEDIAWORLD_HEADERS_ITALIAN];
+    // Build data rows for export (WITHOUT headers - will be inserted starting from row 3)
+    const dataRows: (string | number)[][] = [];
     
     // Log per debug: tracciamento conversione prezzi
     let debugLogCount = 0;
@@ -491,7 +497,7 @@ export async function exportMediaworldCatalog({
     });
     
     // Check if we have valid data rows after validation
-    const validRowCount = dataRows.length - 1; // Exclude header row
+    const validRowCount = dataRows.length; // No header row included in dataRows
     
     // === LOG RIEPILOGO INTERNO UTILITY MEDIAWORLD ===
     console.log('%c[Mediaworld:util:complete]', 'color: #00BCD4;', {
@@ -523,40 +529,67 @@ export async function exportMediaworldCatalog({
     // Create new workbook with 3 sheets
     const wb = XLSX.utils.book_new();
     
-    // Sheet 1: Data
-    const dataSheet = XLSX.utils.aoa_to_sheet(dataRows);
+    // Sheet 1: Data - use template sheet to preserve rows 1 and 2
+    // Clone the template Data sheet to preserve original structure
+    const dataSheet = templateDataSheet ? { ...templateDataSheet } : XLSX.utils.aoa_to_sheet([]);
+    
+    // IMPORTANT: Write data starting from row 3 (rowIndex = 2, 0-indexed)
+    // Row 1 (index 0) = Italian headers from template
+    // Row 2 (index 1) = Technical codes from template (sku, product-id, etc.)
+    // Row 3+ (index 2+) = Data rows
+    const DATA_START_ROW = 2; // 0-indexed, corresponds to Excel row 3
+    
+    // Write each data row starting from row 3
+    dataRows.forEach((row, dataIndex) => {
+      const rowIndex = DATA_START_ROW + dataIndex; // Row 2, 3, 4... (0-indexed)
+      
+      row.forEach((value, colIndex) => {
+        const addr = XLSX.utils.encode_cell({ r: rowIndex, c: colIndex });
+        
+        // Create cell based on value type
+        if (typeof value === 'number') {
+          dataSheet[addr] = { v: value, t: 'n' };
+        } else {
+          dataSheet[addr] = { v: value, t: 's' };
+        }
+      });
+    });
+    
+    // Update sheet range to include all data rows
+    const lastRow = DATA_START_ROW + dataRows.length - 1;
+    const lastCol = MEDIAWORLD_HEADERS_ITALIAN.length - 1;
+    dataSheet['!ref'] = XLSX.utils.encode_range({
+      s: { r: 0, c: 0 },
+      e: { r: lastRow, c: lastCol }
+    });
     
     // Force ID Prodotto (column B, index 1) to text format to preserve leading zeros
-    // Data rows start at row 2 (index 1) since row 1 is headers
-    if (dataSheet['!ref']) {
-      const range = XLSX.utils.decode_range(dataSheet['!ref']);
-      const eanCol = 1; // Column B (ID Prodotto)
-      
-      // Start from R=1 (first data row after header)
-      for (let R = 1; R <= range.e.r; R++) {
-        const addr = XLSX.utils.encode_cell({ r: R, c: eanCol });
-        const cell = dataSheet[addr];
-        if (cell) {
-          cell.v = (cell.v ?? '').toString();
-          cell.t = 's';
-          cell.z = '@';
-          dataSheet[addr] = cell;
-        }
+    // Data rows start at row 3 (index 2) since rows 1-2 are headers
+    const eanCol = 1; // Column B (ID Prodotto)
+    
+    for (let R = DATA_START_ROW; R <= lastRow; R++) {
+      const addr = XLSX.utils.encode_cell({ r: R, c: eanCol });
+      const cell = dataSheet[addr];
+      if (cell) {
+        cell.v = (cell.v ?? '').toString();
+        cell.t = 's';
+        cell.z = '@';
+        dataSheet[addr] = cell;
       }
-      
-      // Format price columns with "0.00" to ensure two decimal places
-      // Column indices: Prezzo dell'offerta (5) and Prezzo scontato (13)
-      const priceCols = [5, 13];
-      
-      for (let R = 1; R <= range.e.r; R++) {
-        for (const C of priceCols) {
-          const addr = XLSX.utils.encode_cell({ r: R, c: C });
-          const cell = dataSheet[addr];
-          if (cell && typeof cell.v === 'number') {
-            cell.t = 'n'; // number type
-            cell.z = '0.00'; // format with 2 decimal places
-            dataSheet[addr] = cell;
-          }
+    }
+    
+    // Format price columns with "0.00" to ensure two decimal places
+    // Column indices: Prezzo dell'offerta (5) and Prezzo scontato (13)
+    const priceCols = [5, 13];
+    
+    for (let R = DATA_START_ROW; R <= lastRow; R++) {
+      for (const C of priceCols) {
+        const addr = XLSX.utils.encode_cell({ r: R, c: C });
+        const cell = dataSheet[addr];
+        if (cell && typeof cell.v === 'number') {
+          cell.t = 'n'; // number type
+          cell.z = '0.00'; // format with 2 decimal places
+          dataSheet[addr] = cell;
         }
       }
     }
