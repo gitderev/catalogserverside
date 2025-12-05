@@ -415,7 +415,7 @@ export async function exportMediaworldCatalog({
         '',                                          // Col 5: Descrizione interna offerta → vuoto
         listPriceConFee,                             // Col 6: Prezzo dell'offerta → ListPrice con Fee (NUMBER)
         '',                                          // Col 7: Info aggiuntive prezzo offerta → vuoto
-        Math.floor(stockValue),                      // Col 8: Quantità dell'offerta → ExistingStock (INTEGER)
+        stockValue,                                  // Col 8: Quantità dell'offerta → ExistingStock (valore esatto dal Catalogo EAN)
         '',                                          // Col 9: Avviso quantità minima → vuoto
         'Nuovo',                                     // Col 10: Stato dell'offerta → "Nuovo" (fixed)
         '',                                          // Col 11: Data di inizio disponibilità → vuoto
