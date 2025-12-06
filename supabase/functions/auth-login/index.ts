@@ -5,28 +5,74 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
-// Generate a simple signed token
-function generateToken(secret: string): string {
+// Rate limiting: 10 requests per minute per IP
+const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
+const RATE_LIMIT_MAX_REQUESTS = 10;
+const rateLimitMap = new Map<string, { count: number; windowStart: number }>();
+
+function getClientIP(req: Request): string {
+  return req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 
+         req.headers.get('x-real-ip') || 
+         'unknown';
+}
+
+function checkRateLimit(ip: string): boolean {
+  const now = Date.now();
+  const entry = rateLimitMap.get(ip);
+  
+  if (!entry || now - entry.windowStart > RATE_LIMIT_WINDOW_MS) {
+    rateLimitMap.set(ip, { count: 1, windowStart: now });
+    return true;
+  }
+  
+  if (entry.count >= RATE_LIMIT_MAX_REQUESTS) {
+    return false;
+  }
+  
+  entry.count++;
+  return true;
+}
+
+// Generate HMAC-SHA256 token
+async function generateToken(secret: string): Promise<string> {
   const expiry = Date.now() + (24 * 60 * 60 * 1000); // 24 hours
   const payload = `authenticated:${expiry}`;
   
-  // Create a simple hash-based signature
   const encoder = new TextEncoder();
-  const data = encoder.encode(payload + secret);
-  let hash = 0;
-  for (let i = 0; i < data.length; i++) {
-    hash = ((hash << 5) - hash) + data[i];
-    hash = hash & hash;
-  }
-  const signature = Math.abs(hash).toString(36);
+  const keyData = encoder.encode(secret);
+  const payloadData = encoder.encode(payload);
   
-  return btoa(`${payload}:${signature}`);
+  const cryptoKey = await crypto.subtle.importKey(
+    'raw',
+    keyData,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  
+  const signature = await crypto.subtle.sign('HMAC', cryptoKey, payloadData);
+  const signatureHex = Array.from(new Uint8Array(signature))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+  
+  // Format: base64(payload.signature)
+  return btoa(`${payload}.${signatureHex}`);
 }
 
 serve(async (req) => {
   // Handle CORS preflight requests
   if (req.method === 'OPTIONS') {
     return new Response(null, { headers: corsHeaders });
+  }
+
+  // Rate limiting check
+  const clientIP = getClientIP(req);
+  if (!checkRateLimit(clientIP)) {
+    console.log(`Rate limit exceeded for IP: ${clientIP}`);
+    return new Response(
+      JSON.stringify({ success: false, error: 'Troppe richieste. Riprova tra un minuto.' }),
+      { status: 429, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+    );
   }
 
   try {
@@ -41,6 +87,7 @@ serve(async (req) => {
     }
 
     const correctPassword = Deno.env.get('APP_ACCESS_PASSWORD');
+    const tokenSecret = Deno.env.get('AUTH_TOKEN_SECRET') || correctPassword;
     
     if (!correctPassword) {
       console.error('APP_ACCESS_PASSWORD not configured');
@@ -50,9 +97,17 @@ serve(async (req) => {
       );
     }
 
+    if (!tokenSecret) {
+      console.error('AUTH_TOKEN_SECRET not configured');
+      return new Response(
+        JSON.stringify({ success: false, error: 'Configurazione server non valida' }),
+        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
     if (password === correctPassword) {
       console.log('Login successful');
-      const token = generateToken(correctPassword);
+      const token = await generateToken(tokenSecret);
       
       return new Response(
         JSON.stringify({ success: true, token }),

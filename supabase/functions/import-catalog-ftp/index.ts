@@ -9,7 +9,6 @@ const corsHeaders = {
 interface FileResult {
   filename: string;
   path: string;
-  url: string;
   size: number;
 }
 
@@ -28,7 +27,6 @@ const FILE_CONFIG = {
 
 type FileType = keyof typeof FILE_CONFIG;
 
-const TIMEOUT_MS = 600000; // 10 minutes
 const BUCKET_NAME = "ftp-import";
 
 class FTPClient {
@@ -210,6 +208,51 @@ class FTPClient {
   }
 }
 
+// Authentication check: verify user is authenticated and is admin
+async function checkAuthAndAdmin(req: Request, supabaseUrl: string, supabaseAnonKey: string): Promise<{ authorized: boolean; error?: string; status?: number }> {
+  const authHeader = req.headers.get('authorization');
+  
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return { authorized: false, error: 'Token di autenticazione mancante', status: 401 };
+  }
+  
+  const token = authHeader.replace('Bearer ', '');
+  
+  // Create a Supabase client with the user's token
+  const supabase = createClient(supabaseUrl, supabaseAnonKey, {
+    global: {
+      headers: {
+        Authorization: `Bearer ${token}`
+      }
+    }
+  });
+  
+  // Get the authenticated user
+  const { data: { user }, error: userError } = await supabase.auth.getUser();
+  
+  if (userError || !user) {
+    console.log('Authentication failed:', userError?.message || 'No user');
+    return { authorized: false, error: 'Autenticazione non valida', status: 401 };
+  }
+  
+  console.log(`User authenticated: ${user.id}`);
+  
+  // Check if user is admin
+  const { data: adminData, error: adminError } = await supabase
+    .from('admin_users')
+    .select('user_id')
+    .eq('user_id', user.id)
+    .single();
+  
+  if (adminError || !adminData) {
+    console.log(`User ${user.id} is not an admin`);
+    return { authorized: false, error: 'Accesso non autorizzato. Solo gli amministratori possono importare file.', status: 403 };
+  }
+  
+  console.log(`User ${user.id} is admin, proceeding`);
+  return { authorized: true };
+}
+
 serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response(null, { headers: corsHeaders });
@@ -225,6 +268,27 @@ serve(async (req) => {
   let client: FTPClient | null = null;
 
   try {
+    // Read environment variables first for auth check
+    const supabaseUrl = Deno.env.get('SUPABASE_URL');
+    const supabaseAnonKey = Deno.env.get('SUPABASE_ANON_KEY');
+    const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
+
+    if (!supabaseUrl || !supabaseAnonKey) {
+      return new Response(
+        JSON.stringify({ status: "error", code: "CONFIG_MISSING", message: "Supabase config missing" } as ErrorResponse),
+        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
+    // Check authentication and admin status
+    const authResult = await checkAuthAndAdmin(req, supabaseUrl, supabaseAnonKey);
+    if (!authResult.authorized) {
+      return new Response(
+        JSON.stringify({ status: "error", code: "UNAUTHORIZED", message: authResult.error } as ErrorResponse),
+        { status: authResult.status || 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
     // Parse request body
     const body = await req.json().catch(() => ({}));
     const fileType = body.fileType as string | undefined;
@@ -244,15 +308,13 @@ serve(async (req) => {
     const config = FILE_CONFIG[fileType as FileType];
     console.log(`Processing single file: ${fileType} -> ${config.ftpName}`);
 
-    // Read environment variables
+    // Read FTP environment variables
     const ftpHost = Deno.env.get('FTP_HOST');
     const ftpUser = Deno.env.get('FTP_USER');
     const ftpPass = Deno.env.get('FTP_PASSWORD');
     const ftpPort = parseInt(Deno.env.get('FTP_PORT') || '21');
     const ftpInputDir = Deno.env.get('FTP_INPUT_DIR') || '/';
     const ftpUseTLS = Deno.env.get('FTP_USE_TLS') === 'true';
-    const supabaseUrl = Deno.env.get('SUPABASE_URL');
-    const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
 
     if (!ftpHost || !ftpUser || !ftpPass) {
       return new Response(
@@ -261,13 +323,14 @@ serve(async (req) => {
       );
     }
 
-    if (!supabaseUrl || !supabaseServiceKey) {
+    if (!supabaseServiceKey) {
       return new Response(
-        JSON.stringify({ status: "error", code: "CONFIG_MISSING", message: "Supabase config missing" } as ErrorResponse),
+        JSON.stringify({ status: "error", code: "CONFIG_MISSING", message: "Supabase service key missing" } as ErrorResponse),
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
 
+    // Use service role key for storage operations (bypasses RLS)
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
     client = new FTPClient(ftpUseTLS);
 
@@ -324,15 +387,20 @@ serve(async (req) => {
 
     console.log(`Upload complete`);
 
-    // Get public URL
-    const { data: urlData } = supabase.storage.from(BUCKET_NAME).getPublicUrl(storagePath);
+    // Create signed URL for the file (valid for 1 hour)
+    const { data: signedUrlData, error: signedUrlError } = await supabase.storage
+      .from(BUCKET_NAME)
+      .createSignedUrl(storagePath, 3600);
 
-    const fileResult: FileResult = {
+    const fileResult: FileResult & { url?: string } = {
       filename: newFilename,
       path: storagePath,
-      url: urlData.publicUrl,
       size: fileSize,
     };
+
+    if (signedUrlData && !signedUrlError) {
+      fileResult.url = signedUrlData.signedUrl;
+    }
 
     // Build response with dynamic key
     const response = {
