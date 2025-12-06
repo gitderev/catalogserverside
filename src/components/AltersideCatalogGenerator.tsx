@@ -1101,6 +1101,20 @@ const AltersideCatalogGenerator: React.FC = () => {
   const handleFtpImport = async () => {
     setFtpImportLoading(true);
     
+    // Check authentication first
+    const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+    
+    if (sessionError || !session || !session.access_token) {
+      toast({
+        title: "Autenticazione richiesta",
+        description: "Devi effettuare il login come admin per eseguire l'import da FTP.",
+        variant: "destructive"
+      });
+      setFtpImportLoading(false);
+      return;
+    }
+    
+    const accessToken = session.access_token;
     const edgeFunctionUrl = "https://hdcniibdblgqkhhgbqtz.supabase.co/functions/v1/import-catalog-ftp";
     
     // Helper: download file from URL and convert to File object
@@ -1115,12 +1129,15 @@ const AltersideCatalogGenerator: React.FC = () => {
     
     // Helper: import a single file type from FTP
     const importSingleFileFromFtp = async (fileType: "material" | "stock" | "price") => {
-      // Call edge function
+      // Call edge function with Authorization header
       let res: Response;
       try {
         res = await fetch(edgeFunctionUrl, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { 
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${accessToken}`
+          },
           body: JSON.stringify({ fileType }),
         });
       } catch (e) {
