@@ -10,6 +10,14 @@ import { Upload, Download, FileText, CheckCircle, XCircle, AlertCircle, Clock, A
 import { useAuth } from '@/hooks/useAuth';
 import { filterAndNormalizeForEAN, type EANStats, type DiscardedRow } from '@/utils/ean';
 import { forceEANText, exportDiscardedRowsCSV } from '@/utils/excelFormatter';
+import { 
+  parseOverrideFile, 
+  applyOverrideToCatalog, 
+  validateEnding99Guard,
+  type OverrideIndex,
+  type OverrideError,
+  type OverrideStats
+} from '@/utils/override';
 import { exportMediaworldCatalog } from '@/utils/mediaworldExport';
 import { 
   toComma99Cents, 
@@ -116,6 +124,19 @@ interface PrefillState {
   status: 'idle' | 'running' | 'done' | 'skipped';
   counters: EANPrefillCounters | null;
   reports: EANPrefillReports | null;
+}
+
+// Override Prodotti State
+interface OverrideState {
+  file: File | null;
+  filename: string | null;
+  uploadedAt: Date | null;
+  index: OverrideIndex | null;
+  errors: OverrideError[];
+  disabled: boolean;
+  validCount: number;
+  invalidCount: number;
+  lastApplyStats: OverrideStats | null;
 }
 
 interface FileUploadState {
@@ -395,6 +416,22 @@ const AltersideCatalogGenerator: React.FC = () => {
   const eanPrefillCounters = prefillState.counters;
   const eanPrefillReports = prefillState.reports;
   const isProcessingPrefill = prefillState.status === 'running';
+
+  // Override Prodotti state
+  const [overrideState, setOverrideState] = useState<OverrideState>({
+    file: null,
+    filename: null,
+    uploadedAt: null,
+    index: null,
+    errors: [],
+    disabled: false,
+    validCount: 0,
+    invalidCount: 0,
+    lastApplyStats: null
+  });
+  
+  // Base catalog (before override) and final dataset
+  const [eanCatalogBase, setEanCatalogBase] = useState<any[]>([]);
 
   // Mapping persistence state
   const [mappingInfo, setMappingInfo] = useState<{ filename: string; uploadedAt: string } | null>(null);
@@ -1985,23 +2022,88 @@ const AltersideCatalogGenerator: React.FC = () => {
       });
       
       // =====================================================================
+      // SALVA IL CATALOGO BASE (prima dell'override)
+      // =====================================================================
+      setEanCatalogBase(cleanDataset);
+      
+      // =====================================================================
+      // APPLICA OVERRIDE SE PRESENTE E ABILITATO
+      // =====================================================================
+      let finalDataset = cleanDataset;
+      
+      if (shouldApplyOverride && overrideState.index) {
+        console.log('%c[Override:applying] === APPLICAZIONE OVERRIDE ===', 'color: #E91E63; font-weight: bold; font-size: 14px;');
+        
+        const overrideResult = applyOverrideToCatalog(cleanDataset, overrideState.index);
+        
+        // Valida che tutti i prezzi finali terminino con ,99
+        const guardResult = validateEnding99Guard(overrideResult.catalog);
+        
+        if (!guardResult.valid) {
+          console.error('%c[Override:guard:FAIL]', 'color: red; font-weight: bold;', {
+            failures: guardResult.failures.slice(0, 10)
+          });
+          toast({
+            title: "Errore validazione Override",
+            description: `${guardResult.failures.length} prezzi override non terminano con ,99. Override non applicato.`,
+            variant: "destructive"
+          });
+          // Usa il dataset base senza override
+          finalDataset = cleanDataset;
+          setOverrideState(prev => ({
+            ...prev,
+            errors: [...prev.errors, ...guardResult.failures.map(f => ({
+              rowIndex: f.index,
+              field: 'Prezzo Finale',
+              value: f.price,
+              reason: `Prezzo non termina con ,99 per EAN ${f.ean}`
+            }))]
+          }));
+        } else {
+          // Override applicato con successo
+          finalDataset = overrideResult.catalog;
+          
+          // Aggiorna stats e errori nello state
+          setOverrideState(prev => ({
+            ...prev,
+            errors: [...prev.errors, ...overrideResult.errors],
+            lastApplyStats: overrideResult.stats
+          }));
+          
+          console.log('%c[Override:applied]', 'color: #E91E63; font-weight: bold;', {
+            updatedExisting: overrideResult.stats.updatedExisting,
+            addedNew: overrideResult.stats.addedNew,
+            skippedRows: overrideResult.stats.skippedRows,
+            warnings: overrideResult.stats.warnings,
+            totalErrors: overrideResult.errors.length
+          });
+          
+          toast({
+            title: "Override applicato",
+            description: `${overrideResult.stats.updatedExisting} aggiornati, ${overrideResult.stats.addedNew} nuovi prodotti`
+          });
+        }
+      }
+      
+      // =====================================================================
       // SALVA IL DATASET FINALE PER RIUTILIZZO IN EPRICE E MEDIAWORLD
       // Questo dataset contiene i prezzi formattati "NN,99" e sarà usato
       // come UNICA FONTE DI VERITÀ per tutti gli export.
       // =====================================================================
-      setEanCatalogDataset(cleanDataset);
+      setEanCatalogDataset(finalDataset);
       
       // =====================================================================
       // LOG ESTESO: SALVATAGGIO eanCatalogDataset
       // =====================================================================
       console.log('%c[eanCatalogDataset:saved] === DATASET SALVATO ===', 'color: #FF9800; font-weight: bold; font-size: 14px;');
       console.log(`%c[eanCatalogDataset:saved]`, 'color: #FF9800;', { 
-        numero_totale_record: cleanDataset.length,
+        numero_totale_record: finalDataset.length,
+        overrideApplied: shouldApplyOverride,
         timestamp: new Date().toISOString()
       });
       
       // Log primi 5 record per verifica formato prezzi con confronto
-      cleanDataset.slice(0, 5).forEach((record: any, idx: number) => {
+      finalDataset.slice(0, 5).forEach((record: any, idx: number) => {
         const prezzoFinale = record['Prezzo Finale'];
         const terminaCon99 = typeof prezzoFinale === 'string' && prezzoFinale.endsWith(',99');
         
@@ -2013,7 +2115,9 @@ const AltersideCatalogGenerator: React.FC = () => {
           'termina_con_99': terminaCon99,
           'ListPrice con Fee RAW': record['ListPrice con Fee'],
           'ListPrice con Fee RAW type': typeof record['ListPrice con Fee'],
-          'ExistingStock RAW': record.ExistingStock
+          'ExistingStock RAW': record.ExistingStock,
+          '__override': record.__override || false,
+          '__overrideSource': record.__overrideSource || 'none'
         });
         
         // ALERT se il prezzo NON termina con ,99
@@ -2026,13 +2130,13 @@ const AltersideCatalogGenerator: React.FC = () => {
         }
       });
       
-      // Create worksheet from clean dataset
-      const ws = XLSX.utils.json_to_sheet(cleanDataset, { skipHeader: false });
+      // Create worksheet from final dataset (with override applied if applicable)
+      const ws = XLSX.utils.json_to_sheet(finalDataset, { skipHeader: false });
       
       // Ensure !ref exists
       if (!ws['!ref']) {
-        const rows = cleanDataset.length + 1; // +1 for header
-        const cols = Object.keys(cleanDataset[0] || {}).length;
+        const rows = finalDataset.length + 1; // +1 for header
+        const cols = Object.keys(finalDataset[0] || {}).length;
         ws['!ref'] = XLSX.utils.encode_range({s:{r:0,c:0}, e:{r:rows-1,c:cols-1}});
       }
       
@@ -3045,6 +3149,105 @@ const AltersideCatalogGenerator: React.FC = () => {
     });
   };
 
+  // =====================================================================
+  // OVERRIDE PRODOTTI - Gestione file
+  // =====================================================================
+  
+  const handleOverrideFileUpload = async (file: File) => {
+    // Validate file extension
+    const fileExt = file.name.substring(file.name.lastIndexOf('.')).toLowerCase();
+    
+    if (fileExt !== '.xlsx' && fileExt !== '.xls') {
+      toast({
+        title: "Formato file non valido",
+        description: "Accettati solo file Excel (.xlsx, .xls)",
+        variant: "destructive"
+      });
+      return;
+    }
+    
+    try {
+      const buffer = await file.arrayBuffer();
+      const result = parseOverrideFile(buffer);
+      
+      setOverrideState({
+        file,
+        filename: file.name,
+        uploadedAt: new Date(),
+        index: result.index,
+        errors: result.errors,
+        disabled: false,
+        validCount: result.validCount,
+        invalidCount: result.invalidCount,
+        lastApplyStats: null
+      });
+      
+      if (result.success && result.index) {
+        toast({
+          title: "File override caricato",
+          description: `${result.validCount} righe valide, ${result.invalidCount} scartate`
+        });
+      } else {
+        toast({
+          title: "Errore file override",
+          description: result.errors[0]?.reason || "File non valido",
+          variant: "destructive"
+        });
+      }
+    } catch (error) {
+      toast({
+        title: "Errore lettura file",
+        description: error instanceof Error ? error.message : "Errore sconosciuto",
+        variant: "destructive"
+      });
+    }
+  };
+  
+  const handleDisableOverride = () => {
+    setOverrideState(prev => ({
+      ...prev,
+      disabled: true
+    }));
+    toast({
+      title: "Override disabilitato",
+      description: "L'override non verrà applicato alla prossima generazione"
+    });
+  };
+  
+  const handleEnableOverride = () => {
+    setOverrideState(prev => ({
+      ...prev,
+      disabled: false
+    }));
+    toast({
+      title: "Override riabilitato",
+      description: "L'override verrà applicato alla prossima generazione"
+    });
+  };
+  
+  const handleRemoveOverrideFile = () => {
+    setOverrideState({
+      file: null,
+      filename: null,
+      uploadedAt: null,
+      index: null,
+      errors: [],
+      disabled: false,
+      validCount: 0,
+      invalidCount: 0,
+      lastApplyStats: null
+    });
+    toast({
+      title: "File override rimosso",
+      description: "Il file override è stato eliminato"
+    });
+  };
+  
+  // Check if override should be applied
+  const shouldApplyOverride = overrideState.file !== null && 
+                               overrideState.index !== null && 
+                               !overrideState.disabled;
+
   const processEANPrefill = async () => {
     if (!files.eanMapping.file || !files.material.file) {
       toast({
@@ -3837,7 +4040,137 @@ const AltersideCatalogGenerator: React.FC = () => {
           </div>
         </div>
 
-        {/* FTP Import Button */}
+        {/* Override Prodotti Section (Optional) */}
+        <div className="card border-strong" style={{ background: '#fef3c7' }}>
+          <div className="card-body">
+            <div className="flex items-start gap-4 mb-4">
+              <Info className="h-6 w-6 icon-dark mt-1 flex-shrink-0" />
+              <div className="flex-1">
+                <h3 className="card-title mb-2">Override Prodotti (opzionale)</h3>
+                <p className="text-sm text-muted mb-3">
+                  File XLSX con colonne: <strong>SKU, EAN, Quantity, ListPrice, OfferPrice</strong> — Sovrascrive prezzi e quantità nel Catalogo EAN
+                </p>
+                
+                {!overrideState.file ? (
+                  <div className="mt-4">
+                    <div className="dropzone text-center p-6">
+                      <Upload className="mx-auto h-10 w-10 icon-dark mb-3" />
+                      <input
+                        type="file"
+                        accept=".xlsx,.xls"
+                        onChange={(e) => {
+                          const selectedFile = e.target.files?.[0];
+                          if (selectedFile) {
+                            handleOverrideFileUpload(selectedFile);
+                          }
+                        }}
+                        className="hidden"
+                        id="file-override"
+                      />
+                      <label
+                        htmlFor="file-override"
+                        className="btn btn-primary cursor-pointer px-6 py-3"
+                      >
+                        Carica File Override
+                      </label>
+                      <p className="text-muted text-xs mt-3">
+                        File Excel .xlsx con le 5 colonne richieste
+                      </p>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="mt-4">
+                    <div className="flex items-center justify-between p-4 bg-white rounded-lg border-strong mb-3">
+                      <div className="flex items-center gap-3">
+                        <FileText className="h-6 w-6 icon-dark" />
+                        <div>
+                          <p className="font-medium">{overrideState.filename}</p>
+                          <p className="text-sm text-muted">
+                            {overrideState.uploadedAt && `Caricato: ${overrideState.uploadedAt.toLocaleString('it-IT')}`}
+                            {' • '}
+                            {overrideState.validCount} righe valide, {overrideState.invalidCount} scartate
+                            {overrideState.disabled && <span className="text-orange-600 font-medium"> • DISABILITATO</span>}
+                          </p>
+                        </div>
+                      </div>
+                      <div className="flex gap-2">
+                        {overrideState.disabled ? (
+                          <button
+                            onClick={handleEnableOverride}
+                            className="btn btn-primary text-sm px-3 py-2"
+                          >
+                            Riabilita
+                          </button>
+                        ) : (
+                          <button
+                            onClick={handleDisableOverride}
+                            className="btn btn-secondary text-sm px-3 py-2"
+                          >
+                            Disabilita
+                          </button>
+                        )}
+                        <button
+                          onClick={handleRemoveOverrideFile}
+                          className="btn btn-secondary text-sm px-3 py-2"
+                          style={{ color: '#dc2626' }}
+                        >
+                          Elimina
+                        </button>
+                      </div>
+                    </div>
+                    
+                    {/* Override Errors */}
+                    {overrideState.errors.length > 0 && (
+                      <div className="p-3 rounded-lg border-strong mb-3" style={{ background: '#fef2f2' }}>
+                        <h4 className="text-sm font-semibold mb-2" style={{ color: '#dc2626' }}>
+                          Errori/Warning ({overrideState.errors.length})
+                        </h4>
+                        <div className="max-h-32 overflow-y-auto text-xs space-y-1">
+                          {overrideState.errors.slice(0, 20).map((err, idx) => (
+                            <div key={idx} className="text-red-700">
+                              Riga {err.rowIndex}: {err.field} - {err.reason}
+                            </div>
+                          ))}
+                          {overrideState.errors.length > 20 && (
+                            <div className="text-muted">...e altri {overrideState.errors.length - 20} errori</div>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                    
+                    {/* Override Apply Stats */}
+                    {overrideState.lastApplyStats && (
+                      <div className="p-4 rounded-lg border-strong" style={{ background: '#ecfdf5' }}>
+                        <h4 className="text-sm font-semibold mb-3" style={{ color: '#059669' }}>
+                          <CheckCircle className="inline h-4 w-4 mr-1" />
+                          Override applicato nell'ultima generazione
+                        </h4>
+                        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+                          <div className="p-2 bg-white rounded">
+                            <div className="font-bold text-lg text-green-600">{overrideState.lastApplyStats.updatedExisting}</div>
+                            <div className="text-muted">Prodotti aggiornati</div>
+                          </div>
+                          <div className="p-2 bg-white rounded">
+                            <div className="font-bold text-lg text-blue-600">{overrideState.lastApplyStats.addedNew}</div>
+                            <div className="text-muted">Nuovi prodotti</div>
+                          </div>
+                          <div className="p-2 bg-white rounded">
+                            <div className="font-bold text-lg text-orange-600">{overrideState.lastApplyStats.skippedRows}</div>
+                            <div className="text-muted">Righe scartate</div>
+                          </div>
+                          <div className="p-2 bg-white rounded">
+                            <div className="font-bold text-lg text-yellow-600">{overrideState.lastApplyStats.warnings}</div>
+                            <div className="text-muted">Warning</div>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
         <div className="flex justify-end mb-4">
           <Button
             variant="outline"
