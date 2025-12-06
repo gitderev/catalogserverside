@@ -66,14 +66,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (data?.success && data?.token) {
         localStorage.setItem(AUTH_TOKEN_KEY, data.token);
         setIsAuthenticated(true);
-        
-        // Auto-promote user to admin for fee_config access
-        try {
-          await supabase.rpc('add_self_as_admin');
-        } catch (adminErr) {
-          console.warn('Could not add user as admin:', adminErr);
-        }
-        
         return { success: true };
       }
 
