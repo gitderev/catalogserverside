@@ -14,7 +14,33 @@ export type Database = {
   }
   public: {
     Tables: {
-      [_ in never]: never
+      fee_config: {
+        Row: {
+          created_at: string | null
+          fee_drev: number
+          fee_mkt: number
+          id: string
+          shipping_cost: number
+          updated_at: string | null
+        }
+        Insert: {
+          created_at?: string | null
+          fee_drev: number
+          fee_mkt: number
+          id?: string
+          shipping_cost: number
+          updated_at?: string | null
+        }
+        Update: {
+          created_at?: string | null
+          fee_drev?: number
+          fee_mkt?: number
+          id?: string
+          shipping_cost?: number
+          updated_at?: string | null
+        }
+        Relationships: []
+      }
     }
     Views: {
       [_ in never]: never

@@ -206,25 +206,6 @@ const OPTIONAL_HEADERS = {
 
 const DEFAULT_FEES: FeeConfig = { feeDrev: 1.05, feeMkt: 1.08, shippingCost: 6.00 };
 
-function loadFees(): FeeConfig {
-  try {
-    const raw = localStorage.getItem('catalog_fees_v2');
-    if (!raw) return DEFAULT_FEES;
-    const obj = JSON.parse(raw);
-    return {
-      feeDrev: Number(obj.feeDrev) || DEFAULT_FEES.feeDrev,
-      feeMkt: Number(obj.feeMkt) || DEFAULT_FEES.feeMkt,
-      shippingCost: Number(obj.shippingCost) || DEFAULT_FEES.shippingCost,
-    };
-  } catch { 
-    return DEFAULT_FEES; 
-  }
-}
-
-function saveFees(cfg: FeeConfig) {
-  localStorage.setItem('catalog_fees_v2', JSON.stringify(cfg));
-}
-
 
 
 function computeFinalPrice({
@@ -441,15 +422,90 @@ const AltersideCatalogGenerator: React.FC = () => {
   const mappingLoadedRef = useRef(false);
 
   // Fee configuration
-  const [feeConfig, setFeeConfig] = useState<FeeConfig>(loadFees());
-  const [rememberFees, setRememberFees] = useState(false);
+  const [feeConfig, setFeeConfig] = useState<FeeConfig>(DEFAULT_FEES);
+  const [isLoadingFees, setIsLoadingFees] = useState(true);
+  const [isSavingFees, setIsSavingFees] = useState(false);
 
-  // Save fees when rememberFees is checked
+  // Load fee config from Supabase on mount
   useEffect(() => {
-    if (rememberFees) {
-      saveFees(feeConfig);
+    const loadFeesFromSupabase = async () => {
+      try {
+        const { data, error } = await supabase
+          .from('fee_config')
+          .select('fee_drev, fee_mkt, shipping_cost')
+          .order('updated_at', { ascending: false })
+          .limit(1);
+        
+        if (error) {
+          console.error('Errore caricamento fee config:', error);
+          toast({
+            title: "Errore caricamento regole",
+            description: "Impossibile caricare le regole di calcolo dal server. Utilizzati valori predefiniti.",
+            variant: "destructive"
+          });
+        } else if (data && data.length > 0) {
+          const row = data[0];
+          setFeeConfig({
+            feeDrev: Number(row.fee_drev),
+            feeMkt: Number(row.fee_mkt),
+            shippingCost: Number(row.shipping_cost)
+          });
+          console.log('Fee config caricato da Supabase:', row);
+        } else {
+          console.log('Nessuna fee config trovata, utilizzo valori predefiniti');
+        }
+      } catch (err) {
+        console.error('Errore loadFeesFromSupabase:', err);
+        toast({
+          title: "Errore caricamento regole",
+          description: "Impossibile caricare le regole di calcolo dal server. Utilizzati valori predefiniti.",
+          variant: "destructive"
+        });
+      } finally {
+        setIsLoadingFees(false);
+      }
+    };
+
+    loadFeesFromSupabase();
+  }, []);
+
+  // Save fee config to Supabase
+  const handleSaveFees = async () => {
+    setIsSavingFees(true);
+    try {
+      const { error } = await supabase
+        .from('fee_config')
+        .insert({
+          fee_drev: feeConfig.feeDrev,
+          fee_mkt: feeConfig.feeMkt,
+          shipping_cost: feeConfig.shippingCost
+        });
+      
+      if (error) {
+        console.error('Errore salvataggio fee config:', error);
+        toast({
+          title: "Errore salvataggio",
+          description: "Impossibile salvare le regole di calcolo sul server.",
+          variant: "destructive"
+        });
+      } else {
+        toast({
+          title: "Regole salvate",
+          description: "Le regole di calcolo sono state salvate con successo."
+        });
+        console.log('Fee config salvato su Supabase');
+      }
+    } catch (err) {
+      console.error('Errore handleSaveFees:', err);
+      toast({
+        title: "Errore salvataggio",
+        description: "Impossibile salvare le regole di calcolo sul server.",
+        variant: "destructive"
+      });
+    } finally {
+      setIsSavingFees(false);
     }
-  }, [feeConfig, rememberFees]);
+  };
 
   // Persist mapping file to Supabase Storage
   const persistMappingFile = async (file: File) => {
@@ -4408,20 +4464,21 @@ const AltersideCatalogGenerator: React.FC = () => {
                 </div>
               </div>
               
-              <div className="mt-4 flex items-center space-x-2">
-                <Checkbox
-                  id="remember-fees"
-                  checked={rememberFees}
-                  onCheckedChange={(checked) => {
-                    setRememberFees(!!checked);
-                    if (checked) {
-                      saveFees(feeConfig);
-                    }
-                  }}
-                />
-                <Label htmlFor="remember-fees" className="text-sm">
-                  Ricorda queste impostazioni
-                </Label>
+              <div className="mt-4">
+                <Button
+                  onClick={handleSaveFees}
+                  disabled={isLoadingFees || isSavingFees}
+                  className="w-full"
+                >
+                  {isSavingFees ? (
+                    <>
+                      <Activity className="mr-2 h-4 w-4 animate-spin" />
+                      Salvataggio...
+                    </>
+                  ) : (
+                    'Salva regole di calcolo'
+                  )}
+                </Button>
               </div>
             </div>
           </div>
