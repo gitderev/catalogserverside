@@ -1101,13 +1101,14 @@ const AltersideCatalogGenerator: React.FC = () => {
   const handleFtpImport = async () => {
     setFtpImportLoading(true);
     
-    // Check authentication first
+    // Check authentication - session should already exist after password gate
     const { data: { session }, error: sessionError } = await supabase.auth.getSession();
     
     if (sessionError || !session || !session.access_token) {
+      console.error('FTP Import: No valid session found', { sessionError });
       toast({
-        title: "Autenticazione richiesta",
-        description: "Devi effettuare il login come admin per eseguire l'import da FTP.",
+        title: "Errore di configurazione",
+        description: "Nessuna sessione admin attiva. Ricarica la pagina e reinserisci la password di accesso.",
         variant: "destructive"
       });
       setFtpImportLoading(false);
