@@ -1347,7 +1347,28 @@ const AltersideCatalogGenerator: React.FC = () => {
   }, [processingState, startTime, processed, total]);
 
   const processDataPipeline = async (pipelineType: 'EAN' | 'MPN') => {
-    if (!files.material.file || !files.stock.file || !files.price.file) {
+    // Usa filesRef.current per avere lo stato aggiornato (stessa fonte di verità della UI)
+    const currentFiles = filesRef.current;
+    
+    // hasAllBaseFiles: true solo se tutti e tre i file base sono presenti e validi
+    // (stessa logica usata dalle card per mostrare "Caricato")
+    const hasMaterial = !!currentFiles.material.file && 
+                        (currentFiles.material.status === 'valid' || currentFiles.material.status === 'warning');
+    const hasStock = !!currentFiles.stock.file && 
+                     (currentFiles.stock.status === 'valid' || currentFiles.stock.status === 'warning');
+    const hasPrice = !!currentFiles.price.file && 
+                     (currentFiles.price.status === 'valid' || currentFiles.price.status === 'warning');
+    const hasAllBaseFiles = hasMaterial && hasStock && hasPrice;
+    
+    // Debug: log per diagnosticare lo stato dei file base
+    console.log("DEBUG base files presence", { 
+      material: { file: !!currentFiles.material.file, status: currentFiles.material.status, hasMaterial },
+      stock: { file: !!currentFiles.stock.file, status: currentFiles.stock.status, hasStock },
+      price: { file: !!currentFiles.price.file, status: currentFiles.price.status, hasPrice },
+      hasAllBaseFiles 
+    });
+    
+    if (!hasAllBaseFiles) {
       toast({
         title: "File mancanti",
         description: "Carica tutti e tre i file prima di procedere",
@@ -1366,10 +1387,10 @@ const AltersideCatalogGenerator: React.FC = () => {
       return;
     }
 
-    // Validate required headers only
-    const materialValidation = validateHeaders(files.material.file.headers, REQUIRED_HEADERS.material);
-    const stockValidation = validateHeaders(files.stock.file.headers, REQUIRED_HEADERS.stock);
-    const priceValidation = validateHeaders(files.price.file.headers, REQUIRED_HEADERS.price);
+    // Validate required headers only (using currentFiles from filesRef)
+    const materialValidation = validateHeaders(currentFiles.material.file!.headers, REQUIRED_HEADERS.material);
+    const stockValidation = validateHeaders(currentFiles.stock.file!.headers, REQUIRED_HEADERS.stock);
+    const priceValidation = validateHeaders(currentFiles.price.file!.headers, REQUIRED_HEADERS.price);
 
     if (!materialValidation.valid || !stockValidation.valid || !priceValidation.valid) {
       toast({
@@ -1504,7 +1525,7 @@ const AltersideCatalogGenerator: React.FC = () => {
     // STOCK parse (simulate chunk logging using one chunk)
     dbg('parse:stock:start');
     let stockRowCounter = 0;
-    files.stock.file.data.forEach((row, index) => {
+    currentFiles.stock.file!.data.forEach((row, index) => {
       const matnr = row.Matnr?.toString().trim();
       if (!matnr) return;
       stockRowCounter++;
@@ -1520,7 +1541,7 @@ const AltersideCatalogGenerator: React.FC = () => {
     // PRICE parse
     dbg('parse:price:start');
     let priceRowCounter = 0;
-    files.price.file.data.forEach((row, index) => {
+    currentFiles.price.file!.data.forEach((row, index) => {
       const matnr = row.Matnr?.toString().trim();
       if (!matnr) return;
       priceRowCounter++;
@@ -1538,7 +1559,7 @@ const AltersideCatalogGenerator: React.FC = () => {
     dbg('parse:price:done', { totalRecords: priceMap.size, totalChunks: 1 });
 
     // Use updated material data (from pre-fill or original)
-    const currentMaterialData = files.material.file.data;
+    const currentMaterialData = currentFiles.material.file!.data;
     const materialRowsCount = currentMaterialData.length;
     
     // Diagnostic: Log EAN count before processing
@@ -1565,8 +1586,8 @@ const AltersideCatalogGenerator: React.FC = () => {
 
     // Join streaming pass
     const optionalHeadersMissing = {
-      stock: !files.stock.file.headers.includes('ManufPartNr'),
-      price: !files.price.file.headers.includes('ManufPartNr')
+      stock: !currentFiles.stock.file!.headers.includes('ManufPartNr'),
+      price: !currentFiles.price.file!.headers.includes('ManufPartNr')
     };
 
     const processedEAN: ProcessedRecord[] = [];
