@@ -14,3 +14,9 @@ verify_jwt = false
 
 [functions.upload-exports-to-sftp]
 verify_jwt = false
+
+[functions.run-full-sync]
+verify_jwt = false
+
+[functions.stop-sync]
+verify_jwt = false

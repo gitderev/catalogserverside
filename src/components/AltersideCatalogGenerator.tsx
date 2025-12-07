@@ -34,6 +34,7 @@ import {
 } from '@/utils/pricing';
 import * as XLSX from 'xlsx';
 import Papa from 'papaparse';
+import SyncScheduler from '@/components/SyncScheduler';
 
 // Helper functions for MPN calculations
 function asNum(v: any): number {
@@ -4811,6 +4812,9 @@ const AltersideCatalogGenerator: React.FC = () => {
             Genera due cataloghi Excel distinti (EAN e ManufPartNr) con calcoli avanzati di prezzo e commissioni
           </p>
         </div>
+
+        {/* Sync Scheduler */}
+        <SyncScheduler />
 
         {/* Pipeline Master Button */}
         <div className="card border-strong" style={{ background: '#1e3a5f' }}>

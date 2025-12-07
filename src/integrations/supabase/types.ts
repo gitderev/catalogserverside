@@ -62,6 +62,87 @@ export type Database = {
         }
         Relationships: []
       }
+      sync_config: {
+        Row: {
+          daily_time: string | null
+          enabled: boolean
+          frequency_minutes: number
+          id: number
+          max_retries: number
+          retry_delay_minutes: number
+          updated_at: string
+        }
+        Insert: {
+          daily_time?: string | null
+          enabled?: boolean
+          frequency_minutes?: number
+          id?: number
+          max_retries?: number
+          retry_delay_minutes?: number
+          updated_at?: string
+        }
+        Update: {
+          daily_time?: string | null
+          enabled?: boolean
+          frequency_minutes?: number
+          id?: number
+          max_retries?: number
+          retry_delay_minutes?: number
+          updated_at?: string
+        }
+        Relationships: []
+      }
+      sync_runs: {
+        Row: {
+          attempt: number
+          cancel_requested: boolean
+          cancelled_by_user: boolean
+          created_at: string
+          error_details: Json | null
+          error_message: string | null
+          finished_at: string | null
+          id: string
+          metrics: Json
+          runtime_ms: number | null
+          started_at: string
+          status: string
+          steps: Json
+          trigger_type: string
+        }
+        Insert: {
+          attempt?: number
+          cancel_requested?: boolean
+          cancelled_by_user?: boolean
+          created_at?: string
+          error_details?: Json | null
+          error_message?: string | null
+          finished_at?: string | null
+          id?: string
+          metrics?: Json
+          runtime_ms?: number | null
+          started_at?: string
+          status?: string
+          steps?: Json
+          trigger_type: string
+        }
+        Update: {
+          attempt?: number
+          cancel_requested?: boolean
+          cancelled_by_user?: boolean
+          created_at?: string
+          error_details?: Json | null
+          error_message?: string | null
+          finished_at?: string | null
+          id?: string
+          metrics?: Json
+          runtime_ms?: number | null
+          started_at?: string
+          status?: string
+          steps?: Json
+          trigger_type?: string
+        }
+        Relationships: []
+      }
     }
     Views: {
       [_ in never]: never
