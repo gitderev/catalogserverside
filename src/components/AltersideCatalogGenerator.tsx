@@ -2084,20 +2084,77 @@ const AltersideCatalogGenerator: React.FC = () => {
     dbg('excel:write:start');
     
     try {
-      // Get EAN filtered data
-      const eanFilteredData = currentProcessedData.filter(record => record.EAN && record.EAN.length >= 12);
+      // =====================================================================
+      // DEBUG: Verifica fonte dati per export EAN
+      // =====================================================================
+      console.log('%c[onExportEAN:source-check]', 'color: #FF5722; font-weight: bold;', {
+        eanCatalogDataset_length: eanCatalogDataset?.length ?? 0,
+        currentProcessedData_length: currentProcessedData?.length ?? 0,
+        timestamp: new Date().toISOString()
+      });
+      
+      // =====================================================================
+      // FONTE UNICA: Usa eanCatalogDataset se disponibile (pipeline già completata)
+      // Altrimenti, usa currentProcessedData (retro-compatibilità)
+      // =====================================================================
+      let eanFilteredData: any[] = [];
+      
+      if (eanCatalogDataset && eanCatalogDataset.length > 0) {
+        // FONTE UNICA: eanCatalogDataset è già filtrato e formattato dalla pipeline
+        eanFilteredData = eanCatalogDataset;
+        console.log('%c[onExportEAN:using-eanCatalogDataset]', 'color: #4CAF50; font-weight: bold;', {
+          source: 'eanCatalogDataset',
+          rows: eanFilteredData.length,
+          sample_EAN: eanFilteredData[0]?.EAN,
+          sample_PrezzoFinale: eanFilteredData[0]?.['Prezzo Finale']
+        });
+      } else {
+        // Fallback: usa currentProcessedData se eanCatalogDataset non è ancora popolato
+        eanFilteredData = currentProcessedData.filter(record => record.EAN && record.EAN.length >= 12);
+        console.log('%c[onExportEAN:using-currentProcessedData-fallback]', 'color: #FFC107; font-weight: bold;', {
+          source: 'currentProcessedData (fallback)',
+          filtered_rows: eanFilteredData.length,
+          original_rows: currentProcessedData.length
+        });
+      }
       
       if (eanFilteredData.length === 0) {
+        console.error('%c[onExportEAN:NO-DATA]', 'color: red; font-weight: bold;', {
+          eanCatalogDataset_length: eanCatalogDataset?.length ?? 0,
+          currentProcessedData_length: currentProcessedData?.length ?? 0,
+          message: 'Nessuna riga valida per EAN'
+        });
         toast({
           title: "Nessuna riga valida per EAN",
-          description: "Non ci sono record con EAN validi da esportare"
+          description: "Non ci sono record con EAN validi da esportare. Verifica che la pipeline EAN sia completata."
         });
         return;
       }
       
-      // Create dataset with proper column order - UNIFIED pricing via robust IT locale parsing
-      const dataset = eanFilteredData.map((record, index) => {
-        // Determine route and calculate baseCents correctly (with Surcharge for CBP)
+      // =====================================================================
+      // BRANCH: Se eanCatalogDataset è già popolato (dalla pipeline), usa quello
+      // direttamente senza ricalcolare. Altrimenti, crea il dataset da zero.
+      // =====================================================================
+      let finalDataset: any[];
+      let shouldApplyOverride = false; // Dichiarato qui per visibilità in entrambi i branch
+      
+      if (eanCatalogDataset && eanCatalogDataset.length > 0) {
+        // FONTE UNICA: eanCatalogDataset è già filtrato, validato e con override applicato
+        finalDataset = eanCatalogDataset;
+        console.log('%c[onExportEAN:SKIP-CREATION] Uso eanCatalogDataset esistente', 'color: #4CAF50; font-weight: bold;', {
+          rows: finalDataset.length,
+          sample_EAN: finalDataset[0]?.EAN,
+          sample_PrezzoFinale: finalDataset[0]?.['Prezzo Finale']
+        });
+      } else {
+        // FALLBACK: Crea dataset da currentProcessedData (prima esecuzione o stato non sincronizzato)
+        console.log('%c[onExportEAN:CREATE-DATASET] Creazione dataset da eanFilteredData', 'color: #FFC107; font-weight: bold;', {
+          source_rows: eanFilteredData.length
+        });
+        
+        // Create dataset with proper column order - UNIFIED pricing via robust IT locale parsing
+        const dataset = eanFilteredData.map((record, index) => {
+          // Determine route and calculate baseCents correctly (with Surcharge for CBP)
         const hasBest = Number.isFinite(record.CustBestPrice) && record.CustBestPrice > 0;
         const hasListPrice = Number.isFinite(record.ListPrice) && record.ListPrice > 0;
         const surchargeValue = (Number.isFinite(record.Surcharge) && record.Surcharge >= 0) ? record.Surcharge : 0;
@@ -2354,7 +2411,7 @@ const AltersideCatalogGenerator: React.FC = () => {
       // =====================================================================
       // APPLICA OVERRIDE SE PRESENTE E ABILITATO
       // =====================================================================
-      let finalDataset = cleanDataset;
+      finalDataset = cleanDataset;
       
       if (shouldApplyOverride && overrideState.index) {
         console.log('%c[Override:applying] === APPLICAZIONE OVERRIDE ===', 'color: #E91E63; font-weight: bold; font-size: 14px;');
@@ -2416,6 +2473,8 @@ const AltersideCatalogGenerator: React.FC = () => {
       // come UNICA FONTE DI VERITÀ per tutti gli export.
       // =====================================================================
       setEanCatalogDataset(finalDataset);
+      
+      } // Fine del branch else (creazione dataset da currentProcessedData)
       
       // =====================================================================
       // LOG ESTESO: SALVATAGGIO eanCatalogDataset
@@ -2590,11 +2649,11 @@ const AltersideCatalogGenerator: React.FC = () => {
       
       // === LOG CORRETTO: RIEPILOGO FINALE CATALOGO EAN ===
       console.log('%c[EAN:generation:complete]', 'color: #4CAF50; font-weight: bold; font-size: 14px;', {
-        totale_prodotti_generati: cleanDataset.length,
-        dataset_salvato_in_eanCatalogDataset: cleanDataset.length,
+        totale_prodotti_generati: finalDataset.length,
+        dataset_salvato_in_eanCatalogDataset: finalDataset.length,
         allineamento: 'OK',
-        pronto_per_ePrice: cleanDataset.length > 0,
-        pronto_per_Mediaworld: cleanDataset.length > 0,
+        pronto_per_ePrice: finalDataset.length > 0,
+        pronto_per_Mediaworld: finalDataset.length > 0,
         timestamp: new Date().toISOString(),
       });
       
@@ -2790,7 +2849,7 @@ const AltersideCatalogGenerator: React.FC = () => {
     } finally {
       setIsExportingEAN(false);
     }
-  }, [currentProcessedData, isExportingEAN, feeConfig, prepDays, prepDaysMediaworld, dbg, toast]);
+  }, [eanCatalogDataset, currentProcessedData, isExportingEAN, feeConfig, prepDays, prepDaysMediaworld, dbg, toast]);
 
   // =====================================================================
   // TEMPLATE EPRICE UFFICIALE: Struttura e validazione
