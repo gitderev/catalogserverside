@@ -23,3 +23,6 @@ verify_jwt = false
 
 [functions.force-reset-sync]
 verify_jwt = false
+
+[functions.sync-step-runner]
+verify_jwt = false

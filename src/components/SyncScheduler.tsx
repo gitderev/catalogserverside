@@ -622,6 +622,21 @@ export const SyncScheduler: React.FC = () => {
             </div>
           </div>
 
+          {/* Current step indicator for running sync */}
+          {currentRun && currentRun.status === 'running' && (
+            <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+              <div className="flex items-center gap-3">
+                <Loader2 className="h-5 w-5 animate-spin text-blue-600" />
+                <div>
+                  <p className="font-semibold text-blue-800">Sincronizzazione in corso</p>
+                  <p className="text-sm text-blue-600">
+                    Step corrente: {STEP_LABELS[(currentRun.steps as any)?.current_step] || (currentRun.steps as any)?.current_step || 'Avvio...'}
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* Status Summary Section */}
           <div className="grid gap-4 md:grid-cols-3">
             {/* Last sync */}
