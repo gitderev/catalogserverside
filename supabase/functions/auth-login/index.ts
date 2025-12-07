@@ -1,4 +1,5 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.39.3';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -33,32 +34,6 @@ function checkRateLimit(ip: string): boolean {
   return true;
 }
 
-// Generate HMAC-SHA256 token
-async function generateToken(secret: string): Promise<string> {
-  const expiry = Date.now() + (24 * 60 * 60 * 1000); // 24 hours
-  const payload = `authenticated:${expiry}`;
-  
-  const encoder = new TextEncoder();
-  const keyData = encoder.encode(secret);
-  const payloadData = encoder.encode(payload);
-  
-  const cryptoKey = await crypto.subtle.importKey(
-    'raw',
-    keyData,
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['sign']
-  );
-  
-  const signature = await crypto.subtle.sign('HMAC', cryptoKey, payloadData);
-  const signatureHex = Array.from(new Uint8Array(signature))
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('');
-  
-  // Format: base64(payload.signature)
-  return btoa(`${payload}.${signatureHex}`);
-}
-
 serve(async (req) => {
   // Handle CORS preflight requests
   if (req.method === 'OPTIONS') {
@@ -87,7 +62,10 @@ serve(async (req) => {
     }
 
     const correctPassword = Deno.env.get('APP_ACCESS_PASSWORD');
-    const tokenSecret = Deno.env.get('AUTH_TOKEN_SECRET') || correctPassword;
+    const adminEmail = Deno.env.get('ADMIN_SUPABASE_EMAIL');
+    const adminPassword = Deno.env.get('ADMIN_SUPABASE_PASSWORD');
+    const supabaseUrl = Deno.env.get('SUPABASE_URL');
+    const supabaseAnonKey = Deno.env.get('SUPABASE_ANON_KEY');
     
     if (!correctPassword) {
       console.error('APP_ACCESS_PASSWORD not configured');
@@ -97,29 +75,61 @@ serve(async (req) => {
       );
     }
 
-    if (!tokenSecret) {
-      console.error('AUTH_TOKEN_SECRET not configured');
+    if (!adminEmail || !adminPassword) {
+      console.error('Admin credentials not configured (ADMIN_SUPABASE_EMAIL or ADMIN_SUPABASE_PASSWORD missing)');
       return new Response(
         JSON.stringify({ success: false, error: 'Configurazione server non valida' }),
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
 
-    if (password === correctPassword) {
-      console.log('Login successful');
-      const token = await generateToken(tokenSecret);
-      
+    if (!supabaseUrl || !supabaseAnonKey) {
+      console.error('Supabase credentials not configured');
       return new Response(
-        JSON.stringify({ success: true, token }),
-        { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        JSON.stringify({ success: false, error: 'Configurazione server non valida' }),
+        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
-    } else {
+    }
+
+    // Verify the access password first
+    if (password !== correctPassword) {
       console.log('Login failed: incorrect password');
       return new Response(
         JSON.stringify({ success: false, error: 'Password errata, riprova' }),
         { status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
+
+    // Password is correct - now sign in as the technical admin user
+    console.log('Access password correct, signing in as admin user...');
+    
+    const supabase = createClient(supabaseUrl, supabaseAnonKey);
+    
+    const { data: authData, error: authError } = await supabase.auth.signInWithPassword({
+      email: adminEmail,
+      password: adminPassword,
+    });
+
+    if (authError || !authData.session) {
+      console.error('Admin sign-in failed:', authError?.message);
+      return new Response(
+        JSON.stringify({ success: false, error: 'Errore interno di autenticazione' }),
+        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
+    console.log('Admin sign-in successful, returning session tokens');
+    
+    return new Response(
+      JSON.stringify({ 
+        success: true, 
+        access_token: authData.session.access_token,
+        refresh_token: authData.session.refresh_token,
+        expires_in: authData.session.expires_in,
+        expires_at: authData.session.expires_at
+      }),
+      { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+    );
   } catch (error) {
     console.error('Error in auth-login:', error);
     return new Response(
