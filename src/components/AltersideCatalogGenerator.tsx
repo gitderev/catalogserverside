@@ -918,12 +918,14 @@ const AltersideCatalogGenerator: React.FC = () => {
   const prefillStateRef = useRef(prefillState);
   const processingStateRef = useRef(processingState);
   const sftpUploadStatusRef = useRef(sftpUploadStatus);
+  const eanCatalogDatasetRef = useRef(eanCatalogDataset);
   
   // Keep refs in sync with state
   useEffect(() => { filesRef.current = files; }, [files]);
   useEffect(() => { prefillStateRef.current = prefillState; }, [prefillState]);
   useEffect(() => { processingStateRef.current = processingState; }, [processingState]);
   useEffect(() => { sftpUploadStatusRef.current = sftpUploadStatus; }, [sftpUploadStatus]);
+  useEffect(() => { eanCatalogDatasetRef.current = eanCatalogDataset; }, [eanCatalogDataset]);
 
   const isProcessing = processingState === 'running';
   const isCompleted = processingState === 'completed';
@@ -1671,6 +1673,98 @@ const AltersideCatalogGenerator: React.FC = () => {
         stockDuplicates,
         priceDuplicates
       });
+      
+      // =====================================================================
+      // CRITICAL: Popola eanCatalogDataset DIRETTAMENTE alla fine della pipeline EAN
+      // Questo garantisce che i dati siano disponibili per l'export anche quando
+      // onExportEAN viene chiamato immediatamente dopo processDataPipeline
+      // =====================================================================
+      if (pipelineType === 'EAN' && currentData.length > 0) {
+        // Costruisce il dataset formattato per l'export EAN
+        const formattedDataset = currentData.map((record: any) => {
+          // Determina la route e calcola baseCents correttamente (con Surcharge per CBP)
+          const hasBest = Number.isFinite(record.CustBestPrice) && record.CustBestPrice > 0;
+          const hasListPrice = Number.isFinite(record.ListPrice) && record.ListPrice > 0;
+          const surchargeValue = (Number.isFinite(record.Surcharge) && record.Surcharge >= 0) ? record.Surcharge : 0;
+          
+          let baseCents = 0;
+          let route = '';
+          
+          if (hasBest) {
+            baseCents = Math.round((record.CustBestPrice + surchargeValue) * 100);
+            route = 'cbp';
+          } else if (hasListPrice) {
+            baseCents = Math.round(record.ListPrice * 100);
+            route = 'listprice';
+          } else {
+            baseCents = 0;
+            route = 'none';
+          }
+          
+          // Calcola prezzi usando la stessa logica dell'export
+          const shippingCents = Math.round(feeConfig.shippingCost * 100);
+          const afterShippingCents = baseCents + shippingCents;
+          const afterIvaCents = Math.round(afterShippingCents * 1.22);
+          const afterFeeDeRevCents = Math.round(afterIvaCents * feeConfig.feeDrev);
+          const afterFeesCents = Math.round(afterFeeDeRevCents * feeConfig.feeMkt);
+          const finalCents = toComma99Cents(afterFeesCents);
+          const finalEuros = finalCents / 100;
+          const prezzoFinaleString = finalEuros.toFixed(2).replace('.', ',');
+          
+          // ListPrice con Fee
+          let listPriceConFeeString: string | number = '';
+          const normListPrice = Number.isFinite(record.ListPrice) ? record.ListPrice : null;
+          const normCustBestPrice = Number.isFinite(record.CustBestPrice) ? record.CustBestPrice : null;
+          
+          const shouldUseAltRule = normListPrice === null || normListPrice === 0 || 
+                                   (normCustBestPrice !== null && normListPrice < normCustBestPrice);
+          
+          if (shouldUseAltRule && normCustBestPrice !== null) {
+            const baseLP = normCustBestPrice * 1.25;
+            const valoreCandidat = ((baseLP + feeConfig.shippingCost) * 1.22) * feeConfig.feeDrev * feeConfig.feeMkt;
+            const candidatoCeil = Math.ceil(valoreCandidat);
+            const minimoConsentito = Math.ceil(finalEuros * 1.25);
+            listPriceConFeeString = Math.max(candidatoCeil, minimoConsentito);
+          } else if (normListPrice !== null && normListPrice > 0) {
+            const subtotConIvaLP = (normListPrice + feeConfig.shippingCost) * 1.22;
+            const postFeeLP = subtotConIvaLP * feeConfig.feeDrev * feeConfig.feeMkt;
+            listPriceConFeeString = Math.ceil(postFeeLP);
+          }
+          
+          return {
+            Matnr: record.Matnr,
+            ManufPartNr: record.ManufPartNr,
+            EAN: record.EAN,
+            ShortDescription: record.ShortDescription,
+            ExistingStock: record.ExistingStock,
+            ListPrice: record.ListPrice,
+            CustBestPrice: record.CustBestPrice,
+            Surcharge: record.Surcharge,
+            basePriceCents: baseCents,
+            'Costo di Spedizione': feeConfig.shippingCost,
+            IVA: afterIvaCents / 100 - afterShippingCents / 100,
+            'Prezzo con spediz e IVA': afterIvaCents / 100,
+            FeeDeRev: feeConfig.feeDrev,
+            'Fee Marketplace': feeConfig.feeMkt,
+            'Subtotale post-fee': afterFeesCents / 100,
+            'Prezzo Finale': prezzoFinaleString,
+            'ListPrice con Fee': listPriceConFeeString,
+            _route: route,
+            _finalCents: finalCents
+          };
+        });
+        
+        // Salva nel state E nella ref per accesso immediato
+        setEanCatalogDataset(formattedDataset);
+        eanCatalogDatasetRef.current = formattedDataset;
+        
+        console.log('%c[processDataPipeline:eanCatalogDataset:set]', 'color: #4CAF50; font-weight: bold;', {
+          rows: formattedDataset.length,
+          sample_EAN: formattedDataset[0]?.EAN,
+          sample_PrezzoFinale: formattedDataset[0]?.['Prezzo Finale'],
+          timestamp: new Date().toISOString()
+        });
+      }
 
       // Update download ready state
       setDownloadReady(prev => ({
@@ -2085,31 +2179,44 @@ const AltersideCatalogGenerator: React.FC = () => {
     
     try {
       // =====================================================================
-      // DEBUG: Verifica fonte dati per export EAN
+      // FONTE DATI: Usa eanCatalogDatasetRef per accedere ai dati più recenti
+      // (evita closure stale quando chiamato da handleFullPipeline)
       // =====================================================================
+      const datasetFromRef = eanCatalogDatasetRef.current;
+      const datasetFromState = eanCatalogDataset;
+      
       console.log('%c[onExportEAN:source-check]', 'color: #FF5722; font-weight: bold;', {
-        eanCatalogDataset_length: eanCatalogDataset?.length ?? 0,
+        eanCatalogDatasetRef_length: datasetFromRef?.length ?? 0,
+        eanCatalogDataset_length: datasetFromState?.length ?? 0,
         currentProcessedData_length: currentProcessedData?.length ?? 0,
         timestamp: new Date().toISOString()
       });
       
       // =====================================================================
-      // FONTE UNICA: Usa eanCatalogDataset se disponibile (pipeline già completata)
-      // Altrimenti, usa currentProcessedData (retro-compatibilità)
+      // FONTE UNICA: Priorità a ref (più recente), poi state, poi fallback
       // =====================================================================
       let eanFilteredData: any[] = [];
       
-      if (eanCatalogDataset && eanCatalogDataset.length > 0) {
-        // FONTE UNICA: eanCatalogDataset è già filtrato e formattato dalla pipeline
-        eanFilteredData = eanCatalogDataset;
-        console.log('%c[onExportEAN:using-eanCatalogDataset]', 'color: #4CAF50; font-weight: bold;', {
-          source: 'eanCatalogDataset',
+      // Prima controlla la ref (contiene i dati più recenti dopo processDataPipeline)
+      if (datasetFromRef && datasetFromRef.length > 0) {
+        eanFilteredData = datasetFromRef;
+        console.log('%c[onExportEAN:using-eanCatalogDatasetRef]', 'color: #4CAF50; font-weight: bold;', {
+          source: 'eanCatalogDatasetRef (ref)',
+          rows: eanFilteredData.length,
+          sample_EAN: eanFilteredData[0]?.EAN,
+          sample_PrezzoFinale: eanFilteredData[0]?.['Prezzo Finale']
+        });
+      } else if (datasetFromState && datasetFromState.length > 0) {
+        // Fallback allo state (per chiamate manuali dopo che React ha aggiornato)
+        eanFilteredData = datasetFromState;
+        console.log('%c[onExportEAN:using-eanCatalogDataset-state]', 'color: #4CAF50; font-weight: bold;', {
+          source: 'eanCatalogDataset (state)',
           rows: eanFilteredData.length,
           sample_EAN: eanFilteredData[0]?.EAN,
           sample_PrezzoFinale: eanFilteredData[0]?.['Prezzo Finale']
         });
       } else {
-        // Fallback: usa currentProcessedData se eanCatalogDataset non è ancora popolato
+        // Ultimo fallback: usa currentProcessedData se non c'è dataset
         eanFilteredData = currentProcessedData.filter(record => record.EAN && record.EAN.length >= 12);
         console.log('%c[onExportEAN:using-currentProcessedData-fallback]', 'color: #FFC107; font-weight: bold;', {
           source: 'currentProcessedData (fallback)',
@@ -2120,7 +2227,8 @@ const AltersideCatalogGenerator: React.FC = () => {
       
       if (eanFilteredData.length === 0) {
         console.error('%c[onExportEAN:NO-DATA]', 'color: red; font-weight: bold;', {
-          eanCatalogDataset_length: eanCatalogDataset?.length ?? 0,
+          eanCatalogDatasetRef_length: datasetFromRef?.length ?? 0,
+          eanCatalogDataset_length: datasetFromState?.length ?? 0,
           currentProcessedData_length: currentProcessedData?.length ?? 0,
           message: 'Nessuna riga valida per EAN'
         });
@@ -2132,16 +2240,20 @@ const AltersideCatalogGenerator: React.FC = () => {
       }
       
       // =====================================================================
-      // BRANCH: Se eanCatalogDataset è già popolato (dalla pipeline), usa quello
+      // BRANCH: Se i dati sono già formattati (dalla pipeline), usa quelli
       // direttamente senza ricalcolare. Altrimenti, crea il dataset da zero.
       // =====================================================================
       let finalDataset: any[];
       let shouldApplyOverride = false; // Dichiarato qui per visibilità in entrambi i branch
       
-      if (eanCatalogDataset && eanCatalogDataset.length > 0) {
+      // Controlla se i dati sono già formattati (provengono dalla ref o dallo state)
+      const dataIsAlreadyFormatted = (datasetFromRef && datasetFromRef.length > 0) || 
+                                      (datasetFromState && datasetFromState.length > 0);
+      
+      if (dataIsAlreadyFormatted) {
         // FONTE UNICA: eanCatalogDataset è già filtrato, validato e con override applicato
-        finalDataset = eanCatalogDataset;
-        console.log('%c[onExportEAN:SKIP-CREATION] Uso eanCatalogDataset esistente', 'color: #4CAF50; font-weight: bold;', {
+        finalDataset = eanFilteredData;
+        console.log('%c[onExportEAN:SKIP-CREATION] Uso dataset già formattato', 'color: #4CAF50; font-weight: bold;', {
           rows: finalDataset.length,
           sample_EAN: finalDataset[0]?.EAN,
           sample_PrezzoFinale: finalDataset[0]?.['Prezzo Finale']
@@ -2473,6 +2585,7 @@ const AltersideCatalogGenerator: React.FC = () => {
       // come UNICA FONTE DI VERITÀ per tutti gli export.
       // =====================================================================
       setEanCatalogDataset(finalDataset);
+      eanCatalogDatasetRef.current = finalDataset;
       
       } // Fine del branch else (creazione dataset da currentProcessedData)
       
