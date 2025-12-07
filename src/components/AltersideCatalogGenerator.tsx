@@ -432,7 +432,7 @@ const AltersideCatalogGenerator: React.FC = () => {
       try {
         const { data, error } = await supabase
           .from('fee_config')
-          .select('fee_drev, fee_mkt, shipping_cost')
+          .select('fee_drev, fee_mkt, shipping_cost, mediaworld_preparation_days, eprice_preparation_days')
           .order('updated_at', { ascending: false })
           .limit(1);
         
@@ -450,6 +450,13 @@ const AltersideCatalogGenerator: React.FC = () => {
             feeMkt: Number(row.fee_mkt),
             shippingCost: Number(row.shipping_cost)
           });
+          // Load preparation days if present
+          if (row.mediaworld_preparation_days !== null && row.mediaworld_preparation_days !== undefined) {
+            setPrepDaysMediaworld(Number(row.mediaworld_preparation_days));
+          }
+          if (row.eprice_preparation_days !== null && row.eprice_preparation_days !== undefined) {
+            setPrepDays(Number(row.eprice_preparation_days));
+          }
           console.log('Fee config caricato da Supabase:', row);
         } else {
           console.log('Nessuna fee config trovata, utilizzo valori predefiniti');
@@ -504,6 +511,99 @@ const AltersideCatalogGenerator: React.FC = () => {
       });
     } finally {
       setIsSavingFees(false);
+    }
+  };
+
+  // Save preparation days to Supabase (global settings)
+  const handleSavePrepDays = async () => {
+    // Validate inputs
+    if (!Number.isInteger(prepDays) || prepDays < 1) {
+      toast({
+        title: "Errore validazione",
+        description: "I giorni di preparazione ePrice devono essere un numero intero >= 1",
+        variant: "destructive"
+      });
+      return;
+    }
+    if (!Number.isInteger(prepDaysMediaworld) || prepDaysMediaworld < 1) {
+      toast({
+        title: "Errore validazione",
+        description: "I giorni di preparazione Mediaworld devono essere un numero intero >= 1",
+        variant: "destructive"
+      });
+      return;
+    }
+
+    setIsSavingPrepDays(true);
+    try {
+      // Get existing config to update (or insert new)
+      const { data: existingConfig } = await supabase
+        .from('fee_config')
+        .select('id')
+        .order('updated_at', { ascending: false })
+        .limit(1);
+      
+      if (existingConfig && existingConfig.length > 0) {
+        // Update existing record
+        const { error } = await supabase
+          .from('fee_config')
+          .update({
+            mediaworld_preparation_days: prepDaysMediaworld,
+            eprice_preparation_days: prepDays,
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', existingConfig[0].id);
+        
+        if (error) {
+          console.error('Errore salvataggio giorni preparazione:', error);
+          toast({
+            title: "Errore salvataggio",
+            description: "Impossibile salvare i giorni di preparazione sul server.",
+            variant: "destructive"
+          });
+        } else {
+          toast({
+            title: "Impostazioni salvate",
+            description: "I giorni di preparazione sono stati salvati come impostazioni globali."
+          });
+          console.log('Giorni preparazione salvati su Supabase');
+        }
+      } else {
+        // Insert new record with all defaults plus prep days
+        const { error } = await supabase
+          .from('fee_config')
+          .insert({
+            fee_drev: feeConfig.feeDrev,
+            fee_mkt: feeConfig.feeMkt,
+            shipping_cost: feeConfig.shippingCost,
+            mediaworld_preparation_days: prepDaysMediaworld,
+            eprice_preparation_days: prepDays
+          });
+        
+        if (error) {
+          console.error('Errore salvataggio giorni preparazione:', error);
+          toast({
+            title: "Errore salvataggio",
+            description: "Impossibile salvare i giorni di preparazione sul server.",
+            variant: "destructive"
+          });
+        } else {
+          toast({
+            title: "Impostazioni salvate",
+            description: "I giorni di preparazione sono stati salvati come impostazioni globali."
+          });
+          console.log('Giorni preparazione salvati su Supabase');
+        }
+      }
+    } catch (err) {
+      console.error('Errore handleSavePrepDays:', err);
+      toast({
+        title: "Errore salvataggio",
+        description: "Impossibile salvare i giorni di preparazione sul server.",
+        variant: "destructive"
+      });
+    } finally {
+      setIsSavingPrepDays(false);
     }
   };
 
@@ -790,6 +890,9 @@ const AltersideCatalogGenerator: React.FC = () => {
   
   // Mediaworld export configuration
   const [prepDaysMediaworld, setPrepDaysMediaworld] = useState<number>(3);
+  
+  // State for saving preparation days
+  const [isSavingPrepDays, setIsSavingPrepDays] = useState(false);
 
   const workerRef = useRef<Worker | null>(null);
 
@@ -4938,12 +5041,12 @@ const AltersideCatalogGenerator: React.FC = () => {
                     <Input
                       id="prepDays"
                       type="number"
-                      min={0}
+                      min={1}
                       max={30}
                       value={prepDays}
                       onChange={(e) => {
                         const val = parseInt(e.target.value, 10);
-                        if (!isNaN(val) && val >= 0 && val <= 30) {
+                        if (!isNaN(val) && val >= 1 && val <= 30) {
                           setPrepDays(val);
                         }
                       }}
@@ -5005,6 +5108,28 @@ const AltersideCatalogGenerator: React.FC = () => {
                 <p className="text-xs text-muted-foreground mt-3">
                   Genera il file "mediaworld-offers-YYYYMMDD.xlsx" con formato Mediaworld
                 </p>
+              </div>
+            )}
+
+            {/* Salva impostazioni giorni di preparazione - Only for EAN pipeline */}
+            {currentPipeline === 'EAN' && (
+              <div className="mt-4 flex justify-center">
+                <button
+                  type="button"
+                  onClick={handleSavePrepDays}
+                  disabled={isSavingPrepDays}
+                  className={`btn btn-secondary text-sm px-6 py-2 ${isSavingPrepDays ? 'opacity-50 cursor-not-allowed' : ''}`}
+                  style={{ background: '#6b7280', color: 'white' }}
+                >
+                  {isSavingPrepDays ? (
+                    <>
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      Salvataggio...
+                    </>
+                  ) : (
+                    'Salva impostazioni giorni di preparazione'
+                  )}
+                </button>
               </div>
             )}
 

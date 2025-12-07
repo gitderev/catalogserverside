@@ -32,25 +32,31 @@ export type Database = {
       fee_config: {
         Row: {
           created_at: string | null
+          eprice_preparation_days: number
           fee_drev: number
           fee_mkt: number
           id: string
+          mediaworld_preparation_days: number
           shipping_cost: number
           updated_at: string | null
         }
         Insert: {
           created_at?: string | null
+          eprice_preparation_days?: number
           fee_drev: number
           fee_mkt: number
           id?: string
+          mediaworld_preparation_days?: number
           shipping_cost: number
           updated_at?: string | null
         }
         Update: {
           created_at?: string | null
+          eprice_preparation_days?: number
           fee_drev?: number
           fee_mkt?: number
           id?: string
+          mediaworld_preparation_days?: number
           shipping_cost?: number
           updated_at?: string | null
         }
