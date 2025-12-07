@@ -60,7 +60,7 @@ serve(async (req) => {
 
   try {
     // =========================================================================
-    // 1. AUTHENTICATION: Validate JWT from Authorization header
+    // 1. AUTHENTICATION: Validate JWT or service role key
     // =========================================================================
     const authHeader = req.headers.get('Authorization');
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -77,23 +77,29 @@ serve(async (req) => {
     const supabaseAnonKey = Deno.env.get('SUPABASE_ANON_KEY')!;
     const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
     
-    // Validate JWT by getting user
-    const userClient = createClient(supabaseUrl, supabaseAnonKey, {
-      global: { headers: { Authorization: `Bearer ${jwt}` } }
-    });
-    
-    const { data: userData, error: userError } = await userClient.auth.getUser();
-    
-    if (userError || !userData?.user) {
-      console.log('[upload-exports-to-sftp] JWT validation failed:', userError?.message);
-      return new Response(
-        JSON.stringify({ status: 'error', message: 'Token JWT non valido o scaduto.' }),
-        { status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
+    // Check if this is a service role key (for internal calls from run-full-sync)
+    let isServiceRole = false;
+    if (jwt === supabaseServiceKey) {
+      console.log('[upload-exports-to-sftp] Service role authentication - internal call');
+      isServiceRole = true;
+    } else {
+      // Validate JWT by getting user
+      const userClient = createClient(supabaseUrl, supabaseAnonKey, {
+        global: { headers: { Authorization: `Bearer ${jwt}` } }
+      });
+      
+      const { data: userData, error: userError } = await userClient.auth.getUser();
+      
+      if (userError || !userData?.user) {
+        console.log('[upload-exports-to-sftp] JWT validation failed:', userError?.message);
+        return new Response(
+          JSON.stringify({ status: 'error', message: 'Token JWT non valido o scaduto.' }),
+          { status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
 
-    const userId = userData.user.id;
-    console.log('[upload-exports-to-sftp] User authenticated:', userId);
+      console.log('[upload-exports-to-sftp] User authenticated:', userData.user.id);
+    }
 
     // =========================================================================
     // 2. VALIDATE REQUEST BODY
@@ -204,10 +210,11 @@ serve(async (req) => {
     const sftpPassword = Deno.env.get('SFTP_PASSWORD');
     const sftpBaseDir = Deno.env.get('SFTP_BASE_DIR');
 
-    console.log('[upload-exports-to-sftp] SFTP config check:', {
-      hasHost: !!sftpHost,
-      hasPort: !!sftpPort,
-      hasUser: !!sftpUser,
+    // Log diagnostic info for SFTP connection (without password)
+    console.log('[upload-exports-to-sftp] SFTP Config:', {
+      host: sftpHost,
+      port: sftpPort,
+      user: sftpUser,
       hasPassword: !!sftpPassword,
       baseDir: sftpBaseDir
     });
