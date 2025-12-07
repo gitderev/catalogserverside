@@ -6,7 +6,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Checkbox } from '@/components/ui/checkbox';
 import { toast } from '@/hooks/use-toast';
-import { Upload, Download, FileText, CheckCircle, XCircle, AlertCircle, Clock, Activity, Info, LogOut } from 'lucide-react';
+import { Upload, Download, FileText, CheckCircle, XCircle, AlertCircle, Clock, Activity, Info, LogOut, Cloud, Loader2 } from 'lucide-react';
 import { useAuth } from '@/hooks/useAuth';
 import { filterAndNormalizeForEAN, type EANStats, type DiscardedRow } from '@/utils/ean';
 import { forceEANText, exportDiscardedRowsCSV } from '@/utils/excelFormatter';
@@ -795,6 +795,15 @@ const AltersideCatalogGenerator: React.FC = () => {
 
   // FTP import loading state
   const [ftpImportLoading, setFtpImportLoading] = useState(false);
+
+  // SFTP Upload state
+  interface SftpUploadStatus {
+    phase: 'idle' | 'generating' | 'saving' | 'uploading' | 'complete' | 'error';
+    message: string;
+    results?: Array<{ filename: string; uploaded: boolean; error?: string }>;
+  }
+  const [sftpUploadStatus, setSftpUploadStatus] = useState<SftpUploadStatus>({ phase: 'idle', message: '' });
+  const [isUploadingToSftp, setIsUploadingToSftp] = useState(false);
 
   const isProcessing = processingState === 'running';
   const isCompleted = processingState === 'completed';
@@ -3187,6 +3196,275 @@ const AltersideCatalogGenerator: React.FC = () => {
     }
   }, [eanCatalogDataset, isExportingMediaworld, feeConfig, prepDaysMediaworld, toast]);
 
+  // =====================================================================
+  // COMBINED EXPORT + SFTP UPLOAD FUNCTION
+  // Generates all 3 exports, saves to bucket, and uploads to SFTP
+  // =====================================================================
+  const onGenerateAndUploadSftp = useCallback(async () => {
+    if (isUploadingToSftp) {
+      toast({
+        title: "Upload in corso...",
+        description: "Attendere il completamento dell'upload corrente"
+      });
+      return;
+    }
+
+    // Validate prerequisites
+    if (!eanCatalogDataset || eanCatalogDataset.length === 0) {
+      toast({
+        title: "Catalogo EAN non disponibile",
+        description: "Devi prima generare il Catalogo EAN prima di procedere con l'upload SFTP",
+        variant: "destructive"
+      });
+      return;
+    }
+
+    setIsUploadingToSftp(true);
+    setSftpUploadStatus({ phase: 'generating', message: 'Generazione file in corso...' });
+
+    try {
+      console.log('[SFTP:combined] Starting combined export and SFTP upload');
+      
+      // =====================================================================
+      // STEP 1: Generate all 3 Excel files in memory
+      // =====================================================================
+      const generatedFiles: { name: string; blob: Blob }[] = [];
+
+      // 1a. Generate Catalogo EAN (reuse existing dataset)
+      console.log('[SFTP:combined] Generating Catalogo EAN...');
+      const eanWs = XLSX.utils.json_to_sheet(eanCatalogDataset, { skipHeader: false });
+      const eanWb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(eanWb, eanWs, "Catalogo_EAN");
+      const eanBuffer = XLSX.write(eanWb, { bookType: "xlsx", type: "array" });
+      generatedFiles.push({
+        name: 'Catalogo EAN.xlsx',
+        blob: new Blob([eanBuffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" })
+      });
+      console.log('[SFTP:combined] Catalogo EAN generated:', eanBuffer.byteLength, 'bytes');
+
+      // 1b. Generate Export ePrice
+      console.log('[SFTP:combined] Generating Export ePrice...');
+      // Create ePrice dataset from eanCatalogDataset
+      const ePriceDataset = eanCatalogDataset.map((record: any) => {
+        // Parse price from format "NN,99" to number
+        const prezzoFinaleRaw = record['Prezzo Finale'];
+        let price = 0;
+        if (typeof prezzoFinaleRaw === 'string') {
+          price = parseFloat(prezzoFinaleRaw.replace(',', '.'));
+        } else if (typeof prezzoFinaleRaw === 'number') {
+          price = prezzoFinaleRaw;
+        }
+
+        return {
+          'sku': record.ManufPartNr || '',
+          'product-id': record.EAN || '',
+          'product-id-type': 'EAN',
+          'price': price,
+          'quantity': record.ExistingStock || 0,
+          'state': 11,
+          'fulfillment-latency': prepDays,
+          'logistic-class': 'K'
+        };
+      }).filter((r: any) => r['product-id'] && r['product-id'].length >= 12 && r.quantity > 0);
+
+      const ePriceWs = XLSX.utils.json_to_sheet(ePriceDataset);
+      const ePriceWb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(ePriceWb, ePriceWs, "Tracciato_Inserimento_Offerte");
+      const ePriceBuffer = XLSX.write(ePriceWb, { bookType: "xlsx", type: "array" });
+      generatedFiles.push({
+        name: 'Export ePrice.xlsx',
+        blob: new Blob([ePriceBuffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" })
+      });
+      console.log('[SFTP:combined] Export ePrice generated:', ePriceBuffer.byteLength, 'bytes');
+
+      // 1c. Generate Export Mediaworld (using the same utility)
+      console.log('[SFTP:combined] Generating Export Mediaworld...');
+      // Load template from public folder
+      const templateResponse = await fetch('/mediaworld-template.xlsx');
+      if (!templateResponse.ok) {
+        throw new Error('Template Mediaworld non trovato');
+      }
+      const templateBuffer = await templateResponse.arrayBuffer();
+      const templateWb = XLSX.read(templateBuffer, { type: 'array' });
+      const dataSheet = templateWb.Sheets['Data'];
+      
+      if (!dataSheet) {
+        throw new Error('Foglio "Data" non trovato nel template Mediaworld');
+      }
+
+      // Build Mediaworld data rows
+      const mediaworldRows: any[][] = [];
+      eanCatalogDataset.forEach((record: any) => {
+        const ean = record.EAN || '';
+        const sku = record.ManufPartNr || '';
+        const stock = Number(record.ExistingStock) || 0;
+        
+        // Skip invalid records
+        if (!ean || ean.length < 12 || stock <= 0 || !sku) return;
+
+        // Parse prices
+        const prezzoFinaleRaw = record['Prezzo Finale'];
+        const listPriceConFeeRaw = record['ListPrice con Fee'];
+        
+        let prezzoFinale = 0;
+        if (typeof prezzoFinaleRaw === 'string') {
+          prezzoFinale = parseFloat(prezzoFinaleRaw.replace(',', '.'));
+        } else if (typeof prezzoFinaleRaw === 'number') {
+          prezzoFinale = prezzoFinaleRaw;
+        }
+
+        let listPriceConFee = 0;
+        if (typeof listPriceConFeeRaw === 'number') {
+          listPriceConFee = listPriceConFeeRaw;
+        } else if (typeof listPriceConFeeRaw === 'string') {
+          listPriceConFee = parseFloat(listPriceConFeeRaw.replace(',', '.'));
+        }
+
+        if (prezzoFinale <= 0 || listPriceConFee <= 0) return;
+
+        // Build row according to Mediaworld template (22 columns)
+        const row = [
+          sku,                                         // SKU offerta
+          ean,                                         // ID Prodotto
+          'EAN',                                       // Tipo ID prodotto
+          record.ShortDescription || '',               // Descrizione offerta
+          '',                                          // Descrizione interna offerta
+          listPriceConFee,                             // Prezzo dell'offerta
+          '',                                          // Info aggiuntive prezzo offerta
+          stock,                                       // Quantità dell'offerta
+          '',                                          // Avviso quantità minima
+          'Nuovo',                                     // Stato dell'offerta
+          '',                                          // Data di inizio della disponibilità
+          '',                                          // Data di conclusione della disponibilità
+          'Consegna gratuita',                         // Classe logistica
+          prezzoFinale,                                // Prezzo scontato
+          '',                                          // Data di inizio dello sconto
+          '',                                          // Data di termine dello sconto
+          prepDaysMediaworld,                          // Tempo di preparazione della spedizione
+          '',                                          // Aggiorna/Cancella
+          'recommended-retail-price',                  // Tipo di prezzo barrato
+          '',                                          // Obbligo di ritiro RAEE
+          '',                                          // Orario di cut-off
+          ''                                           // VAT Rate % (Turkey only)
+        ];
+        
+        mediaworldRows.push(row);
+      });
+
+      // Write rows to template starting at row 3 (index 2)
+      const startRow = 2;
+      mediaworldRows.forEach((row, rowIndex) => {
+        row.forEach((value, colIndex) => {
+          const addr = XLSX.utils.encode_cell({ r: startRow + rowIndex, c: colIndex });
+          if (typeof value === 'number') {
+            dataSheet[addr] = { v: value, t: 'n' };
+          } else {
+            dataSheet[addr] = { v: value, t: 's' };
+          }
+        });
+      });
+
+      // Update sheet range
+      const endRow = startRow + mediaworldRows.length - 1;
+      dataSheet['!ref'] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: endRow, c: 21 } });
+
+      const mediaworldBuffer = XLSX.write(templateWb, { bookType: "xlsx", type: "array" });
+      generatedFiles.push({
+        name: 'Export Mediaworld.xlsx',
+        blob: new Blob([mediaworldBuffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" })
+      });
+      console.log('[SFTP:combined] Export Mediaworld generated:', mediaworldBuffer.byteLength, 'bytes,', mediaworldRows.length, 'rows');
+
+      // =====================================================================
+      // STEP 2: Save files to Supabase Storage bucket "exports"
+      // =====================================================================
+      setSftpUploadStatus({ phase: 'saving', message: 'Salvataggio file nel bucket...' });
+      console.log('[SFTP:combined] Saving files to bucket...');
+
+      for (const file of generatedFiles) {
+        const { error } = await supabase.storage
+          .from('exports')
+          .upload(file.name, file.blob, { upsert: true });
+
+        if (error) {
+          console.error(`[SFTP:combined] Error saving ${file.name}:`, error);
+          throw new Error(`Errore salvataggio ${file.name}: ${error.message}`);
+        }
+        console.log(`[SFTP:combined] Saved ${file.name} to bucket`);
+      }
+
+      // =====================================================================
+      // STEP 3: Call edge function to upload to SFTP
+      // =====================================================================
+      setSftpUploadStatus({ phase: 'uploading', message: 'Upload SFTP in corso...' });
+      console.log('[SFTP:combined] Calling upload-exports-to-sftp edge function...');
+
+      const { data: sftpResult, error: sftpError } = await supabase.functions.invoke('upload-exports-to-sftp', {
+        body: {
+          files: [
+            { bucket: 'exports', path: 'Catalogo EAN.xlsx', filename: 'Catalogo EAN.xlsx' },
+            { bucket: 'exports', path: 'Export ePrice.xlsx', filename: 'Export ePrice.xlsx' },
+            { bucket: 'exports', path: 'Export Mediaworld.xlsx', filename: 'Export Mediaworld.xlsx' }
+          ]
+        }
+      });
+
+      if (sftpError) {
+        console.error('[SFTP:combined] Edge function error:', sftpError);
+        setSftpUploadStatus({ 
+          phase: 'error', 
+          message: `Errore SFTP: ${sftpError.message}`,
+          results: generatedFiles.map(f => ({ filename: f.name, uploaded: false, error: sftpError.message }))
+        });
+        toast({
+          title: "Errore upload SFTP",
+          description: sftpError.message,
+          variant: "destructive"
+        });
+        return;
+      }
+
+      console.log('[SFTP:combined] Edge function response:', sftpResult);
+
+      if (sftpResult?.status === 'ok') {
+        setSftpUploadStatus({ 
+          phase: 'complete', 
+          message: 'Upload SFTP completato con successo!',
+          results: sftpResult.results
+        });
+        toast({
+          title: "Upload SFTP completato",
+          description: "I 3 file sono stati caricati correttamente sul server SFTP"
+        });
+      } else {
+        setSftpUploadStatus({ 
+          phase: 'error', 
+          message: sftpResult?.message || 'Errore durante l\'upload SFTP',
+          results: sftpResult?.results
+        });
+        toast({
+          title: "Errore upload SFTP",
+          description: sftpResult?.message || "Alcuni file non sono stati caricati",
+          variant: "destructive"
+        });
+      }
+
+    } catch (error: any) {
+      console.error('[SFTP:combined] Error:', error);
+      setSftpUploadStatus({ 
+        phase: 'error', 
+        message: error.message || 'Errore durante la generazione o upload'
+      });
+      toast({
+        title: "Errore",
+        description: error.message || "Errore sconosciuto durante l'operazione",
+        variant: "destructive"
+      });
+    } finally {
+      setIsUploadingToSftp(false);
+    }
+  }, [eanCatalogDataset, isUploadingToSftp, prepDays, prepDaysMediaworld, toast]);
+
   const downloadExcel = (type: 'ean' | 'manufpartnr') => {
     if (type === 'ean') {
       // Use the new onExportEAN function for EAN catalog
@@ -4819,6 +5097,79 @@ const AltersideCatalogGenerator: React.FC = () => {
                 <p className="text-xs text-muted-foreground mt-3">
                   Genera il file "mediaworld-offers-YYYYMMDD.xlsx" con formato Mediaworld
                 </p>
+              </div>
+            )}
+
+            {/* SFTP Upload Section - Only for EAN pipeline */}
+            {currentPipeline === 'EAN' && eanCatalogDataset.length > 0 && (
+              <div className="mt-8 p-6 rounded-lg border-2" style={{ background: '#f0fdf4', borderColor: '#22c55e' }}>
+                <h4 className="text-lg font-semibold mb-4 text-green-800 flex items-center gap-2">
+                  <Cloud className="h-5 w-5" />
+                  Genera Export e Carica su SFTP
+                </h4>
+                <p className="text-sm text-muted-foreground mb-4">
+                  Genera i 3 file Excel (Catalogo EAN, ePrice, Mediaworld) e caricali automaticamente sul server SFTP.
+                </p>
+                
+                <div className="flex flex-wrap items-center justify-center gap-4">
+                  <button 
+                    type="button"
+                    onClick={onGenerateAndUploadSftp}
+                    disabled={isUploadingToSftp}
+                    className={`btn btn-primary text-lg px-8 py-3 flex items-center gap-2 ${isUploadingToSftp ? 'opacity-50 cursor-not-allowed' : ''}`}
+                    style={{ background: '#16a34a' }}
+                  >
+                    {isUploadingToSftp ? (
+                      <>
+                        <Loader2 className="h-5 w-5 animate-spin" />
+                        {sftpUploadStatus.message}
+                      </>
+                    ) : (
+                      <>
+                        <Cloud className="h-5 w-5" />
+                        Genera e Carica su SFTP
+                      </>
+                    )}
+                  </button>
+                </div>
+
+                {/* SFTP Upload Status */}
+                {sftpUploadStatus.phase !== 'idle' && (
+                  <div className={`mt-4 p-4 rounded-lg ${
+                    sftpUploadStatus.phase === 'complete' ? 'bg-green-100 border-green-500' :
+                    sftpUploadStatus.phase === 'error' ? 'bg-red-100 border-red-500' :
+                    'bg-blue-100 border-blue-500'
+                  } border`}>
+                    <div className="flex items-center gap-2 mb-2">
+                      {sftpUploadStatus.phase === 'complete' && <CheckCircle className="h-5 w-5 text-green-600" />}
+                      {sftpUploadStatus.phase === 'error' && <XCircle className="h-5 w-5 text-red-600" />}
+                      {['generating', 'saving', 'uploading'].includes(sftpUploadStatus.phase) && <Loader2 className="h-5 w-5 animate-spin text-blue-600" />}
+                      <span className={`font-medium ${
+                        sftpUploadStatus.phase === 'complete' ? 'text-green-700' :
+                        sftpUploadStatus.phase === 'error' ? 'text-red-700' :
+                        'text-blue-700'
+                      }`}>
+                        {sftpUploadStatus.message}
+                      </span>
+                    </div>
+                    
+                    {sftpUploadStatus.results && (
+                      <div className="mt-2 space-y-1">
+                        {sftpUploadStatus.results.map((result, idx) => (
+                          <div key={idx} className="flex items-center gap-2 text-sm">
+                            {result.uploaded ? (
+                              <CheckCircle className="h-4 w-4 text-green-600" />
+                            ) : (
+                              <XCircle className="h-4 w-4 text-red-600" />
+                            )}
+                            <span>{result.filename}</span>
+                            {result.error && <span className="text-red-600 text-xs">({result.error})</span>}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             )}
           </div>

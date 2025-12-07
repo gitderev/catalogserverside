@@ -8,3 +8,9 @@ verify_jwt = false
 
 [functions.auth-validate]
 verify_jwt = false
+
+[functions.setup-admin-user]
+verify_jwt = false
+
+[functions.upload-exports-to-sftp]
+verify_jwt = false
