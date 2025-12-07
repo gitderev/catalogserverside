@@ -31,7 +31,15 @@ async function callStep(supabaseUrl: string, serviceKey: string, functionName: s
       headers: { 'Authorization': `Bearer ${serviceKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     });
-    const data = await resp.json();
+    
+    // Check HTTP status first
+    if (!resp.ok) {
+      const errorText = await resp.text().catch(() => 'Unknown error');
+      console.log(`[orchestrator] ${functionName} HTTP error ${resp.status}: ${errorText}`);
+      return { success: false, error: `HTTP ${resp.status}: ${errorText}` };
+    }
+    
+    const data = await resp.json().catch(() => ({ status: 'error', message: 'Invalid JSON response' }));
     if (data.status === 'error') {
       console.log(`[orchestrator] ${functionName} failed: ${data.message || data.error}`);
       return { success: false, error: data.message || data.error, data };
@@ -42,6 +50,30 @@ async function callStep(supabaseUrl: string, serviceKey: string, functionName: s
     console.error(`[orchestrator] Error calling ${functionName}:`, e);
     return { success: false, error: e.message };
   }
+}
+
+// Verify step completion by checking the database
+async function verifyStepCompleted(supabase: any, runId: string, stepName: string): Promise<{ success: boolean; error?: string }> {
+  const { data: run } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
+  const stepResult = run?.steps?.[stepName];
+  
+  if (!stepResult) {
+    console.log(`[orchestrator] Step ${stepName} has no result in database - likely crashed`);
+    return { success: false, error: `Step ${stepName} non ha prodotto risultati (possibile crash per memoria)` };
+  }
+  
+  if (stepResult.status === 'failed') {
+    console.log(`[orchestrator] Step ${stepName} failed according to database: ${stepResult.error}`);
+    return { success: false, error: stepResult.error };
+  }
+  
+  if (stepResult.status !== 'success') {
+    console.log(`[orchestrator] Step ${stepName} has unexpected status: ${stepResult.status}`);
+    return { success: false, error: `Step ${stepName} stato imprevisto: ${stepResult.status}` };
+  }
+  
+  console.log(`[orchestrator] Step ${stepName} verified as successful in database`);
+  return { success: true };
 }
 
 async function isCancelRequested(supabase: any, runId: string): Promise<boolean> {
@@ -187,9 +219,14 @@ serve(async (req) => {
         run_id: runId, step, fee_config: feeConfig 
       });
       
-      if (!result.success) {
-        await finalizeRun(supabase, runId, 'failed', startTime, `${step}: ${result.error}`);
-        return new Response(JSON.stringify({ status: 'failed', error: result.error }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      // Even if HTTP call succeeded, verify the step actually completed in the database
+      // This catches cases where the edge function crashed (e.g., memory limit)
+      const verification = await verifyStepCompleted(supabase, runId, step);
+      
+      if (!result.success || !verification.success) {
+        const error = result.error || verification.error || `Step ${step} fallito`;
+        await finalizeRun(supabase, runId, 'failed', startTime, error);
+        return new Response(JSON.stringify({ status: 'failed', error }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       }
     }
 

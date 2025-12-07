@@ -360,7 +360,7 @@ async function stepParseMerge(supabase: any, runId: string): Promise<{ success: 
     priceResult = { content: null, fileName: priceFileName }; // Release memory
     console.log(`[sync:step:parse_merge] Price entries loaded: ${priceMap.size}, memory released`);
     
-    // Phase 3: Process material file in chunks
+    // Phase 3: Process material file WITHOUT loading all lines into memory
     console.log(`[sync:step:parse_merge] Phase 3/4: Loading material file...`);
     let materialResult = await getLatestFile(supabase, 'material');
     if (!materialResult.content) {
@@ -370,16 +370,23 @@ async function stepParseMerge(supabase: any, runId: string): Promise<{ success: 
     }
     
     const materialFileName = materialResult.fileName;
-    const materialLines = materialResult.content.split('\n');
-    materialResult = { content: null, fileName: materialFileName }; // Release raw content immediately
+    const materialContent = materialResult.content;
+    const materialSize = materialContent.length;
+    materialResult = { content: null, fileName: materialFileName }; // Release reference early
     
-    console.log(`[sync:step:parse_merge] Material file: ${materialFileName}, ${materialLines.length} lines`);
+    console.log(`[sync:step:parse_merge] Material file: ${materialFileName}, ${materialSize} bytes`);
     
-    // Find header line
-    let matHeaderIdx = 0;
-    while (matHeaderIdx < materialLines.length && !materialLines[matHeaderIdx].trim()) matHeaderIdx++;
-    const matDelimiter = detectDelimiter(materialLines[matHeaderIdx] || '');
-    const matHeaders = (materialLines[matHeaderIdx] || '').split(matDelimiter).map(h => h.trim());
+    // Find first newline to get header
+    const firstNewline = materialContent.indexOf('\n');
+    if (firstNewline === -1) {
+      const error = 'Material file vuoto o senza righe';
+      await updateStepResult(supabase, runId, 'parse_merge', { status: 'failed', error, metrics: {} });
+      return { success: false, error };
+    }
+    
+    const headerLine = materialContent.substring(0, firstNewline).trim();
+    const matDelimiter = detectDelimiter(headerLine);
+    const matHeaders = headerLine.split(matDelimiter).map(h => h.trim());
     
     const matMatnr = findColumnIndex(matHeaders, 'Matnr');
     const matMpn = findColumnIndex(matHeaders, 'ManufPartNr');
@@ -396,34 +403,53 @@ async function stepParseMerge(supabase: any, runId: string): Promise<{ success: 
     
     const skipped = { noStock: 0, noPrice: 0, lowStock: 0, noValid: 0 };
     let productCount = 0;
+    let lineCount = 0;
     const outputLines: string[] = ['Matnr\tMPN\tEAN\tDesc\tStock\tLP\tCBP\tSur'];
     
-    // Process material lines starting after header
-    for (let i = matHeaderIdx + 1; i < materialLines.length; i++) {
-      const line = materialLines[i];
-      if (!line.trim()) continue;
-      
-      const vals = line.split(matDelimiter);
-      const m = vals[matMatnr.index]?.trim();
-      if (!m) continue;
-      
-      const stock = stockMap.get(m);
-      const price = priceMap.get(m);
-      
-      if (stock === undefined) { skipped.noStock++; continue; }
-      if (!price) { skipped.noPrice++; continue; }
-      if (stock < 2) { skipped.lowStock++; continue; }
-      if (price.lp <= 0 && price.cbp <= 0) { skipped.noValid++; continue; }
-      
-      const mpn = matMpn.index >= 0 ? vals[matMpn.index]?.trim() || '' : '';
-      const ean = matEan.index >= 0 ? vals[matEan.index]?.trim() || '' : '';
-      const desc = matDesc.index >= 0 ? vals[matDesc.index]?.trim() || '' : '';
-      
-      outputLines.push(`${m}\t${mpn}\t${ean}\t${desc}\t${stock}\t${price.lp}\t${price.cbp}\t${price.sur}`);
-      productCount++;
+    // Stream through material content character by character to find lines
+    // This avoids creating a huge array of all lines
+    let lineStart = firstNewline + 1;
+    let pos = lineStart;
+    
+    while (pos <= materialSize) {
+      // Find end of line or end of content
+      if (pos === materialSize || materialContent[pos] === '\n') {
+        const line = materialContent.substring(lineStart, pos).trim();
+        lineStart = pos + 1;
+        lineCount++;
+        
+        if (line) {
+          const vals = line.split(matDelimiter);
+          const m = vals[matMatnr.index]?.trim();
+          
+          if (m) {
+            const stock = stockMap.get(m);
+            const price = priceMap.get(m);
+            
+            if (stock === undefined) { skipped.noStock++; }
+            else if (!price) { skipped.noPrice++; }
+            else if (stock < 2) { skipped.lowStock++; }
+            else if (price.lp <= 0 && price.cbp <= 0) { skipped.noValid++; }
+            else {
+              const mpn = matMpn.index >= 0 ? vals[matMpn.index]?.trim() || '' : '';
+              const ean = matEan.index >= 0 ? vals[matEan.index]?.trim() || '' : '';
+              const desc = matDesc.index >= 0 ? vals[matDesc.index]?.trim() || '' : '';
+              
+              outputLines.push(`${m}\t${mpn}\t${ean}\t${desc}\t${stock}\t${price.lp}\t${price.cbp}\t${price.sur}`);
+              productCount++;
+            }
+          }
+        }
+        
+        // Log progress every 50K lines
+        if (lineCount % 50000 === 0) {
+          console.log(`[sync:step:parse_merge] Processed ${lineCount} lines, ${productCount} products so far...`);
+        }
+      }
+      pos++;
     }
     
-    console.log(`[sync:step:parse_merge] Products merged: ${productCount}, skipped: ${JSON.stringify(skipped)}`);
+    console.log(`[sync:step:parse_merge] Products merged: ${productCount}, lines processed: ${lineCount}, skipped: ${JSON.stringify(skipped)}`);
     
     // Phase 4: Save output
     console.log(`[sync:step:parse_merge] Phase 4/4: Saving products to ${PRODUCTS_FILE_PATH}...`);
