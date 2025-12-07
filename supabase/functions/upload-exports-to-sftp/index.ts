@@ -12,11 +12,17 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
-// Expected file configuration
-const EXPECTED_FILES = [
+// Expected file configuration - supports both XLSX and CSV formats
+const EXPECTED_FILES_XLSX = [
   { bucket: 'exports', path: 'Catalogo EAN.xlsx', filename: 'Catalogo EAN.xlsx' },
   { bucket: 'exports', path: 'Export ePrice.xlsx', filename: 'Export ePrice.xlsx' },
   { bucket: 'exports', path: 'Export Mediaworld.xlsx', filename: 'Export Mediaworld.xlsx' }
+];
+
+const EXPECTED_FILES_CSV = [
+  { bucket: 'exports', path: 'Catalogo EAN.csv', filename: 'Catalogo EAN.csv' },
+  { bucket: 'exports', path: 'Export ePrice.csv', filename: 'Export ePrice.csv' },
+  { bucket: 'exports', path: 'Export Mediaworld.csv', filename: 'Export Mediaworld.csv' }
 ];
 
 interface FileSpec {
@@ -114,10 +120,9 @@ serve(async (req) => {
       );
     }
 
-    // Validate each file spec
+    // Validate each file spec - accept both XLSX and CSV formats
     for (let i = 0; i < body.files.length; i++) {
       const file = body.files[i];
-      const expected = EXPECTED_FILES[i];
       
       if (!file.bucket || !file.path || !file.filename) {
         console.log('[upload-exports-to-sftp] Invalid file spec:', file);
@@ -130,12 +135,18 @@ serve(async (req) => {
         );
       }
 
-      if (file.bucket !== expected.bucket || file.path !== expected.path || file.filename !== expected.filename) {
-        console.log('[upload-exports-to-sftp] File spec mismatch:', { file, expected });
+      // Check if file matches expected XLSX or CSV format
+      const expectedXlsx = EXPECTED_FILES_XLSX[i];
+      const expectedCsv = EXPECTED_FILES_CSV[i];
+      const matchesXlsx = file.bucket === expectedXlsx?.bucket && file.path === expectedXlsx?.path && file.filename === expectedXlsx?.filename;
+      const matchesCsv = file.bucket === expectedCsv?.bucket && file.path === expectedCsv?.path && file.filename === expectedCsv?.filename;
+      
+      if (!matchesXlsx && !matchesCsv) {
+        console.log('[upload-exports-to-sftp] File spec mismatch:', { file, expectedXlsx, expectedCsv });
         return new Response(
           JSON.stringify({ 
             status: 'error', 
-            message: `File ${i + 1}: configurazione non valida. Atteso: ${JSON.stringify(expected)}` 
+            message: `File ${i + 1}: configurazione non valida. Attesi formati XLSX o CSV.` 
           }),
           { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
