@@ -897,6 +897,8 @@ const AltersideCatalogGenerator: React.FC = () => {
   // Pipeline Master state
   const [pipelineRunning, setPipelineRunning] = useState(false);
   const [pipelineStatus, setPipelineStatus] = useState<string>('');
+  const [pipelineProgress, setPipelineProgress] = useState<number>(0);
+  const [pipelineStepLabel, setPipelineStepLabel] = useState<string>('In attesa');
 
   const workerRef = useRef<Worker | null>(null);
 
@@ -4174,11 +4176,15 @@ const AltersideCatalogGenerator: React.FC = () => {
     
     setPipelineRunning(true);
     setPipelineStatus('');
+    setPipelineProgress(0);
+    setPipelineStepLabel('Inizializzazione pipeline…');
     
     try {
       // =====================================================================
       // STEP 1: Import FTP
       // =====================================================================
+      setPipelineProgress(0);
+      setPipelineStepLabel('Import FTP in corso…');
       setPipelineStatus('Import FTP in corso…');
       console.log('[Pipeline Master] Step 1: handleFtpImport');
       
@@ -4209,6 +4215,8 @@ const AltersideCatalogGenerator: React.FC = () => {
       });
       
       console.log('[Pipeline Master] Step 1 completato: file importati');
+      setPipelineProgress(25);
+      setPipelineStepLabel('Import FTP completato. Esecuzione EAN Prefill…');
       
       // =====================================================================
       // STEP 2: EAN Prefill (se non già completato)
@@ -4219,8 +4227,11 @@ const AltersideCatalogGenerator: React.FC = () => {
       if (currentPrefillState.status === 'done') {
         console.log('[Pipeline Master] Step 2 saltato: prefill già completato');
         setPipelineStatus('EAN Prefill già completato, proseguo…');
+        setPipelineProgress(50);
+        setPipelineStepLabel('EAN Prefill già completato. Elaborazione pipeline EAN…');
       } else if (currentFilesForPrefill.eanMapping.file && currentFilesForPrefill.material.file) {
         setPipelineStatus('EAN Prefill in corso…');
+        setPipelineStepLabel('EAN Prefill in corso…');
         console.log('[Pipeline Master] Step 2: processEANPrefill');
         
         await processEANPrefill();
@@ -4250,15 +4261,20 @@ const AltersideCatalogGenerator: React.FC = () => {
         });
         
         console.log('[Pipeline Master] Step 2 completato: prefill eseguito');
+        setPipelineProgress(50);
+        setPipelineStepLabel('EAN Prefill completato. Elaborazione pipeline EAN…');
       } else {
         console.log('[Pipeline Master] Step 2 saltato: file mapping non presente');
         setPipelineStatus('Nessun file mapping, proseguo…');
+        setPipelineProgress(50);
+        setPipelineStepLabel('File mapping assente, prefill saltato. Elaborazione pipeline EAN…');
       }
       
       // =====================================================================
       // STEP 3: processDataPipeline('EAN')
       // =====================================================================
       setPipelineStatus('Elaborazione EAN in corso…');
+      setPipelineStepLabel('Elaborazione EAN in corso…');
       console.log('[Pipeline Master] Step 3: processDataPipeline(EAN)');
       
       await processDataPipeline('EAN');
@@ -4287,11 +4303,14 @@ const AltersideCatalogGenerator: React.FC = () => {
       });
       
       console.log('[Pipeline Master] Step 3 completato: pipeline EAN elaborata');
+      setPipelineProgress(75);
+      setPipelineStepLabel('Elaborazione EAN completata. Export e upload in corso…');
       
       // =====================================================================
       // STEP 4: downloadExcel('ean') che include salvataggio bucket e SFTP
       // =====================================================================
       setPipelineStatus('Export e upload in corso…');
+      setPipelineStepLabel('Export e upload SFTP in corso…');
       console.log('[Pipeline Master] Step 4: downloadExcel(ean)');
       
       // Reset SFTP status before starting export
@@ -4328,6 +4347,8 @@ const AltersideCatalogGenerator: React.FC = () => {
       // =====================================================================
       // SUCCESSO COMPLETO
       // =====================================================================
+      setPipelineProgress(100);
+      setPipelineStepLabel('Pipeline completata con successo');
       setPipelineStatus('Pipeline completata con successo!');
       toast({
         title: "Pipeline completata con successo",
@@ -4337,6 +4358,7 @@ const AltersideCatalogGenerator: React.FC = () => {
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Errore sconosciuto';
       console.error('[Pipeline Master] Errore:', errorMessage);
+      setPipelineStepLabel(`Errore: ${errorMessage}`);
       setPipelineStatus(`Errore: ${errorMessage}`);
       toast({
         title: "Pipeline interrotta",
@@ -4560,7 +4582,29 @@ const AltersideCatalogGenerator: React.FC = () => {
                     </>
                   )}
                 </Button>
-                {pipelineStatus && (
+                {/* Progress Bar */}
+                {(pipelineRunning || pipelineProgress > 0) && (
+                  <div className="w-full mt-3">
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="text-sm text-white font-medium">{pipelineStepLabel}</span>
+                      <span className="text-sm text-white font-bold">{pipelineProgress}%</span>
+                    </div>
+                    <div className="w-full h-3 bg-gray-300 rounded-full overflow-hidden">
+                      <div 
+                        className="h-full transition-all duration-300 ease-out"
+                        style={{ 
+                          width: `${pipelineProgress}%`,
+                          background: pipelineStepLabel.includes('Errore') 
+                            ? '#ef4444' 
+                            : pipelineProgress === 100 
+                              ? '#22c55e' 
+                              : '#3b82f6'
+                        }}
+                      />
+                    </div>
+                  </div>
+                )}
+                {pipelineStatus && !pipelineRunning && pipelineProgress === 0 && (
                   <div className={`text-sm px-3 py-1 rounded ${
                     pipelineStatus.includes('Errore') 
                       ? 'bg-red-100 text-red-700' 
