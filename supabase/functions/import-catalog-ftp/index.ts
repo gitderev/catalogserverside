@@ -62,8 +62,16 @@ class FTPClient {
   private async sendCommand(cmd: string): Promise<string> {
     if (!this.conn) throw new Error("Not connected");
     const encoder = new TextEncoder();
+    // Log command without password
+    if (cmd.startsWith('PASS ')) {
+      console.log('[FTPClient] Sending: PASS ****');
+    } else {
+      console.log(`[FTPClient] Sending: ${cmd}`);
+    }
     await this.conn.write(encoder.encode(cmd + "\r\n"));
-    return await this.readResponse();
+    const response = await this.readResponse();
+    console.log(`[FTPClient] Response: ${response.substring(0, 100)}`);
+    return response;
   }
 
   private parseResponse(response: string): { code: number; message: string } {
@@ -73,66 +81,77 @@ class FTPClient {
   }
 
   async connect(host: string, port: number): Promise<void> {
-    console.log(`Connecting to ${host}:${port}...`);
+    console.log(`[FTPClient] Connecting to ${host}:${port} (TLS: ${this.useTLS})...`);
     
-    if (this.useTLS) {
-      this.conn = await Deno.connectTls({ hostname: host, port });
-    } else {
-      this.conn = await Deno.connect({ hostname: host, port });
-    }
-    
-    this.reader = this.conn.readable.getReader();
-    const welcome = await this.readResponse();
-    console.log("Connected to FTP");
-    
-    const { code } = this.parseResponse(welcome);
-    if (code !== 220) {
-      throw new Error(`Unexpected welcome code: ${code}`);
+    try {
+      if (this.useTLS) {
+        this.conn = await Deno.connectTls({ hostname: host, port });
+      } else {
+        this.conn = await Deno.connect({ hostname: host, port });
+      }
+      
+      this.reader = this.conn.readable.getReader();
+      const welcome = await this.readResponse();
+      console.log(`[FTPClient] Welcome message received: ${welcome.substring(0, 50)}...`);
+      
+      const { code } = this.parseResponse(welcome);
+      if (code !== 220) {
+        throw new Error(`Unexpected welcome code: ${code} - ${welcome}`);
+      }
+    } catch (e: any) {
+      console.error(`[FTPClient] Connection failed: ${e.message}`);
+      throw new Error(`FTP connection failed: ${e.message}`);
     }
   }
 
   async login(user: string, pass: string): Promise<void> {
-    console.log("Logging in...");
+    console.log(`[FTPClient] Logging in as user: ${user}...`);
     
     const userResp = await this.sendCommand(`USER ${user}`);
     const { code: userCode } = this.parseResponse(userResp);
     
     if (userCode === 331) {
       const passResp = await this.sendCommand(`PASS ${pass}`);
-      const { code: passCode } = this.parseResponse(passResp);
+      const { code: passCode, message: passMessage } = this.parseResponse(passResp);
       if (passCode !== 230) {
-        throw new Error(`Login failed`);
+        console.error(`[FTPClient] Login failed with code ${passCode}: ${passMessage}`);
+        throw new Error(`FTP authentication failed: invalid credentials (code ${passCode})`);
       }
     } else if (userCode !== 230) {
-      throw new Error(`Login failed`);
+      console.error(`[FTPClient] USER command failed with code ${userCode}`);
+      throw new Error(`FTP authentication failed: user rejected (code ${userCode})`);
     }
     
-    console.log("Logged in");
+    console.log('[FTPClient] Login successful');
   }
 
   async cwd(dir: string): Promise<void> {
+    console.log(`[FTPClient] Changing directory to: ${dir}`);
     const resp = await this.sendCommand(`CWD ${dir}`);
-    const { code } = this.parseResponse(resp);
+    const { code, message } = this.parseResponse(resp);
     if (code !== 250) {
-      throw new Error(`CWD_FAILED`);
+      console.error(`[FTPClient] CWD failed: ${message}`);
+      throw new Error(`FTP directory change failed: ${dir} (code ${code})`);
     }
   }
 
   async setPassiveMode(): Promise<{ host: string; port: number }> {
     const resp = await this.sendCommand("PASV");
-    const { code } = this.parseResponse(resp);
+    const { code, message } = this.parseResponse(resp);
     if (code !== 227) {
-      throw new Error(`PASV failed`);
+      console.error(`[FTPClient] PASV failed: ${message}`);
+      throw new Error(`FTP passive mode failed (code ${code})`);
     }
     
     const match = resp.match(/\((\d+),(\d+),(\d+),(\d+),(\d+),(\d+)\)/);
     if (!match) {
-      throw new Error("Could not parse PASV");
+      throw new Error("Could not parse PASV response");
     }
     
     const host = `${match[1]}.${match[2]}.${match[3]}.${match[4]}`;
     const port = parseInt(match[5]) * 256 + parseInt(match[6]);
     
+    console.log(`[FTPClient] Passive mode: ${host}:${port}`);
     return { host, port };
   }
 
@@ -141,7 +160,7 @@ class FTPClient {
   }
 
   async downloadFile(filename: string): Promise<Uint8Array> {
-    console.log(`Downloading: ${filename}`);
+    console.log(`[FTPClient] Downloading: ${filename}`);
     
     await this.setBinaryMode();
     
@@ -149,16 +168,18 @@ class FTPClient {
     const dataConn = await Deno.connect({ hostname: host, port });
     
     const retrResp = await this.sendCommand(`RETR ${filename}`);
-    const { code: retrCode } = this.parseResponse(retrResp);
+    const { code: retrCode, message: retrMessage } = this.parseResponse(retrResp);
     
     if (retrCode === 550) {
       try { dataConn.close(); } catch (_) {}
-      throw new Error(`FILE_NOT_FOUND:${filename}`);
+      console.error(`[FTPClient] File not found: ${filename}`);
+      throw new Error(`FTP file not found: ${filename}`);
     }
     
     if (retrCode !== 125 && retrCode !== 150) {
       try { dataConn.close(); } catch (_) {}
-      throw new Error(`FTP_DOWNLOAD_FAILED`);
+      console.error(`[FTPClient] RETR failed: ${retrMessage}`);
+      throw new Error(`FTP download failed: ${filename} (code ${retrCode})`);
     }
     
     const chunks: Uint8Array[] = [];
@@ -173,7 +194,7 @@ class FTPClient {
         totalSize += n;
         
         if (totalSize % 10485760 < 131072) {
-          console.log(`Downloaded: ${Math.round(totalSize / 1048576)} MB`);
+          console.log(`[FTPClient] Downloaded: ${Math.round(totalSize / 1048576)} MB`);
         }
       }
     } catch (_e) {}
@@ -182,7 +203,7 @@ class FTPClient {
     
     try { await this.readResponse(); } catch (_) {}
     
-    console.log(`Combining ${chunks.length} chunks, total: ${totalSize} bytes`);
+    console.log(`[FTPClient] Combining ${chunks.length} chunks, total: ${totalSize} bytes`);
     const result = new Uint8Array(totalSize);
     let offset = 0;
     for (const chunk of chunks) {
@@ -191,7 +212,7 @@ class FTPClient {
     }
     chunks.length = 0;
     
-    console.log(`Download complete: ${totalSize} bytes`);
+    console.log(`[FTPClient] Download complete: ${totalSize} bytes`);
     return result;
   }
 
@@ -208,8 +229,8 @@ class FTPClient {
   }
 }
 
-// Authentication check: verify user is authenticated and is admin
-async function checkAuthAndAdmin(req: Request, supabaseUrl: string, supabaseAnonKey: string): Promise<{ authorized: boolean; error?: string; status?: number }> {
+// Authentication check: verify user is authenticated and is admin OR service role
+async function checkAuth(req: Request, supabaseUrl: string, supabaseAnonKey: string, supabaseServiceKey: string): Promise<{ authorized: boolean; error?: string; status?: number; isServiceRole?: boolean }> {
   const authHeader = req.headers.get('authorization');
   
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -218,7 +239,13 @@ async function checkAuthAndAdmin(req: Request, supabaseUrl: string, supabaseAnon
   
   const token = authHeader.replace('Bearer ', '');
   
-  // Create a Supabase client with the user's token
+  // Check if this is a service role key (for internal calls from run-full-sync)
+  if (token === supabaseServiceKey) {
+    console.log('[import-catalog-ftp] Service role authentication - internal call');
+    return { authorized: true, isServiceRole: true };
+  }
+  
+  // Otherwise validate as user JWT
   const supabase = createClient(supabaseUrl, supabaseAnonKey, {
     global: {
       headers: {
@@ -231,11 +258,11 @@ async function checkAuthAndAdmin(req: Request, supabaseUrl: string, supabaseAnon
   const { data: { user }, error: userError } = await supabase.auth.getUser();
   
   if (userError || !user) {
-    console.log('Authentication failed:', userError?.message || 'No user');
+    console.log('[import-catalog-ftp] Authentication failed:', userError?.message || 'No user');
     return { authorized: false, error: 'Autenticazione non valida', status: 401 };
   }
   
-  console.log(`User authenticated: ${user.id}`);
+  console.log(`[import-catalog-ftp] User authenticated: ${user.id}`);
   
   // Check if user is admin
   const { data: adminData, error: adminError } = await supabase
@@ -245,12 +272,12 @@ async function checkAuthAndAdmin(req: Request, supabaseUrl: string, supabaseAnon
     .single();
   
   if (adminError || !adminData) {
-    console.log(`User ${user.id} is not an admin`);
+    console.log(`[import-catalog-ftp] User ${user.id} is not an admin`);
     return { authorized: false, error: 'Accesso non autorizzato. Solo gli amministratori possono importare file.', status: 403 };
   }
   
-  console.log(`User ${user.id} is admin, proceeding`);
-  return { authorized: true };
+  console.log(`[import-catalog-ftp] User ${user.id} is admin, proceeding`);
+  return { authorized: true, isServiceRole: false };
 }
 
 serve(async (req) => {
@@ -281,7 +308,7 @@ serve(async (req) => {
     }
 
     // Check authentication and admin status
-    const authResult = await checkAuthAndAdmin(req, supabaseUrl, supabaseAnonKey);
+    const authResult = await checkAuth(req, supabaseUrl, supabaseAnonKey, supabaseServiceKey || '');
     if (!authResult.authorized) {
       return new Response(
         JSON.stringify({ status: "error", code: "UNAUTHORIZED", message: authResult.error } as ErrorResponse),
@@ -306,9 +333,9 @@ serve(async (req) => {
     }
 
     const config = FILE_CONFIG[fileType as FileType];
-    console.log(`Processing single file: ${fileType} -> ${config.ftpName}`);
+    console.log(`[import-catalog-ftp] Processing file: ${fileType} -> ${config.ftpName}`);
 
-    // Read FTP environment variables
+    // Read FTP environment variables and log diagnostic info
     const ftpHost = Deno.env.get('FTP_HOST');
     const ftpUser = Deno.env.get('FTP_USER');
     const ftpPass = Deno.env.get('FTP_PASSWORD');
@@ -316,9 +343,17 @@ serve(async (req) => {
     const ftpInputDir = Deno.env.get('FTP_INPUT_DIR') || '/';
     const ftpUseTLS = Deno.env.get('FTP_USE_TLS') === 'true';
 
+    // Diagnostic log (without password)
+    console.log(`[import-catalog-ftp] FTP Config: host=${ftpHost}, port=${ftpPort}, user=${ftpUser}, hasPassword=${!!ftpPass}, inputDir=${ftpInputDir}, useTLS=${ftpUseTLS}`);
+
     if (!ftpHost || !ftpUser || !ftpPass) {
+      console.error('[import-catalog-ftp] Missing FTP credentials');
       return new Response(
-        JSON.stringify({ status: "error", code: "CONFIG_MISSING", message: "FTP config missing" } as ErrorResponse),
+        JSON.stringify({ 
+          status: "error", 
+          code: "CONFIG_MISSING", 
+          message: "Configurazione FTP incompleta. Verifica FTP_HOST, FTP_USER, FTP_PASSWORD." 
+        } as ErrorResponse),
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
@@ -334,9 +369,12 @@ serve(async (req) => {
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
     client = new FTPClient(ftpUseTLS);
 
-    // Connect to FTP
+    // Connect to FTP with detailed logging
+    console.log(`[import-catalog-ftp] Initiating FTP connection...`);
     await client.connect(ftpHost, ftpPort);
+    console.log(`[import-catalog-ftp] FTP connected, attempting login...`);
     await client.login(ftpUser, ftpPass);
+    console.log(`[import-catalog-ftp] FTP login successful, changing to directory: ${ftpInputDir}`);
     await client.cwd(ftpInputDir);
 
     const timestamp = Date.now();
@@ -344,12 +382,14 @@ serve(async (req) => {
     // Download the requested file
     let fileBuffer: Uint8Array;
     try {
+      console.log(`[import-catalog-ftp] Starting download of ${config.ftpName}...`);
       fileBuffer = await client.downloadFile(config.ftpName);
     } catch (e) {
       const errMsg = e instanceof Error ? e.message : String(e);
-      if (errMsg.includes("FILE_NOT_FOUND")) {
+      console.error(`[import-catalog-ftp] Download failed: ${errMsg}`);
+      if (errMsg.includes("not found")) {
         return new Response(
-          JSON.stringify({ status: "error", code: "FILE_NOT_FOUND", message: `File ${config.ftpName} non trovato` } as ErrorResponse),
+          JSON.stringify({ status: "error", code: "FILE_NOT_FOUND", message: `File ${config.ftpName} non trovato sul server FTP` } as ErrorResponse),
           { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
@@ -357,18 +397,18 @@ serve(async (req) => {
     }
 
     const fileSize = fileBuffer.length;
-    console.log(`File size: ${fileSize} bytes (${Math.round(fileSize / 1048576)} MB)`);
+    console.log(`[import-catalog-ftp] File downloaded: ${fileSize} bytes (${Math.round(fileSize / 1048576)} MB)`);
 
     // Close FTP before upload to free memory
     await client.close();
     client = null;
-    console.log(`FTP connection closed`);
+    console.log(`[import-catalog-ftp] FTP connection closed`);
 
     // Upload to Storage
     const newFilename = `${config.prefix}_${timestamp}.txt`;
     const storagePath = `${config.folder}/${newFilename}`;
     
-    console.log(`Uploading to Storage: ${storagePath}`);
+    console.log(`[import-catalog-ftp] Uploading to Storage: ${storagePath}`);
     
     const { error: uploadError } = await supabase.storage
       .from(BUCKET_NAME)
@@ -378,14 +418,14 @@ serve(async (req) => {
     fileBuffer = new Uint8Array(0);
 
     if (uploadError) {
-      console.error(`Upload error:`, uploadError.message);
+      console.error(`[import-catalog-ftp] Storage upload error:`, uploadError.message);
       return new Response(
         JSON.stringify({ status: "error", code: "STORAGE_ERROR", message: uploadError.message } as ErrorResponse),
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
 
-    console.log(`Upload complete`);
+    console.log(`[import-catalog-ftp] Upload complete: ${storagePath}`);
 
     // Create signed URL for the file (valid for 1 hour)
     const { data: signedUrlData, error: signedUrlError } = await supabase.storage
@@ -410,7 +450,7 @@ serve(async (req) => {
       },
     };
 
-    console.log(`${fileType} file processed successfully`);
+    console.log(`[import-catalog-ftp] ${fileType} file processed successfully`);
     
     return new Response(
       JSON.stringify(response),
@@ -418,11 +458,26 @@ serve(async (req) => {
     );
 
   } catch (e) {
-    console.error("Error:", e);
+    console.error("[import-catalog-ftp] Error:", e);
     const errMsg = e instanceof Error ? e.message : String(e);
     
+    // Provide user-friendly error messages
+    let userMessage = errMsg;
+    let errorCode = "FTP_RUNTIME_ERROR";
+    
+    if (errMsg.toLowerCase().includes('authentication') || errMsg.toLowerCase().includes('credentials') || errMsg.includes('530')) {
+      userMessage = "Errore FTP: credenziali non valide. Verifica host, utente e password.";
+      errorCode = "FTP_AUTH_ERROR";
+    } else if (errMsg.toLowerCase().includes('connection') || errMsg.toLowerCase().includes('connect')) {
+      userMessage = "Errore FTP: impossibile connettersi al server. Verifica host e porta.";
+      errorCode = "FTP_CONNECTION_ERROR";
+    } else if (errMsg.toLowerCase().includes('timeout')) {
+      userMessage = "Errore FTP: timeout connessione.";
+      errorCode = "FTP_TIMEOUT";
+    }
+    
     return new Response(
-      JSON.stringify({ status: "error", code: "FTP_RUNTIME_ERROR", message: errMsg.substring(0, 200) } as ErrorResponse),
+      JSON.stringify({ status: "error", code: errorCode, message: userMessage } as ErrorResponse),
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
     
