@@ -238,33 +238,41 @@ async function updateStepResult(supabase: any, runId: string, stepName: string, 
   await supabase.from('sync_runs').update({ steps, metrics }).eq('id', runId);
 }
 
-// ========== STEP: PARSE_MERGE (MEMORY OPTIMIZED) ==========
+// ========== STEP: PARSE_MERGE (MEMORY OPTIMIZED v2) ==========
 
 /**
- * Build an index map from file content, processing line by line
- * This function clears the content after processing to free memory
+ * Build a lightweight index object from file content
+ * Uses plain object instead of Map for lower memory overhead
+ * Returns {[key: string]: value} where value is the minimal data needed
  */
-function buildIndexFromContent(
+function buildLightweightIndex(
   content: string, 
   keyColIdx: number, 
-  valueExtractor: (vals: string[], delimiter: string) => any,
-  delimiter: string
-): Map<string, any> {
-  const map = new Map<string, any>();
-  const lines = content.split('\n');
+  valueColIdx: number | number[],
+  delimiter: string,
+  parseValue: (vals: string[]) => any
+): Record<string, any> {
+  const index: Record<string, any> = Object.create(null); // No prototype = less memory
+  let pos = content.indexOf('\n') + 1; // Skip header line
   
-  // Skip header
-  for (let i = 1; i < lines.length; i++) {
-    const line = lines[i];
+  while (pos < content.length) {
+    // Find end of current line
+    let lineEnd = content.indexOf('\n', pos);
+    if (lineEnd === -1) lineEnd = content.length;
+    
+    const line = content.substring(pos, lineEnd);
+    pos = lineEnd + 1;
+    
     if (!line.trim()) continue;
+    
     const vals = line.split(delimiter);
     const key = vals[keyColIdx]?.trim();
     if (key) {
-      map.set(key, valueExtractor(vals, delimiter));
+      index[key] = parseValue(vals);
     }
   }
   
-  return map;
+  return index;
 }
 
 async function stepParseMerge(supabase: any, runId: string): Promise<{ success: boolean; error?: string }> {
@@ -272,73 +280,63 @@ async function stepParseMerge(supabase: any, runId: string): Promise<{ success: 
   const startTime = Date.now();
   
   try {
-    // Phase 1: Build stock index
+    // Phase 1: Build stock index (lightweight object)
     console.log(`[sync:step:parse_merge] Phase 1/4: Loading stock file...`);
-    let stockResult = await getLatestFile(supabase, 'stock');
-    if (!stockResult.content) {
+    let stockContent = (await getLatestFile(supabase, 'stock')).content;
+    if (!stockContent) {
       const error = 'Stock file mancante o non leggibile';
       await updateStepResult(supabase, runId, 'parse_merge', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
     
-    const stockFileName = stockResult.fileName;
-    console.log(`[sync:step:parse_merge] Parsing stock file: ${stockFileName}...`);
-    
-    // Parse headers only first
-    const stockFirstLines = stockResult.content.split('\n').slice(0, 5);
-    let stockHeaderIdx = 0;
-    while (stockHeaderIdx < stockFirstLines.length && !stockFirstLines[stockHeaderIdx].trim()) stockHeaderIdx++;
-    const stockDelimiter = detectDelimiter(stockFirstLines[stockHeaderIdx] || '');
-    const stockHeaders = (stockFirstLines[stockHeaderIdx] || '').split(stockDelimiter).map(h => h.trim());
+    // Get header and detect delimiter
+    const stockFirstNewline = stockContent.indexOf('\n');
+    const stockHeaderLine = stockContent.substring(0, stockFirstNewline).trim();
+    const stockDelimiter = detectDelimiter(stockHeaderLine);
+    const stockHeaders = stockHeaderLine.split(stockDelimiter).map(h => h.trim());
     
     console.log(`[sync:step:parse_merge] Stock headers: [${stockHeaders.join(', ')}]`);
     
     const stockMatnr = findColumnIndex(stockHeaders, 'Matnr');
     const stockQty = findColumnIndex(stockHeaders, 'ExistingStock');
     
-    console.log(`[sync:step:parse_merge] Stock column mapping: Matnr=${stockMatnr.index} (${stockMatnr.matchedAs}), ExistingStock=${stockQty.index} (${stockQty.matchedAs})`);
+    console.log(`[sync:step:parse_merge] Stock column mapping: Matnr=${stockMatnr.index}, ExistingStock=${stockQty.index}`);
     
     if (stockMatnr.index === -1 || stockQty.index === -1) {
-      const error = `Stock headers non validi. Trovati: [${stockHeaders.join(', ')}]. Matnr=${stockMatnr.index}, ExistingStock=${stockQty.index}`;
-      console.error(`[sync:step:parse_merge] ${error}`);
-      await updateStepResult(supabase, runId, 'parse_merge', { status: 'failed', error, headers_found: stockHeaders, metrics: {} });
+      const error = `Stock headers non validi. Matnr=${stockMatnr.index}, ExistingStock=${stockQty.index}`;
+      await updateStepResult(supabase, runId, 'parse_merge', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
     
-    // Build stock map and immediately release content
-    const stockMap = buildIndexFromContent(
-      stockResult.content, 
-      stockMatnr.index, 
-      (vals) => parseInt(vals[stockQty.index]) || 0,
-      stockDelimiter
+    // Build stock index using lightweight function
+    const stockIndex = buildLightweightIndex(
+      stockContent, stockMatnr.index, stockQty.index, stockDelimiter,
+      (vals) => parseInt(vals[stockQty.index]) || 0
     );
-    stockResult = { content: null, fileName: stockFileName }; // Release memory
-    console.log(`[sync:step:parse_merge] Stock entries loaded: ${stockMap.size}, memory released`);
+    stockContent = null as any; // Release memory
+    const stockSize = Object.keys(stockIndex).length;
+    console.log(`[sync:step:parse_merge] Stock entries: ${stockSize}, memory released`);
     
-    // Phase 2: Build price index
+    // Phase 2: Build price index (lightweight object with compressed values)
     console.log(`[sync:step:parse_merge] Phase 2/4: Loading price file...`);
-    let priceResult = await getLatestFile(supabase, 'price');
-    if (!priceResult.content) {
+    let priceContent = (await getLatestFile(supabase, 'price')).content;
+    if (!priceContent) {
       const error = 'Price file mancante o non leggibile';
       await updateStepResult(supabase, runId, 'parse_merge', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
     
-    const priceFileName = priceResult.fileName;
-    console.log(`[sync:step:parse_merge] Parsing price file: ${priceFileName}...`);
-    
-    const priceFirstLines = priceResult.content.split('\n').slice(0, 5);
-    let priceHeaderIdx = 0;
-    while (priceHeaderIdx < priceFirstLines.length && !priceFirstLines[priceHeaderIdx].trim()) priceHeaderIdx++;
-    const priceDelimiter = detectDelimiter(priceFirstLines[priceHeaderIdx] || '');
-    const priceHeaders = (priceFirstLines[priceHeaderIdx] || '').split(priceDelimiter).map(h => h.trim());
+    const priceFirstNewline = priceContent.indexOf('\n');
+    const priceHeaderLine = priceContent.substring(0, priceFirstNewline).trim();
+    const priceDelimiter = detectDelimiter(priceHeaderLine);
+    const priceHeaders = priceHeaderLine.split(priceDelimiter).map(h => h.trim());
     
     const priceMatnr = findColumnIndex(priceHeaders, 'Matnr');
     const priceLp = findColumnIndex(priceHeaders, 'ListPrice');
     const priceCbp = findColumnIndex(priceHeaders, 'CustBestPrice');
     const priceSur = findColumnIndex(priceHeaders, 'Surcharge');
     
-    console.log(`[sync:step:parse_merge] Price column mapping: Matnr=${priceMatnr.index}, LP=${priceLp.index}, CBP=${priceCbp.index}, Sur=${priceSur.index}`);
+    console.log(`[sync:step:parse_merge] Price columns: Matnr=${priceMatnr.index}, LP=${priceLp.index}, CBP=${priceCbp.index}, Sur=${priceSur.index}`);
     
     if (priceMatnr.index === -1) {
       const error = `Price headers non validi. Matnr=${priceMatnr.index}`;
@@ -346,47 +344,45 @@ async function stepParseMerge(supabase: any, runId: string): Promise<{ success: 
       return { success: false, error };
     }
     
-    const parse = (v: any) => parseFloat(String(v || '0').replace(',', '.')) || 0;
-    const priceMap = buildIndexFromContent(
-      priceResult.content,
-      priceMatnr.index,
-      (vals) => ({
-        lp: priceLp.index >= 0 ? parse(vals[priceLp.index]) : 0,
-        cbp: priceCbp.index >= 0 ? parse(vals[priceCbp.index]) : 0,
-        sur: priceSur.index >= 0 ? parse(vals[priceSur.index]) : 0
-      }),
-      priceDelimiter
-    );
-    priceResult = { content: null, fileName: priceFileName }; // Release memory
-    console.log(`[sync:step:parse_merge] Price entries loaded: ${priceMap.size}, memory released`);
+    const parseNum = (v: any) => parseFloat(String(v || '0').replace(',', '.')) || 0;
     
-    // Phase 3: Process material file WITHOUT loading all lines into memory
+    // Store as array [lp, cbp, sur] to save memory on object keys
+    const priceIndex = buildLightweightIndex(
+      priceContent, priceMatnr.index, [priceLp.index, priceCbp.index, priceSur.index], priceDelimiter,
+      (vals) => [
+        priceLp.index >= 0 ? parseNum(vals[priceLp.index]) : 0,
+        priceCbp.index >= 0 ? parseNum(vals[priceCbp.index]) : 0,
+        priceSur.index >= 0 ? parseNum(vals[priceSur.index]) : 0
+      ]
+    );
+    priceContent = null as any; // Release memory
+    const priceSize = Object.keys(priceIndex).length;
+    console.log(`[sync:step:parse_merge] Price entries: ${priceSize}, memory released`);
+    
+    // Phase 3: Process material file streaming line by line
     console.log(`[sync:step:parse_merge] Phase 3/4: Loading material file...`);
-    let materialResult = await getLatestFile(supabase, 'material');
+    const materialResult = await getLatestFile(supabase, 'material');
     if (!materialResult.content) {
       const error = 'Material file mancante o non leggibile';
       await updateStepResult(supabase, runId, 'parse_merge', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
     
-    const materialFileName = materialResult.fileName;
     const materialContent = materialResult.content;
     const materialSize = materialContent.length;
-    materialResult = { content: null, fileName: materialFileName }; // Release reference early
+    console.log(`[sync:step:parse_merge] Material file: ${materialSize} bytes`);
     
-    console.log(`[sync:step:parse_merge] Material file: ${materialFileName}, ${materialSize} bytes`);
-    
-    // Find first newline to get header
-    const firstNewline = materialContent.indexOf('\n');
-    if (firstNewline === -1) {
-      const error = 'Material file vuoto o senza righe';
+    // Get header
+    const matFirstNewline = materialContent.indexOf('\n');
+    if (matFirstNewline === -1) {
+      const error = 'Material file vuoto';
       await updateStepResult(supabase, runId, 'parse_merge', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
     
-    const headerLine = materialContent.substring(0, firstNewline).trim();
-    const matDelimiter = detectDelimiter(headerLine);
-    const matHeaders = headerLine.split(matDelimiter).map(h => h.trim());
+    const matHeaderLine = materialContent.substring(0, matFirstNewline).trim();
+    const matDelimiter = detectDelimiter(matHeaderLine);
+    const matHeaders = matHeaderLine.split(matDelimiter).map(h => h.trim());
     
     const matMatnr = findColumnIndex(matHeaders, 'Matnr');
     const matMpn = findColumnIndex(matHeaders, 'ManufPartNr');
@@ -396,83 +392,85 @@ async function stepParseMerge(supabase: any, runId: string): Promise<{ success: 
     console.log(`[sync:step:parse_merge] Material columns: Matnr=${matMatnr.index}, MPN=${matMpn.index}, EAN=${matEan.index}, Desc=${matDesc.index}`);
     
     if (matMatnr.index === -1) {
-      const error = `Material headers non validi. Trovati: [${matHeaders.slice(0, 10).join(', ')}...]`;
+      const error = `Material headers non validi. Matnr=${matMatnr.index}`;
       await updateStepResult(supabase, runId, 'parse_merge', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
     
+    // Process material streaming - build output directly
     const skipped = { noStock: 0, noPrice: 0, lowStock: 0, noValid: 0 };
     let productCount = 0;
     let lineCount = 0;
-    const outputLines: string[] = ['Matnr\tMPN\tEAN\tDesc\tStock\tLP\tCBP\tSur'];
     
-    // Stream through material content character by character to find lines
-    // This avoids creating a huge array of all lines
-    let lineStart = firstNewline + 1;
-    let pos = lineStart;
+    // Use a single mutable string builder for output
+    let outputTSV = 'Matnr\tMPN\tEAN\tDesc\tStock\tLP\tCBP\tSur\n';
     
-    while (pos <= materialSize) {
-      // Find end of line or end of content
-      if (pos === materialSize || materialContent[pos] === '\n') {
-        const line = materialContent.substring(lineStart, pos).trim();
-        lineStart = pos + 1;
-        lineCount++;
-        
-        if (line) {
-          const vals = line.split(matDelimiter);
-          const m = vals[matMatnr.index]?.trim();
-          
-          if (m) {
-            const stock = stockMap.get(m);
-            const price = priceMap.get(m);
-            
-            if (stock === undefined) { skipped.noStock++; }
-            else if (!price) { skipped.noPrice++; }
-            else if (stock < 2) { skipped.lowStock++; }
-            else if (price.lp <= 0 && price.cbp <= 0) { skipped.noValid++; }
-            else {
-              const mpn = matMpn.index >= 0 ? vals[matMpn.index]?.trim() || '' : '';
-              const ean = matEan.index >= 0 ? vals[matEan.index]?.trim() || '' : '';
-              const desc = matDesc.index >= 0 ? vals[matDesc.index]?.trim() || '' : '';
-              
-              outputLines.push(`${m}\t${mpn}\t${ean}\t${desc}\t${stock}\t${price.lp}\t${price.cbp}\t${price.sur}`);
-              productCount++;
-            }
-          }
-        }
-        
-        // Log progress every 50K lines
-        if (lineCount % 50000 === 0) {
-          console.log(`[sync:step:parse_merge] Processed ${lineCount} lines, ${productCount} products so far...`);
-        }
+    // Stream through content
+    let pos = matFirstNewline + 1;
+    while (pos < materialSize) {
+      // Find end of line
+      let lineEnd = materialContent.indexOf('\n', pos);
+      if (lineEnd === -1) lineEnd = materialSize;
+      
+      const line = materialContent.substring(pos, lineEnd);
+      pos = lineEnd + 1;
+      lineCount++;
+      
+      if (!line.trim()) continue;
+      
+      const vals = line.split(matDelimiter);
+      const m = vals[matMatnr.index]?.trim();
+      if (!m) continue;
+      
+      // Direct object access (faster than Map.get)
+      const stock = stockIndex[m];
+      const price = priceIndex[m];
+      
+      if (stock === undefined) { skipped.noStock++; continue; }
+      if (!price) { skipped.noPrice++; continue; }
+      if (stock < 2) { skipped.lowStock++; continue; }
+      
+      // price is [lp, cbp, sur]
+      const lp = price[0], cbp = price[1], sur = price[2];
+      if (lp <= 0 && cbp <= 0) { skipped.noValid++; continue; }
+      
+      const mpn = matMpn.index >= 0 ? (vals[matMpn.index]?.trim() || '') : '';
+      const ean = matEan.index >= 0 ? (vals[matEan.index]?.trim() || '') : '';
+      const desc = matDesc.index >= 0 ? (vals[matDesc.index]?.trim() || '') : '';
+      
+      outputTSV += `${m}\t${mpn}\t${ean}\t${desc}\t${stock}\t${lp}\t${cbp}\t${sur}\n`;
+      productCount++;
+      
+      // Log progress
+      if (lineCount % 50000 === 0) {
+        console.log(`[sync:step:parse_merge] Processed ${lineCount} lines, ${productCount} products...`);
       }
-      pos++;
     }
     
-    console.log(`[sync:step:parse_merge] Products merged: ${productCount}, lines processed: ${lineCount}, skipped: ${JSON.stringify(skipped)}`);
+    console.log(`[sync:step:parse_merge] Merge complete: ${productCount} products, ${lineCount} lines, skipped: ${JSON.stringify(skipped)}`);
     
-    // Phase 4: Save output
-    console.log(`[sync:step:parse_merge] Phase 4/4: Saving products to ${PRODUCTS_FILE_PATH}...`);
-    const csvContent = outputLines.join('\n');
-    console.log(`[sync:step:parse_merge] Output size: ${csvContent.length} bytes`);
-    
-    const uploadResult = await uploadToStorage(supabase, 'exports', PRODUCTS_FILE_PATH, csvContent, 'text/tab-separated-values');
+    // Phase 4: Save to storage
+    console.log(`[sync:step:parse_merge] Phase 4/4: Saving ${outputTSV.length} bytes to ${PRODUCTS_FILE_PATH}...`);
+    const uploadResult = await uploadToStorage(supabase, 'exports', PRODUCTS_FILE_PATH, outputTSV, 'text/tab-separated-values');
     
     if (!uploadResult.success) {
-      const error = `Failed to save products file: ${uploadResult.error}`;
+      const error = `Failed to save products: ${uploadResult.error}`;
       await updateStepResult(supabase, runId, 'parse_merge', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
     
+    const durationMs = Date.now() - startTime;
     await updateStepResult(supabase, runId, 'parse_merge', {
-      status: 'success', duration_ms: Date.now() - startTime, 
-      products: productCount, skipped,
-      files: { stock: stockFileName, price: priceFileName, material: materialFileName },
+      status: 'success', 
+      duration_ms: durationMs, 
+      products: productCount, 
+      skipped,
+      stats: { stockEntries: stockSize, priceEntries: priceSize, materialBytes: materialSize, outputBytes: outputTSV.length },
       output_file: PRODUCTS_FILE_PATH,
       metrics: { products_total: productCount + Object.values(skipped).reduce((a, b) => a + b, 0), products_processed: productCount }
     });
     
-    console.log(`[sync:step:parse_merge] Completed in ${Date.now() - startTime}ms, saved to ${PRODUCTS_FILE_PATH}`);
+    console.log(`[sync:step:parse_merge] SUCCESS in ${durationMs}ms, ${productCount} products saved to ${PRODUCTS_FILE_PATH}`);
     return { success: true };
     
   } catch (e: any) {
