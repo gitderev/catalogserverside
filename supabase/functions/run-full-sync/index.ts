@@ -70,14 +70,22 @@ async function verifyStepCompleted(supabase: any, runId: string, stepName: strin
     return { success: false, status: 'failed', error: stepResult.error };
   }
   
-  if (stepResult.status === 'in_progress') {
-    console.log(`[orchestrator] Step ${stepName} is in_progress (chunked processing)`);
+  // For parse_merge: handle intermediate phases as "still in progress"
+  const intermediatePhases = ['building_stock_index', 'building_price_index', 'preparing_material', 'in_progress'];
+  if (intermediatePhases.includes(stepResult.status)) {
+    console.log(`[orchestrator] Step ${stepName} is ${stepResult.status} (needs more invocations)`);
     return { success: true, status: 'in_progress' };
   }
   
   if (stepResult.status === 'completed' || stepResult.status === 'success') {
     console.log(`[orchestrator] Step ${stepName} verified as completed`);
     return { success: true, status: 'completed' };
+  }
+  
+  // 'pending' at this point means step didn't start processing yet - should continue
+  if (stepResult.status === 'pending') {
+    console.log(`[orchestrator] Step ${stepName} is pending (first invocation needed)`);
+    return { success: true, status: 'in_progress' };
   }
   
   console.log(`[orchestrator] Step ${stepName} has unexpected status: ${stepResult.status}`);
