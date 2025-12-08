@@ -32,7 +32,6 @@ const CHUNK_SIZE = 5000; // Righe di material file processate per ogni invocazio
 
 const PRODUCTS_FILE_PATH = '_pipeline/products.tsv';
 const PARTIAL_PRODUCTS_FILE_PATH = '_pipeline/partial_products.tsv';
-const INDICES_FILE_PATH = '_pipeline/indices.json';
 const EAN_CATALOG_FILE_PATH = '_pipeline/ean_catalog.tsv';
 
 // ========== COLUMN ALIASES (case-insensitive matching) ==========
@@ -208,8 +207,16 @@ async function deleteFromStorage(supabase: any, bucket: string, path: string): P
 
 // ========== PARSE_MERGE STATE MANAGEMENT ==========
 
+// Sub-phases for building indices to stay within memory limits:
+// - pending: initial state
+// - building_stock_index: loading and parsing stock file
+// - building_price_index: loading and parsing price file  
+// - preparing_material: reading material file metadata
+// - in_progress: chunked material processing
+// - completed / failed
+
 interface ParseMergeState {
-  status: 'pending' | 'building_indices' | 'in_progress' | 'completed' | 'failed';
+  status: 'pending' | 'building_stock_index' | 'building_price_index' | 'preparing_material' | 'in_progress' | 'completed' | 'failed';
   offset: number;
   productCount: number;
   skipped: { noStock: number; noPrice: number; lowStock: number; noValid: number };
@@ -239,45 +246,90 @@ async function updateParseMergeState(supabase: any, runId: string, state: Partia
   } : currentMetrics;
   
   await supabase.from('sync_runs').update({ steps: updatedSteps, metrics: updatedMetrics }).eq('id', runId);
-  console.log(`[parse_merge] State updated: status=${state.status}, offset=${state.offset}, products=${state.productCount}`);
+  console.log(`[parse_merge] State updated: status=${state.status}, offset=${state.offset ?? 'N/A'}, products=${state.productCount ?? 'N/A'}`);
 }
 
-// ========== INDICES STORAGE (for chunked processing) ==========
+// ========== INDICES STORAGE (split into separate files for memory efficiency) ==========
 
-interface StoredIndices {
-  stockIndex: Record<string, number>;
-  priceIndex: Record<string, [number, number, number]>;
-  materialMeta: {
-    delimiter: string;
-    matnrIdx: number;
-    mpnIdx: number;
-    eanIdx: number;
-    descIdx: number;
-    headerEndPos: number;
-  };
+const STOCK_INDEX_FILE = '_pipeline/stock_index.json';
+const PRICE_INDEX_FILE = '_pipeline/price_index.json';
+const MATERIAL_META_FILE = '_pipeline/material_meta.json';
+
+interface MaterialMeta {
+  delimiter: string;
+  matnrIdx: number;
+  mpnIdx: number;
+  eanIdx: number;
+  descIdx: number;
+  headerEndPos: number;
+  totalBytes: number;
 }
 
-async function saveIndicesToStorage(supabase: any, indices: StoredIndices): Promise<{ success: boolean; error?: string }> {
-  const json = JSON.stringify(indices);
-  console.log(`[parse_merge] Saving indices to storage: ${json.length} bytes`);
-  return await uploadToStorage(supabase, 'exports', INDICES_FILE_PATH, json, 'application/json');
+async function saveStockIndex(supabase: any, stockIndex: Record<string, number>): Promise<{ success: boolean; error?: string }> {
+  const json = JSON.stringify(stockIndex);
+  console.log(`[parse_merge:indices] Saving stock index: ${Object.keys(stockIndex).length} entries, ${json.length} bytes`);
+  return await uploadToStorage(supabase, 'exports', STOCK_INDEX_FILE, json, 'application/json');
 }
 
-async function loadIndicesFromStorage(supabase: any): Promise<{ indices: StoredIndices | null; error?: string }> {
-  const { content, error } = await downloadFromStorage(supabase, 'exports', INDICES_FILE_PATH);
-  if (error || !content) {
-    return { indices: null, error: error || 'Empty content' };
-  }
+async function loadStockIndex(supabase: any): Promise<{ index: Record<string, number> | null; error?: string }> {
+  const { content, error } = await downloadFromStorage(supabase, 'exports', STOCK_INDEX_FILE);
+  if (error || !content) return { index: null, error: error || 'Empty content' };
   try {
-    const indices = JSON.parse(content) as StoredIndices;
-    console.log(`[parse_merge] Loaded indices: stock=${Object.keys(indices.stockIndex).length}, price=${Object.keys(indices.priceIndex).length}`);
-    return { indices };
+    const index = JSON.parse(content);
+    console.log(`[parse_merge:indices] Loaded stock index: ${Object.keys(index).length} entries`);
+    return { index };
   } catch (e: any) {
-    return { indices: null, error: `JSON parse error: ${e.message}` };
+    return { index: null, error: `JSON parse error: ${e.message}` };
   }
 }
 
-// ========== STEP: PARSE_MERGE (CHUNKED VERSION) ==========
+async function savePriceIndex(supabase: any, priceIndex: Record<string, [number, number, number]>): Promise<{ success: boolean; error?: string }> {
+  const json = JSON.stringify(priceIndex);
+  console.log(`[parse_merge:indices] Saving price index: ${Object.keys(priceIndex).length} entries, ${json.length} bytes`);
+  return await uploadToStorage(supabase, 'exports', PRICE_INDEX_FILE, json, 'application/json');
+}
+
+async function loadPriceIndex(supabase: any): Promise<{ index: Record<string, [number, number, number]> | null; error?: string }> {
+  const { content, error } = await downloadFromStorage(supabase, 'exports', PRICE_INDEX_FILE);
+  if (error || !content) return { index: null, error: error || 'Empty content' };
+  try {
+    const index = JSON.parse(content);
+    console.log(`[parse_merge:indices] Loaded price index: ${Object.keys(index).length} entries`);
+    return { index };
+  } catch (e: any) {
+    return { index: null, error: `JSON parse error: ${e.message}` };
+  }
+}
+
+async function saveMaterialMeta(supabase: any, meta: MaterialMeta): Promise<{ success: boolean; error?: string }> {
+  const json = JSON.stringify(meta);
+  console.log(`[parse_merge:indices] Saving material meta: headerEndPos=${meta.headerEndPos}, totalBytes=${meta.totalBytes}`);
+  return await uploadToStorage(supabase, 'exports', MATERIAL_META_FILE, json, 'application/json');
+}
+
+async function loadMaterialMeta(supabase: any): Promise<{ meta: MaterialMeta | null; error?: string }> {
+  const { content, error } = await downloadFromStorage(supabase, 'exports', MATERIAL_META_FILE);
+  if (error || !content) return { meta: null, error: error || 'Empty content' };
+  try {
+    return { meta: JSON.parse(content) };
+  } catch (e: any) {
+    return { meta: null, error: `JSON parse error: ${e.message}` };
+  }
+}
+
+async function cleanupIndexFiles(supabase: any): Promise<void> {
+  await deleteFromStorage(supabase, 'exports', STOCK_INDEX_FILE);
+  await deleteFromStorage(supabase, 'exports', PRICE_INDEX_FILE);
+  await deleteFromStorage(supabase, 'exports', MATERIAL_META_FILE);
+  await deleteFromStorage(supabase, 'exports', PARTIAL_PRODUCTS_FILE_PATH);
+}
+
+// ========== STEP: PARSE_MERGE (MULTI-PHASE CHUNKED VERSION) ==========
+// Split into multiple invocations to stay within memory limits:
+// Phase 1a: building_stock_index - load and parse stock file, save index
+// Phase 1b: building_price_index - load and parse price file, save index  
+// Phase 1c: preparing_material - read material file metadata, save it
+// Phase 2: in_progress - chunked material processing
 
 async function stepParseMerge(supabase: any, runId: string): Promise<{ success: boolean; error?: string; status?: string }> {
   console.log(`[parse_merge] Starting for run ${runId}, CHUNK_SIZE=${CHUNK_SIZE}`);
@@ -299,97 +351,150 @@ async function stepParseMerge(supabase: any, runId: string): Promise<{ success: 
       return { success: false, error: state.error, status: 'failed' };
     }
     
-    // PHASE 1: Build indices (first invocation only)
-    if (!state || state.status === 'pending' || state.status === 'building_indices') {
-      console.log(`[parse_merge] Phase 1: Building indices...`);
+    // ========== PHASE 1a: BUILD STOCK INDEX ==========
+    if (!state || state.status === 'pending') {
+      console.log(`[parse_merge] Phase 1a: Building stock index...`);
       
       await updateParseMergeState(supabase, runId, {
-        status: 'building_indices',
+        status: 'building_stock_index',
         offset: 0,
         productCount: 0,
         skipped: { noStock: 0, noPrice: 0, lowStock: 0, noValid: 0 },
         startTime: Date.now()
       });
       
-      // Build stock index
-      console.log(`[parse_merge] Loading stock file...`);
+      // Load and parse stock file
+      console.log(`[parse_merge:indices] Loading stock file from ftp-import/stock...`);
       const stockResult = await getLatestFile(supabase, 'stock');
       if (!stockResult.content) {
-        const error = 'Stock file mancante o non leggibile';
+        const error = `Stock file mancante o non leggibile in ftp-import/stock`;
+        console.error(`[parse_merge:indices] ${error}`);
         await updateParseMergeState(supabase, runId, { status: 'failed', error });
         return { success: false, error, status: 'failed' };
       }
       
+      console.log(`[parse_merge:indices] Stock file loaded: ${stockResult.fileName}, ${stockResult.content.length} bytes`);
+      
       const stockFirstNewline = stockResult.content.indexOf('\n');
+      if (stockFirstNewline === -1) {
+        const error = 'Stock file vuoto o senza header';
+        await updateParseMergeState(supabase, runId, { status: 'failed', error });
+        return { success: false, error, status: 'failed' };
+      }
+      
       const stockHeaderLine = stockResult.content.substring(0, stockFirstNewline).trim();
       const stockDelimiter = detectDelimiter(stockHeaderLine);
       const stockHeaders = stockHeaderLine.split(stockDelimiter).map(h => h.trim());
       
+      console.log(`[parse_merge:indices] Stock headers: [${stockHeaders.join(', ')}]`);
+      
       const stockMatnr = findColumnIndex(stockHeaders, 'Matnr');
       const stockQty = findColumnIndex(stockHeaders, 'ExistingStock');
       
-      console.log(`[parse_merge] Stock columns: Matnr=${stockMatnr.index}, ExistingStock=${stockQty.index}`);
+      console.log(`[parse_merge:indices] Stock column mapping: Matnr=${stockMatnr.index} (${stockMatnr.matchedAs}), ExistingStock=${stockQty.index} (${stockQty.matchedAs})`);
       
       if (stockMatnr.index === -1 || stockQty.index === -1) {
-        const error = `Stock headers non validi. Matnr=${stockMatnr.index}, ExistingStock=${stockQty.index}`;
+        const error = `Stock headers non validi. Trovati: [${stockHeaders.join(', ')}]. Matnr=${stockMatnr.index}, ExistingStock=${stockQty.index}`;
+        console.error(`[parse_merge:indices] ${error}`);
         await updateParseMergeState(supabase, runId, { status: 'failed', error });
         return { success: false, error, status: 'failed' };
       }
       
-      // Build stock index inline
+      // Build stock index
       const stockIndex: Record<string, number> = Object.create(null);
       let pos = stockFirstNewline + 1;
       const stockContent = stockResult.content;
+      let stockLineCount = 0;
+      
       while (pos < stockContent.length) {
         let lineEnd = stockContent.indexOf('\n', pos);
         if (lineEnd === -1) lineEnd = stockContent.length;
         const line = stockContent.substring(pos, lineEnd);
         pos = lineEnd + 1;
         if (!line.trim()) continue;
+        stockLineCount++;
         const vals = line.split(stockDelimiter);
         const key = vals[stockMatnr.index]?.trim();
         if (key) stockIndex[key] = parseInt(vals[stockQty.index]) || 0;
       }
-      console.log(`[parse_merge] Stock index: ${Object.keys(stockIndex).length} entries`);
       
-      // Build price index
-      console.log(`[parse_merge] Loading price file...`);
-      const priceResult = await getLatestFile(supabase, 'price');
-      if (!priceResult.content) {
-        const error = 'Price file mancante o non leggibile';
+      console.log(`[parse_merge:indices] Stock index built: ${Object.keys(stockIndex).length} entries from ${stockLineCount} lines`);
+      
+      // Save stock index
+      const saveResult = await saveStockIndex(supabase, stockIndex);
+      if (!saveResult.success) {
+        const error = `Failed to save stock index: ${saveResult.error}`;
         await updateParseMergeState(supabase, runId, { status: 'failed', error });
         return { success: false, error, status: 'failed' };
       }
       
+      // Update state to next phase
+      await updateParseMergeState(supabase, runId, { status: 'building_price_index' });
+      
+      console.log(`[parse_merge] Phase 1a complete in ${Date.now() - invocationStart}ms, stock index saved`);
+      return { success: true, status: 'building_price_index' };
+    }
+    
+    // ========== PHASE 1b: BUILD PRICE INDEX ==========
+    if (state.status === 'building_stock_index' || state.status === 'building_price_index') {
+      console.log(`[parse_merge] Phase 1b: Building price index...`);
+      
+      await updateParseMergeState(supabase, runId, { status: 'building_price_index' });
+      
+      // Load and parse price file
+      console.log(`[parse_merge:indices] Loading price file from ftp-import/price...`);
+      const priceResult = await getLatestFile(supabase, 'price');
+      if (!priceResult.content) {
+        const error = `Price file mancante o non leggibile in ftp-import/price`;
+        console.error(`[parse_merge:indices] ${error}`);
+        await updateParseMergeState(supabase, runId, { status: 'failed', error });
+        return { success: false, error, status: 'failed' };
+      }
+      
+      console.log(`[parse_merge:indices] Price file loaded: ${priceResult.fileName}, ${priceResult.content.length} bytes`);
+      
       const priceFirstNewline = priceResult.content.indexOf('\n');
+      if (priceFirstNewline === -1) {
+        const error = 'Price file vuoto o senza header';
+        await updateParseMergeState(supabase, runId, { status: 'failed', error });
+        return { success: false, error, status: 'failed' };
+      }
+      
       const priceHeaderLine = priceResult.content.substring(0, priceFirstNewline).trim();
       const priceDelimiter = detectDelimiter(priceHeaderLine);
       const priceHeaders = priceHeaderLine.split(priceDelimiter).map(h => h.trim());
+      
+      console.log(`[parse_merge:indices] Price headers: [${priceHeaders.join(', ')}]`);
       
       const priceMatnr = findColumnIndex(priceHeaders, 'Matnr');
       const priceLp = findColumnIndex(priceHeaders, 'ListPrice');
       const priceCbp = findColumnIndex(priceHeaders, 'CustBestPrice');
       const priceSur = findColumnIndex(priceHeaders, 'Surcharge');
       
-      console.log(`[parse_merge] Price columns: Matnr=${priceMatnr.index}, LP=${priceLp.index}, CBP=${priceCbp.index}, Sur=${priceSur.index}`);
+      console.log(`[parse_merge:indices] Price column mapping: Matnr=${priceMatnr.index}, LP=${priceLp.index}, CBP=${priceCbp.index}, Sur=${priceSur.index}`);
       
       if (priceMatnr.index === -1) {
-        const error = `Price headers non validi. Matnr=${priceMatnr.index}`;
+        const error = `Price headers non validi. Trovati: [${priceHeaders.join(', ')}]. Matnr non trovato.`;
+        console.error(`[parse_merge:indices] ${error}`);
         await updateParseMergeState(supabase, runId, { status: 'failed', error });
         return { success: false, error, status: 'failed' };
       }
       
       const parseNum = (v: any) => parseFloat(String(v || '0').replace(',', '.')) || 0;
       
+      // Build price index
       const priceIndex: Record<string, [number, number, number]> = Object.create(null);
-      pos = priceFirstNewline + 1;
+      let pos = priceFirstNewline + 1;
       const priceContent = priceResult.content;
+      let priceLineCount = 0;
+      
       while (pos < priceContent.length) {
         let lineEnd = priceContent.indexOf('\n', pos);
         if (lineEnd === -1) lineEnd = priceContent.length;
         const line = priceContent.substring(pos, lineEnd);
         pos = lineEnd + 1;
         if (!line.trim()) continue;
+        priceLineCount++;
         const vals = line.split(priceDelimiter);
         const key = vals[priceMatnr.index]?.trim();
         if (key) {
@@ -400,20 +505,43 @@ async function stepParseMerge(supabase: any, runId: string): Promise<{ success: 
           ];
         }
       }
-      console.log(`[parse_merge] Price index: ${Object.keys(priceIndex).length} entries`);
       
-      // Get material file metadata (header only)
-      console.log(`[parse_merge] Loading material file header...`);
-      const materialResult = await getLatestFile(supabase, 'material');
-      if (!materialResult.content) {
-        const error = 'Material file mancante o non leggibile';
+      console.log(`[parse_merge:indices] Price index built: ${Object.keys(priceIndex).length} entries from ${priceLineCount} lines`);
+      
+      // Save price index
+      const saveResult = await savePriceIndex(supabase, priceIndex);
+      if (!saveResult.success) {
+        const error = `Failed to save price index: ${saveResult.error}`;
         await updateParseMergeState(supabase, runId, { status: 'failed', error });
         return { success: false, error, status: 'failed' };
       }
       
+      // Update state to next phase
+      await updateParseMergeState(supabase, runId, { status: 'preparing_material' });
+      
+      console.log(`[parse_merge] Phase 1b complete in ${Date.now() - invocationStart}ms, price index saved`);
+      return { success: true, status: 'preparing_material' };
+    }
+    
+    // ========== PHASE 1c: PREPARE MATERIAL METADATA ==========
+    if (state.status === 'preparing_material') {
+      console.log(`[parse_merge] Phase 1c: Preparing material file metadata...`);
+      
+      // Load material file
+      console.log(`[parse_merge:indices] Loading material file from ftp-import/material...`);
+      const materialResult = await getLatestFile(supabase, 'material');
+      if (!materialResult.content) {
+        const error = `Material file mancante o non leggibile in ftp-import/material`;
+        console.error(`[parse_merge:indices] ${error}`);
+        await updateParseMergeState(supabase, runId, { status: 'failed', error });
+        return { success: false, error, status: 'failed' };
+      }
+      
+      console.log(`[parse_merge:indices] Material file loaded: ${materialResult.fileName}, ${materialResult.content.length} bytes`);
+      
       const matFirstNewline = materialResult.content.indexOf('\n');
       if (matFirstNewline === -1) {
-        const error = 'Material file vuoto';
+        const error = 'Material file vuoto o senza header';
         await updateParseMergeState(supabase, runId, { status: 'failed', error });
         return { success: false, error, status: 'failed' };
       }
@@ -422,36 +550,36 @@ async function stepParseMerge(supabase: any, runId: string): Promise<{ success: 
       const matDelimiter = detectDelimiter(matHeaderLine);
       const matHeaders = matHeaderLine.split(matDelimiter).map(h => h.trim());
       
+      console.log(`[parse_merge:indices] Material headers: [${matHeaders.join(', ')}]`);
+      
       const matMatnr = findColumnIndex(matHeaders, 'Matnr');
       const matMpn = findColumnIndex(matHeaders, 'ManufPartNr');
       const matEan = findColumnIndex(matHeaders, 'EAN');
       const matDesc = findColumnIndex(matHeaders, 'ShortDescription');
       
-      console.log(`[parse_merge] Material columns: Matnr=${matMatnr.index}, MPN=${matMpn.index}, EAN=${matEan.index}, Desc=${matDesc.index}`);
+      console.log(`[parse_merge:indices] Material column mapping: Matnr=${matMatnr.index}, MPN=${matMpn.index}, EAN=${matEan.index}, Desc=${matDesc.index}`);
       
       if (matMatnr.index === -1) {
-        const error = `Material headers non validi. Matnr=${matMatnr.index}`;
+        const error = `Material headers non validi. Trovati: [${matHeaders.join(', ')}]. Matnr non trovato.`;
+        console.error(`[parse_merge:indices] ${error}`);
         await updateParseMergeState(supabase, runId, { status: 'failed', error });
         return { success: false, error, status: 'failed' };
       }
       
-      // Save indices to storage
-      const indices: StoredIndices = {
-        stockIndex,
-        priceIndex,
-        materialMeta: {
-          delimiter: matDelimiter,
-          matnrIdx: matMatnr.index,
-          mpnIdx: matMpn.index,
-          eanIdx: matEan.index,
-          descIdx: matDesc.index,
-          headerEndPos: matFirstNewline + 1
-        }
+      // Save material metadata
+      const meta: MaterialMeta = {
+        delimiter: matDelimiter,
+        matnrIdx: matMatnr.index,
+        mpnIdx: matMpn.index,
+        eanIdx: matEan.index,
+        descIdx: matDesc.index,
+        headerEndPos: matFirstNewline + 1,
+        totalBytes: materialResult.content.length
       };
       
-      const saveResult = await saveIndicesToStorage(supabase, indices);
+      const saveResult = await saveMaterialMeta(supabase, meta);
       if (!saveResult.success) {
-        const error = `Failed to save indices: ${saveResult.error}`;
+        const error = `Failed to save material metadata: ${saveResult.error}`;
         await updateParseMergeState(supabase, runId, { status: 'failed', error });
         return { success: false, error, status: 'failed' };
       }
@@ -460,29 +588,41 @@ async function stepParseMerge(supabase: any, runId: string): Promise<{ success: 
       const headerTSV = 'Matnr\tMPN\tEAN\tDesc\tStock\tLP\tCBP\tSur\n';
       await uploadToStorage(supabase, 'exports', PARTIAL_PRODUCTS_FILE_PATH, headerTSV, 'text/tab-separated-values');
       
-      // Update state to in_progress
+      // Update state to chunked processing
       await updateParseMergeState(supabase, runId, {
         status: 'in_progress',
         offset: 0,
         productCount: 0,
         skipped: { noStock: 0, noPrice: 0, lowStock: 0, noValid: 0 },
-        materialBytes: materialResult.content.length,
-        startTime: Date.now()
+        materialBytes: materialResult.content.length
       });
       
-      console.log(`[parse_merge] Phase 1 complete: indices saved, ready for chunked processing`);
-      console.log(`[parse_merge] Invocation took ${Date.now() - invocationStart}ms`);
+      console.log(`[parse_merge] Phase 1c complete in ${Date.now() - invocationStart}ms, ready for chunked processing`);
       return { success: true, status: 'in_progress' };
     }
     
-    // PHASE 2: Process chunks
+    // ========== PHASE 2: CHUNKED MATERIAL PROCESSING ==========
     if (state.status === 'in_progress') {
       console.log(`[parse_merge] Phase 2: Processing chunk from offset ${state.offset}...`);
       
-      // Load indices from storage
-      const { indices, error: indicesError } = await loadIndicesFromStorage(supabase);
-      if (!indices) {
-        const error = `Failed to load indices: ${indicesError}`;
+      // Load indices and metadata from storage
+      const { index: stockIndex, error: stockError } = await loadStockIndex(supabase);
+      if (!stockIndex) {
+        const error = `Failed to load stock index: ${stockError}`;
+        await updateParseMergeState(supabase, runId, { status: 'failed', error });
+        return { success: false, error, status: 'failed' };
+      }
+      
+      const { index: priceIndex, error: priceError } = await loadPriceIndex(supabase);
+      if (!priceIndex) {
+        const error = `Failed to load price index: ${priceError}`;
+        await updateParseMergeState(supabase, runId, { status: 'failed', error });
+        return { success: false, error, status: 'failed' };
+      }
+      
+      const { meta: materialMeta, error: metaError } = await loadMaterialMeta(supabase);
+      if (!materialMeta) {
+        const error = `Failed to load material metadata: ${metaError}`;
         await updateParseMergeState(supabase, runId, { status: 'failed', error });
         return { success: false, error, status: 'failed' };
       }
@@ -495,7 +635,6 @@ async function stepParseMerge(supabase: any, runId: string): Promise<{ success: 
         return { success: false, error, status: 'failed' };
       }
       
-      const { stockIndex, priceIndex, materialMeta } = indices;
       const materialContent = materialResult.content;
       const materialSize = materialContent.length;
       
@@ -574,8 +713,7 @@ async function stepParseMerge(supabase: any, runId: string): Promise<{ success: 
         }
         
         // Cleanup intermediate files
-        await deleteFromStorage(supabase, 'exports', PARTIAL_PRODUCTS_FILE_PATH);
-        await deleteFromStorage(supabase, 'exports', INDICES_FILE_PATH);
+        await cleanupIndexFiles(supabase);
         
         const durationMs = Date.now() - state.startTime;
         await updateParseMergeState(supabase, runId, {
@@ -597,7 +735,7 @@ async function stepParseMerge(supabase: any, runId: string): Promise<{ success: 
           skipped
         });
         
-        console.log(`[parse_merge] Chunk complete, ${currentLineNum}/${Math.ceil(materialSize / 100)} lines processed, more to go`);
+        console.log(`[parse_merge] Chunk complete, ${currentLineNum} lines processed, more to go`);
         console.log(`[parse_merge] Invocation took ${Date.now() - invocationStart}ms`);
         return { success: true, status: 'in_progress' };
       }
