@@ -15,9 +15,11 @@ const corsHeaders = {
  * File intermedi:
  * - exports/_pipeline/products.tsv (dopo parse_merge)
  * - exports/_pipeline/ean_catalog.tsv (dopo export_ean)
+ * - exports/_pipeline/indices.json (indici stock/price per chunking)
+ * - exports/_pipeline/partial_products.tsv (prodotti parziali durante chunking)
  * 
  * Steps:
- * - parse_merge: Parse e merge file FTP (streaming line-by-line)
+ * - parse_merge: Parse e merge file FTP (CHUNKED - 5000 righe per invocazione)
  * - ean_mapping: Mapping EAN da file CSV
  * - pricing: Calcolo prezzi finali
  * - export_ean: Generazione catalogo EAN
@@ -25,7 +27,12 @@ const corsHeaders = {
  * - export_eprice: Generazione export ePrice
  */
 
+// ========== CONFIGURAZIONE CHUNKING ==========
+const CHUNK_SIZE = 5000; // Righe di material file processate per ogni invocazione
+
 const PRODUCTS_FILE_PATH = '_pipeline/products.tsv';
+const PARTIAL_PRODUCTS_FILE_PATH = '_pipeline/partial_products.tsv';
+const INDICES_FILE_PATH = '_pipeline/indices.json';
 const EAN_CATALOG_FILE_PATH = '_pipeline/ean_catalog.tsv';
 
 // ========== COLUMN ALIASES (case-insensitive matching) ==========
@@ -61,9 +68,6 @@ function normalizeEAN(raw: unknown): { ok: boolean; value?: string; reason?: str
   return { ok: false, reason: `lunghezza ${compact.length}` };
 }
 
-/**
- * Auto-detect delimiter from first line of file
- */
 function detectDelimiter(firstLine: string): string {
   const delimiters = ['\t', ';', ',', '|'];
   let bestDelimiter = '\t';
@@ -81,26 +85,16 @@ function detectDelimiter(firstLine: string): string {
   return bestDelimiter;
 }
 
-/**
- * Find column index with case-insensitive matching and aliases
- */
 function findColumnIndex(headers: string[], columnName: string): { index: number; matchedAs: string } {
-  // Normalize headers for comparison
   const normalizedHeaders = headers.map(h => h.trim().toLowerCase().replace(/[\s_-]+/g, ''));
-  
-  // Get aliases for this column
   const aliases = COLUMN_ALIASES[columnName] || [columnName.toLowerCase()];
   
-  // Try each alias
   for (const alias of aliases) {
     const normalizedAlias = alias.toLowerCase().replace(/[\s_-]+/g, '');
     const idx = normalizedHeaders.indexOf(normalizedAlias);
-    if (idx !== -1) {
-      return { index: idx, matchedAs: headers[idx] };
-    }
+    if (idx !== -1) return { index: idx, matchedAs: headers[idx] };
   }
   
-  // Try partial matching as fallback
   for (const alias of aliases) {
     const normalizedAlias = alias.toLowerCase().replace(/[\s_-]+/g, '');
     for (let i = 0; i < normalizedHeaders.length; i++) {
@@ -111,32 +105,6 @@ function findColumnIndex(headers: string[], columnName: string): { index: number
   }
   
   return { index: -1, matchedAs: '' };
-}
-
-/**
- * Parse a delimited file with auto-detection
- */
-function parseDelimitedFile(content: string): { headers: string[]; lines: string[]; delimiter: string } {
-  const allLines = content.split('\n');
-  
-  // Skip empty lines at the beginning
-  let headerLineIdx = 0;
-  while (headerLineIdx < allLines.length && !allLines[headerLineIdx].trim()) {
-    headerLineIdx++;
-  }
-  
-  if (headerLineIdx >= allLines.length) {
-    return { headers: [], lines: [], delimiter: '\t' };
-  }
-  
-  const headerLine = allLines[headerLineIdx];
-  const delimiter = detectDelimiter(headerLine);
-  const headers = headerLine.split(delimiter).map(h => h.trim());
-  const lines = allLines.slice(headerLineIdx + 1);
-  
-  console.log(`[parser] Headers found (${headers.length}): ${headers.slice(0, 10).join(', ')}${headers.length > 10 ? '...' : ''}`);
-  
-  return { headers, lines, delimiter };
 }
 
 async function getLatestFile(supabase: any, folder: string): Promise<{ content: string | null; fileName: string | null }> {
@@ -181,7 +149,6 @@ async function uploadToStorage(supabase: any, bucket: string, path: string, cont
     return { success: false, error: error.message };
   }
   
-  // Verify the file was uploaded by checking if we can list it
   const folder = path.includes('/') ? path.substring(0, path.lastIndexOf('/')) : '';
   const fileName = path.includes('/') ? path.substring(path.lastIndexOf('/') + 1) : path;
   
@@ -200,7 +167,6 @@ async function uploadToStorage(supabase: any, bucket: string, path: string, cont
 async function downloadFromStorage(supabase: any, bucket: string, path: string): Promise<{ content: string | null; error?: string }> {
   console.log(`[storage] Downloading from ${bucket}/${path}`);
   
-  // First check if file exists
   const folder = path.includes('/') ? path.substring(0, path.lastIndexOf('/')) : '';
   const fileName = path.includes('/') ? path.substring(path.lastIndexOf('/') + 1) : path;
   
@@ -231,252 +197,421 @@ async function downloadFromStorage(supabase: any, bucket: string, path: string):
   return { content };
 }
 
-async function updateStepResult(supabase: any, runId: string, stepName: string, result: any): Promise<void> {
-  const { data: run } = await supabase.from('sync_runs').select('steps, metrics').eq('id', runId).single();
-  const steps = { ...(run?.steps || {}), [stepName]: result, current_step: stepName };
-  const metrics = { ...(run?.metrics || {}), ...result.metrics };
-  await supabase.from('sync_runs').update({ steps, metrics }).eq('id', runId);
-}
-
-// ========== STEP: PARSE_MERGE (MEMORY OPTIMIZED v2) ==========
-
-/**
- * Build a lightweight index object from file content
- * Uses plain object instead of Map for lower memory overhead
- * Returns {[key: string]: value} where value is the minimal data needed
- */
-function buildLightweightIndex(
-  content: string, 
-  keyColIdx: number, 
-  valueColIdx: number | number[],
-  delimiter: string,
-  parseValue: (vals: string[]) => any
-): Record<string, any> {
-  const index: Record<string, any> = Object.create(null); // No prototype = less memory
-  let pos = content.indexOf('\n') + 1; // Skip header line
-  
-  while (pos < content.length) {
-    // Find end of current line
-    let lineEnd = content.indexOf('\n', pos);
-    if (lineEnd === -1) lineEnd = content.length;
-    
-    const line = content.substring(pos, lineEnd);
-    pos = lineEnd + 1;
-    
-    if (!line.trim()) continue;
-    
-    const vals = line.split(delimiter);
-    const key = vals[keyColIdx]?.trim();
-    if (key) {
-      index[key] = parseValue(vals);
-    }
+async function deleteFromStorage(supabase: any, bucket: string, path: string): Promise<void> {
+  try {
+    await supabase.storage.from(bucket).remove([path]);
+    console.log(`[storage] Deleted ${bucket}/${path}`);
+  } catch (e) {
+    console.log(`[storage] Failed to delete ${bucket}/${path}:`, e);
   }
-  
-  return index;
 }
 
-async function stepParseMerge(supabase: any, runId: string): Promise<{ success: boolean; error?: string }> {
-  console.log(`[sync:step:parse_merge] Starting for run ${runId}`);
-  const startTime = Date.now();
+// ========== PARSE_MERGE STATE MANAGEMENT ==========
+
+interface ParseMergeState {
+  status: 'pending' | 'building_indices' | 'in_progress' | 'completed' | 'failed';
+  offset: number;
+  productCount: number;
+  skipped: { noStock: number; noPrice: number; lowStock: number; noValid: number };
+  materialBytes: number;
+  startTime: number;
+  error?: string;
+}
+
+async function getParseMergeState(supabase: any, runId: string): Promise<ParseMergeState | null> {
+  const { data: run } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
+  return run?.steps?.parse_merge || null;
+}
+
+async function updateParseMergeState(supabase: any, runId: string, state: Partial<ParseMergeState>): Promise<void> {
+  const { data: run } = await supabase.from('sync_runs').select('steps, metrics').eq('id', runId).single();
+  const currentSteps = run?.steps || {};
+  const currentMetrics = run?.metrics || {};
+  
+  const updatedParseMerge = { ...currentSteps.parse_merge, ...state };
+  const updatedSteps = { ...currentSteps, parse_merge: updatedParseMerge, current_step: 'parse_merge' };
+  
+  // Update metrics if completed
+  const updatedMetrics = state.status === 'completed' ? {
+    ...currentMetrics,
+    products_total: (state.productCount || 0) + Object.values(state.skipped || {}).reduce((a: number, b: any) => a + (b || 0), 0),
+    products_processed: state.productCount || 0
+  } : currentMetrics;
+  
+  await supabase.from('sync_runs').update({ steps: updatedSteps, metrics: updatedMetrics }).eq('id', runId);
+  console.log(`[parse_merge] State updated: status=${state.status}, offset=${state.offset}, products=${state.productCount}`);
+}
+
+// ========== INDICES STORAGE (for chunked processing) ==========
+
+interface StoredIndices {
+  stockIndex: Record<string, number>;
+  priceIndex: Record<string, [number, number, number]>;
+  materialMeta: {
+    delimiter: string;
+    matnrIdx: number;
+    mpnIdx: number;
+    eanIdx: number;
+    descIdx: number;
+    headerEndPos: number;
+  };
+}
+
+async function saveIndicesToStorage(supabase: any, indices: StoredIndices): Promise<{ success: boolean; error?: string }> {
+  const json = JSON.stringify(indices);
+  console.log(`[parse_merge] Saving indices to storage: ${json.length} bytes`);
+  return await uploadToStorage(supabase, 'exports', INDICES_FILE_PATH, json, 'application/json');
+}
+
+async function loadIndicesFromStorage(supabase: any): Promise<{ indices: StoredIndices | null; error?: string }> {
+  const { content, error } = await downloadFromStorage(supabase, 'exports', INDICES_FILE_PATH);
+  if (error || !content) {
+    return { indices: null, error: error || 'Empty content' };
+  }
+  try {
+    const indices = JSON.parse(content) as StoredIndices;
+    console.log(`[parse_merge] Loaded indices: stock=${Object.keys(indices.stockIndex).length}, price=${Object.keys(indices.priceIndex).length}`);
+    return { indices };
+  } catch (e: any) {
+    return { indices: null, error: `JSON parse error: ${e.message}` };
+  }
+}
+
+// ========== STEP: PARSE_MERGE (CHUNKED VERSION) ==========
+
+async function stepParseMerge(supabase: any, runId: string): Promise<{ success: boolean; error?: string; status?: string }> {
+  console.log(`[parse_merge] Starting for run ${runId}, CHUNK_SIZE=${CHUNK_SIZE}`);
+  const invocationStart = Date.now();
   
   try {
-    // Phase 1: Build stock index (lightweight object)
-    console.log(`[sync:step:parse_merge] Phase 1/4: Loading stock file...`);
-    let stockContent = (await getLatestFile(supabase, 'stock')).content;
-    if (!stockContent) {
-      const error = 'Stock file mancante o non leggibile';
-      await updateStepResult(supabase, runId, 'parse_merge', { status: 'failed', error, metrics: {} });
-      return { success: false, error };
+    // Check current state
+    let state = await getParseMergeState(supabase, runId);
+    
+    // If already completed, skip
+    if (state?.status === 'completed') {
+      console.log(`[parse_merge] Already completed, skipping`);
+      return { success: true, status: 'completed' };
     }
     
-    // Get header and detect delimiter
-    const stockFirstNewline = stockContent.indexOf('\n');
-    const stockHeaderLine = stockContent.substring(0, stockFirstNewline).trim();
-    const stockDelimiter = detectDelimiter(stockHeaderLine);
-    const stockHeaders = stockHeaderLine.split(stockDelimiter).map(h => h.trim());
-    
-    console.log(`[sync:step:parse_merge] Stock headers: [${stockHeaders.join(', ')}]`);
-    
-    const stockMatnr = findColumnIndex(stockHeaders, 'Matnr');
-    const stockQty = findColumnIndex(stockHeaders, 'ExistingStock');
-    
-    console.log(`[sync:step:parse_merge] Stock column mapping: Matnr=${stockMatnr.index}, ExistingStock=${stockQty.index}`);
-    
-    if (stockMatnr.index === -1 || stockQty.index === -1) {
-      const error = `Stock headers non validi. Matnr=${stockMatnr.index}, ExistingStock=${stockQty.index}`;
-      await updateStepResult(supabase, runId, 'parse_merge', { status: 'failed', error, metrics: {} });
-      return { success: false, error };
+    // If failed, don't retry automatically
+    if (state?.status === 'failed') {
+      console.log(`[parse_merge] Previously failed: ${state.error}`);
+      return { success: false, error: state.error, status: 'failed' };
     }
     
-    // Build stock index using lightweight function
-    const stockIndex = buildLightweightIndex(
-      stockContent, stockMatnr.index, stockQty.index, stockDelimiter,
-      (vals) => parseInt(vals[stockQty.index]) || 0
-    );
-    stockContent = null as any; // Release memory
-    const stockSize = Object.keys(stockIndex).length;
-    console.log(`[sync:step:parse_merge] Stock entries: ${stockSize}, memory released`);
-    
-    // Phase 2: Build price index (lightweight object with compressed values)
-    console.log(`[sync:step:parse_merge] Phase 2/4: Loading price file...`);
-    let priceContent = (await getLatestFile(supabase, 'price')).content;
-    if (!priceContent) {
-      const error = 'Price file mancante o non leggibile';
-      await updateStepResult(supabase, runId, 'parse_merge', { status: 'failed', error, metrics: {} });
-      return { success: false, error };
+    // PHASE 1: Build indices (first invocation only)
+    if (!state || state.status === 'pending' || state.status === 'building_indices') {
+      console.log(`[parse_merge] Phase 1: Building indices...`);
+      
+      await updateParseMergeState(supabase, runId, {
+        status: 'building_indices',
+        offset: 0,
+        productCount: 0,
+        skipped: { noStock: 0, noPrice: 0, lowStock: 0, noValid: 0 },
+        startTime: Date.now()
+      });
+      
+      // Build stock index
+      console.log(`[parse_merge] Loading stock file...`);
+      const stockResult = await getLatestFile(supabase, 'stock');
+      if (!stockResult.content) {
+        const error = 'Stock file mancante o non leggibile';
+        await updateParseMergeState(supabase, runId, { status: 'failed', error });
+        return { success: false, error, status: 'failed' };
+      }
+      
+      const stockFirstNewline = stockResult.content.indexOf('\n');
+      const stockHeaderLine = stockResult.content.substring(0, stockFirstNewline).trim();
+      const stockDelimiter = detectDelimiter(stockHeaderLine);
+      const stockHeaders = stockHeaderLine.split(stockDelimiter).map(h => h.trim());
+      
+      const stockMatnr = findColumnIndex(stockHeaders, 'Matnr');
+      const stockQty = findColumnIndex(stockHeaders, 'ExistingStock');
+      
+      console.log(`[parse_merge] Stock columns: Matnr=${stockMatnr.index}, ExistingStock=${stockQty.index}`);
+      
+      if (stockMatnr.index === -1 || stockQty.index === -1) {
+        const error = `Stock headers non validi. Matnr=${stockMatnr.index}, ExistingStock=${stockQty.index}`;
+        await updateParseMergeState(supabase, runId, { status: 'failed', error });
+        return { success: false, error, status: 'failed' };
+      }
+      
+      // Build stock index inline
+      const stockIndex: Record<string, number> = Object.create(null);
+      let pos = stockFirstNewline + 1;
+      const stockContent = stockResult.content;
+      while (pos < stockContent.length) {
+        let lineEnd = stockContent.indexOf('\n', pos);
+        if (lineEnd === -1) lineEnd = stockContent.length;
+        const line = stockContent.substring(pos, lineEnd);
+        pos = lineEnd + 1;
+        if (!line.trim()) continue;
+        const vals = line.split(stockDelimiter);
+        const key = vals[stockMatnr.index]?.trim();
+        if (key) stockIndex[key] = parseInt(vals[stockQty.index]) || 0;
+      }
+      console.log(`[parse_merge] Stock index: ${Object.keys(stockIndex).length} entries`);
+      
+      // Build price index
+      console.log(`[parse_merge] Loading price file...`);
+      const priceResult = await getLatestFile(supabase, 'price');
+      if (!priceResult.content) {
+        const error = 'Price file mancante o non leggibile';
+        await updateParseMergeState(supabase, runId, { status: 'failed', error });
+        return { success: false, error, status: 'failed' };
+      }
+      
+      const priceFirstNewline = priceResult.content.indexOf('\n');
+      const priceHeaderLine = priceResult.content.substring(0, priceFirstNewline).trim();
+      const priceDelimiter = detectDelimiter(priceHeaderLine);
+      const priceHeaders = priceHeaderLine.split(priceDelimiter).map(h => h.trim());
+      
+      const priceMatnr = findColumnIndex(priceHeaders, 'Matnr');
+      const priceLp = findColumnIndex(priceHeaders, 'ListPrice');
+      const priceCbp = findColumnIndex(priceHeaders, 'CustBestPrice');
+      const priceSur = findColumnIndex(priceHeaders, 'Surcharge');
+      
+      console.log(`[parse_merge] Price columns: Matnr=${priceMatnr.index}, LP=${priceLp.index}, CBP=${priceCbp.index}, Sur=${priceSur.index}`);
+      
+      if (priceMatnr.index === -1) {
+        const error = `Price headers non validi. Matnr=${priceMatnr.index}`;
+        await updateParseMergeState(supabase, runId, { status: 'failed', error });
+        return { success: false, error, status: 'failed' };
+      }
+      
+      const parseNum = (v: any) => parseFloat(String(v || '0').replace(',', '.')) || 0;
+      
+      const priceIndex: Record<string, [number, number, number]> = Object.create(null);
+      pos = priceFirstNewline + 1;
+      const priceContent = priceResult.content;
+      while (pos < priceContent.length) {
+        let lineEnd = priceContent.indexOf('\n', pos);
+        if (lineEnd === -1) lineEnd = priceContent.length;
+        const line = priceContent.substring(pos, lineEnd);
+        pos = lineEnd + 1;
+        if (!line.trim()) continue;
+        const vals = line.split(priceDelimiter);
+        const key = vals[priceMatnr.index]?.trim();
+        if (key) {
+          priceIndex[key] = [
+            priceLp.index >= 0 ? parseNum(vals[priceLp.index]) : 0,
+            priceCbp.index >= 0 ? parseNum(vals[priceCbp.index]) : 0,
+            priceSur.index >= 0 ? parseNum(vals[priceSur.index]) : 0
+          ];
+        }
+      }
+      console.log(`[parse_merge] Price index: ${Object.keys(priceIndex).length} entries`);
+      
+      // Get material file metadata (header only)
+      console.log(`[parse_merge] Loading material file header...`);
+      const materialResult = await getLatestFile(supabase, 'material');
+      if (!materialResult.content) {
+        const error = 'Material file mancante o non leggibile';
+        await updateParseMergeState(supabase, runId, { status: 'failed', error });
+        return { success: false, error, status: 'failed' };
+      }
+      
+      const matFirstNewline = materialResult.content.indexOf('\n');
+      if (matFirstNewline === -1) {
+        const error = 'Material file vuoto';
+        await updateParseMergeState(supabase, runId, { status: 'failed', error });
+        return { success: false, error, status: 'failed' };
+      }
+      
+      const matHeaderLine = materialResult.content.substring(0, matFirstNewline).trim();
+      const matDelimiter = detectDelimiter(matHeaderLine);
+      const matHeaders = matHeaderLine.split(matDelimiter).map(h => h.trim());
+      
+      const matMatnr = findColumnIndex(matHeaders, 'Matnr');
+      const matMpn = findColumnIndex(matHeaders, 'ManufPartNr');
+      const matEan = findColumnIndex(matHeaders, 'EAN');
+      const matDesc = findColumnIndex(matHeaders, 'ShortDescription');
+      
+      console.log(`[parse_merge] Material columns: Matnr=${matMatnr.index}, MPN=${matMpn.index}, EAN=${matEan.index}, Desc=${matDesc.index}`);
+      
+      if (matMatnr.index === -1) {
+        const error = `Material headers non validi. Matnr=${matMatnr.index}`;
+        await updateParseMergeState(supabase, runId, { status: 'failed', error });
+        return { success: false, error, status: 'failed' };
+      }
+      
+      // Save indices to storage
+      const indices: StoredIndices = {
+        stockIndex,
+        priceIndex,
+        materialMeta: {
+          delimiter: matDelimiter,
+          matnrIdx: matMatnr.index,
+          mpnIdx: matMpn.index,
+          eanIdx: matEan.index,
+          descIdx: matDesc.index,
+          headerEndPos: matFirstNewline + 1
+        }
+      };
+      
+      const saveResult = await saveIndicesToStorage(supabase, indices);
+      if (!saveResult.success) {
+        const error = `Failed to save indices: ${saveResult.error}`;
+        await updateParseMergeState(supabase, runId, { status: 'failed', error });
+        return { success: false, error, status: 'failed' };
+      }
+      
+      // Initialize partial products file with header
+      const headerTSV = 'Matnr\tMPN\tEAN\tDesc\tStock\tLP\tCBP\tSur\n';
+      await uploadToStorage(supabase, 'exports', PARTIAL_PRODUCTS_FILE_PATH, headerTSV, 'text/tab-separated-values');
+      
+      // Update state to in_progress
+      await updateParseMergeState(supabase, runId, {
+        status: 'in_progress',
+        offset: 0,
+        productCount: 0,
+        skipped: { noStock: 0, noPrice: 0, lowStock: 0, noValid: 0 },
+        materialBytes: materialResult.content.length,
+        startTime: Date.now()
+      });
+      
+      console.log(`[parse_merge] Phase 1 complete: indices saved, ready for chunked processing`);
+      console.log(`[parse_merge] Invocation took ${Date.now() - invocationStart}ms`);
+      return { success: true, status: 'in_progress' };
     }
     
-    const priceFirstNewline = priceContent.indexOf('\n');
-    const priceHeaderLine = priceContent.substring(0, priceFirstNewline).trim();
-    const priceDelimiter = detectDelimiter(priceHeaderLine);
-    const priceHeaders = priceHeaderLine.split(priceDelimiter).map(h => h.trim());
-    
-    const priceMatnr = findColumnIndex(priceHeaders, 'Matnr');
-    const priceLp = findColumnIndex(priceHeaders, 'ListPrice');
-    const priceCbp = findColumnIndex(priceHeaders, 'CustBestPrice');
-    const priceSur = findColumnIndex(priceHeaders, 'Surcharge');
-    
-    console.log(`[sync:step:parse_merge] Price columns: Matnr=${priceMatnr.index}, LP=${priceLp.index}, CBP=${priceCbp.index}, Sur=${priceSur.index}`);
-    
-    if (priceMatnr.index === -1) {
-      const error = `Price headers non validi. Matnr=${priceMatnr.index}`;
-      await updateStepResult(supabase, runId, 'parse_merge', { status: 'failed', error, metrics: {} });
-      return { success: false, error };
-    }
-    
-    const parseNum = (v: any) => parseFloat(String(v || '0').replace(',', '.')) || 0;
-    
-    // Store as array [lp, cbp, sur] to save memory on object keys
-    const priceIndex = buildLightweightIndex(
-      priceContent, priceMatnr.index, [priceLp.index, priceCbp.index, priceSur.index], priceDelimiter,
-      (vals) => [
-        priceLp.index >= 0 ? parseNum(vals[priceLp.index]) : 0,
-        priceCbp.index >= 0 ? parseNum(vals[priceCbp.index]) : 0,
-        priceSur.index >= 0 ? parseNum(vals[priceSur.index]) : 0
-      ]
-    );
-    priceContent = null as any; // Release memory
-    const priceSize = Object.keys(priceIndex).length;
-    console.log(`[sync:step:parse_merge] Price entries: ${priceSize}, memory released`);
-    
-    // Phase 3: Process material file streaming line by line
-    console.log(`[sync:step:parse_merge] Phase 3/4: Loading material file...`);
-    const materialResult = await getLatestFile(supabase, 'material');
-    if (!materialResult.content) {
-      const error = 'Material file mancante o non leggibile';
-      await updateStepResult(supabase, runId, 'parse_merge', { status: 'failed', error, metrics: {} });
-      return { success: false, error };
-    }
-    
-    const materialContent = materialResult.content;
-    const materialSize = materialContent.length;
-    console.log(`[sync:step:parse_merge] Material file: ${materialSize} bytes`);
-    
-    // Get header
-    const matFirstNewline = materialContent.indexOf('\n');
-    if (matFirstNewline === -1) {
-      const error = 'Material file vuoto';
-      await updateStepResult(supabase, runId, 'parse_merge', { status: 'failed', error, metrics: {} });
-      return { success: false, error };
-    }
-    
-    const matHeaderLine = materialContent.substring(0, matFirstNewline).trim();
-    const matDelimiter = detectDelimiter(matHeaderLine);
-    const matHeaders = matHeaderLine.split(matDelimiter).map(h => h.trim());
-    
-    const matMatnr = findColumnIndex(matHeaders, 'Matnr');
-    const matMpn = findColumnIndex(matHeaders, 'ManufPartNr');
-    const matEan = findColumnIndex(matHeaders, 'EAN');
-    const matDesc = findColumnIndex(matHeaders, 'ShortDescription');
-    
-    console.log(`[sync:step:parse_merge] Material columns: Matnr=${matMatnr.index}, MPN=${matMpn.index}, EAN=${matEan.index}, Desc=${matDesc.index}`);
-    
-    if (matMatnr.index === -1) {
-      const error = `Material headers non validi. Matnr=${matMatnr.index}`;
-      await updateStepResult(supabase, runId, 'parse_merge', { status: 'failed', error, metrics: {} });
-      return { success: false, error };
-    }
-    
-    // Process material streaming - build output directly
-    const skipped = { noStock: 0, noPrice: 0, lowStock: 0, noValid: 0 };
-    let productCount = 0;
-    let lineCount = 0;
-    
-    // Use a single mutable string builder for output
-    let outputTSV = 'Matnr\tMPN\tEAN\tDesc\tStock\tLP\tCBP\tSur\n';
-    
-    // Stream through content
-    let pos = matFirstNewline + 1;
-    while (pos < materialSize) {
-      // Find end of line
-      let lineEnd = materialContent.indexOf('\n', pos);
-      if (lineEnd === -1) lineEnd = materialSize;
+    // PHASE 2: Process chunks
+    if (state.status === 'in_progress') {
+      console.log(`[parse_merge] Phase 2: Processing chunk from offset ${state.offset}...`);
       
-      const line = materialContent.substring(pos, lineEnd);
-      pos = lineEnd + 1;
-      lineCount++;
+      // Load indices from storage
+      const { indices, error: indicesError } = await loadIndicesFromStorage(supabase);
+      if (!indices) {
+        const error = `Failed to load indices: ${indicesError}`;
+        await updateParseMergeState(supabase, runId, { status: 'failed', error });
+        return { success: false, error, status: 'failed' };
+      }
       
-      if (!line.trim()) continue;
+      // Load material file content
+      const materialResult = await getLatestFile(supabase, 'material');
+      if (!materialResult.content) {
+        const error = 'Material file mancante durante chunk processing';
+        await updateParseMergeState(supabase, runId, { status: 'failed', error });
+        return { success: false, error, status: 'failed' };
+      }
       
-      const vals = line.split(matDelimiter);
-      const m = vals[matMatnr.index]?.trim();
-      if (!m) continue;
+      const { stockIndex, priceIndex, materialMeta } = indices;
+      const materialContent = materialResult.content;
+      const materialSize = materialContent.length;
       
-      // Direct object access (faster than Map.get)
-      const stock = stockIndex[m];
-      const price = priceIndex[m];
+      // Calculate starting position
+      let pos = materialMeta.headerEndPos;
+      let currentLineNum = 0;
       
-      if (stock === undefined) { skipped.noStock++; continue; }
-      if (!price) { skipped.noPrice++; continue; }
-      if (stock < 2) { skipped.lowStock++; continue; }
+      // Skip to offset (lines already processed)
+      while (pos < materialSize && currentLineNum < state.offset) {
+        let lineEnd = materialContent.indexOf('\n', pos);
+        if (lineEnd === -1) lineEnd = materialSize;
+        pos = lineEnd + 1;
+        currentLineNum++;
+      }
       
-      // price is [lp, cbp, sur]
-      const lp = price[0], cbp = price[1], sur = price[2];
-      if (lp <= 0 && cbp <= 0) { skipped.noValid++; continue; }
+      console.log(`[parse_merge] Starting at line ${currentLineNum}, byte position ${pos}/${materialSize}`);
       
-      const mpn = matMpn.index >= 0 ? (vals[matMpn.index]?.trim() || '') : '';
-      const ean = matEan.index >= 0 ? (vals[matEan.index]?.trim() || '') : '';
-      const desc = matDesc.index >= 0 ? (vals[matDesc.index]?.trim() || '') : '';
+      // Process CHUNK_SIZE lines
+      const skipped = { ...state.skipped };
+      let productCount = state.productCount;
+      let linesProcessed = 0;
+      let chunkTSV = '';
       
-      outputTSV += `${m}\t${mpn}\t${ean}\t${desc}\t${stock}\t${lp}\t${cbp}\t${sur}\n`;
-      productCount++;
+      while (pos < materialSize && linesProcessed < CHUNK_SIZE) {
+        let lineEnd = materialContent.indexOf('\n', pos);
+        if (lineEnd === -1) lineEnd = materialSize;
+        
+        const line = materialContent.substring(pos, lineEnd);
+        pos = lineEnd + 1;
+        currentLineNum++;
+        linesProcessed++;
+        
+        if (!line.trim()) continue;
+        
+        const vals = line.split(materialMeta.delimiter);
+        const m = vals[materialMeta.matnrIdx]?.trim();
+        if (!m) continue;
+        
+        const stock = stockIndex[m];
+        const price = priceIndex[m];
+        
+        if (stock === undefined) { skipped.noStock++; continue; }
+        if (!price) { skipped.noPrice++; continue; }
+        if (stock < 2) { skipped.lowStock++; continue; }
+        
+        const lp = price[0], cbp = price[1], sur = price[2];
+        if (lp <= 0 && cbp <= 0) { skipped.noValid++; continue; }
+        
+        const mpn = materialMeta.mpnIdx >= 0 ? (vals[materialMeta.mpnIdx]?.trim() || '') : '';
+        const ean = materialMeta.eanIdx >= 0 ? (vals[materialMeta.eanIdx]?.trim() || '') : '';
+        const desc = materialMeta.descIdx >= 0 ? (vals[materialMeta.descIdx]?.trim() || '') : '';
+        
+        chunkTSV += `${m}\t${mpn}\t${ean}\t${desc}\t${stock}\t${lp}\t${cbp}\t${sur}\n`;
+        productCount++;
+      }
       
-      // Log progress
-      if (lineCount % 50000 === 0) {
-        console.log(`[sync:step:parse_merge] Processed ${lineCount} lines, ${productCount} products...`);
+      console.log(`[parse_merge] Chunk processed: ${linesProcessed} lines, ${productCount - state.productCount} new products, total=${productCount}`);
+      
+      // Append chunk to partial products file
+      if (chunkTSV.length > 0) {
+        const { content: existingContent } = await downloadFromStorage(supabase, 'exports', PARTIAL_PRODUCTS_FILE_PATH);
+        const updatedContent = (existingContent || '') + chunkTSV;
+        await uploadToStorage(supabase, 'exports', PARTIAL_PRODUCTS_FILE_PATH, updatedContent, 'text/tab-separated-values');
+      }
+      
+      // Check if finished
+      const isFinished = pos >= materialSize;
+      
+      if (isFinished) {
+        console.log(`[parse_merge] All chunks processed, finalizing...`);
+        
+        // Move partial to final products file
+        const { content: finalContent } = await downloadFromStorage(supabase, 'exports', PARTIAL_PRODUCTS_FILE_PATH);
+        if (finalContent) {
+          await uploadToStorage(supabase, 'exports', PRODUCTS_FILE_PATH, finalContent, 'text/tab-separated-values');
+        }
+        
+        // Cleanup intermediate files
+        await deleteFromStorage(supabase, 'exports', PARTIAL_PRODUCTS_FILE_PATH);
+        await deleteFromStorage(supabase, 'exports', INDICES_FILE_PATH);
+        
+        const durationMs = Date.now() - state.startTime;
+        await updateParseMergeState(supabase, runId, {
+          status: 'completed',
+          offset: currentLineNum,
+          productCount,
+          skipped
+        });
+        
+        console.log(`[parse_merge] COMPLETED: ${productCount} products in ${durationMs}ms, skipped=${JSON.stringify(skipped)}`);
+        console.log(`[parse_merge] Invocation took ${Date.now() - invocationStart}ms`);
+        return { success: true, status: 'completed' };
+      } else {
+        // More chunks to process
+        await updateParseMergeState(supabase, runId, {
+          status: 'in_progress',
+          offset: currentLineNum,
+          productCount,
+          skipped
+        });
+        
+        console.log(`[parse_merge] Chunk complete, ${currentLineNum}/${Math.ceil(materialSize / 100)} lines processed, more to go`);
+        console.log(`[parse_merge] Invocation took ${Date.now() - invocationStart}ms`);
+        return { success: true, status: 'in_progress' };
       }
     }
     
-    console.log(`[sync:step:parse_merge] Merge complete: ${productCount} products, ${lineCount} lines, skipped: ${JSON.stringify(skipped)}`);
-    
-    // Phase 4: Save to storage
-    console.log(`[sync:step:parse_merge] Phase 4/4: Saving ${outputTSV.length} bytes to ${PRODUCTS_FILE_PATH}...`);
-    const uploadResult = await uploadToStorage(supabase, 'exports', PRODUCTS_FILE_PATH, outputTSV, 'text/tab-separated-values');
-    
-    if (!uploadResult.success) {
-      const error = `Failed to save products: ${uploadResult.error}`;
-      await updateStepResult(supabase, runId, 'parse_merge', { status: 'failed', error, metrics: {} });
-      return { success: false, error };
-    }
-    
-    const durationMs = Date.now() - startTime;
-    await updateStepResult(supabase, runId, 'parse_merge', {
-      status: 'success', 
-      duration_ms: durationMs, 
-      products: productCount, 
-      skipped,
-      stats: { stockEntries: stockSize, priceEntries: priceSize, materialBytes: materialSize, outputBytes: outputTSV.length },
-      output_file: PRODUCTS_FILE_PATH,
-      metrics: { products_total: productCount + Object.values(skipped).reduce((a, b) => a + b, 0), products_processed: productCount }
-    });
-    
-    console.log(`[sync:step:parse_merge] SUCCESS in ${durationMs}ms, ${productCount} products saved to ${PRODUCTS_FILE_PATH}`);
-    return { success: true };
+    // Unknown state
+    const error = `Unknown parse_merge state: ${state?.status}`;
+    await updateParseMergeState(supabase, runId, { status: 'failed', error });
+    return { success: false, error, status: 'failed' };
     
   } catch (e: any) {
-    console.error(`[sync:step:parse_merge] Error:`, e);
-    await updateStepResult(supabase, runId, 'parse_merge', { status: 'failed', error: e.message, metrics: {} });
-    return { success: false, error: e.message };
+    console.error(`[parse_merge] Error:`, e);
+    await updateParseMergeState(supabase, runId, { status: 'failed', error: e.message });
+    return { success: false, error: e.message, status: 'failed' };
   }
 }
 
@@ -525,7 +660,6 @@ async function stepEanMapping(supabase: any, runId: string): Promise<{ success: 
   const startTime = Date.now();
   
   try {
-    // Load products with detailed error handling
     const { products, error: loadError } = await loadProductsTSV(supabase, runId);
     
     if (loadError || !products) {
@@ -539,7 +673,6 @@ async function stepEanMapping(supabase: any, runId: string): Promise<{ success: 
     
     let eanMapped = 0, eanMissing = 0;
     
-    // Load EAN mapping file
     console.log(`[sync:step:ean_mapping] Looking for EAN mapping file in mapping-files/ean`);
     const { data: files, error: listError } = await supabase.storage.from('mapping-files').list('ean', { 
       limit: 1, sortBy: { column: 'created_at', order: 'desc' } 
@@ -581,7 +714,6 @@ async function stepEanMapping(supabase: any, runId: string): Promise<{ success: 
       console.log(`[sync:step:ean_mapping] No EAN mapping file found, skipping mapping`);
     }
     
-    // Save updated products
     const saveResult = await saveProductsTSV(supabase, products);
     if (!saveResult.success) {
       const error = `Failed to save updated products: ${saveResult.error}`;
@@ -604,6 +736,13 @@ async function stepEanMapping(supabase: any, runId: string): Promise<{ success: 
   }
 }
 
+async function updateStepResult(supabase: any, runId: string, stepName: string, result: any): Promise<void> {
+  const { data: run } = await supabase.from('sync_runs').select('steps, metrics').eq('id', runId).single();
+  const steps = { ...(run?.steps || {}), [stepName]: result, current_step: stepName };
+  const metrics = { ...(run?.metrics || {}), ...result.metrics };
+  await supabase.from('sync_runs').update({ steps, metrics }).eq('id', runId);
+}
+
 // ========== STEP: PRICING ==========
 async function stepPricing(supabase: any, runId: string, feeConfig: any): Promise<{ success: boolean; error?: string }> {
   console.log(`[sync:step:pricing] Starting for run ${runId}`);
@@ -618,28 +757,37 @@ async function stepPricing(supabase: any, runId: string, feeConfig: any): Promis
       return { success: false, error };
     }
     
-    console.log(`[sync:step:pricing] Processing ${products.length} products with feeConfig:`, feeConfig);
+    const feeDrev = feeConfig?.feeDrev || 1.05;
+    const feeMkt = feeConfig?.feeMkt || 1.08;
+    const shippingCost = feeConfig?.shippingCost || 6.00;
+    
+    console.log(`[sync:step:pricing] Processing ${products.length} products with fees: DREV=${feeDrev}, MKT=${feeMkt}, SHIP=${shippingCost}`);
     
     for (const p of products) {
-      const hasCBP = p.CBP > 0;
-      const hasLP = p.LP > 0;
-      let baseCents = hasCBP ? Math.round((p.CBP + p.Sur) * 100) : (hasLP ? Math.round(p.LP * 100) : 0);
+      const base = p.CBP > 0 ? p.CBP : (p.LP > 0 ? p.LP : 0);
+      if (base <= 0) {
+        p.PF = '';
+        p.PFNum = 0;
+        p.LPF = '';
+        continue;
+      }
       
-      const shipCents = Math.round(feeConfig.shippingCost * 100);
-      const finalCents = toComma99Cents(Math.round(Math.round(Math.round((baseCents + shipCents) * 1.22) * feeConfig.feeDrev) * feeConfig.feeMkt));
-      const finalEuros = finalCents / 100;
+      const baseCents = Math.round(base * 100);
+      const shippingCents = Math.round(shippingCost * 100);
+      const afterShipping = baseCents + shippingCents;
+      const afterIva = Math.round(afterShipping * 1.22);
+      const afterFees = Math.round(afterIva * feeDrev * feeMkt);
+      const finalCents = toComma99Cents(afterFees);
       
-      p.PF = finalEuros.toFixed(2).replace('.', ',');
-      p.PFNum = finalEuros;
-
-      const normLP = p.LP, normCBP = p.CBP;
-      const useAlt = normLP <= 0 || (normCBP > 0 && normLP < normCBP);
-      if (useAlt && normCBP > 0) {
-        const base = normCBP * 1.25;
-        const val = ((base + feeConfig.shippingCost) * 1.22) * feeConfig.feeDrev * feeConfig.feeMkt;
-        p.LPF = Math.max(Math.ceil(val), Math.ceil(finalEuros * 1.25));
-      } else if (normLP > 0) {
-        p.LPF = Math.ceil(((normLP + feeConfig.shippingCost) * 1.22) * feeConfig.feeDrev * feeConfig.feeMkt);
+      p.PFNum = finalCents / 100;
+      p.PF = (finalCents / 100).toFixed(2).replace('.', ',');
+      
+      // ListPrice con Fee
+      if (p.LP > 0) {
+        const lpAfterShipping = Math.round(p.LP * 100) + shippingCents;
+        const lpAfterIva = Math.round(lpAfterShipping * 1.22);
+        const lpAfterFees = Math.round(lpAfterIva * feeDrev * feeMkt);
+        p.LPF = Math.ceil(lpAfterFees / 100).toString();
       } else {
         p.LPF = '';
       }
@@ -653,10 +801,11 @@ async function stepPricing(supabase: any, runId: string, feeConfig: any): Promis
     }
     
     await updateStepResult(supabase, runId, 'pricing', {
-      status: 'success', duration_ms: Date.now() - startTime, priced: products.length, metrics: {}
+      status: 'success', duration_ms: Date.now() - startTime,
+      metrics: { products_priced: products.length }
     });
     
-    console.log(`[sync:step:pricing] Completed in ${Date.now() - startTime}ms`);
+    console.log(`[sync:step:pricing] Completed: ${products.length} products priced`);
     return { success: true };
     
   } catch (e: any) {
@@ -680,59 +829,47 @@ async function stepExportEan(supabase: any, runId: string): Promise<{ success: b
       return { success: false, error };
     }
     
-    console.log(`[sync:step:export_ean] Processing ${products.length} products`);
+    const eanRows: string[] = [];
+    let eanSkipped = 0;
     
-    // Filter valid EAN and deduplicate
-    const byEAN = new Map<string, any>();
-    let discarded = 0;
+    const headers = ['EAN', 'MPN', 'Matnr', 'Descrizione', 'Prezzo', 'ListPrice con Fee', 'Stock'];
     
     for (const p of products) {
-      const ean = normalizeEAN(p.EAN);
-      if (!ean.ok) { discarded++; continue; }
-      
-      const existing = byEAN.get(ean.value!);
-      if (!existing || p.PFNum > existing.PFNum) {
-        byEAN.set(ean.value!, { ...p, EAN: ean.value });
+      const norm = normalizeEAN(p.EAN);
+      if (!norm.ok) {
+        eanSkipped++;
+        continue;
       }
+      
+      eanRows.push([
+        norm.value,
+        p.MPN || '',
+        p.Matnr || '',
+        (p.Desc || '').replace(/;/g, ','),
+        p.PF || '',
+        p.LPF || '',
+        String(p.Stock || 0)
+      ].join(';'));
     }
     
-    const eanCatalog = Array.from(byEAN.values());
-    console.log(`[sync:step:export_ean] EAN catalog: ${eanCatalog.length}, discarded: ${discarded}`);
+    const eanCSV = [headers.join(';'), ...eanRows].join('\n');
     
-    // Save EAN catalog for next steps
-    const eanLines = ['Matnr\tMPN\tEAN\tDesc\tStock\tLP\tCBP\tPF\tPFNum\tLPF'];
-    for (const p of eanCatalog) {
-      eanLines.push(`${p.Matnr}\t${p.MPN}\t${p.EAN}\t${p.Desc}\t${p.Stock}\t${p.LP}\t${p.CBP}\t${p.PF}\t${p.PFNum}\t${p.LPF}`);
-    }
+    // Save to both locations
+    await uploadToStorage(supabase, 'exports', EAN_CATALOG_FILE_PATH, eanCSV, 'text/csv');
+    const saveResult = await uploadToStorage(supabase, 'exports', 'Catalogo EAN.csv', eanCSV, 'text/csv');
     
-    const catalogResult = await uploadToStorage(supabase, 'exports', EAN_CATALOG_FILE_PATH, eanLines.join('\n'), 'text/tab-separated-values');
-    if (!catalogResult.success) {
-      const error = `Failed to save EAN catalog: ${catalogResult.error}`;
-      await updateStepResult(supabase, runId, 'export_ean', { status: 'failed', error, metrics: {} });
-      return { success: false, error };
-    }
-    
-    // Generate CSV export
-    const eanHeaders = ['Matnr', 'ManufPartNr', 'EAN', 'ShortDescription', 'ExistingStock', 'ListPrice', 'CustBestPrice', 'Prezzo Finale', 'ListPrice con Fee'];
-    const eanRows = eanCatalog.map(p => [p.Matnr, p.MPN, p.EAN, p.Desc, p.Stock, p.LP, p.CBP, p.PF, p.LPF].map(v => {
-      const s = String(v ?? '');
-      return s.includes(';') || s.includes('"') ? `"${s.replace(/"/g, '""')}"` : s;
-    }).join(';'));
-    const eanCSV = [eanHeaders.join(';'), ...eanRows].join('\n');
-    
-    const csvResult = await uploadToStorage(supabase, 'exports', 'Catalogo EAN.csv', eanCSV, 'text/csv');
-    if (!csvResult.success) {
-      const error = `Failed to save Catalogo EAN.csv: ${csvResult.error}`;
+    if (!saveResult.success) {
+      const error = `Failed to save Catalogo EAN.csv: ${saveResult.error}`;
       await updateStepResult(supabase, runId, 'export_ean', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
     
     await updateStepResult(supabase, runId, 'export_ean', {
-      status: 'success', duration_ms: Date.now() - startTime, rows: eanCatalog.length, discarded,
-      metrics: { products_ean_invalid: discarded, products_after_override: products.length, exported_files_count: 1 }
+      status: 'success', duration_ms: Date.now() - startTime, rows: eanRows.length, skipped: eanSkipped,
+      metrics: { ean_export_rows: eanRows.length, ean_export_skipped: eanSkipped }
     });
     
-    console.log(`[sync:step:export_ean] Completed in ${Date.now() - startTime}ms`);
+    console.log(`[sync:step:export_ean] Completed: ${eanRows.length} rows, ${eanSkipped} skipped`);
     return { success: true };
     
   } catch (e: any) {
@@ -742,65 +879,48 @@ async function stepExportEan(supabase: any, runId: string): Promise<{ success: b
   }
 }
 
-// ========== HELPER: Load EAN Catalog ==========
-async function loadEanCatalog(supabase: any, runId: string): Promise<{ products: any[] | null; error?: string }> {
-  console.log(`[sync:ean_catalog] Loading EAN catalog for run ${runId}`);
-  
-  const { content, error } = await downloadFromStorage(supabase, 'exports', EAN_CATALOG_FILE_PATH);
-  
-  if (error || !content) {
-    return { products: null, error: error || 'EAN catalog not found' };
-  }
-  
-  const lines = content.split('\n');
-  const products: any[] = [];
-  
-  for (let i = 1; i < lines.length; i++) {
-    const line = lines[i];
-    if (!line.trim()) continue;
-    const vals = line.split('\t');
-    products.push({
-      Matnr: vals[0] || '', MPN: vals[1] || '', EAN: vals[2] || '', Desc: vals[3] || '',
-      Stock: parseInt(vals[4]) || 0, LP: parseFloat(vals[5]) || 0, CBP: parseFloat(vals[6]) || 0,
-      PF: vals[7] || '', PFNum: parseFloat(vals[8]) || 0, LPF: vals[9] || ''
-    });
-  }
-  
-  console.log(`[sync:ean_catalog] Loaded ${products.length} EAN products`);
-  return { products };
-}
-
 // ========== STEP: EXPORT_MEDIAWORLD ==========
 async function stepExportMediaworld(supabase: any, runId: string, prepDays: number): Promise<{ success: boolean; error?: string }> {
-  console.log(`[sync:step:export_mediaworld] Starting for run ${runId}`);
+  console.log(`[sync:step:export_mediaworld] Starting for run ${runId}, prepDays=${prepDays}`);
   const startTime = Date.now();
   
   try {
-    const { products: eanCatalog, error: loadError } = await loadEanCatalog(supabase, runId);
+    const { products, error: loadError } = await loadProductsTSV(supabase, runId);
     
-    if (loadError || !eanCatalog) {
-      const error = loadError || 'EAN catalog not found';
+    if (loadError || !products) {
+      const error = loadError || 'Products file not found';
       await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
     
-    console.log(`[sync:step:export_mediaworld] Processing ${eanCatalog.length} products`);
-    
-    const mwHeaders = ['SKU offerta', 'ID Prodotto', 'Tipo ID prodotto', 'Descrizione offerta', 'Descrizione interna offerta', "Prezzo dell'offerta", 'Info aggiuntive prezzo offerta', "Quantità dell'offerta", 'Avviso quantità minima', "Stato dell'offerta", 'Data di inizio della disponibilità', 'Data di conclusione della disponibilità', 'Classe logistica', 'Prezzo scontato', 'Data di inizio dello sconto', 'Data di termine dello sconto', 'Tempo di preparazione della spedizione (in giorni)', 'Aggiorna/Cancella', 'Tipo di prezzo che verrà barrato quando verrà definito un prezzo scontato.', 'Obbligo di ritiro RAEE', 'Orario di cut-off (solo se la consegna il giorno successivo è abilitata)', 'VAT Rate % (Turkey only)'];
-    
     const mwRows: string[] = [];
     let mwSkipped = 0;
     
-    for (const p of eanCatalog) {
-      if (!p.MPN || p.MPN.length > 40 || !p.EAN || p.EAN.length < 12 || p.Stock <= 0 || !p.LPF || !p.PFNum) { 
-        mwSkipped++; continue; 
+    const leadTime = prepDays + 2;
+    const headers = ['sku', 'ean', 'price', 'leadtime-to-ship', 'quantity'];
+    
+    for (const p of products) {
+      const norm = normalizeEAN(p.EAN);
+      if (!norm.ok) {
+        mwSkipped++;
+        continue;
       }
-      const lpf = typeof p.LPF === 'number' ? p.LPF.toFixed(2) : String(p.LPF);
-      const pf = p.PFNum.toFixed(2);
-      mwRows.push([p.MPN, p.EAN, 'EAN', p.Desc, '', lpf, '', String(p.Stock), '', 'Nuovo', '', '', 'Consegna gratuita', pf, '', '', String(prepDays), '', 'recommended-retail-price', '', '', ''].map(c => c.includes(';') ? `"${c}"` : c).join(';'));
+      
+      if (!p.PFNum || p.PFNum <= 0) {
+        mwSkipped++;
+        continue;
+      }
+      
+      mwRows.push([
+        p.Matnr || '',
+        norm.value,
+        p.PFNum.toFixed(2).replace('.', ','),
+        String(leadTime),
+        String(Math.min(p.Stock || 0, 99))
+      ].join(';'));
     }
     
-    const mwCSV = [mwHeaders.join(';'), ...mwRows].join('\n');
+    const mwCSV = [headers.join(';'), ...mwRows].join('\n');
     const saveResult = await uploadToStorage(supabase, 'exports', 'Export Mediaworld.csv', mwCSV, 'text/csv');
     
     if (!saveResult.success) {
@@ -826,30 +946,45 @@ async function stepExportMediaworld(supabase: any, runId: string, prepDays: numb
 
 // ========== STEP: EXPORT_EPRICE ==========
 async function stepExportEprice(supabase: any, runId: string, prepDays: number): Promise<{ success: boolean; error?: string }> {
-  console.log(`[sync:step:export_eprice] Starting for run ${runId}`);
+  console.log(`[sync:step:export_eprice] Starting for run ${runId}, prepDays=${prepDays}`);
   const startTime = Date.now();
   
   try {
-    const { products: eanCatalog, error: loadError } = await loadEanCatalog(supabase, runId);
+    const { products, error: loadError } = await loadProductsTSV(supabase, runId);
     
-    if (loadError || !eanCatalog) {
-      const error = loadError || 'EAN catalog not found';
+    if (loadError || !products) {
+      const error = loadError || 'Products file not found';
       await updateStepResult(supabase, runId, 'export_eprice', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
     
-    console.log(`[sync:step:export_eprice] Processing ${eanCatalog.length} products`);
-    
-    const epHeaders = ['EAN', 'SKU', 'Titolo', 'Prezzo', 'Quantita', 'Tempo Consegna'];
     const epRows: string[] = [];
     let epSkipped = 0;
     
-    for (const p of eanCatalog) {
-      if (!p.EAN || !p.MPN || p.Stock <= 0 || !p.PFNum) { epSkipped++; continue; }
-      epRows.push([p.EAN, p.MPN, p.Desc, p.PF, String(p.Stock), String(prepDays)].map(c => String(c).includes(';') ? `"${c}"` : c).join(';'));
+    const headers = ['sku', 'ean', 'price', 'quantity', 'leadtime'];
+    
+    for (const p of products) {
+      const norm = normalizeEAN(p.EAN);
+      if (!norm.ok) {
+        epSkipped++;
+        continue;
+      }
+      
+      if (!p.PFNum || p.PFNum <= 0) {
+        epSkipped++;
+        continue;
+      }
+      
+      epRows.push([
+        p.Matnr || '',
+        norm.value,
+        p.PFNum.toFixed(2).replace('.', ','),
+        String(Math.min(p.Stock || 0, 99)),
+        String(prepDays)
+      ].join(';'));
     }
     
-    const epCSV = [epHeaders.join(';'), ...epRows].join('\n');
+    const epCSV = [headers.join(';'), ...epRows].join('\n');
     const saveResult = await uploadToStorage(supabase, 'exports', 'Export ePrice.csv', epCSV, 'text/csv');
     
     if (!saveResult.success) {
@@ -898,7 +1033,7 @@ serve(async (req) => {
     console.log(`[sync-step-runner] Executing step: ${step} for run: ${run_id}`);
     console.log(`[sync-step-runner] ========================================`);
     
-    let result: { success: boolean; error?: string };
+    let result: { success: boolean; error?: string; status?: string };
     
     switch (step) {
       case 'parse_merge':
@@ -924,10 +1059,14 @@ serve(async (req) => {
           { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
     
-    console.log(`[sync-step-runner] Step ${step} result: ${result.success ? 'SUCCESS' : 'FAILED'} ${result.error || ''}`);
+    console.log(`[sync-step-runner] Step ${step} result: success=${result.success}, status=${result.status || 'N/A'}, error=${result.error || 'none'}`);
     
-    return new Response(JSON.stringify({ status: result.success ? 'ok' : 'error', ...result }), 
-      { status: result.success ? 200 : 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    // Return status in response for orchestrator to handle in_progress
+    return new Response(JSON.stringify({ 
+      status: result.success ? 'ok' : 'error', 
+      step_status: result.status,
+      ...result 
+    }), { status: result.success ? 200 : 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     
   } catch (e: any) {
     console.error('[sync-step-runner] Fatal error:', e);

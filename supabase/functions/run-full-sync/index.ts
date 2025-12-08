@@ -12,16 +12,21 @@ const corsHeaders = {
  * Non esegue logica di business, solo orchestrazione.
  * Chiama step separati tramite sync-step-runner per evitare WORKER_LIMIT.
  * 
+ * IMPORTANTE: parse_merge è CHUNKED - può richiedere più invocazioni.
+ * L'orchestratore chiama parse_merge in loop finché non è completed.
+ * 
  * Sequenza step:
  * 1. import_ftp - Download file da FTP (import-catalog-ftp)
- * 2. parse_merge - Parse e merge file (chunked)
+ * 2. parse_merge - Parse e merge file (CHUNKED - loop finché completed)
  * 3. ean_mapping - Mapping EAN
- * 4. pricing - Calcolo prezzi (chunked)
+ * 4. pricing - Calcolo prezzi
  * 5. export_ean - Generazione catalogo EAN
  * 6. export_mediaworld - Export Mediaworld
  * 7. export_eprice - Export ePrice
  * 8. upload_sftp - Upload su SFTP (upload-exports-to-sftp)
  */
+
+const MAX_PARSE_MERGE_CHUNKS = 100; // Safety limit: max chunks per parse_merge
 
 async function callStep(supabaseUrl: string, serviceKey: string, functionName: string, body: any): Promise<{ success: boolean; error?: string; data?: any }> {
   try {
@@ -32,7 +37,6 @@ async function callStep(supabaseUrl: string, serviceKey: string, functionName: s
       body: JSON.stringify(body)
     });
     
-    // Check HTTP status first
     if (!resp.ok) {
       const errorText = await resp.text().catch(() => 'Unknown error');
       console.log(`[orchestrator] ${functionName} HTTP error ${resp.status}: ${errorText}`);
@@ -44,7 +48,7 @@ async function callStep(supabaseUrl: string, serviceKey: string, functionName: s
       console.log(`[orchestrator] ${functionName} failed: ${data.message || data.error}`);
       return { success: false, error: data.message || data.error, data };
     }
-    console.log(`[orchestrator] ${functionName} completed`);
+    console.log(`[orchestrator] ${functionName} completed, step_status=${data.step_status || 'N/A'}`);
     return { success: true, data };
   } catch (e: any) {
     console.error(`[orchestrator] Error calling ${functionName}:`, e);
@@ -52,8 +56,7 @@ async function callStep(supabaseUrl: string, serviceKey: string, functionName: s
   }
 }
 
-// Verify step completion by checking the database
-async function verifyStepCompleted(supabase: any, runId: string, stepName: string): Promise<{ success: boolean; error?: string }> {
+async function verifyStepCompleted(supabase: any, runId: string, stepName: string): Promise<{ success: boolean; status?: string; error?: string }> {
   const { data: run } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
   const stepResult = run?.steps?.[stepName];
   
@@ -63,17 +66,22 @@ async function verifyStepCompleted(supabase: any, runId: string, stepName: strin
   }
   
   if (stepResult.status === 'failed') {
-    console.log(`[orchestrator] Step ${stepName} failed according to database: ${stepResult.error}`);
-    return { success: false, error: stepResult.error };
+    console.log(`[orchestrator] Step ${stepName} failed: ${stepResult.error}`);
+    return { success: false, status: 'failed', error: stepResult.error };
   }
   
-  if (stepResult.status !== 'success') {
-    console.log(`[orchestrator] Step ${stepName} has unexpected status: ${stepResult.status}`);
-    return { success: false, error: `Step ${stepName} stato imprevisto: ${stepResult.status}` };
+  if (stepResult.status === 'in_progress') {
+    console.log(`[orchestrator] Step ${stepName} is in_progress (chunked processing)`);
+    return { success: true, status: 'in_progress' };
   }
   
-  console.log(`[orchestrator] Step ${stepName} verified as successful in database`);
-  return { success: true };
+  if (stepResult.status === 'completed' || stepResult.status === 'success') {
+    console.log(`[orchestrator] Step ${stepName} verified as completed`);
+    return { success: true, status: 'completed' };
+  }
+  
+  console.log(`[orchestrator] Step ${stepName} has unexpected status: ${stepResult.status}`);
+  return { success: false, error: `Step ${stepName} stato imprevisto: ${stepResult.status}` };
 }
 
 async function isCancelRequested(supabase: any, runId: string): Promise<boolean> {
@@ -121,7 +129,6 @@ serve(async (req) => {
 
     console.log(`[orchestrator] Starting pipeline, trigger: ${trigger}`);
 
-    // Auth for manual triggers
     if (trigger === 'manual') {
       const authHeader = req.headers.get('Authorization');
       if (!authHeader?.startsWith('Bearer ')) {
@@ -140,14 +147,12 @@ serve(async (req) => {
 
     supabase = createClient(supabaseUrl, supabaseServiceKey);
 
-    // Check running jobs
     const { data: runningJobs } = await supabase.from('sync_runs').select('id').eq('status', 'running').limit(1);
     if (runningJobs?.length) {
       return new Response(JSON.stringify({ status: 'error', message: 'Sync già in corso' }), 
         { status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
-    // For cron, check if enabled
     if (trigger === 'cron') {
       const { data: config } = await supabase.from('sync_config').select('enabled, frequency_minutes').eq('id', 1).single();
       if (!config?.enabled) {
@@ -167,7 +172,6 @@ serve(async (req) => {
       }
     }
 
-    // Get fee config
     const { data: feeData } = await supabase.from('fee_config').select('*').limit(1).single();
     const feeConfig = {
       feeDrev: feeData?.fee_drev ?? 1.05,
@@ -177,7 +181,6 @@ serve(async (req) => {
       epricePrepDays: feeData?.eprice_preparation_days ?? 1
     };
 
-    // Create run record
     runId = crypto.randomUUID();
     startTime = Date.now();
     await supabase.from('sync_runs').insert({ 
@@ -203,10 +206,60 @@ serve(async (req) => {
       }
     }
 
-    // ========== STEPS 2-7: Processing via sync-step-runner (chunked) ==========
-    const processingSteps = ['parse_merge', 'ean_mapping', 'pricing', 'export_ean', 'export_mediaworld', 'export_eprice'];
+    // ========== STEP 2: PARSE_MERGE (CHUNKED) ==========
+    await updateRun(supabase, runId, { steps: { current_step: 'parse_merge' } });
+    console.log('[orchestrator] === STEP 2: parse_merge (CHUNKED) ===');
     
-    for (const step of processingSteps) {
+    let parseMergeComplete = false;
+    let chunkCount = 0;
+    
+    while (!parseMergeComplete && chunkCount < MAX_PARSE_MERGE_CHUNKS) {
+      if (await isCancelRequested(supabase, runId)) {
+        await finalizeRun(supabase, runId, 'failed', startTime, 'Interrotta dall\'utente');
+        return new Response(JSON.stringify({ status: 'cancelled' }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+      
+      chunkCount++;
+      console.log(`[orchestrator] parse_merge chunk ${chunkCount}/${MAX_PARSE_MERGE_CHUNKS}...`);
+      
+      const result = await callStep(supabaseUrl, supabaseServiceKey, 'sync-step-runner', { 
+        run_id: runId, step: 'parse_merge', fee_config: feeConfig 
+      });
+      
+      if (!result.success) {
+        await finalizeRun(supabase, runId, 'failed', startTime, `parse_merge chunk ${chunkCount}: ${result.error}`);
+        return new Response(JSON.stringify({ status: 'failed', error: result.error }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+      
+      // Verify status in database
+      const verification = await verifyStepCompleted(supabase, runId, 'parse_merge');
+      
+      if (!verification.success) {
+        await finalizeRun(supabase, runId, 'failed', startTime, verification.error || 'parse_merge verification failed');
+        return new Response(JSON.stringify({ status: 'failed', error: verification.error }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+      
+      if (verification.status === 'completed') {
+        parseMergeComplete = true;
+        console.log(`[orchestrator] parse_merge completed after ${chunkCount} chunks`);
+      } else if (verification.status === 'in_progress') {
+        console.log(`[orchestrator] parse_merge in_progress, continuing to next chunk...`);
+        // Continue loop for next chunk
+      } else {
+        await finalizeRun(supabase, runId, 'failed', startTime, `parse_merge unexpected status: ${verification.status}`);
+        return new Response(JSON.stringify({ status: 'failed', error: `Unexpected status: ${verification.status}` }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+    }
+    
+    if (!parseMergeComplete) {
+      await finalizeRun(supabase, runId, 'failed', startTime, `parse_merge exceeded ${MAX_PARSE_MERGE_CHUNKS} chunks limit`);
+      return new Response(JSON.stringify({ status: 'failed', error: 'parse_merge chunk limit exceeded' }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+
+    // ========== STEPS 3-7: Processing via sync-step-runner ==========
+    const remainingSteps = ['ean_mapping', 'pricing', 'export_ean', 'export_mediaworld', 'export_eprice'];
+    
+    for (const step of remainingSteps) {
       if (await isCancelRequested(supabase, runId)) {
         await finalizeRun(supabase, runId, 'failed', startTime, 'Interrotta dall\'utente');
         return new Response(JSON.stringify({ status: 'cancelled' }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
@@ -219,8 +272,6 @@ serve(async (req) => {
         run_id: runId, step, fee_config: feeConfig 
       });
       
-      // Even if HTTP call succeeded, verify the step actually completed in the database
-      // This catches cases where the edge function crashed (e.g., memory limit)
       const verification = await verifyStepCompleted(supabase, runId, step);
       
       if (!result.success || !verification.success) {
