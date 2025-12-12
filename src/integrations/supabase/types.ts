@@ -110,6 +110,30 @@ export type Database = {
         }
         Relationships: []
       }
+      sync_locks: {
+        Row: {
+          expires_at: string
+          lock_key: string
+          locked_at: string
+          locked_by: string
+          run_id: string | null
+        }
+        Insert: {
+          expires_at: string
+          lock_key: string
+          locked_at?: string
+          locked_by: string
+          run_id?: string | null
+        }
+        Update: {
+          expires_at?: string
+          lock_key?: string
+          locked_at?: string
+          locked_by?: string
+          run_id?: string | null
+        }
+        Relationships: []
+      }
       sync_runs: {
         Row: {
           attempt: number

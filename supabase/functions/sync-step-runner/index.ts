@@ -1053,7 +1053,7 @@ async function stepEanMapping(supabase: any, runId: string): Promise<{ success: 
       console.log(`[sync:step:ean_mapping] No EAN mapping file found, skipping mapping`);
     }
     
-    const saveResult = await saveProductsTSV(supabase, products);
+    const saveResult = await saveProductsTSV(supabase, runId, products);
     if (!saveResult.success) {
       const error = `Failed to save updated products: ${saveResult.error}`;
       await updateStepResult(supabase, runId, 'ean_mapping', { status: 'failed', error, metrics: {} });
@@ -1132,7 +1132,7 @@ async function stepPricing(supabase: any, runId: string, feeConfig: any): Promis
       }
     }
     
-    const saveResult = await saveProductsTSV(supabase, products);
+    const saveResult = await saveProductsTSV(supabase, runId, products);
     if (!saveResult.success) {
       const error = `Failed to save priced products: ${saveResult.error}`;
       await updateStepResult(supabase, runId, 'pricing', { status: 'failed', error, metrics: {} });
