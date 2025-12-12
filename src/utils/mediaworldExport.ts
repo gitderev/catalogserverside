@@ -338,9 +338,16 @@ export async function exportMediaworldCatalog({
     // Log per debug: tracciamento conversione prezzi
     let debugLogCount = 0;
     
+    // Diagnostic counters for EU-only records
+    let euOnlyCount = 0;
+    let euOnlyExported = 0;
+    
     // === LOG INIZIO EXPORT MEDIAWORLD (interno utility) ===
     console.log('%c[Mediaworld:util:start]', 'color: #00BCD4;', { 
       rows_input: processedData.length,
+      includeEu,
+      itDays,
+      euDays,
       timestamp: new Date().toISOString()
     });
     
@@ -393,6 +400,12 @@ export async function exportMediaworldCatalog({
         euDays
       );
       
+      // Track EU-only records (IT < 2 and EU >= 2)
+      const isEuOnly = stockIT < 2 && stockEU >= 2;
+      if (isEuOnly) {
+        euOnlyCount++;
+      }
+      
       // === FILTER 2: Skip products that don't meet threshold (min 2) ===
       if (!stockResult.shouldExport) {
         validationErrors.push({
@@ -403,6 +416,11 @@ export async function exportMediaworldCatalog({
         });
         skippedCount++;
         return;
+      }
+      
+      // Track EU-only records that get exported when includeEU=true
+      if (isEuOnly && stockResult.shouldExport) {
+        euOnlyExported++;
       }
       
       // === VALIDATION: SKU offerta ===
@@ -509,9 +527,14 @@ export async function exportMediaworldCatalog({
           includeEU: includeEu,
           exportQty: stockResult.exportQty,
           leadDays: stockResult.leadDays,
+          leadDaysWithOffset: stockResult.leadDays + 2,
           source: stockResult.source
         });
       }
+      
+      // Calculate final lead time for Mediaworld: base lead days + 2
+      // This +2 offset is Mediaworld-specific and should be applied only once
+      const mediaworldLeadDays = stockResult.leadDays + 2;
       
       // Build row according to Mediaworld template mapping
       // All 22 columns in exact order, empty strings for unused fields
@@ -532,7 +555,7 @@ export async function exportMediaworldCatalog({
         prezzoFinale,                                // Col 14: Prezzo scontato → Prezzo Finale ESATTO (NUMBER)
         '',                                          // Col 15: Data di inizio dello sconto → vuoto
         '',                                          // Col 16: Data di termine dello sconto → vuoto
-        stockResult.leadDays,                        // Col 17: Tempo preparazione spedizione → IT/EU resolved lead days
+        mediaworldLeadDays,                          // Col 17: Tempo preparazione spedizione → leadDays + 2 for Mediaworld
         '',                                          // Col 18: Aggiorna/Cancella → vuoto
         'recommended-retail-price',                  // Col 19: Tipo prezzo barrato → fixed
         '',                                          // Col 20: Obbligo di ritiro RAEE → vuoto
@@ -564,6 +587,10 @@ export async function exportMediaworldCatalog({
       rows_input: processedData.length,
       rows_exported: validRowCount,
       rows_skipped: skippedCount,
+      euOnly_total: euOnlyCount,
+      euOnly_exported: euOnlyExported,
+      euOnly_skipped: euOnlyCount - euOnlyExported,
+      includeEu,
       allineamento: processedData.length === (validRowCount + skippedCount) ? 'OK' : 'MISMATCH'
     });
     

@@ -1901,6 +1901,9 @@ const AltersideCatalogGenerator: React.FC = () => {
       // onExportEAN viene chiamato immediatamente dopo processDataPipeline
       // =====================================================================
       if (pipelineType === 'EAN' && currentData.length > 0) {
+        // Create local mutable warnings for this run
+        const localWarnings = { ...EMPTY_WARNINGS };
+        
         // Costruisce il dataset formattato per l'export EAN
         const formattedDataset = currentData.map((record: any) => {
           // Determina la route e calcola baseCents correttamente (con Surcharge per CBP)
@@ -1952,12 +1955,45 @@ const AltersideCatalogGenerator: React.FC = () => {
             listPriceConFeeString = Math.ceil(postFeeLP);
           }
           
+          // =====================================================================
+          // POPULATE StockIT and StockEU for EAN Catalog
+          // If stockLocationIndex exists, use it; otherwise fallback
+          // =====================================================================
+          const existingStock = Number(record.ExistingStock) || 0;
+          const matnr = String(record.Matnr || '');
+          let stockIT: number;
+          let stockEU: number;
+          
+          if (stockLocationIndex && Object.keys(stockLocationIndex).length > 0) {
+            // Stock location file is loaded - get IT/EU from it
+            const entry = stockLocationIndex[matnr];
+            if (entry) {
+              stockIT = entry.stockIT;
+              stockEU = entry.stockEU;
+              // Check for split mismatch
+              if (stockIT + stockEU !== existingStock) {
+                localWarnings.split_mismatch++;
+              }
+            } else {
+              // Matnr not in location file - fallback to 0/0 for strict matching
+              stockIT = 0;
+              stockEU = 0;
+              localWarnings.missing_location_data++;
+            }
+          } else {
+            // No location file loaded - backward compat: IT=ExistingStock, EU=0
+            stockIT = existingStock;
+            stockEU = 0;
+          }
+          
           return {
             Matnr: record.Matnr,
             ManufPartNr: record.ManufPartNr,
             EAN: record.EAN,
             ShortDescription: record.ShortDescription,
             ExistingStock: record.ExistingStock,
+            StockIT: stockIT,      // NEW: IT stock
+            StockEU: stockEU,      // NEW: EU stock
             ListPrice: record.ListPrice,
             CustBestPrice: record.CustBestPrice,
             Surcharge: record.Surcharge,
@@ -1973,6 +2009,23 @@ const AltersideCatalogGenerator: React.FC = () => {
             _route: route,
             _finalCents: finalCents
           };
+        });
+        
+        // Update warnings state with accumulated counts
+        setStockLocationWarnings(prev => ({
+          ...prev,
+          missing_location_data: prev.missing_location_data + localWarnings.missing_location_data,
+          split_mismatch: prev.split_mismatch + localWarnings.split_mismatch
+        }));
+        
+        // Log StockIT/StockEU population results
+        console.log('%c[processDataPipeline:StockIT_EU:populated]', 'color: #4CAF50; font-weight: bold;', {
+          totalRecords: formattedDataset.length,
+          stockLocationIndex_present: !!stockLocationIndex && Object.keys(stockLocationIndex || {}).length > 0,
+          missing_location_data: localWarnings.missing_location_data,
+          split_mismatch: localWarnings.split_mismatch,
+          sample_StockIT: formattedDataset[0]?.StockIT,
+          sample_StockEU: formattedDataset[0]?.StockEU
         });
         
         // Salva nel state E nella ref per accesso immediato
@@ -3491,6 +3544,10 @@ const AltersideCatalogGenerator: React.FC = () => {
       const validationWarnings: string[] = [];
       let skippedCount = 0;
       
+      // Diagnostic counters for EU-only records
+      let euOnlyCount = 0;
+      let euOnlyExported = 0;
+      
       // Use template headers
       const headers = [...EPRICE_TEMPLATE.headers];
       
@@ -3540,10 +3597,21 @@ const AltersideCatalogGenerator: React.FC = () => {
           extendedFeeConfig.epriceEuPreparationDays
         );
         
+        // Track EU-only records (IT < 2 and EU >= 2)
+        const isEuOnly = stockIT < 2 && stockEU >= 2;
+        if (isEuOnly) {
+          euOnlyCount++;
+        }
+        
         // Skip if shouldn't export (min 2 threshold)
         if (!stockResult.shouldExport) {
           skippedCount++;
           return; // Skip this row
+        }
+        
+        // Track EU-only records that get exported when includeEU=true
+        if (isEuOnly && stockResult.shouldExport) {
+          euOnlyExported++;
         }
         
         // =====================================================================
@@ -3620,6 +3688,16 @@ const AltersideCatalogGenerator: React.FC = () => {
       if (validationWarnings.length > 0) {
         console.warn("Warning validazione ePrice:", validationWarnings);
       }
+      
+      // Log EU-only diagnostic summary
+      console.log('%c[ePrice:export:EU-only-summary]', 'color: #9C27B0; font-weight: bold;', {
+        euOnly_total: euOnlyCount,
+        euOnly_exported: euOnlyExported,
+        euOnly_skipped: euOnlyCount - euOnlyExported,
+        includeEu: extendedFeeConfig.epriceIncludeEu,
+        itDays: extendedFeeConfig.epriceItPreparationDays,
+        euDays: extendedFeeConfig.epriceEuPreparationDays
+      });
       
       // Show summary if rows were skipped
       if (skippedCount > 0) {
