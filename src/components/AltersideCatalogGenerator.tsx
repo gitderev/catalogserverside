@@ -497,14 +497,11 @@ const AltersideCatalogGenerator: React.FC = () => {
           // Load extended IT/EU config
           // BACKWARD COMPATIBILITY: if includeEu is null/undefined, default to TRUE
           // (previous behavior used total stock which is equivalent to "includeEU always ON")
-          const mediaworldIncludeEu = row.mediaworld_include_eu === null || row.mediaworld_include_eu === undefined
-            ? true  // Default to true for backward compat
-            : Boolean(row.mediaworld_include_eu);
-          const epriceIncludeEu = row.eprice_include_eu === null || row.eprice_include_eu === undefined
-            ? true  // Default to true for backward compat
-            : Boolean(row.eprice_include_eu);
+          // CRITICAL: Use == null check (covers null AND undefined), then coerce with !!
+          const mediaworldIncludeEu = row.mediaworld_include_eu == null ? true : !!row.mediaworld_include_eu;
+          const epriceIncludeEu = row.eprice_include_eu == null ? true : !!row.eprice_include_eu;
           
-          setExtendedFeeConfig({
+          const loadedConfig = {
             feeDrev: Number(row.fee_drev),
             feeMkt: Number(row.fee_mkt),
             shippingCost: Number(row.shipping_cost),
@@ -516,8 +513,27 @@ const AltersideCatalogGenerator: React.FC = () => {
             epriceIncludeEu,
             epriceItPreparationDays: Number(row.eprice_it_preparation_days || row.eprice_preparation_days || 1),
             epriceEuPreparationDays: Number(row.eprice_eu_preparation_days || 3)
+          };
+          
+          setExtendedFeeConfig(loadedConfig);
+          
+          // DIAGNOSTIC: Log IT/EU config with explicit values
+          console.log('%c[FeeConfig:loaded:IT_EU]', 'color: #9C27B0; font-weight: bold;', {
+            raw_db_values: {
+              mediaworld_include_eu: row.mediaworld_include_eu,
+              eprice_include_eu: row.eprice_include_eu,
+              mediaworld_include_eu_type: typeof row.mediaworld_include_eu,
+              eprice_include_eu_type: typeof row.eprice_include_eu
+            },
+            resolved_values: {
+              mediaworldIncludeEu: loadedConfig.mediaworldIncludeEu,
+              epriceIncludeEu: loadedConfig.epriceIncludeEu,
+              mediaworldItDays: loadedConfig.mediaworldItPreparationDays,
+              mediaworldEuDays: loadedConfig.mediaworldEuPreparationDays,
+              epriceItDays: loadedConfig.epriceItPreparationDays,
+              epriceEuDays: loadedConfig.epriceEuPreparationDays
+            }
           });
-          console.log('Fee config caricato da Supabase (con IT/EU):', row);
         } else {
           console.log('Nessuna fee config trovata, utilizzo valori predefiniti');
         }
@@ -2451,6 +2467,21 @@ const AltersideCatalogGenerator: React.FC = () => {
     setIsExportingEAN(true);
     dbg('excel:write:start');
     
+    // RESET WARNINGS at start of each manual run
+    setStockLocationWarnings(EMPTY_WARNINGS);
+    
+    // DIAGNOSTIC: Log IT/EU config being used for EAN export
+    console.log('%c[onExportEAN:IT_EU_Config]', 'color: #9C27B0; font-weight: bold;', {
+      mediaworldIncludeEu: extendedFeeConfig.mediaworldIncludeEu,
+      epriceIncludeEu: extendedFeeConfig.epriceIncludeEu,
+      mediaworldItDays: extendedFeeConfig.mediaworldItPreparationDays,
+      mediaworldEuDays: extendedFeeConfig.mediaworldEuPreparationDays,
+      epriceItDays: extendedFeeConfig.epriceItPreparationDays,
+      epriceEuDays: extendedFeeConfig.epriceEuPreparationDays,
+      stockLocationIndex_loaded: !!stockLocationIndex,
+      stockLocationIndex_count: stockLocationIndex ? Object.keys(stockLocationIndex).length : 0
+    });
+    
     try {
       // =====================================================================
       // FONTE DATI: Usa eanCatalogDatasetRef per accedere ai dati più recenti
@@ -3083,6 +3114,21 @@ const AltersideCatalogGenerator: React.FC = () => {
       
       setExcelDone(true);
       
+      // === AGGREGATE DIAGNOSTICS: StockIT/StockEU population ===
+      const stockITCount = finalDataset.filter((r: any) => typeof r.StockIT === 'number' && r.StockIT > 0).length;
+      const stockEUCount = finalDataset.filter((r: any) => typeof r.StockEU === 'number' && r.StockEU > 0).length;
+      const stockITMissing = finalDataset.filter((r: any) => r.StockIT === undefined || r.StockIT === null).length;
+      const stockEUMissing = finalDataset.filter((r: any) => r.StockEU === undefined || r.StockEU === null).length;
+      
+      console.log('%c[EAN:StockIT_EU:aggregate]', 'color: #4CAF50; font-weight: bold;', {
+        total_rows: finalDataset.length,
+        stockIT_populated: stockITCount,
+        stockEU_populated: stockEUCount,
+        stockIT_missing_or_null: stockITMissing,
+        stockEU_missing_or_null: stockEUMissing,
+        stockLocationIndex_used: !!stockLocationIndex
+      });
+      
       // === LOG CORRETTO: RIEPILOGO FINALE CATALOGO EAN ===
       console.log('%c[EAN:generation:complete]', 'color: #4CAF50; font-weight: bold; font-size: 14px;', {
         totale_prodotti_generati: finalDataset.length,
@@ -3090,6 +3136,10 @@ const AltersideCatalogGenerator: React.FC = () => {
         allineamento: 'OK',
         pronto_per_ePrice: finalDataset.length > 0,
         pronto_per_Mediaworld: finalDataset.length > 0,
+        stockIT_EU_config: {
+          mediaworldIncludeEu: extendedFeeConfig.mediaworldIncludeEu,
+          epriceIncludeEu: extendedFeeConfig.epriceIncludeEu
+        },
         timestamp: new Date().toISOString(),
       });
       
@@ -3285,7 +3335,7 @@ const AltersideCatalogGenerator: React.FC = () => {
     } finally {
       setIsExportingEAN(false);
     }
-  }, [eanCatalogDataset, currentProcessedData, isExportingEAN, feeConfig, prepDays, prepDaysMediaworld, dbg, toast]);
+  }, [eanCatalogDataset, currentProcessedData, isExportingEAN, feeConfig, prepDays, prepDaysMediaworld, dbg, toast, extendedFeeConfig, stockLocationIndex]);
 
   // =====================================================================
   // TEMPLATE EPRICE UFFICIALE: Struttura e validazione
@@ -3455,6 +3505,18 @@ const AltersideCatalogGenerator: React.FC = () => {
     }
     
     setIsExportingEprice(true);
+    
+    // RESET WARNINGS at start of each manual run
+    setStockLocationWarnings(EMPTY_WARNINGS);
+    
+    // === DIAGNOSTIC LOG: IT/EU Config for ePrice ===
+    console.log('%c[ePrice:IT_EU_Config]', 'color: #9C27B0; font-weight: bold;', {
+      epriceIncludeEu: extendedFeeConfig.epriceIncludeEu,
+      epriceItDays: extendedFeeConfig.epriceItPreparationDays,
+      epriceEuDays: extendedFeeConfig.epriceEuPreparationDays,
+      stockLocationIndex_loaded: !!stockLocationIndex,
+      stockLocationIndex_count: stockLocationIndex ? Object.keys(stockLocationIndex).length : 0
+    });
     
     try {
       // =====================================================================
@@ -3849,7 +3911,7 @@ const AltersideCatalogGenerator: React.FC = () => {
     } finally {
       setIsExportingEprice(false);
     }
-  }, [eanCatalogDataset, isExportingEprice, prepDays, toast, validateEpriceStructure]);
+  }, [eanCatalogDataset, isExportingEprice, prepDays, toast, validateEpriceStructure, extendedFeeConfig, stockLocationIndex, stockLocationWarnings]);
 
   // Mediaworld Export Function - reuses EAN dataset
   const onExportMediaworld = useCallback(async (event: React.MouseEvent) => {
@@ -3876,6 +3938,18 @@ const AltersideCatalogGenerator: React.FC = () => {
       });
       return;
     }
+    
+    // RESET WARNINGS at start of each manual run
+    setStockLocationWarnings(EMPTY_WARNINGS);
+    
+    // === DIAGNOSTIC LOG: IT/EU Config for Mediaworld ===
+    console.log('%c[Mediaworld:IT_EU_Config]', 'color: #00BCD4; font-weight: bold;', {
+      mediaworldIncludeEu: extendedFeeConfig.mediaworldIncludeEu,
+      mediaworldItDays: extendedFeeConfig.mediaworldItPreparationDays,
+      mediaworldEuDays: extendedFeeConfig.mediaworldEuPreparationDays,
+      stockLocationIndex_loaded: !!stockLocationIndex,
+      stockLocationIndex_count: stockLocationIndex ? Object.keys(stockLocationIndex).length : 0
+    });
     
     // === LOG ESTESO: VERIFICA FONTE DATI MEDIAWORLD ===
     console.log('%c[Mediaworld:source:check] === VERIFICA FONTE DATI ===', 'color: #00BCD4; font-weight: bold; font-size: 14px;');
@@ -4037,7 +4111,7 @@ const AltersideCatalogGenerator: React.FC = () => {
     } finally {
       setIsExportingMediaworld(false);
     }
-  }, [eanCatalogDataset, isExportingMediaworld, feeConfig, prepDaysMediaworld, toast]);
+  }, [eanCatalogDataset, isExportingMediaworld, feeConfig, prepDaysMediaworld, toast, extendedFeeConfig, stockLocationIndex, stockLocationWarnings]);
 
   // SFTP upload is now integrated into onExportEAN - no separate function needed
 
