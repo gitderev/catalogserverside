@@ -7,6 +7,9 @@ import {
   type StockLocationWarnings
 } from './stockLocation';
 
+// Import the logistic offset constant from config component for single source of truth
+import { MEDIAWORLD_LOGISTIC_OFFSET_DAYS } from '@/components/StockLocationConfig';
+
 /**
  * Mediaworld Export Utility
  * 
@@ -19,6 +22,10 @@ import {
  * si riflette automaticamente anche nell'export Mediaworld.
  * 
  * IT/EU Stock Split: Uses resolveMarketplaceStock for quantity and lead time.
+ * 
+ * LEAD TIME: Mediaworld applies a logistic offset of +${MEDIAWORLD_LOGISTIC_OFFSET_DAYS} days
+ * on top of preparation days. This offset is defined in StockLocationConfig
+ * and applied exactly ONCE here during export.
  */
 
 // =====================================================================
@@ -526,15 +533,16 @@ export async function exportMediaworldCatalog({
           stockIT, stockEU,
           includeEU: includeEu,
           exportQty: stockResult.exportQty,
-          leadDays: stockResult.leadDays,
-          leadDaysWithOffset: stockResult.leadDays + 2,
+          baseLeadDays: stockResult.leadDays,
+          logisticOffset: MEDIAWORLD_LOGISTIC_OFFSET_DAYS,
+          finalLeadDays: stockResult.leadDays + MEDIAWORLD_LOGISTIC_OFFSET_DAYS,
           source: stockResult.source
         });
       }
       
-      // Calculate final lead time for Mediaworld: base lead days + 2
-      // This +2 offset is Mediaworld-specific and should be applied only once
-      const mediaworldLeadDays = stockResult.leadDays + 2;
+      // Calculate final lead time for Mediaworld: base lead days + logistic offset
+      // The offset is defined as a constant (MEDIAWORLD_LOGISTIC_OFFSET_DAYS) and applied exactly ONCE here
+      const mediaworldLeadDays = stockResult.leadDays + MEDIAWORLD_LOGISTIC_OFFSET_DAYS;
       
       // Build row according to Mediaworld template mapping
       // All 22 columns in exact order, empty strings for unused fields
