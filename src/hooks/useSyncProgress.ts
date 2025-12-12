@@ -47,9 +47,9 @@ const POLL_INTERVAL_MS = 2000;
 
 // Server-generated export files - paths retrieved from sync_runs.steps.exports.files
 export const EXPORT_FILES = {
-  ean: { path: 'Catalogo EAN.csv', displayName: 'Catalogo EAN' },
-  eprice: { path: 'Export ePrice.csv', displayName: 'Export ePrice' },
-  mediaworld: { path: 'Export Mediaworld.csv', displayName: 'Export Mediaworld' },
+  ean: { path: 'Catalogo EAN.xlsx', displayName: 'Catalogo EAN' },
+  eprice: { path: 'Export ePrice.xlsx', displayName: 'Export ePrice' },
+  mediaworld: { path: 'Export Mediaworld.xlsx', displayName: 'Export Mediaworld' },
 };
 
 export function useSyncProgress() {

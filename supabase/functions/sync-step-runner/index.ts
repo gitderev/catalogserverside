@@ -1,5 +1,6 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
+import * as XLSX from "https://esm.sh/xlsx@0.18.5";
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -292,11 +293,15 @@ async function getLatestFile(supabase: any, folder: string): Promise<{ content: 
   return { content, fileName };
 }
 
-async function uploadToStorage(supabase: any, bucket: string, path: string, content: string, contentType: string): Promise<{ success: boolean; error?: string }> {
-  console.log(`[storage] Uploading to ${bucket}/${path}, size: ${content.length} bytes`);
+async function uploadToStorage(supabase: any, bucket: string, path: string, content: string | Uint8Array, contentType: string): Promise<{ success: boolean; error?: string }> {
+  const size = typeof content === 'string' ? content.length : content.byteLength;
+  console.log(`[storage] Uploading to ${bucket}/${path}, size: ${size} bytes`);
   
-  const { data, error } = await supabase.storage.from(bucket).upload(path, 
-    new Blob([content], { type: contentType }), { upsert: true });
+  const blob = typeof content === 'string' 
+    ? new Blob([content], { type: contentType })
+    : new Blob([content], { type: contentType });
+  
+  const { data, error } = await supabase.storage.from(bucket).upload(path, blob, { upsert: true });
   
   if (error) {
     console.error(`[storage] Upload failed for ${bucket}/${path}:`, error);
@@ -1108,6 +1113,23 @@ async function stepPricing(supabase: any, runId: string, feeConfig: any): Promis
   }
 }
 
+// ========== XLSX GENERATION HELPER ==========
+function createXLSXBuffer(headers: string[], rows: string[][]): Uint8Array {
+  const wsData = [headers, ...rows];
+  const ws = XLSX.utils.aoa_to_sheet(wsData);
+  
+  // Set column widths
+  const colWidths = headers.map(() => ({ width: 20 }));
+  ws['!cols'] = colWidths;
+  
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Export');
+  
+  // Write to binary buffer
+  const xlsxBuffer = XLSX.write(wb, { type: 'array', bookType: 'xlsx' });
+  return new Uint8Array(xlsxBuffer);
+}
+
 // ========== STEP: EXPORT_EAN ==========
 async function stepExportEan(supabase: any, runId: string): Promise<{ success: boolean; error?: string }> {
   console.log(`[sync:step:export_ean] Starting for run ${runId}`);
@@ -1122,7 +1144,7 @@ async function stepExportEan(supabase: any, runId: string): Promise<{ success: b
       return { success: false, error };
     }
     
-    const eanRows: string[] = [];
+    const eanRows: string[][] = [];
     let eanSkipped = 0;
     
     const headers = ['EAN', 'MPN', 'Matnr', 'Descrizione', 'Prezzo', 'ListPrice con Fee', 'Stock'];
@@ -1135,30 +1157,30 @@ async function stepExportEan(supabase: any, runId: string): Promise<{ success: b
       }
       
       eanRows.push([
-        norm.value,
+        norm.value || '',
         p.MPN || '',
         p.Matnr || '',
         (p.Desc || '').replace(/;/g, ','),
         p.PF || '',
         p.LPF || '',
         String(p.Stock || 0)
-      ].join(';'));
+      ]);
     }
     
-    const eanCSV = [headers.join(';'), ...eanRows].join('\n');
+    // Generate XLSX buffer
+    const xlsxBuffer = createXLSXBuffer(headers, eanRows);
     
-    // Save to both locations
-    await uploadToStorage(supabase, 'exports', EAN_CATALOG_FILE_PATH, eanCSV, 'text/csv');
-    const saveResult = await uploadToStorage(supabase, 'exports', 'Catalogo EAN.csv', eanCSV, 'text/csv');
+    // Save to exports bucket as XLSX
+    const saveResult = await uploadToStorage(supabase, 'exports', 'Catalogo EAN.xlsx', xlsxBuffer, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     
     if (!saveResult.success) {
-      const error = `Failed to save Catalogo EAN.csv: ${saveResult.error}`;
+      const error = `Failed to save Catalogo EAN.xlsx: ${saveResult.error}`;
       await updateStepResult(supabase, runId, 'export_ean', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
     
     // Save export file path to sync_runs.steps.exports.files
-    await updateExportFilePath(supabase, runId, 'ean', 'exports/Catalogo EAN.csv');
+    await updateExportFilePath(supabase, runId, 'ean', 'exports/Catalogo EAN.xlsx');
     
     await updateStepResult(supabase, runId, 'export_ean', {
       status: 'success', duration_ms: Date.now() - startTime, rows: eanRows.length, skipped: eanSkipped,
@@ -1265,7 +1287,7 @@ async function stepExportMediaworld(supabase: any, runId: string, feeConfig: any
       warnings.missing_location_file++;
     }
     
-    const mwRows: string[] = [];
+    const mwRows: string[][] = [];
     let mwSkipped = 0;
     
     const headers = ['sku', 'ean', 'price', 'leadtime-to-ship', 'quantity'];
@@ -1300,18 +1322,19 @@ async function stepExportMediaworld(supabase: any, runId: string, feeConfig: any
       
       mwRows.push([
         p.Matnr || '',
-        norm.value,
+        norm.value || '',
         p.PFNum.toFixed(2).replace('.', ','),
         String(leadTimeToShip),
         String(Math.min(stockResult.exportQty, 99))
-      ].join(';'));
+      ]);
     }
     
-    const mwCSV = [headers.join(';'), ...mwRows].join('\n');
-    const saveResult = await uploadToStorage(supabase, 'exports', 'Export Mediaworld.csv', mwCSV, 'text/csv');
+    // Generate XLSX buffer
+    const xlsxBuffer = createXLSXBuffer(headers, mwRows);
+    const saveResult = await uploadToStorage(supabase, 'exports', 'Export Mediaworld.xlsx', xlsxBuffer, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     
     if (!saveResult.success) {
-      const error = `Failed to save Export Mediaworld.csv: ${saveResult.error}`;
+      const error = `Failed to save Export Mediaworld.xlsx: ${saveResult.error}`;
       await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
@@ -1320,7 +1343,7 @@ async function stepExportMediaworld(supabase: any, runId: string, feeConfig: any
     await updateLocationWarnings(supabase, runId, warnings);
     
     // Save export file path to sync_runs.steps.exports.files
-    await updateExportFilePath(supabase, runId, 'mediaworld', 'exports/Export Mediaworld.csv');
+    await updateExportFilePath(supabase, runId, 'mediaworld', 'exports/Export Mediaworld.xlsx');
     
     await updateStepResult(supabase, runId, 'export_mediaworld', {
       status: 'success', duration_ms: Date.now() - startTime, rows: mwRows.length, skipped: mwSkipped,
@@ -1392,7 +1415,7 @@ async function stepExportEprice(supabase: any, runId: string, feeConfig: any): P
       }
     }
     
-    const epRows: string[] = [];
+    const epRows: string[][] = [];
     let epSkipped = 0;
     const exportHeaders = ['sku', 'ean', 'price', 'quantity', 'leadtime'];
     
@@ -1415,24 +1438,25 @@ async function stepExportEprice(supabase: any, runId: string, feeConfig: any): P
       
       epRows.push([
         p.Matnr || '',
-        norm.value,
+        norm.value || '',
         p.PFNum.toFixed(2).replace('.', ','),
         String(Math.min(stockResult.exportQty, 99)),
         String(stockResult.leadDays)  // ePrice: no +2
-      ].join(';'));
+      ]);
     }
     
-    const epCSV = [exportHeaders.join(';'), ...epRows].join('\n');
-    const saveResult = await uploadToStorage(supabase, 'exports', 'Export ePrice.csv', epCSV, 'text/csv');
+    // Generate XLSX buffer
+    const xlsxBuffer = createXLSXBuffer(exportHeaders, epRows);
+    const saveResult = await uploadToStorage(supabase, 'exports', 'Export ePrice.xlsx', xlsxBuffer, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     
     if (!saveResult.success) {
-      const error = `Failed to save Export ePrice.csv: ${saveResult.error}`;
+      const error = `Failed to save Export ePrice.xlsx: ${saveResult.error}`;
       await updateStepResult(supabase, runId, 'export_eprice', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
     
     // Save export file path to sync_runs.steps.exports.files
-    await updateExportFilePath(supabase, runId, 'eprice', 'exports/Export ePrice.csv');
+    await updateExportFilePath(supabase, runId, 'eprice', 'exports/Export ePrice.xlsx');
     
     await updateStepResult(supabase, runId, 'export_eprice', {
       status: 'success', duration_ms: Date.now() - startTime, rows: epRows.length, skipped: epSkipped,
