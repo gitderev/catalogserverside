@@ -7,9 +7,6 @@ import {
   type StockLocationWarnings
 } from './stockLocation';
 
-// Import the logistic offset constant from config component for single source of truth
-import { MEDIAWORLD_LOGISTIC_OFFSET_DAYS } from '@/components/StockLocationConfig';
-
 /**
  * Mediaworld Export Utility
  * 
@@ -23,9 +20,8 @@ import { MEDIAWORLD_LOGISTIC_OFFSET_DAYS } from '@/components/StockLocationConfi
  * 
  * IT/EU Stock Split: Uses resolveMarketplaceStock for quantity and lead time.
  * 
- * LEAD TIME: Mediaworld applies a logistic offset of +${MEDIAWORLD_LOGISTIC_OFFSET_DAYS} days
- * on top of preparation days. This offset is defined in StockLocationConfig
- * and applied exactly ONCE here during export.
+ * LEAD TIME: Mediaworld lead time = exactly stockResult.leadDays (NO offset).
+ * The value exported matches exactly the UI configuration (IT days or EU days).
  */
 
 // =====================================================================
@@ -525,24 +521,24 @@ export async function exportMediaworldCatalog({
       // Nota: Il limite superiore di 100000€ è stato rimosso.
       // Il controllo prezzoFinale <= 0 è già coperto sopra (linee 394-403).
       
-      // Log IT/EU stock calculation for first 10 records
-      if (index < 10) {
+      // Log IT/EU stock calculation for first 20 records (diagnostic: NO offset applied)
+      if (index < 20) {
         console.log(`%c[Mediaworld:export:IT_EU:row${index}]`, 'color: #00BCD4;', {
           EAN: ean,
           SKU: sku,
           stockIT, stockEU,
           includeEU: includeEu,
           exportQty: stockResult.exportQty,
-          baseLeadDays: stockResult.leadDays,
-          logisticOffset: MEDIAWORLD_LOGISTIC_OFFSET_DAYS,
-          finalLeadDays: stockResult.leadDays + MEDIAWORLD_LOGISTIC_OFFSET_DAYS,
-          source: stockResult.source
+          leadDays: stockResult.leadDays,
+          exportedLeadDays: stockResult.leadDays, // NO offset - exported value = calculated value
+          source: stockResult.source,
+          verification: 'exportedLeadDays === leadDays (no offset)'
         });
       }
       
-      // Calculate final lead time for Mediaworld: base lead days + logistic offset
-      // The offset is defined as a constant (MEDIAWORLD_LOGISTIC_OFFSET_DAYS) and applied exactly ONCE here
-      const mediaworldLeadDays = stockResult.leadDays + MEDIAWORLD_LOGISTIC_OFFSET_DAYS;
+      // Mediaworld lead time: EXACTLY stockResult.leadDays (NO offset)
+      // The exported value matches exactly the UI configuration
+      const mediaworldLeadDays = stockResult.leadDays;
       
       // Build row according to Mediaworld template mapping
       // All 22 columns in exact order, empty strings for unused fields
@@ -563,7 +559,7 @@ export async function exportMediaworldCatalog({
         prezzoFinale,                                // Col 14: Prezzo scontato → Prezzo Finale ESATTO (NUMBER)
         '',                                          // Col 15: Data di inizio dello sconto → vuoto
         '',                                          // Col 16: Data di termine dello sconto → vuoto
-        mediaworldLeadDays,                          // Col 17: Tempo preparazione spedizione → leadDays + 2 for Mediaworld
+        mediaworldLeadDays,                          // Col 17: Tempo preparazione spedizione → leadDays (NO offset)
         '',                                          // Col 18: Aggiorna/Cancella → vuoto
         'recommended-retail-price',                  // Col 19: Tipo prezzo barrato → fixed
         '',                                          // Col 20: Obbligo di ritiro RAEE → vuoto

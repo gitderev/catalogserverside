@@ -5,9 +5,6 @@ import { Switch } from '@/components/ui/switch';
 import { Card } from '@/components/ui/card';
 import type { FeeConfigState } from '@/types/feeConfig';
 
-// Mediaworld logistic offset: added once to lead time for all Mediaworld exports
-export const MEDIAWORLD_LOGISTIC_OFFSET_DAYS = 2;
-
 interface StockLocationConfigProps {
   config: FeeConfigState;
   onConfigChange: (updates: Partial<FeeConfigState>) => void;
@@ -20,17 +17,13 @@ interface StockLocationConfigProps {
  * Provides controls for IT/EU stock split configuration:
  * - Toggle for including EU stock (per marketplace)
  * - Preparation days for IT and EU (per marketplace)
- * - Shows calculated lead times with Mediaworld offset preview
+ * - Lead time exported = exactly the configured preparation days (NO offset)
  */
 const StockLocationConfig: React.FC<StockLocationConfigProps> = ({
   config,
   onConfigChange,
   disabled = false
 }) => {
-  // Calculate displayed lead times for Mediaworld (with offset)
-  const mediaworldItLeadTime = config.mediaworldItPreparationDays + MEDIAWORLD_LOGISTIC_OFFSET_DAYS;
-  const mediaworldEuLeadTime = config.mediaworldEuPreparationDays + MEDIAWORLD_LOGISTIC_OFFSET_DAYS;
-
   return (
     <div className="space-y-6">
       {/* Mediaworld Configuration */}
@@ -80,7 +73,7 @@ const StockLocationConfig: React.FC<StockLocationConfigProps> = ({
                 disabled={disabled}
               />
               <p className="text-xs text-green-600 mt-1">
-                Lead time export: <strong>{mediaworldItLeadTime}</strong> giorni (+{MEDIAWORLD_LOGISTIC_OFFSET_DAYS} offset)
+                Lead time export: <strong>{config.mediaworldItPreparationDays}</strong> giorni
               </p>
             </div>
             <div>
@@ -103,7 +96,7 @@ const StockLocationConfig: React.FC<StockLocationConfigProps> = ({
                 disabled={disabled}
               />
               <p className="text-xs text-blue-600 mt-1">
-                Lead time export: <strong>{mediaworldEuLeadTime}</strong> giorni (+{MEDIAWORLD_LOGISTIC_OFFSET_DAYS} offset)
+                Lead time export: <strong>{config.mediaworldEuPreparationDays}</strong> giorni
               </p>
             </div>
           </div>
@@ -190,8 +183,8 @@ const StockLocationConfig: React.FC<StockLocationConfigProps> = ({
       {/* Legend */}
       <div className="text-xs text-muted-foreground p-3 bg-gray-50 rounded-lg">
         <p><strong>Logica stock:</strong> Se IT ≥ 2 → usa IT; altrimenti se EU abilitato e IT+EU ≥ 2 → usa combinato con lead time EU</p>
-        <p className="mt-1"><strong>Mediaworld:</strong> lead time = giorni preparazione + {MEDIAWORLD_LOGISTIC_OFFSET_DAYS} offset logistico</p>
-        <p><strong>ePrice:</strong> lead time = giorni preparazione (senza offset aggiuntivo)</p>
+        <p className="mt-1"><strong>Mediaworld:</strong> lead time export = giorni preparazione configurati (nessun offset)</p>
+        <p><strong>ePrice:</strong> lead time export = giorni preparazione configurati (nessun offset)</p>
       </div>
     </div>
   );

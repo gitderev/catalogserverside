@@ -1257,8 +1257,9 @@ async function stepExportMediaworld(supabase: any, runId: string, feeConfig: any
       
       if (!stockResult.shouldExport) { mwSkipped++; continue; }
       
-      // Mediaworld server-side: leadtime-to-ship = leadDays + 2 (one time only)
-      const leadTimeToShip = stockResult.leadDays + 2;
+      // Mediaworld server-side: leadtime-to-ship = stockResult.leadDays (NO offset)
+      // The exported value matches exactly the UI configuration
+      const leadTimeToShip = stockResult.leadDays;
       
       mwRows.push([
         p.Matnr || '',
