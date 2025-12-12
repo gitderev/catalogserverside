@@ -149,47 +149,90 @@ interface GoldenCase {
   expectedExportQty: number;
   expectedShouldExport: boolean;
   expectedSource: 'IT' | 'EU_FALLBACK' | 'NONE';
+  expectedLeadSource: 'IT' | 'EU';  // Which days should be used
 }
 
 const GOLDEN_CASES: GoldenCase[] = [
   // includeEU ON
-  { stockIT: 2, stockEU: 10, includeEU: true, expectedExportQty: 2, expectedShouldExport: true, expectedSource: 'IT' },
-  { stockIT: 1, stockEU: 1, includeEU: true, expectedExportQty: 2, expectedShouldExport: true, expectedSource: 'EU_FALLBACK' },
-  { stockIT: 1, stockEU: 0, includeEU: true, expectedExportQty: 1, expectedShouldExport: false, expectedSource: 'NONE' },
-  { stockIT: 0, stockEU: 2, includeEU: true, expectedExportQty: 2, expectedShouldExport: true, expectedSource: 'EU_FALLBACK' },
+  { stockIT: 2, stockEU: 10, includeEU: true, expectedExportQty: 2, expectedShouldExport: true, expectedSource: 'IT', expectedLeadSource: 'IT' },
+  { stockIT: 1, stockEU: 1, includeEU: true, expectedExportQty: 2, expectedShouldExport: true, expectedSource: 'EU_FALLBACK', expectedLeadSource: 'EU' },
+  { stockIT: 1, stockEU: 0, includeEU: true, expectedExportQty: 1, expectedShouldExport: false, expectedSource: 'NONE', expectedLeadSource: 'IT' },
+  { stockIT: 0, stockEU: 2, includeEU: true, expectedExportQty: 2, expectedShouldExport: true, expectedSource: 'EU_FALLBACK', expectedLeadSource: 'EU' },
   // includeEU OFF
-  { stockIT: 2, stockEU: 0, includeEU: false, expectedExportQty: 2, expectedShouldExport: true, expectedSource: 'IT' },
-  { stockIT: 1, stockEU: 10, includeEU: false, expectedExportQty: 1, expectedShouldExport: false, expectedSource: 'NONE' },
+  { stockIT: 2, stockEU: 0, includeEU: false, expectedExportQty: 2, expectedShouldExport: true, expectedSource: 'IT', expectedLeadSource: 'IT' },
+  { stockIT: 1, stockEU: 10, includeEU: false, expectedExportQty: 1, expectedShouldExport: false, expectedSource: 'NONE', expectedLeadSource: 'IT' },
 ];
+
+export interface GoldenCaseResult {
+  caseIndex: number;
+  input: { stockIT: number; stockEU: number; includeEU: boolean };
+  expected: { qty: number; shouldExport: boolean; leadSource: string };
+  actual: { qty: number; shouldExport: boolean; leadDays: number; source: string };
+  passed: boolean;
+}
 
 /**
  * Validates resolveMarketplaceStock against known golden cases.
- * Logs mismatches but does NOT fail the pipeline.
+ * Logs PASS/FAIL for each case but does NOT fail the pipeline.
+ * Returns detailed results for inspection.
  * 
  * @param logPrefix Prefix for log messages (e.g., "[client]" or "[server]")
+ * @param daysIT IT lead time in days (default: 2)
+ * @param daysEU EU lead time in days (default: 5)
+ * @returns Array of test results with PASS/FAIL status
  */
-export function validateGoldenCases(logPrefix: string): void {
-  const daysIT = 2;
-  const daysEU = 5;
+export function validateGoldenCases(logPrefix: string, daysIT: number = 2, daysEU: number = 5): GoldenCaseResult[] {
+  const results: GoldenCaseResult[] = [];
   
-  for (const tc of GOLDEN_CASES) {
+  console.log(`%c${logPrefix} ========== GOLDEN CASES VALIDATION START ==========`, 'color: #6366f1; font-weight: bold;');
+  
+  for (let i = 0; i < GOLDEN_CASES.length; i++) {
+    const tc = GOLDEN_CASES[i];
     const result = resolveMarketplaceStock(tc.stockIT, tc.stockEU, tc.includeEU, daysIT, daysEU);
     
-    const mismatch = 
-      result.exportQty !== tc.expectedExportQty ||
-      result.shouldExport !== tc.expectedShouldExport ||
-      result.source !== tc.expectedSource;
+    // Check all expected values
+    const qtyMatch = result.exportQty === tc.expectedExportQty;
+    const exportMatch = result.shouldExport === tc.expectedShouldExport;
+    const sourceMatch = result.source === tc.expectedSource;
     
-    if (mismatch) {
-      console.error(`${logPrefix} GOLDEN CASE MISMATCH:`, {
-        input: { stockIT: tc.stockIT, stockEU: tc.stockEU, includeEU: tc.includeEU },
-        expected: { exportQty: tc.expectedExportQty, shouldExport: tc.expectedShouldExport, source: tc.expectedSource },
-        actual: { exportQty: result.exportQty, shouldExport: result.shouldExport, source: result.source }
-      });
-    }
+    // Check lead days match expected source
+    const expectedLeadDays = tc.expectedLeadSource === 'IT' ? daysIT : daysEU;
+    const leadMatch = !tc.expectedShouldExport || result.leadDays === expectedLeadDays;
+    
+    const passed = qtyMatch && exportMatch && sourceMatch && leadMatch;
+    
+    const caseResult: GoldenCaseResult = {
+      caseIndex: i + 1,
+      input: { stockIT: tc.stockIT, stockEU: tc.stockEU, includeEU: tc.includeEU },
+      expected: { qty: tc.expectedExportQty, shouldExport: tc.expectedShouldExport, leadSource: tc.expectedLeadSource },
+      actual: { qty: result.exportQty, shouldExport: result.shouldExport, leadDays: result.leadDays, source: result.source },
+      passed
+    };
+    
+    results.push(caseResult);
+    
+    // Log result with PASS/FAIL status
+    const status = passed ? 'PASS' : 'FAIL';
+    const color = passed ? 'color: #22c55e;' : 'color: #ef4444; font-weight: bold;';
+    
+    console.log(
+      `%c${logPrefix} Case ${i + 1}: ${status}`,
+      color,
+      `| IT=${tc.stockIT} EU=${tc.stockEU} includeEU=${tc.includeEU}`,
+      `→ qty=${result.exportQty} lead=${result.leadDays} export=${result.shouldExport} source=${result.source}`,
+      passed ? '' : `(expected: qty=${tc.expectedExportQty} lead=${expectedLeadDays} export=${tc.expectedShouldExport})`
+    );
   }
   
-  console.log(`${logPrefix} Golden cases validation completed`);
+  const passCount = results.filter(r => r.passed).length;
+  const failCount = results.length - passCount;
+  
+  console.log(
+    `%c${logPrefix} ========== GOLDEN CASES VALIDATION END: ${passCount}/${results.length} PASSED, ${failCount} FAILED ==========`,
+    failCount > 0 ? 'color: #ef4444; font-weight: bold;' : 'color: #22c55e; font-weight: bold;'
+  );
+  
+  return results;
 }
 
 // ============================================================

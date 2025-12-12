@@ -25,6 +25,8 @@ const corsHeaders = {
  * - export_ean: Generazione catalogo EAN
  * - export_mediaworld: Generazione export Mediaworld
  * - export_eprice: Generazione export ePrice
+ * 
+ * IT/EU Stock Split: Uses resolveMarketplaceStock with golden cases validation
  */
 
 // ========== CONFIGURAZIONE CHUNKING ==========
@@ -33,6 +35,134 @@ const CHUNK_SIZE = 5000; // Righe di material file processate per ogni invocazio
 const PRODUCTS_FILE_PATH = '_pipeline/products.tsv';
 const PARTIAL_PRODUCTS_FILE_PATH = '_pipeline/partial_products.tsv';
 const EAN_CATALOG_FILE_PATH = '_pipeline/ean_catalog.tsv';
+
+// ========== LOCATION ID CONSTANTS ==========
+const LOCATION_ID_IT = 4242;
+const LOCATION_ID_EU = 4254;
+const LOCATION_ID_EU_DUPLICATE = 4255; // Ignored in calculations
+
+// ========== STOCK LOCATION WARNINGS TYPE ==========
+interface StockLocationWarnings {
+  missing_location_file: number;
+  invalid_location_parse: number;
+  missing_location_data: number;
+  split_mismatch: number;
+  multi_mpn_per_matnr: number;
+  orphan_4255: number;
+  decode_fallback_used: number;
+  invalid_stock_value: number;
+}
+
+function createEmptyWarnings(): StockLocationWarnings {
+  return {
+    missing_location_file: 0,
+    invalid_location_parse: 0,
+    missing_location_data: 0,
+    split_mismatch: 0,
+    multi_mpn_per_matnr: 0,
+    orphan_4255: 0,
+    decode_fallback_used: 0,
+    invalid_stock_value: 0
+  };
+}
+
+// ========== RESOLVE MARKETPLACE STOCK - PURE FUNCTION ==========
+interface ResolveMarketplaceStockResult {
+  exportQty: number;
+  leadDays: number;
+  shouldExport: boolean;
+  source: 'IT' | 'EU_FALLBACK' | 'NONE';
+}
+
+function resolveMarketplaceStock(
+  stockIT: number,
+  stockEU: number,
+  includeEU: boolean,
+  daysIT: number,
+  daysEU: number
+): ResolveMarketplaceStockResult {
+  if (!includeEU) {
+    const exportQty = stockIT;
+    const shouldExport = exportQty >= 2;
+    return {
+      exportQty,
+      leadDays: shouldExport ? daysIT : 0,
+      shouldExport,
+      source: shouldExport ? 'IT' : 'NONE'
+    };
+  }
+  if (stockIT >= 2) {
+    return { exportQty: stockIT, leadDays: daysIT, shouldExport: true, source: 'IT' };
+  }
+  const combined = stockIT + stockEU;
+  const shouldExport = combined >= 2;
+  return {
+    exportQty: combined,
+    leadDays: shouldExport ? daysEU : 0,
+    shouldExport,
+    source: shouldExport ? 'EU_FALLBACK' : 'NONE'
+  };
+}
+
+// ========== GOLDEN CASES VALIDATION ==========
+interface GoldenCase {
+  stockIT: number;
+  stockEU: number;
+  includeEU: boolean;
+  expectedExportQty: number;
+  expectedShouldExport: boolean;
+  expectedSource: 'IT' | 'EU_FALLBACK' | 'NONE';
+  expectedLeadSource: 'IT' | 'EU';
+}
+
+const GOLDEN_CASES: GoldenCase[] = [
+  { stockIT: 2, stockEU: 10, includeEU: true, expectedExportQty: 2, expectedShouldExport: true, expectedSource: 'IT', expectedLeadSource: 'IT' },
+  { stockIT: 1, stockEU: 1, includeEU: true, expectedExportQty: 2, expectedShouldExport: true, expectedSource: 'EU_FALLBACK', expectedLeadSource: 'EU' },
+  { stockIT: 1, stockEU: 0, includeEU: true, expectedExportQty: 1, expectedShouldExport: false, expectedSource: 'NONE', expectedLeadSource: 'IT' },
+  { stockIT: 0, stockEU: 2, includeEU: true, expectedExportQty: 2, expectedShouldExport: true, expectedSource: 'EU_FALLBACK', expectedLeadSource: 'EU' },
+  { stockIT: 2, stockEU: 0, includeEU: false, expectedExportQty: 2, expectedShouldExport: true, expectedSource: 'IT', expectedLeadSource: 'IT' },
+  { stockIT: 1, stockEU: 10, includeEU: false, expectedExportQty: 1, expectedShouldExport: false, expectedSource: 'NONE', expectedLeadSource: 'IT' },
+];
+
+function validateGoldenCases(logPrefix: string, daysIT: number = 2, daysEU: number = 5): { passed: number; failed: number } {
+  let passed = 0;
+  let failed = 0;
+  console.log(`${logPrefix} ========== GOLDEN CASES VALIDATION START ==========`);
+  
+  for (let i = 0; i < GOLDEN_CASES.length; i++) {
+    const tc = GOLDEN_CASES[i];
+    const result = resolveMarketplaceStock(tc.stockIT, tc.stockEU, tc.includeEU, daysIT, daysEU);
+    const expectedLeadDays = tc.expectedLeadSource === 'IT' ? daysIT : daysEU;
+    
+    const qtyMatch = result.exportQty === tc.expectedExportQty;
+    const exportMatch = result.shouldExport === tc.expectedShouldExport;
+    const sourceMatch = result.source === tc.expectedSource;
+    const leadMatch = !tc.expectedShouldExport || result.leadDays === expectedLeadDays;
+    
+    const success = qtyMatch && exportMatch && sourceMatch && leadMatch;
+    const status = success ? 'PASS' : 'FAIL';
+    
+    if (success) passed++; else failed++;
+    
+    console.log(
+      `${logPrefix} Case ${i + 1}: ${status} | IT=${tc.stockIT} EU=${tc.stockEU} includeEU=${tc.includeEU} → qty=${result.exportQty} lead=${result.leadDays} export=${result.shouldExport}`,
+      success ? '' : `(expected: qty=${tc.expectedExportQty} lead=${expectedLeadDays} export=${tc.expectedShouldExport})`
+    );
+  }
+  
+  console.log(`${logPrefix} ========== GOLDEN CASES VALIDATION END: ${passed}/${GOLDEN_CASES.length} PASSED, ${failed} FAILED ==========`);
+  return { passed, failed };
+}
+
+// ========== UPDATE LOCATION WARNINGS IN DB ==========
+async function updateLocationWarnings(supabase: any, runId: string, warnings: StockLocationWarnings): Promise<void> {
+  try {
+    await supabase.from('sync_runs').update({ location_warnings: warnings }).eq('id', runId);
+    console.log(`[sync-step-runner] Updated location_warnings for run ${runId}:`, warnings);
+  } catch (e) {
+    console.error(`[sync-step-runner] Failed to update location_warnings:`, e);
+  }
+}
 
 // ========== COLUMN ALIASES (case-insensitive matching) ==========
 const COLUMN_ALIASES: Record<string, string[]> = {
@@ -1019,13 +1149,15 @@ async function stepExportEan(supabase: any, runId: string): Promise<{ success: b
 
 // ========== STEP: EXPORT_MEDIAWORLD (with IT/EU stock support) ==========
 async function stepExportMediaworld(supabase: any, runId: string, feeConfig: any): Promise<{ success: boolean; error?: string }> {
-  const prepDays = feeConfig?.mediaworldItPrepDays || feeConfig?.mediaworldPrepDays || 3;
   const includeEu = feeConfig?.mediaworldIncludeEu || false;
   const itDays = feeConfig?.mediaworldItPrepDays || 3;
   const euDays = feeConfig?.mediaworldEuPrepDays || 5;
   
   console.log(`[sync:step:export_mediaworld] Starting for run ${runId}, IT days=${itDays}, EU days=${euDays}, includeEU=${includeEu}`);
   const startTime = Date.now();
+  
+  // Initialize warnings
+  const warnings = createEmptyWarnings();
   
   try {
     const { products, error: loadError } = await loadProductsTSV(supabase, runId);
@@ -1036,10 +1168,14 @@ async function stepExportMediaworld(supabase: any, runId: string, feeConfig: any
       return { success: false, error };
     }
     
-    // Load stock location index from per-run file
+    // Load stock location index from per-run file with robust parsing
     let stockLocationIndex: Record<string, { stockIT: number; stockEU: number }> | null = null;
     const stockLocationPath = `stock-location/runs/${runId}.txt`;
     const { content: stockLocationContent } = await downloadFromStorage(supabase, 'ftp-import', stockLocationPath);
+    
+    // Track 4255 vs 4254 entries for orphan detection
+    const entries4254 = new Set<string>();
+    const entries4255 = new Set<string>();
     
     if (stockLocationContent) {
       stockLocationIndex = {};
@@ -1054,15 +1190,42 @@ async function stepExportMediaworld(supabase: any, runId: string, feeConfig: any
           const vals = lines[i].split(';');
           const matnr = vals[matnrIdx]?.trim();
           if (!matnr) continue;
-          const stock = parseInt(vals[stockIdx]) || 0;
+          
+          const stockRaw = vals[stockIdx]?.trim() || '0';
+          let stock = parseInt(stockRaw, 10);
+          if (isNaN(stock) || !Number.isFinite(stock)) {
+            stock = 0;
+            warnings.invalid_stock_value++;
+          }
+          
           const locationId = parseInt(vals[locationIdx]) || 0;
           
           if (!stockLocationIndex[matnr]) stockLocationIndex[matnr] = { stockIT: 0, stockEU: 0 };
-          if (locationId === 4242) stockLocationIndex[matnr].stockIT += stock;
-          else if (locationId === 4254) stockLocationIndex[matnr].stockEU += stock;
+          
+          if (locationId === LOCATION_ID_IT) {
+            stockLocationIndex[matnr].stockIT += stock;
+          } else if (locationId === LOCATION_ID_EU) {
+            stockLocationIndex[matnr].stockEU += stock;
+            entries4254.add(matnr);
+          } else if (locationId === LOCATION_ID_EU_DUPLICATE) {
+            // LocationID 4255 is ignored in calculations
+            entries4255.add(matnr);
+          }
         }
+        
+        // Check for orphan_4255 warnings
+        for (const matnr of entries4255) {
+          if (!entries4254.has(matnr)) {
+            warnings.orphan_4255++;
+          }
+        }
+        
         console.log(`[sync:step:export_mediaworld] Loaded stock location: ${Object.keys(stockLocationIndex).length} entries`);
+      } else {
+        warnings.invalid_location_parse++;
       }
+    } else {
+      warnings.missing_location_file++;
     }
     
     const mwRows: string[] = [];
@@ -1075,42 +1238,34 @@ async function stepExportMediaworld(supabase: any, runId: string, feeConfig: any
       if (!norm.ok) { mwSkipped++; continue; }
       if (!p.PFNum || p.PFNum <= 0) { mwSkipped++; continue; }
       
-      // IT/EU stock resolution
+      // IT/EU stock resolution using resolveMarketplaceStock
       let stockIT = p.Stock || 0;
       let stockEU = 0;
+      
       if (stockLocationIndex && stockLocationIndex[p.Matnr]) {
         stockIT = stockLocationIndex[p.Matnr].stockIT;
         stockEU = stockLocationIndex[p.Matnr].stockEU;
+      } else if (stockLocationIndex) {
+        // Matnr not found in location file - fallback StockIT=0 StockEU=0
+        warnings.missing_location_data++;
+        stockIT = 0;
+        stockEU = 0;
       }
+      // If stockLocationIndex is null (file missing), use fallback: stockIT = p.Stock, stockEU = 0
       
-      let exportQty: number, leadDays: number, shouldExport: boolean;
-      if (!includeEu) {
-        exportQty = stockIT;
-        shouldExport = exportQty >= 2;
-        leadDays = shouldExport ? itDays : 0;
-      } else {
-        if (stockIT >= 2) {
-          exportQty = stockIT;
-          leadDays = itDays;
-          shouldExport = true;
-        } else {
-          exportQty = stockIT + stockEU;
-          shouldExport = exportQty >= 2;
-          leadDays = shouldExport ? euDays : 0;
-        }
-      }
+      const stockResult = resolveMarketplaceStock(stockIT, stockEU, includeEu, itDays, euDays);
       
-      if (!shouldExport) { mwSkipped++; continue; }
+      if (!stockResult.shouldExport) { mwSkipped++; continue; }
       
-      // Mediaworld server-side: leadtime-to-ship = leadDays + 2
-      const leadTimeToShip = leadDays + 2;
+      // Mediaworld server-side: leadtime-to-ship = leadDays + 2 (one time only)
+      const leadTimeToShip = stockResult.leadDays + 2;
       
       mwRows.push([
         p.Matnr || '',
         norm.value,
         p.PFNum.toFixed(2).replace('.', ','),
         String(leadTimeToShip),
-        String(Math.min(exportQty, 99))
+        String(Math.min(stockResult.exportQty, 99))
       ].join(';'));
     }
     
@@ -1123,12 +1278,15 @@ async function stepExportMediaworld(supabase: any, runId: string, feeConfig: any
       return { success: false, error };
     }
     
+    // Update location_warnings in sync_runs
+    await updateLocationWarnings(supabase, runId, warnings);
+    
     await updateStepResult(supabase, runId, 'export_mediaworld', {
       status: 'success', duration_ms: Date.now() - startTime, rows: mwRows.length, skipped: mwSkipped,
       metrics: { mediaworld_export_rows: mwRows.length, mediaworld_export_skipped: mwSkipped }
     });
     
-    console.log(`[sync:step:export_mediaworld] Completed: ${mwRows.length} rows, ${mwSkipped} skipped`);
+    console.log(`[sync:step:export_mediaworld] Completed: ${mwRows.length} rows, ${mwSkipped} skipped, warnings:`, warnings);
     return { success: true };
     
   } catch (e: any) {
@@ -1193,7 +1351,7 @@ async function stepExportEprice(supabase: any, runId: string, feeConfig: any): P
       if (!norm.ok) { epSkipped++; continue; }
       if (!p.PFNum || p.PFNum <= 0) { epSkipped++; continue; }
       
-      // IT/EU stock resolution (same logic as Mediaworld but without +2)
+      // IT/EU stock resolution using resolveMarketplaceStock (no +2 for ePrice)
       let stockIT = p.Stock || 0;
       let stockEU = 0;
       if (stockLocationIndex && stockLocationIndex[p.Matnr]) {
@@ -1201,31 +1359,16 @@ async function stepExportEprice(supabase: any, runId: string, feeConfig: any): P
         stockEU = stockLocationIndex[p.Matnr].stockEU;
       }
       
-      let exportQty: number, leadDays: number, shouldExport: boolean;
-      if (!includeEu) {
-        exportQty = stockIT;
-        shouldExport = exportQty >= 2;
-        leadDays = shouldExport ? itDays : 0;
-      } else {
-        if (stockIT >= 2) {
-          exportQty = stockIT;
-          leadDays = itDays;
-          shouldExport = true;
-        } else {
-          exportQty = stockIT + stockEU;
-          shouldExport = exportQty >= 2;
-          leadDays = shouldExport ? euDays : 0;
-        }
-      }
+      const stockResult = resolveMarketplaceStock(stockIT, stockEU, includeEu, itDays, euDays);
       
-      if (!shouldExport) { epSkipped++; continue; }
+      if (!stockResult.shouldExport) { epSkipped++; continue; }
       
       epRows.push([
         p.Matnr || '',
         norm.value,
         p.PFNum.toFixed(2).replace('.', ','),
-        String(Math.min(exportQty, 99)),
-        String(leadDays)  // ePrice: no +2
+        String(Math.min(stockResult.exportQty, 99)),
+        String(stockResult.leadDays)  // ePrice: no +2
       ].join(';'));
     }
     
@@ -1277,6 +1420,13 @@ serve(async (req) => {
     console.log(`[sync-step-runner] ========================================`);
     console.log(`[sync-step-runner] Executing step: ${step} for run: ${run_id}`);
     console.log(`[sync-step-runner] ========================================`);
+    
+    // Run golden cases validation on first step (parse_merge) for debugging
+    if (step === 'parse_merge') {
+      const itDays = fee_config?.mediaworldItPrepDays || 3;
+      const euDays = fee_config?.mediaworldEuPrepDays || 5;
+      validateGoldenCases('[server]', itDays, euDays);
+    }
     
     let result: { success: boolean; error?: string; status?: string };
     
