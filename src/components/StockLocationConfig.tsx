@@ -5,6 +5,9 @@ import { Switch } from '@/components/ui/switch';
 import { Card } from '@/components/ui/card';
 import type { FeeConfigState } from '@/types/feeConfig';
 
+// Mediaworld logistic offset: added once to lead time for all Mediaworld exports
+export const MEDIAWORLD_LOGISTIC_OFFSET_DAYS = 2;
+
 interface StockLocationConfigProps {
   config: FeeConfigState;
   onConfigChange: (updates: Partial<FeeConfigState>) => void;
@@ -17,12 +20,17 @@ interface StockLocationConfigProps {
  * Provides controls for IT/EU stock split configuration:
  * - Toggle for including EU stock (per marketplace)
  * - Preparation days for IT and EU (per marketplace)
+ * - Shows calculated lead times with Mediaworld offset preview
  */
 const StockLocationConfig: React.FC<StockLocationConfigProps> = ({
   config,
   onConfigChange,
   disabled = false
 }) => {
+  // Calculate displayed lead times for Mediaworld (with offset)
+  const mediaworldItLeadTime = config.mediaworldItPreparationDays + MEDIAWORLD_LOGISTIC_OFFSET_DAYS;
+  const mediaworldEuLeadTime = config.mediaworldEuPreparationDays + MEDIAWORLD_LOGISTIC_OFFSET_DAYS;
+
   return (
     <div className="space-y-6">
       {/* Mediaworld Configuration */}
@@ -31,13 +39,15 @@ const StockLocationConfig: React.FC<StockLocationConfigProps> = ({
         
         <div className="space-y-4">
           {/* Include EU Toggle */}
-          <div className="flex items-center justify-between">
+          <div className="flex items-center justify-between p-3 rounded-lg bg-amber-50">
             <div>
               <Label htmlFor="mediaworld-include-eu" className="text-sm font-medium">
-                Includi stock EU come fallback
+                Includi magazzino EU per Mediaworld
               </Label>
               <p className="text-xs text-muted-foreground mt-1">
-                Se attivo, usa stock EU quando IT &lt; 2
+                {config.mediaworldIncludeEu 
+                  ? '✅ Stock EU abilitato: se IT < 2 usa IT+EU combinato'
+                  : '⚠️ Solo stock IT: prodotti EU-only saranno esclusi'}
               </p>
             </div>
             <Switch
@@ -69,6 +79,9 @@ const StockLocationConfig: React.FC<StockLocationConfigProps> = ({
                 className="w-full mt-1"
                 disabled={disabled}
               />
+              <p className="text-xs text-green-600 mt-1">
+                Lead time export: <strong>{mediaworldItLeadTime}</strong> giorni (+{MEDIAWORLD_LOGISTIC_OFFSET_DAYS} offset)
+              </p>
             </div>
             <div>
               <Label htmlFor="mediaworld-eu-days" className="text-sm font-medium">
@@ -89,6 +102,9 @@ const StockLocationConfig: React.FC<StockLocationConfigProps> = ({
                 className="w-full mt-1"
                 disabled={disabled}
               />
+              <p className="text-xs text-blue-600 mt-1">
+                Lead time export: <strong>{mediaworldEuLeadTime}</strong> giorni (+{MEDIAWORLD_LOGISTIC_OFFSET_DAYS} offset)
+              </p>
             </div>
           </div>
         </div>
@@ -100,13 +116,15 @@ const StockLocationConfig: React.FC<StockLocationConfigProps> = ({
         
         <div className="space-y-4">
           {/* Include EU Toggle */}
-          <div className="flex items-center justify-between">
+          <div className="flex items-center justify-between p-3 rounded-lg bg-blue-50">
             <div>
               <Label htmlFor="eprice-include-eu" className="text-sm font-medium">
-                Includi stock EU come fallback
+                Includi magazzino EU per ePrice
               </Label>
               <p className="text-xs text-muted-foreground mt-1">
-                Se attivo, usa stock EU quando IT &lt; 2
+                {config.epriceIncludeEu 
+                  ? '✅ Stock EU abilitato: se IT < 2 usa IT+EU combinato'
+                  : '⚠️ Solo stock IT: prodotti EU-only saranno esclusi'}
               </p>
             </div>
             <Switch
@@ -138,6 +156,9 @@ const StockLocationConfig: React.FC<StockLocationConfigProps> = ({
                 className="w-full mt-1"
                 disabled={disabled}
               />
+              <p className="text-xs text-green-600 mt-1">
+                Lead time export: <strong>{config.epriceItPreparationDays}</strong> giorni (no offset)
+              </p>
             </div>
             <div>
               <Label htmlFor="eprice-eu-days" className="text-sm font-medium">
@@ -158,10 +179,20 @@ const StockLocationConfig: React.FC<StockLocationConfigProps> = ({
                 className="w-full mt-1"
                 disabled={disabled}
               />
+              <p className="text-xs text-blue-600 mt-1">
+                Lead time export: <strong>{config.epriceEuPreparationDays}</strong> giorni (no offset)
+              </p>
             </div>
           </div>
         </div>
       </Card>
+
+      {/* Legend */}
+      <div className="text-xs text-muted-foreground p-3 bg-gray-50 rounded-lg">
+        <p><strong>Logica stock:</strong> Se IT ≥ 2 → usa IT; altrimenti se EU abilitato e IT+EU ≥ 2 → usa combinato con lead time EU</p>
+        <p className="mt-1"><strong>Mediaworld:</strong> lead time = giorni preparazione + {MEDIAWORLD_LOGISTIC_OFFSET_DAYS} offset logistico</p>
+        <p><strong>ePrice:</strong> lead time = giorni preparazione (senza offset aggiuntivo)</p>
+      </div>
     </div>
   );
 };

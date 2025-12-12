@@ -2465,10 +2465,23 @@ const AltersideCatalogGenerator: React.FC = () => {
     }
     
     setIsExportingEAN(true);
+    const exportStartTime = performance.now();
     dbg('excel:write:start');
     
     // RESET WARNINGS at start of each manual run
     setStockLocationWarnings(EMPTY_WARNINGS);
+    
+    // TIMEOUT WATCHDOG: 120 seconds max for EAN export
+    const EXPORT_TIMEOUT_MS = 120000;
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+    let isTimedOut = false;
+    
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutId = setTimeout(() => {
+        isTimedOut = true;
+        reject(new Error('Generazione Excel in timeout (>120s). Verifica la console per dettagli.'));
+      }, EXPORT_TIMEOUT_MS);
+    });
     
     // DIAGNOSTIC: Log IT/EU config being used for EAN export
     console.log('%c[onExportEAN:IT_EU_Config]', 'color: #9C27B0; font-weight: bold;', {
@@ -2557,11 +2570,43 @@ const AltersideCatalogGenerator: React.FC = () => {
       
       if (dataIsAlreadyFormatted) {
         // FONTE UNICA: eanCatalogDataset è già filtrato, validato e con override applicato
-        finalDataset = eanFilteredData;
-        console.log('%c[onExportEAN:SKIP-CREATION] Uso dataset già formattato', 'color: #4CAF50; font-weight: bold;', {
+        // CRITICAL: Ensure StockIT/StockEU are populated for each row
+        finalDataset = eanFilteredData.map((record: any) => {
+          // If StockIT/StockEU already present and numeric, use them
+          if (typeof record.StockIT === 'number' && typeof record.StockEU === 'number') {
+            return record;
+          }
+          
+          // Otherwise, calculate from stockLocationIndex
+          const matnr = record.Matnr || '';
+          const existingStock = Number(record.ExistingStock) || 0;
+          const localWarnings = createEmptyWarnings();
+          
+          const locationStock = getStockForMatnr(
+            stockLocationIndex,
+            matnr,
+            existingStock,
+            localWarnings,
+            true // useFallback
+          );
+          
+          // If no location file loaded, fallback: StockIT=ExistingStock, StockEU=0
+          const stockIT = stockLocationIndex ? locationStock.stockIT : existingStock;
+          const stockEU = stockLocationIndex ? locationStock.stockEU : 0;
+          
+          return {
+            ...record,
+            StockIT: stockIT,
+            StockEU: stockEU
+          };
+        });
+        
+        console.log('%c[onExportEAN:SKIP-CREATION] Uso dataset già formattato + StockIT/StockEU popolati', 'color: #4CAF50; font-weight: bold;', {
           rows: finalDataset.length,
           sample_EAN: finalDataset[0]?.EAN,
-          sample_PrezzoFinale: finalDataset[0]?.['Prezzo Finale']
+          sample_PrezzoFinale: finalDataset[0]?.['Prezzo Finale'],
+          sample_StockIT: finalDataset[0]?.StockIT,
+          sample_StockEU: finalDataset[0]?.StockEU
         });
       } else {
         // FALLBACK: Crea dataset da currentProcessedData (prima esecuzione o stato non sincronizzato)
@@ -3327,15 +3372,39 @@ const AltersideCatalogGenerator: React.FC = () => {
       }
       
     } catch (error) {
-      dbg('excel:write:error', { message: error instanceof Error ? error.message : 'Unknown error' });
+      const exportEndTime = performance.now();
+      const durationMs = Math.round(exportEndTime - exportStartTime);
+      
+      dbg('excel:write:error', { 
+        message: error instanceof Error ? error.message : 'Unknown error',
+        durationMs,
+        isTimeout: isTimedOut
+      });
+      
+      console.error('%c[onExportEAN:ERROR]', 'color: red; font-weight: bold;', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+        durationMs,
+        isTimeout: isTimedOut,
+        timestamp: new Date().toISOString()
+      });
+      
       toast({
-        title: "Errore durante l'export",
-        description: error instanceof Error ? error.message : "Errore sconosciuto"
+        title: isTimedOut ? "Timeout generazione Excel" : "Errore durante l'export",
+        description: error instanceof Error ? error.message : "Errore sconosciuto",
+        variant: "destructive"
       });
     } finally {
+      // Clear timeout watchdog
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+      
+      const finalDuration = Math.round(performance.now() - exportStartTime);
+      dbg('excel:write:finally', { durationMs: finalDuration });
+      
       setIsExportingEAN(false);
     }
-  }, [eanCatalogDataset, currentProcessedData, isExportingEAN, feeConfig, prepDays, prepDaysMediaworld, dbg, toast, extendedFeeConfig, stockLocationIndex]);
+  }, [eanCatalogDataset, currentProcessedData, isExportingEAN, feeConfig, prepDays, prepDaysMediaworld, dbg, toast, extendedFeeConfig, stockLocationIndex, stockLocationWarnings]);
 
   // =====================================================================
   // TEMPLATE EPRICE UFFICIALE: Struttura e validazione
