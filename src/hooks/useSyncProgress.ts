@@ -7,6 +7,7 @@ export type SyncStatus = 'idle' | 'starting' | 'running' | 'success' | 'failed' 
 export interface SyncStep {
   status: string;
   error?: string;
+  details?: Record<string, any>;
   rows?: number;
   duration_ms?: number;
 }
@@ -23,6 +24,7 @@ export interface SyncRunState {
   currentStep: string;
   steps: Record<string, SyncStep>;
   errorMessage: string | null;
+  errorDetails: Record<string, any> | null;
   runtimeMs: number | null;
   locationWarnings: Record<string, number>;
   startedAt: Date | null;
@@ -36,6 +38,7 @@ const INITIAL_STATE: SyncRunState = {
   currentStep: '',
   steps: {},
   errorMessage: null,
+  errorDetails: null,
   runtimeMs: null,
   locationWarnings: {},
   startedAt: null,
@@ -44,6 +47,9 @@ const INITIAL_STATE: SyncRunState = {
 };
 
 const POLL_INTERVAL_MS = 2000;
+
+// All pipeline steps in order for UI display
+export const ALL_PIPELINE_STEPS = ['import_ftp', 'parse_merge', 'ean_mapping', 'pricing', 'export_ean', 'export_mediaworld', 'export_eprice', 'upload_sftp'];
 
 // Server-generated export files - paths retrieved from sync_runs.steps.exports.files
 export const EXPORT_FILES = {
@@ -72,7 +78,7 @@ export function useSyncProgress() {
     try {
       const { data, error } = await supabase
         .from('sync_runs')
-        .select('status, steps, error_message, runtime_ms, location_warnings, started_at, finished_at')
+        .select('status, steps, error_message, error_details, runtime_ms, location_warnings, started_at, finished_at')
         .eq('id', runId)
         .single();
 
@@ -93,6 +99,7 @@ export function useSyncProgress() {
         currentStep,
         steps: steps as Record<string, SyncStep>,
         errorMessage: data.error_message,
+        errorDetails: (data.error_details || null) as Record<string, any> | null,
         runtimeMs: data.runtime_ms,
         locationWarnings: (data.location_warnings || {}) as Record<string, number>,
         finishedAt: data.finished_at ? new Date(data.finished_at) : null,

@@ -28,6 +28,9 @@ const corsHeaders = {
 
 const MAX_PARSE_MERGE_CHUNKS = 100; // Safety limit: max chunks per parse_merge
 
+// All pipeline steps in order
+const ALL_STEPS = ['import_ftp', 'parse_merge', 'ean_mapping', 'pricing', 'export_ean', 'export_mediaworld', 'export_eprice', 'upload_sftp'];
+
 async function callStep(supabaseUrl: string, serviceKey: string, functionName: string, body: any): Promise<{ success: boolean; error?: string; data?: any }> {
   try {
     console.log(`[orchestrator] Calling ${functionName}...`);
@@ -97,17 +100,35 @@ async function isCancelRequested(supabase: any, runId: string): Promise<boolean>
   return data?.cancel_requested === true;
 }
 
+/**
+ * CRITICAL: updateRunSteps - Merges step updates without overwriting existing steps
+ * This prevents losing step results when updating current_step
+ */
+async function updateRunSteps(supabase: any, runId: string, partialSteps: Record<string, any>): Promise<void> {
+  const { data: run } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
+  const existingSteps = run?.steps || {};
+  const merged = { ...existingSteps, ...partialSteps };
+  await supabase.from('sync_runs').update({ steps: merged }).eq('id', runId);
+  console.log(`[orchestrator] Steps updated (merged): current_step=${partialSteps.current_step || 'unchanged'}`);
+}
+
 async function updateRun(supabase: any, runId: string, updates: any): Promise<void> {
   await supabase.from('sync_runs').update(updates).eq('id', runId);
 }
 
-async function finalizeRun(supabase: any, runId: string, status: string, startTime: number, errorMessage?: string): Promise<void> {
-  await supabase.from('sync_runs').update({
+async function finalizeRun(supabase: any, runId: string, status: string, startTime: number, errorMessage?: string, errorDetails?: any): Promise<void> {
+  const updates: any = {
     status, 
     finished_at: new Date().toISOString(), 
     runtime_ms: Date.now() - startTime,
     error_message: errorMessage || null
-  }).eq('id', runId);
+  };
+  
+  if (errorDetails) {
+    updates.error_details = errorDetails;
+  }
+  
+  await supabase.from('sync_runs').update(updates).eq('id', runId);
   console.log(`[orchestrator] Run ${runId} finalized: ${status}`);
 }
 
@@ -276,17 +297,24 @@ serve(async (req) => {
 
     runId = crypto.randomUUID();
     startTime = Date.now();
+    
+    // Initialize all steps as pending for UI visibility
+    const initialSteps: Record<string, any> = { current_step: 'import_ftp' };
+    for (const step of ALL_STEPS) {
+      initialSteps[step] = { status: 'pending' };
+    }
+    
     await supabase.from('sync_runs').insert({ 
       id: runId, started_at: new Date().toISOString(), status: 'running', 
       trigger_type: trigger, attempt: 1, 
-      steps: { current_step: 'import_ftp' }, 
+      steps: initialSteps, 
       metrics: {},
-      location_warnings: {}
+      location_warnings: {},
+      error_details: null
     });
     console.log(`[orchestrator] Run created: ${runId}`);
 
     // Return immediately with run_id so UI can start polling
-    // Use EdgeRuntime.waitUntil to continue processing in background
     const responseJson = JSON.stringify({ 
       run_id: runId, 
       queued: false, 
@@ -302,7 +330,7 @@ serve(async (req) => {
     const processPipeline = async () => {
       try {
         // ========== STEP 1: FTP Import (including stock location) ==========
-        await updateRun(supabase, runId!, { steps: { current_step: 'import_ftp' } });
+        await updateRunSteps(supabase, runId!, { current_step: 'import_ftp' });
         console.log('[orchestrator] === STEP 1: FTP Import ===');
         
         for (const fileType of ['material', 'stock', 'price', 'stockLocation']) {
@@ -317,7 +345,9 @@ serve(async (req) => {
           });
           
           if (!result.success && fileType !== 'stockLocation') {
-            await finalizeRun(supabase, runId!, 'failed', startTime, `FTP ${fileType}: ${result.error}`);
+            const errorDetails = { step: 'import_ftp', fileType, error: result.error };
+            await updateRunSteps(supabase, runId!, { import_ftp: { status: 'failed', error: result.error, details: errorDetails } });
+            await finalizeRun(supabase, runId!, 'failed', startTime, `FTP ${fileType}: ${result.error}`, errorDetails);
             return;
           }
           
@@ -329,9 +359,12 @@ serve(async (req) => {
             await supabase.from('sync_runs').update({ location_warnings: warnings }).eq('id', runId);
           }
         }
+        
+        // Mark import_ftp as completed
+        await updateRunSteps(supabase, runId!, { import_ftp: { status: 'completed' } });
 
         // ========== STEP 2: PARSE_MERGE (CHUNKED) ==========
-        await updateRun(supabase, runId!, { steps: { current_step: 'parse_merge' } });
+        await updateRunSteps(supabase, runId!, { current_step: 'parse_merge' });
         console.log('[orchestrator] === STEP 2: parse_merge (CHUNKED) ===');
         
         let parseMergeComplete = false;
@@ -351,14 +384,16 @@ serve(async (req) => {
           });
           
           if (!result.success) {
-            await finalizeRun(supabase, runId!, 'failed', startTime, `parse_merge chunk ${chunkCount}: ${result.error}`);
+            const errorDetails = { step: 'parse_merge', chunk: chunkCount, error: result.error };
+            await finalizeRun(supabase, runId!, 'failed', startTime, `parse_merge chunk ${chunkCount}: ${result.error}`, errorDetails);
             return;
           }
           
           const verification = await verifyStepCompleted(supabase, runId!, 'parse_merge');
           
           if (!verification.success) {
-            await finalizeRun(supabase, runId!, 'failed', startTime, verification.error || 'parse_merge verification failed');
+            const errorDetails = { step: 'parse_merge', chunk: chunkCount, verification_error: verification.error };
+            await finalizeRun(supabase, runId!, 'failed', startTime, verification.error || 'parse_merge verification failed', errorDetails);
             return;
           }
           
@@ -368,13 +403,15 @@ serve(async (req) => {
           } else if (verification.status === 'in_progress') {
             console.log(`[orchestrator] parse_merge in_progress, continuing to next chunk...`);
           } else {
-            await finalizeRun(supabase, runId!, 'failed', startTime, `parse_merge unexpected status: ${verification.status}`);
+            const errorDetails = { step: 'parse_merge', unexpected_status: verification.status };
+            await finalizeRun(supabase, runId!, 'failed', startTime, `parse_merge unexpected status: ${verification.status}`, errorDetails);
             return;
           }
         }
         
         if (!parseMergeComplete) {
-          await finalizeRun(supabase, runId!, 'failed', startTime, `parse_merge exceeded ${MAX_PARSE_MERGE_CHUNKS} chunks limit`);
+          const errorDetails = { step: 'parse_merge', chunks: chunkCount, limit: MAX_PARSE_MERGE_CHUNKS };
+          await finalizeRun(supabase, runId!, 'failed', startTime, `parse_merge exceeded ${MAX_PARSE_MERGE_CHUNKS} chunks limit`, errorDetails);
           return;
         }
 
@@ -387,7 +424,7 @@ serve(async (req) => {
             return;
           }
           
-          await updateRun(supabase, runId!, { steps: { current_step: step } });
+          await updateRunSteps(supabase, runId!, { current_step: step });
           console.log(`[orchestrator] === STEP: ${step} ===`);
           
           const result = await callStep(supabaseUrl, supabaseServiceKey, 'sync-step-runner', { 
@@ -398,7 +435,8 @@ serve(async (req) => {
           
           if (!result.success || !verification.success) {
             const error = result.error || verification.error || `Step ${step} fallito`;
-            await finalizeRun(supabase, runId!, 'failed', startTime, error);
+            const errorDetails = { step, call_error: result.error, verification_error: verification.error };
+            await finalizeRun(supabase, runId!, 'failed', startTime, error, errorDetails);
             return;
           }
         }
@@ -409,21 +447,45 @@ serve(async (req) => {
           return;
         }
         
-        await updateRun(supabase, runId!, { steps: { current_step: 'upload_sftp' } });
+        await updateRunSteps(supabase, runId!, { current_step: 'upload_sftp' });
         console.log('[orchestrator] === STEP 8: SFTP Upload ===');
         
-        const sftpResult = await callStep(supabaseUrl, supabaseServiceKey, 'upload-exports-to-sftp', {
-          files: [
-            { bucket: 'exports', path: 'Catalogo EAN.xlsx', filename: 'Catalogo EAN.xlsx' },
-            { bucket: 'exports', path: 'Export ePrice.xlsx', filename: 'Export ePrice.xlsx' },
-            { bucket: 'exports', path: 'Export Mediaworld.xlsx', filename: 'Export Mediaworld.xlsx' }
-          ]
-        });
+        // Read actual export file paths from sync_runs.steps.exports.files
+        const { data: runData } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
+        const exportFiles = runData?.steps?.exports?.files || {};
+        
+        // Build files array from actual paths, with fallback to legacy paths
+        const files = [
+          { 
+            bucket: 'exports', 
+            path: (exportFiles.ean || 'Catalogo EAN.xlsx').replace(/^exports\//, ''), 
+            filename: 'Catalogo EAN.xlsx' 
+          },
+          { 
+            bucket: 'exports', 
+            path: (exportFiles.eprice || 'Export ePrice.xlsx').replace(/^exports\//, ''), 
+            filename: 'Export ePrice.xlsx' 
+          },
+          { 
+            bucket: 'exports', 
+            path: (exportFiles.mediaworld || 'Export Mediaworld.xlsx').replace(/^exports\//, ''), 
+            filename: 'Export Mediaworld.xlsx' 
+          }
+        ];
+        
+        console.log(`[orchestrator] SFTP files from steps.exports.files:`, files.map(f => f.path));
+        
+        const sftpResult = await callStep(supabaseUrl, supabaseServiceKey, 'upload-exports-to-sftp', { files });
         
         if (!sftpResult.success) {
-          await finalizeRun(supabase, runId!, 'failed', startTime, `SFTP: ${sftpResult.error}`);
+          const errorDetails = { step: 'upload_sftp', files, error: sftpResult.error };
+          await updateRunSteps(supabase, runId!, { upload_sftp: { status: 'failed', error: sftpResult.error, details: errorDetails } });
+          await finalizeRun(supabase, runId!, 'failed', startTime, `SFTP: ${sftpResult.error}`, errorDetails);
           return;
         }
+        
+        // Mark upload_sftp as completed
+        await updateRunSteps(supabase, runId!, { upload_sftp: { status: 'completed' } });
 
         // ========== SUCCESS ==========
         await finalizeRun(supabase, runId!, 'success', startTime);
@@ -433,7 +495,8 @@ serve(async (req) => {
         console.error('[orchestrator] Pipeline error:', err);
         if (runId) {
           try {
-            await finalizeRun(supabase, runId, 'failed', startTime, err.message);
+            const errorDetails = { step: 'unknown', exception: err.message, stack: err.stack };
+            await finalizeRun(supabase, runId, 'failed', startTime, err.message, errorDetails);
           } catch (e) {
             console.error('[orchestrator] Failed to finalize:', e);
           }
@@ -458,7 +521,8 @@ serve(async (req) => {
     
     if (runId && supabase) {
       try {
-        await finalizeRun(supabase, runId, 'failed', startTime, err.message);
+        const errorDetails = { fatal: true, exception: err.message, stack: err.stack };
+        await finalizeRun(supabase, runId, 'failed', startTime, err.message, errorDetails);
       } catch (e) {
         console.error('[orchestrator] Failed to finalize:', e);
       }

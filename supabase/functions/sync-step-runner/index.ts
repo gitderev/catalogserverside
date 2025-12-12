@@ -33,9 +33,19 @@ const corsHeaders = {
 // ========== CONFIGURAZIONE CHUNKING ==========
 const CHUNK_SIZE = 5000; // Righe di material file processate per ogni invocazione
 
-const PRODUCTS_FILE_PATH = '_pipeline/products.tsv';
-const PARTIAL_PRODUCTS_FILE_PATH = '_pipeline/partial_products.tsv';
-const EAN_CATALOG_FILE_PATH = '_pipeline/ean_catalog.tsv';
+// Path functions for run_id-versioned intermediate files (avoids race conditions)
+function productsFilePath(runId: string): string { return `_pipeline/${runId}/products.tsv`; }
+function partialProductsFilePath(runId: string): string { return `_pipeline/${runId}/partial_products.tsv`; }
+function eanCatalogFilePath(runId: string): string { return `_pipeline/${runId}/ean_catalog.tsv`; }
+
+// Export file paths (per-run + latest)
+function exportEanPath(runId: string): string { return `runs/${runId}/Catalogo EAN.xlsx`; }
+function exportMediaworldPath(runId: string): string { return `runs/${runId}/Export Mediaworld.xlsx`; }
+function exportEpricePath(runId: string): string { return `runs/${runId}/Export ePrice.xlsx`; }
+
+// Legacy paths for fallback/compatibility
+const LEGACY_PRODUCTS_FILE_PATH = '_pipeline/products.tsv';
+const LEGACY_PARTIAL_PRODUCTS_FILE_PATH = '_pipeline/partial_products.tsv';
 
 // ========== LOCATION ID CONSTANTS ==========
 const LOCATION_ID_IT = 4242;
@@ -509,7 +519,7 @@ async function cleanupIndexFiles(supabase: any, runId: string): Promise<void> {
   await deleteFromStorage(supabase, PIPELINE_BUCKET, stockIndexPath(runId));
   await deleteFromStorage(supabase, PIPELINE_BUCKET, priceIndexPath(runId));
   await deleteFromStorage(supabase, PIPELINE_BUCKET, materialMetaPath(runId));
-  await deleteFromStorage(supabase, 'exports', PARTIAL_PRODUCTS_FILE_PATH);
+  await deleteFromStorage(supabase, 'exports', partialProductsFilePath(runId));
 }
 
 // ========== STEP: PARSE_MERGE (MULTI-PHASE CHUNKED VERSION) ==========
@@ -773,9 +783,9 @@ async function stepParseMerge(supabase: any, runId: string): Promise<{ success: 
         return { success: false, error, status: 'failed' };
       }
       
-      // Initialize partial products file with header
+      // Initialize partial products file with header (versioned by run_id)
       const headerTSV = 'Matnr\tMPN\tEAN\tDesc\tStock\tLP\tCBP\tSur\n';
-      await uploadToStorage(supabase, 'exports', PARTIAL_PRODUCTS_FILE_PATH, headerTSV, 'text/tab-separated-values');
+      await uploadToStorage(supabase, 'exports', partialProductsFilePath(runId), headerTSV, 'text/tab-separated-values');
       
       // Update state to chunked processing
       await updateParseMergeState(supabase, runId, {
@@ -882,11 +892,11 @@ async function stepParseMerge(supabase: any, runId: string): Promise<{ success: 
       
       console.log(`[parse_merge] Chunk processed: ${linesProcessed} lines, ${productCount - state.productCount} new products, total=${productCount}`);
       
-      // Append chunk to partial products file
+      // Append chunk to partial products file (versioned by run_id)
       if (chunkTSV.length > 0) {
-        const { content: existingContent } = await downloadFromStorage(supabase, 'exports', PARTIAL_PRODUCTS_FILE_PATH);
+        const { content: existingContent } = await downloadFromStorage(supabase, 'exports', partialProductsFilePath(runId));
         const updatedContent = (existingContent || '') + chunkTSV;
-        await uploadToStorage(supabase, 'exports', PARTIAL_PRODUCTS_FILE_PATH, updatedContent, 'text/tab-separated-values');
+        await uploadToStorage(supabase, 'exports', partialProductsFilePath(runId), updatedContent, 'text/tab-separated-values');
       }
       
       // Check if finished
@@ -895,10 +905,10 @@ async function stepParseMerge(supabase: any, runId: string): Promise<{ success: 
       if (isFinished) {
         console.log(`[parse_merge] All chunks processed, finalizing...`);
         
-        // Move partial to final products file
-        const { content: finalContent } = await downloadFromStorage(supabase, 'exports', PARTIAL_PRODUCTS_FILE_PATH);
+        // Move partial to final products file (versioned by run_id)
+        const { content: finalContent } = await downloadFromStorage(supabase, 'exports', partialProductsFilePath(runId));
         if (finalContent) {
-          await uploadToStorage(supabase, 'exports', PRODUCTS_FILE_PATH, finalContent, 'text/tab-separated-values');
+          await uploadToStorage(supabase, 'exports', productsFilePath(runId), finalContent, 'text/tab-separated-values');
         }
         
         // Cleanup intermediate files
@@ -945,9 +955,10 @@ async function stepParseMerge(supabase: any, runId: string): Promise<{ success: 
 
 // ========== HELPER: Load/Save Products ==========
 async function loadProductsTSV(supabase: any, runId: string): Promise<{ products: any[] | null; error?: string }> {
-  console.log(`[sync:products] Loading products for run ${runId} from exports/${PRODUCTS_FILE_PATH}`);
+  const path = productsFilePath(runId);
+  console.log(`[sync:products] Loading products for run ${runId} from exports/${path}`);
   
-  const { content, error } = await downloadFromStorage(supabase, 'exports', PRODUCTS_FILE_PATH);
+  const { content, error } = await downloadFromStorage(supabase, 'exports', path);
   
   if (error || !content) {
     console.error(`[sync:products] Failed to load products: ${error || 'empty content'}`);
@@ -974,12 +985,12 @@ async function loadProductsTSV(supabase: any, runId: string): Promise<{ products
   return { products };
 }
 
-async function saveProductsTSV(supabase: any, products: any[]): Promise<{ success: boolean; error?: string }> {
+async function saveProductsTSV(supabase: any, runId: string, products: any[]): Promise<{ success: boolean; error?: string }> {
   const lines = ['Matnr\tMPN\tEAN\tDesc\tStock\tLP\tCBP\tSur\tPF\tPFNum\tLPF'];
   for (const p of products) {
     lines.push(`${p.Matnr}\t${p.MPN}\t${p.EAN}\t${p.Desc}\t${p.Stock}\t${p.LP}\t${p.CBP}\t${p.Sur}\t${p.PF || ''}\t${p.PFNum || ''}\t${p.LPF || ''}`);
   }
-  return await uploadToStorage(supabase, 'exports', PRODUCTS_FILE_PATH, lines.join('\n'), 'text/tab-separated-values');
+  return await uploadToStorage(supabase, 'exports', productsFilePath(runId), lines.join('\n'), 'text/tab-separated-values');
 }
 
 // ========== STEP: EAN_MAPPING ==========
@@ -1200,17 +1211,18 @@ async function stepExportEan(supabase: any, runId: string): Promise<{ success: b
     // Generate XLSX buffer
     const xlsxBuffer = createXLSXBuffer(headers, eanRows);
     
-    // Save to exports bucket as XLSX
-    const saveResult = await uploadToStorage(supabase, 'exports', 'Catalogo EAN.xlsx', xlsxBuffer, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    // Save to exports bucket as XLSX (per-run path)
+    const eanPath = exportEanPath(runId);
+    const saveResult = await uploadToStorage(supabase, 'exports', eanPath, xlsxBuffer, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     
     if (!saveResult.success) {
-      const error = `Failed to save Catalogo EAN.xlsx: ${saveResult.error}`;
+      const error = `Failed to save ${eanPath}: ${saveResult.error}`;
       await updateStepResult(supabase, runId, 'export_ean', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
     
     // Save export file path to sync_runs.steps.exports.files
-    await updateExportFilePath(supabase, runId, 'ean', 'exports/Catalogo EAN.xlsx');
+    await updateExportFilePath(supabase, runId, 'ean', `exports/${eanPath}`);
     
     await updateStepResult(supabase, runId, 'export_ean', {
       status: 'success', duration_ms: Date.now() - startTime, rows: eanRows.length, skipped: eanSkipped,
@@ -1359,12 +1371,13 @@ async function stepExportMediaworld(supabase: any, runId: string, feeConfig: any
       ]);
     }
     
-    // Generate XLSX buffer
+    // Generate XLSX buffer (per-run path)
     const xlsxBuffer = createXLSXBuffer(headers, mwRows);
-    const saveResult = await uploadToStorage(supabase, 'exports', 'Export Mediaworld.xlsx', xlsxBuffer, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    const mwPath = exportMediaworldPath(runId);
+    const saveResult = await uploadToStorage(supabase, 'exports', mwPath, xlsxBuffer, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     
     if (!saveResult.success) {
-      const error = `Failed to save Export Mediaworld.xlsx: ${saveResult.error}`;
+      const error = `Failed to save ${mwPath}: ${saveResult.error}`;
       await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
@@ -1373,7 +1386,7 @@ async function stepExportMediaworld(supabase: any, runId: string, feeConfig: any
     await updateLocationWarnings(supabase, runId, warnings);
     
     // Save export file path to sync_runs.steps.exports.files
-    await updateExportFilePath(supabase, runId, 'mediaworld', 'exports/Export Mediaworld.xlsx');
+    await updateExportFilePath(supabase, runId, 'mediaworld', `exports/${mwPath}`);
     
     await updateStepResult(supabase, runId, 'export_mediaworld', {
       status: 'success', duration_ms: Date.now() - startTime, rows: mwRows.length, skipped: mwSkipped,
