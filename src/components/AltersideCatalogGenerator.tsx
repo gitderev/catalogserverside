@@ -5734,28 +5734,12 @@ const AltersideCatalogGenerator: React.FC = () => {
           </div>
         )}
 
-        {/* Action Buttons */}
+        {/* Action Buttons - EAN export removed (server-side only via ServerSyncPanel) */}
         {allFilesValid && (
           <div className="text-center">
             <h3 className="text-2xl font-bold mb-6">Azioni</h3>
             <div className="flex flex-wrap justify-center gap-6">
-              <button
-                onClick={() => processDataPipeline('EAN')}
-                disabled={!canProcess || isProcessing || pipelineRunning}
-                className={`btn btn-primary text-lg px-12 py-4 ${!canProcess || isProcessing || pipelineRunning ? 'is-disabled' : ''}`}
-              >
-                {isProcessing && currentPipeline === 'EAN' ? (
-                  <>
-                    <Activity className="mr-3 h-5 w-5 animate-spin" />
-                    Elaborazione EAN...
-                  </>
-                ) : (
-                  <>
-                    <Upload className="mr-3 h-5 w-5" />
-                    GENERA EXCEL (EAN)
-                  </>
-                )}
-              </button>
+              {/* EAN export button REMOVED - use ServerSyncPanel for server-side export */}
               <button
                 onClick={() => processDataPipeline('MPN')}
                 disabled={!canProcess || isProcessing || pipelineRunning}
@@ -5774,6 +5758,9 @@ const AltersideCatalogGenerator: React.FC = () => {
                 )}
               </button>
             </div>
+            <p className="text-sm text-slate-500 mt-4">
+              Per generare gli export EAN, ePrice e Mediaworld usa la sezione "Pipeline Server-Side" sopra.
+            </p>
           </div>
         )}
 

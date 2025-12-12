@@ -409,11 +409,15 @@ async function updateParseMergeState(supabase: any, runId: string, state: Partia
   console.log(`[parse_merge] State updated: status=${state.status}, offset=${state.offset ?? 'N/A'}, products=${state.productCount ?? 'N/A'}`);
 }
 
-// ========== INDICES STORAGE (split into separate files for memory efficiency) ==========
+// ========== INDICES STORAGE (versioned by run_id in 'pipeline' bucket) ==========
 
-const STOCK_INDEX_FILE = '_pipeline/stock_index.json';
-const PRICE_INDEX_FILE = '_pipeline/price_index.json';
-const MATERIAL_META_FILE = '_pipeline/material_meta.json';
+// Path functions for run_id-versioned indices (avoids race conditions with queued/FIFO runs)
+function stockIndexPath(runId: string): string { return `stock-index/${runId}.json`; }
+function priceIndexPath(runId: string): string { return `price-index/${runId}.json`; }
+function materialMetaPath(runId: string): string { return `material-meta/${runId}.json`; }
+
+// Bucket for pipeline indices (NOT exports - exports bucket only accepts XLSX)
+const PIPELINE_BUCKET = 'pipeline';
 
 interface MaterialMeta {
   delimiter: string;
@@ -425,15 +429,22 @@ interface MaterialMeta {
   totalBytes: number;
 }
 
-async function saveStockIndex(supabase: any, stockIndex: Record<string, number>): Promise<{ success: boolean; error?: string }> {
+async function saveStockIndex(supabase: any, runId: string, stockIndex: Record<string, number>): Promise<{ success: boolean; error?: string }> {
+  const path = stockIndexPath(runId);
   const json = JSON.stringify(stockIndex);
   const bytes = new TextEncoder().encode(json);
-  console.log(`[parse_merge:indices] Saving stock index: ${Object.keys(stockIndex).length} entries, ${bytes.length} bytes, contentType=application/octet-stream`);
-  return await uploadToStorage(supabase, 'exports', STOCK_INDEX_FILE, bytes, 'application/octet-stream');
+  console.log(`[parse_merge:indices] Saving stock index: run_id=${runId}, bucket=${PIPELINE_BUCKET}, path=${path}, contentType=application/json, bytes=${bytes.length}`);
+  const result = await uploadToStorage(supabase, PIPELINE_BUCKET, path, bytes, 'application/json');
+  if (!result.success) {
+    console.error(`[parse_merge:indices] FAILED to save stock index: run_id=${runId}, bucket=${PIPELINE_BUCKET}, path=${path}, contentType=application/json, bytes=${bytes.length}, error=${result.error}`);
+  }
+  return result;
 }
 
-async function loadStockIndex(supabase: any): Promise<{ index: Record<string, number> | null; error?: string }> {
-  const { content, error } = await downloadFromStorage(supabase, 'exports', STOCK_INDEX_FILE);
+async function loadStockIndex(supabase: any, runId: string): Promise<{ index: Record<string, number> | null; error?: string }> {
+  const path = stockIndexPath(runId);
+  console.log(`[parse_merge:indices] Loading stock index: run_id=${runId}, bucket=${PIPELINE_BUCKET}, path=${path}`);
+  const { content, error } = await downloadFromStorage(supabase, PIPELINE_BUCKET, path);
   if (error || !content) return { index: null, error: error || 'Empty content' };
   try {
     const index = JSON.parse(content);
@@ -444,15 +455,22 @@ async function loadStockIndex(supabase: any): Promise<{ index: Record<string, nu
   }
 }
 
-async function savePriceIndex(supabase: any, priceIndex: Record<string, [number, number, number]>): Promise<{ success: boolean; error?: string }> {
+async function savePriceIndex(supabase: any, runId: string, priceIndex: Record<string, [number, number, number]>): Promise<{ success: boolean; error?: string }> {
+  const path = priceIndexPath(runId);
   const json = JSON.stringify(priceIndex);
   const bytes = new TextEncoder().encode(json);
-  console.log(`[parse_merge:indices] Saving price index: ${Object.keys(priceIndex).length} entries, ${bytes.length} bytes, contentType=application/octet-stream`);
-  return await uploadToStorage(supabase, 'exports', PRICE_INDEX_FILE, bytes, 'application/octet-stream');
+  console.log(`[parse_merge:indices] Saving price index: run_id=${runId}, bucket=${PIPELINE_BUCKET}, path=${path}, contentType=application/json, bytes=${bytes.length}`);
+  const result = await uploadToStorage(supabase, PIPELINE_BUCKET, path, bytes, 'application/json');
+  if (!result.success) {
+    console.error(`[parse_merge:indices] FAILED to save price index: run_id=${runId}, bucket=${PIPELINE_BUCKET}, path=${path}, contentType=application/json, bytes=${bytes.length}, error=${result.error}`);
+  }
+  return result;
 }
 
-async function loadPriceIndex(supabase: any): Promise<{ index: Record<string, [number, number, number]> | null; error?: string }> {
-  const { content, error } = await downloadFromStorage(supabase, 'exports', PRICE_INDEX_FILE);
+async function loadPriceIndex(supabase: any, runId: string): Promise<{ index: Record<string, [number, number, number]> | null; error?: string }> {
+  const path = priceIndexPath(runId);
+  console.log(`[parse_merge:indices] Loading price index: run_id=${runId}, bucket=${PIPELINE_BUCKET}, path=${path}`);
+  const { content, error } = await downloadFromStorage(supabase, PIPELINE_BUCKET, path);
   if (error || !content) return { index: null, error: error || 'Empty content' };
   try {
     const index = JSON.parse(content);
@@ -463,15 +481,22 @@ async function loadPriceIndex(supabase: any): Promise<{ index: Record<string, [n
   }
 }
 
-async function saveMaterialMeta(supabase: any, meta: MaterialMeta): Promise<{ success: boolean; error?: string }> {
+async function saveMaterialMeta(supabase: any, runId: string, meta: MaterialMeta): Promise<{ success: boolean; error?: string }> {
+  const path = materialMetaPath(runId);
   const json = JSON.stringify(meta);
   const bytes = new TextEncoder().encode(json);
-  console.log(`[parse_merge:indices] Saving material meta: headerEndPos=${meta.headerEndPos}, totalBytes=${meta.totalBytes}, contentType=application/octet-stream`);
-  return await uploadToStorage(supabase, 'exports', MATERIAL_META_FILE, bytes, 'application/octet-stream');
+  console.log(`[parse_merge:indices] Saving material meta: run_id=${runId}, bucket=${PIPELINE_BUCKET}, path=${path}, contentType=application/json, bytes=${bytes.length}`);
+  const result = await uploadToStorage(supabase, PIPELINE_BUCKET, path, bytes, 'application/json');
+  if (!result.success) {
+    console.error(`[parse_merge:indices] FAILED to save material meta: run_id=${runId}, bucket=${PIPELINE_BUCKET}, path=${path}, contentType=application/json, bytes=${bytes.length}, error=${result.error}`);
+  }
+  return result;
 }
 
-async function loadMaterialMeta(supabase: any): Promise<{ meta: MaterialMeta | null; error?: string }> {
-  const { content, error } = await downloadFromStorage(supabase, 'exports', MATERIAL_META_FILE);
+async function loadMaterialMeta(supabase: any, runId: string): Promise<{ meta: MaterialMeta | null; error?: string }> {
+  const path = materialMetaPath(runId);
+  console.log(`[parse_merge:indices] Loading material meta: run_id=${runId}, bucket=${PIPELINE_BUCKET}, path=${path}`);
+  const { content, error } = await downloadFromStorage(supabase, PIPELINE_BUCKET, path);
   if (error || !content) return { meta: null, error: error || 'Empty content' };
   try {
     return { meta: JSON.parse(content) };
@@ -480,10 +505,10 @@ async function loadMaterialMeta(supabase: any): Promise<{ meta: MaterialMeta | n
   }
 }
 
-async function cleanupIndexFiles(supabase: any): Promise<void> {
-  await deleteFromStorage(supabase, 'exports', STOCK_INDEX_FILE);
-  await deleteFromStorage(supabase, 'exports', PRICE_INDEX_FILE);
-  await deleteFromStorage(supabase, 'exports', MATERIAL_META_FILE);
+async function cleanupIndexFiles(supabase: any, runId: string): Promise<void> {
+  await deleteFromStorage(supabase, PIPELINE_BUCKET, stockIndexPath(runId));
+  await deleteFromStorage(supabase, PIPELINE_BUCKET, priceIndexPath(runId));
+  await deleteFromStorage(supabase, PIPELINE_BUCKET, materialMetaPath(runId));
   await deleteFromStorage(supabase, 'exports', PARTIAL_PRODUCTS_FILE_PATH);
 }
 
@@ -583,10 +608,10 @@ async function stepParseMerge(supabase: any, runId: string): Promise<{ success: 
       
       console.log(`[parse_merge:indices] Stock index built: ${Object.keys(stockIndex).length} entries from ${stockLineCount} lines`);
       
-      // Save stock index
-      const saveResult = await saveStockIndex(supabase, stockIndex);
+      // Save stock index (versioned by run_id in pipeline bucket)
+      const saveResult = await saveStockIndex(supabase, runId, stockIndex);
       if (!saveResult.success) {
-        const error = `Failed to save stock index: ${saveResult.error}`;
+        const error = `Failed to save stock index: run_id=${runId}, bucket=${PIPELINE_BUCKET}, path=${stockIndexPath(runId)}, error=${saveResult.error}`;
         await updateParseMergeState(supabase, runId, { status: 'failed', error });
         return { success: false, error, status: 'failed' };
       }
@@ -671,10 +696,10 @@ async function stepParseMerge(supabase: any, runId: string): Promise<{ success: 
       
       console.log(`[parse_merge:indices] Price index built: ${Object.keys(priceIndex).length} entries from ${priceLineCount} lines`);
       
-      // Save price index
-      const saveResult = await savePriceIndex(supabase, priceIndex);
+      // Save price index (versioned by run_id in pipeline bucket)
+      const saveResult = await savePriceIndex(supabase, runId, priceIndex);
       if (!saveResult.success) {
-        const error = `Failed to save price index: ${saveResult.error}`;
+        const error = `Failed to save price index: run_id=${runId}, bucket=${PIPELINE_BUCKET}, path=${priceIndexPath(runId)}, error=${saveResult.error}`;
         await updateParseMergeState(supabase, runId, { status: 'failed', error });
         return { success: false, error, status: 'failed' };
       }
@@ -740,9 +765,10 @@ async function stepParseMerge(supabase: any, runId: string): Promise<{ success: 
         totalBytes: materialResult.content.length
       };
       
-      const saveResult = await saveMaterialMeta(supabase, meta);
+      // Save material metadata (versioned by run_id in pipeline bucket)
+      const saveResult = await saveMaterialMeta(supabase, runId, meta);
       if (!saveResult.success) {
-        const error = `Failed to save material metadata: ${saveResult.error}`;
+        const error = `Failed to save material metadata: run_id=${runId}, bucket=${PIPELINE_BUCKET}, path=${materialMetaPath(runId)}, error=${saveResult.error}`;
         await updateParseMergeState(supabase, runId, { status: 'failed', error });
         return { success: false, error, status: 'failed' };
       }
@@ -768,24 +794,24 @@ async function stepParseMerge(supabase: any, runId: string): Promise<{ success: 
     if (state.status === 'in_progress') {
       console.log(`[parse_merge] Phase 2: Processing chunk from offset ${state.offset}...`);
       
-      // Load indices and metadata from storage
-      const { index: stockIndex, error: stockError } = await loadStockIndex(supabase);
+      // Load indices and metadata from storage (versioned by run_id from pipeline bucket)
+      const { index: stockIndex, error: stockError } = await loadStockIndex(supabase, runId);
       if (!stockIndex) {
-        const error = `Failed to load stock index: ${stockError}`;
+        const error = `Failed to load stock index: run_id=${runId}, bucket=${PIPELINE_BUCKET}, path=${stockIndexPath(runId)}, error=${stockError}`;
         await updateParseMergeState(supabase, runId, { status: 'failed', error });
         return { success: false, error, status: 'failed' };
       }
       
-      const { index: priceIndex, error: priceError } = await loadPriceIndex(supabase);
+      const { index: priceIndex, error: priceError } = await loadPriceIndex(supabase, runId);
       if (!priceIndex) {
-        const error = `Failed to load price index: ${priceError}`;
+        const error = `Failed to load price index: run_id=${runId}, bucket=${PIPELINE_BUCKET}, path=${priceIndexPath(runId)}, error=${priceError}`;
         await updateParseMergeState(supabase, runId, { status: 'failed', error });
         return { success: false, error, status: 'failed' };
       }
       
-      const { meta: materialMeta, error: metaError } = await loadMaterialMeta(supabase);
+      const { meta: materialMeta, error: metaError } = await loadMaterialMeta(supabase, runId);
       if (!materialMeta) {
-        const error = `Failed to load material metadata: ${metaError}`;
+        const error = `Failed to load material metadata: run_id=${runId}, bucket=${PIPELINE_BUCKET}, path=${materialMetaPath(runId)}, error=${metaError}`;
         await updateParseMergeState(supabase, runId, { status: 'failed', error });
         return { success: false, error, status: 'failed' };
       }
@@ -876,7 +902,8 @@ async function stepParseMerge(supabase: any, runId: string): Promise<{ success: 
         }
         
         // Cleanup intermediate files
-        await cleanupIndexFiles(supabase);
+        // Cleanup intermediate files (versioned by run_id)
+        await cleanupIndexFiles(supabase, runId);
         
         const durationMs = Date.now() - state.startTime;
         await updateParseMergeState(supabase, runId, {
