@@ -32,6 +32,27 @@ import {
   ceilToComma99, 
   ceilToIntegerEuros 
 } from '@/utils/pricing';
+import {
+  parseStockLocationFile,
+  createEmptyWarnings,
+  resolveMarketplaceStock,
+  validateGoldenCases,
+  getStockForMatnr,
+  checkSplitMismatch,
+  STOCK_LOCATION_LATEST_KEY,
+  type StockLocationIndex,
+  type StockLocationWarnings
+} from '@/utils/stockLocation';
+import StockLocationUpload from '@/components/StockLocationUpload';
+import StockLocationConfig from '@/components/StockLocationConfig';
+import StockLocationWarningsDisplay from '@/components/StockLocationWarnings';
+import { 
+  type FeeConfigState, 
+  type StockLocationWarningsState,
+  DEFAULT_FEE_CONFIG,
+  EMPTY_WARNINGS,
+  mapFeeConfigRowToState
+} from '@/types/feeConfig';
 import * as XLSX from 'xlsx';
 import Papa from 'papaparse';
 import SyncScheduler from '@/components/SyncScheduler';
@@ -153,6 +174,8 @@ interface ProcessedRecord {
   EAN: string;
   ShortDescription: string;
   ExistingStock: number;
+  StockIT?: number;
+  StockEU?: number;
   ListPrice: number;
   CustBestPrice: number;
   Surcharge: number;
@@ -167,6 +190,7 @@ interface ProcessedRecord {
   'ListPrice con Fee': number | string; // Can be empty string for invalid ListPrice
 }
 
+// Legacy FeeConfig interface for backward compatibility
 interface FeeConfig {
   feeDrev: number;      // e.g. 1.05
   feeMkt: number;       // e.g. 1.08

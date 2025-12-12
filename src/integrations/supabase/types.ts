@@ -32,30 +32,48 @@ export type Database = {
       fee_config: {
         Row: {
           created_at: string | null
+          eprice_eu_preparation_days: number
+          eprice_include_eu: boolean
+          eprice_it_preparation_days: number
           eprice_preparation_days: number
           fee_drev: number
           fee_mkt: number
           id: string
+          mediaworld_eu_preparation_days: number
+          mediaworld_include_eu: boolean
+          mediaworld_it_preparation_days: number
           mediaworld_preparation_days: number
           shipping_cost: number
           updated_at: string | null
         }
         Insert: {
           created_at?: string | null
+          eprice_eu_preparation_days?: number
+          eprice_include_eu?: boolean
+          eprice_it_preparation_days?: number
           eprice_preparation_days?: number
           fee_drev: number
           fee_mkt: number
           id?: string
+          mediaworld_eu_preparation_days?: number
+          mediaworld_include_eu?: boolean
+          mediaworld_it_preparation_days?: number
           mediaworld_preparation_days?: number
           shipping_cost: number
           updated_at?: string | null
         }
         Update: {
           created_at?: string | null
+          eprice_eu_preparation_days?: number
+          eprice_include_eu?: boolean
+          eprice_it_preparation_days?: number
           eprice_preparation_days?: number
           fee_drev?: number
           fee_mkt?: number
           id?: string
+          mediaworld_eu_preparation_days?: number
+          mediaworld_include_eu?: boolean
+          mediaworld_it_preparation_days?: number
           mediaworld_preparation_days?: number
           shipping_cost?: number
           updated_at?: string | null
@@ -102,6 +120,7 @@ export type Database = {
           error_message: string | null
           finished_at: string | null
           id: string
+          location_warnings: Json
           metrics: Json
           runtime_ms: number | null
           started_at: string
@@ -118,6 +137,7 @@ export type Database = {
           error_message?: string | null
           finished_at?: string | null
           id?: string
+          location_warnings?: Json
           metrics?: Json
           runtime_ms?: number | null
           started_at?: string
@@ -134,6 +154,7 @@ export type Database = {
           error_message?: string | null
           finished_at?: string | null
           id?: string
+          location_warnings?: Json
           metrics?: Json
           runtime_ms?: number | null
           started_at?: string
