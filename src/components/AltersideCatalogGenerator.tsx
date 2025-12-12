@@ -5139,6 +5139,13 @@ const AltersideCatalogGenerator: React.FC = () => {
         {/* Sync Scheduler */}
         <SyncScheduler />
 
+        {/* Server-Side Pipeline - Always visible */}
+        <ServerSyncPanel
+          disabled={!files.material.file || !files.stock.file || !files.price.file}
+          onSyncStarted={() => setPipelineRunning(true)}
+          onSyncComplete={() => setPipelineRunning(false)}
+        />
+
         {/* Pipeline Master Button */}
         <div className="card border-strong" style={{ background: '#1e3a5f' }}>
           <div className="card-body">
@@ -5734,32 +5741,12 @@ const AltersideCatalogGenerator: React.FC = () => {
           </div>
         )}
 
-        {/* Action Buttons - EAN export removed (server-side only via ServerSyncPanel) */}
+        {/* Action section removed - all exports are now server-side only via ServerSyncPanel */}
         {allFilesValid && (
-          <div className="text-center">
-            <h3 className="text-2xl font-bold mb-6">Azioni</h3>
-            <div className="flex flex-wrap justify-center gap-6">
-              {/* EAN export button REMOVED - use ServerSyncPanel for server-side export */}
-              <button
-                onClick={() => processDataPipeline('MPN')}
-                disabled={!canProcess || isProcessing || pipelineRunning}
-                className={`btn btn-primary text-lg px-12 py-4 ${!canProcess || isProcessing || pipelineRunning ? 'is-disabled' : ''}`}
-              >
-                {isProcessing && currentPipeline === 'MPN' ? (
-                  <>
-                    <Activity className="mr-3 h-5 w-5 animate-spin" />
-                    Elaborazione ManufPartNr...
-                  </>
-                ) : (
-                  <>
-                    <Upload className="mr-3 h-5 w-5" />
-                    GENERA EXCEL (ManufPartNr)
-                  </>
-                )}
-              </button>
-            </div>
-            <p className="text-sm text-slate-500 mt-4">
-              Per generare gli export EAN, ePrice e Mediaworld usa la sezione "Pipeline Server-Side" sopra.
+          <div className="text-center p-4 bg-blue-50 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-800 rounded-lg">
+            <p className="text-sm text-blue-700 dark:text-blue-300">
+              <strong>Nota:</strong> Per generare gli export (Catalogo EAN, ePrice, Mediaworld) usa la sezione "Pipeline Server-Side" sopra.
+              Il bottone genera tutti e 3 gli export sul server e li carica automaticamente su SFTP.
             </p>
           </div>
         )}
@@ -5934,17 +5921,12 @@ const AltersideCatalogGenerator: React.FC = () => {
               {currentPipeline === 'EAN' ? 'Export Server-Side' : `Download Pipeline ${currentPipeline}`}
             </h3>
             
-            {/* For EAN pipeline: ONLY show ServerSyncPanel - NO client-side export */}
+            {/* For EAN pipeline: Note about server-side (ServerSyncPanel is now always visible above) */}
             {currentPipeline === 'EAN' && (
               <div className="mb-6">
-                <p className="text-sm text-muted-foreground mb-4">
-                  Tutti gli export EAN sono generati esclusivamente server-side per garantire coerenza con i file caricati su SFTP.
+                <p className="text-sm text-muted-foreground">
+                  Gli export EAN sono generati server-side. Usa il pannello "Pipeline Server-Side" in alto per avviare e scaricare i file.
                 </p>
-                <ServerSyncPanel
-                  disabled={pipelineRunning || isProcessing}
-                  onSyncStarted={() => setPipelineRunning(true)}
-                  onSyncComplete={() => setPipelineRunning(false)}
-                />
               </div>
             )}
             

@@ -1488,18 +1488,19 @@ async function stepExportEprice(supabase: any, runId: string, feeConfig: any): P
       ]);
     }
     
-    // Generate XLSX buffer
+    // Generate XLSX buffer (per-run path)
     const xlsxBuffer = createXLSXBuffer(exportHeaders, epRows);
-    const saveResult = await uploadToStorage(supabase, 'exports', 'Export ePrice.xlsx', xlsxBuffer, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    const epPath = exportEpricePath(runId);
+    const saveResult = await uploadToStorage(supabase, 'exports', epPath, xlsxBuffer, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     
     if (!saveResult.success) {
-      const error = `Failed to save Export ePrice.xlsx: ${saveResult.error}`;
+      const error = `Failed to save ${epPath}: ${saveResult.error}`;
       await updateStepResult(supabase, runId, 'export_eprice', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
     
     // Save export file path to sync_runs.steps.exports.files
-    await updateExportFilePath(supabase, runId, 'eprice', 'exports/Export ePrice.xlsx');
+    await updateExportFilePath(supabase, runId, 'eprice', `exports/${epPath}`);
     
     await updateStepResult(supabase, runId, 'export_eprice', {
       status: 'success', duration_ms: Date.now() - startTime, rows: epRows.length, skipped: epSkipped,

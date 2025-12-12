@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Progress } from '@/components/ui/progress';
@@ -10,9 +10,14 @@ import {
   Cloud, 
   FileText,
   Clock,
-  AlertTriangle
+  AlertTriangle,
+  Copy,
+  ChevronDown,
+  ChevronUp,
+  Bug
 } from 'lucide-react';
-import { useSyncProgress, EXPORT_FILES, type SyncRunState } from '@/hooks/useSyncProgress';
+import { useSyncProgress, EXPORT_FILES, ALL_PIPELINE_STEPS, type SyncRunState } from '@/hooks/useSyncProgress';
+import { toast } from '@/hooks/use-toast';
 
 interface ServerSyncPanelProps {
   disabled?: boolean;
@@ -37,6 +42,8 @@ export const ServerSyncPanel: React.FC<ServerSyncPanelProps> = ({
     getStepDisplayName,
   } = useSyncProgress();
 
+  const [debugExpanded, setDebugExpanded] = useState(false);
+
   const handleStartSync = async () => {
     onSyncStarted?.();
     const success = await startSync();
@@ -53,6 +60,61 @@ export const ServerSyncPanel: React.FC<ServerSyncPanelProps> = ({
 
   const progress = getProgress();
   const stepName = getStepDisplayName(state.currentStep);
+
+  // Get step status with fallback to pending
+  const getStepStatus = (stepKey: string): string => {
+    const stepData = state.steps[stepKey];
+    if (!stepData) return 'pending';
+    return stepData.status || 'pending';
+  };
+
+  // Get step icon based on status
+  const getStepIcon = (status: string) => {
+    switch (status) {
+      case 'completed':
+      case 'success':
+        return <CheckCircle className="h-3 w-3 text-emerald-600" />;
+      case 'failed':
+        return <XCircle className="h-3 w-3 text-rose-600" />;
+      case 'in_progress':
+      case 'running':
+      case 'building_stock_index':
+      case 'building_price_index':
+      case 'preparing_material':
+        return <Activity className="h-3 w-3 text-blue-600 animate-spin" />;
+      default:
+        return <Clock className="h-3 w-3 text-slate-400" />;
+    }
+  };
+
+  // Copy debug info to clipboard
+  const copyDebugInfo = () => {
+    const debugData = {
+      runId: state.runId,
+      status: state.status,
+      currentStep: state.currentStep,
+      errorMessage: state.errorMessage,
+      errorDetails: state.errorDetails,
+      steps: state.steps,
+      exportFiles: state.exportFiles,
+      locationWarnings: state.locationWarnings,
+      runtimeMs: state.runtimeMs,
+    };
+    navigator.clipboard.writeText(JSON.stringify(debugData, null, 2));
+    toast({ title: 'Debug copiato', description: 'Informazioni debug copiate negli appunti' });
+  };
+
+  // Copy last error to clipboard
+  const copyLastError = () => {
+    const errorData = {
+      errorMessage: state.errorMessage,
+      errorDetails: state.errorDetails,
+      currentStep: state.currentStep,
+      stepError: state.steps[state.currentStep]?.error,
+    };
+    navigator.clipboard.writeText(JSON.stringify(errorData, null, 2));
+    toast({ title: 'Errore copiato', description: 'Dettagli errore copiati negli appunti' });
+  };
 
   return (
     <Card className="p-6 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg shadow-sm">
@@ -75,7 +137,7 @@ export const ServerSyncPanel: React.FC<ServerSyncPanelProps> = ({
           I file scaricati saranno identici a quelli inviati via SFTP.
         </p>
 
-        {/* Status Display */}
+        {/* Progress Display */}
         {isRunning && (
           <div className="space-y-3 p-4 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg">
             <div className="flex items-center gap-2">
@@ -151,7 +213,7 @@ export const ServerSyncPanel: React.FC<ServerSyncPanelProps> = ({
         )}
 
         {/* Location Warnings */}
-        {Object.keys(state.locationWarnings).length > 0 && (
+        {Object.keys(state.locationWarnings).length > 0 && Object.values(state.locationWarnings).some(v => v > 0) && (
           <div className="p-3 bg-amber-50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-800 rounded-lg">
             <div className="flex items-center gap-2 text-amber-700 dark:text-amber-400 mb-2">
               <AlertTriangle className="h-4 w-4" />
@@ -219,34 +281,150 @@ export const ServerSyncPanel: React.FC<ServerSyncPanelProps> = ({
           </div>
         )}
 
-        {/* Step Details (collapsible) */}
-        {Object.keys(state.steps).length > 0 && state.currentStep !== 'current_step' && (
-          <details className="border-t border-slate-200 dark:border-slate-700 pt-4 mt-4">
-            <summary className="text-sm font-medium cursor-pointer text-slate-900 dark:text-slate-100 hover:text-blue-600 dark:hover:text-blue-400">
-              Dettaglio step eseguiti
-            </summary>
-            <div className="mt-2 space-y-1 text-xs">
-              {Object.entries(state.steps)
-                .filter(([key]) => key !== 'current_step')
-                .map(([stepKey, stepData]) => (
-                  <div key={stepKey} className="flex items-center gap-2 p-2 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded">
-                    {stepData.status === 'completed' || stepData.status === 'success' ? (
-                      <CheckCircle className="h-3 w-3 text-emerald-600" />
-                    ) : stepData.status === 'failed' ? (
-                      <XCircle className="h-3 w-3 text-rose-600" />
-                    ) : (
-                      <Activity className="h-3 w-3 text-blue-600 animate-spin" />
-                    )}
-                    <span className="font-mono text-slate-900 dark:text-slate-100">{stepKey}</span>
+        {/* ALL Steps - Always visible */}
+        <div className="border-t border-slate-200 dark:border-slate-700 pt-4 mt-4">
+          <h4 className="text-sm font-medium mb-3 text-slate-900 dark:text-slate-100">
+            Stato Step Pipeline
+          </h4>
+          <div className="space-y-1">
+            {ALL_PIPELINE_STEPS.map((stepKey) => {
+              const status = getStepStatus(stepKey);
+              const stepData = state.steps[stepKey];
+              const isCurrent = state.currentStep === stepKey;
+              
+              return (
+                <div 
+                  key={stepKey} 
+                  className={`flex items-center gap-2 p-2 rounded text-xs ${
+                    isCurrent 
+                      ? 'bg-blue-50 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-800' 
+                      : 'bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700'
+                  }`}
+                >
+                  {getStepIcon(status)}
+                  <span className="font-mono text-slate-900 dark:text-slate-100 flex-1">
+                    {getStepDisplayName(stepKey)}
+                  </span>
+                  <span className={`text-xs px-2 py-0.5 rounded ${
+                    status === 'completed' || status === 'success' 
+                      ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/50 dark:text-emerald-400'
+                      : status === 'failed' 
+                        ? 'bg-rose-100 text-rose-700 dark:bg-rose-900/50 dark:text-rose-400'
+                        : status === 'pending' 
+                          ? 'bg-slate-100 text-slate-500 dark:bg-slate-700 dark:text-slate-400'
+                          : 'bg-blue-100 text-blue-700 dark:bg-blue-900/50 dark:text-blue-400'
+                  }`}>
+                    {status}
+                  </span>
+                  {stepData?.rows !== undefined && (
                     <span className="text-slate-500 dark:text-slate-400">
-                      {stepData.status}
-                      {stepData.rows && ` (${stepData.rows} righe)`}
-                      {stepData.duration_ms && ` - ${stepData.duration_ms}ms`}
+                      ({stepData.rows} righe)
                     </span>
+                  )}
+                  {stepData?.duration_ms !== undefined && (
+                    <span className="text-slate-500 dark:text-slate-400">
+                      {stepData.duration_ms}ms
+                    </span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Debug Panel - Always visible when run exists */}
+        {state.runId && (
+          <div className="border-t border-slate-200 dark:border-slate-700 pt-4 mt-4">
+            <button
+              onClick={() => setDebugExpanded(!debugExpanded)}
+              className="flex items-center gap-2 text-sm font-medium text-slate-700 dark:text-slate-300 hover:text-slate-900 dark:hover:text-slate-100 w-full"
+            >
+              <Bug className="h-4 w-4" />
+              Debug Info
+              {debugExpanded ? <ChevronUp className="h-4 w-4 ml-auto" /> : <ChevronDown className="h-4 w-4 ml-auto" />}
+            </button>
+            
+            {debugExpanded && (
+              <div className="mt-3 space-y-3">
+                {/* Quick actions */}
+                <div className="flex gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={copyDebugInfo}
+                    className="text-xs"
+                  >
+                    <Copy className="h-3 w-3 mr-1" />
+                    Copia debug
+                  </Button>
+                  {(state.errorMessage || state.errorDetails) && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={copyLastError}
+                      className="text-xs text-rose-600 border-rose-300 hover:bg-rose-50"
+                    >
+                      <Copy className="h-3 w-3 mr-1" />
+                      Copia ultimo errore
+                    </Button>
+                  )}
+                </div>
+
+                {/* Debug fields */}
+                <div className="space-y-2 text-xs font-mono bg-slate-100 dark:bg-slate-800 p-3 rounded-lg overflow-x-auto">
+                  <div className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1">
+                    <span className="text-slate-500">runId:</span>
+                    <span className="text-slate-900 dark:text-slate-100">{state.runId}</span>
+                    
+                    <span className="text-slate-500">status:</span>
+                    <span className="text-slate-900 dark:text-slate-100">{state.status}</span>
+                    
+                    <span className="text-slate-500">current_step:</span>
+                    <span className="text-slate-900 dark:text-slate-100">{state.currentStep || 'N/A'}</span>
+                    
+                    <span className="text-slate-500">runtime_ms:</span>
+                    <span className="text-slate-900 dark:text-slate-100">{state.runtimeMs ?? 'N/A'}</span>
                   </div>
-                ))}
-            </div>
-          </details>
+
+                  {state.errorMessage && (
+                    <div className="mt-2 pt-2 border-t border-slate-300 dark:border-slate-600">
+                      <span className="text-rose-600 dark:text-rose-400 font-semibold">error_message:</span>
+                      <pre className="mt-1 text-rose-700 dark:text-rose-300 whitespace-pre-wrap break-all">
+                        {state.errorMessage}
+                      </pre>
+                    </div>
+                  )}
+
+                  {state.errorDetails && (
+                    <div className="mt-2 pt-2 border-t border-slate-300 dark:border-slate-600">
+                      <span className="text-rose-600 dark:text-rose-400 font-semibold">error_details:</span>
+                      <pre className="mt-1 text-rose-700 dark:text-rose-300 whitespace-pre-wrap break-all max-h-40 overflow-y-auto">
+                        {JSON.stringify(state.errorDetails, null, 2)}
+                      </pre>
+                    </div>
+                  )}
+
+                  {state.exportFiles && Object.keys(state.exportFiles).length > 0 && (
+                    <div className="mt-2 pt-2 border-t border-slate-300 dark:border-slate-600">
+                      <span className="text-emerald-600 dark:text-emerald-400 font-semibold">exports.files:</span>
+                      <pre className="mt-1 text-slate-700 dark:text-slate-300 whitespace-pre-wrap">
+                        {JSON.stringify(state.exportFiles, null, 2)}
+                      </pre>
+                    </div>
+                  )}
+
+                  <details className="mt-2 pt-2 border-t border-slate-300 dark:border-slate-600">
+                    <summary className="cursor-pointer text-slate-500 hover:text-slate-700 dark:hover:text-slate-300">
+                      steps (raw JSON)
+                    </summary>
+                    <pre className="mt-1 text-slate-700 dark:text-slate-300 whitespace-pre-wrap break-all max-h-60 overflow-y-auto">
+                      {JSON.stringify(state.steps, null, 2)}
+                    </pre>
+                  </details>
+                </div>
+              </div>
+            )}
+          </div>
         )}
       </div>
     </Card>
