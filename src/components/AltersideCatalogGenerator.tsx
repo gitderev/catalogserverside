@@ -1411,6 +1411,8 @@ const AltersideCatalogGenerator: React.FC = () => {
     // Helper: import stock location file from FTP
     const importStockLocationFromFtp = async () => {
       console.log('[FTP Import] Importing stock location file...');
+      
+      // Step 1: Trigger the edge function to download from FTP and upload to Storage
       let res: Response;
       try {
         res = await fetch(edgeFunctionUrl, {
@@ -1423,41 +1425,46 @@ const AltersideCatalogGenerator: React.FC = () => {
         });
       } catch (e) {
         console.warn('[FTP Import] Network error for stockLocation, continuing with fallback');
-        return { success: false, error: 'network' };
+        return { success: false, error: 'Errore di rete' };
       }
 
       const data = await res.json();
 
       if (!res.ok || data.status !== "ok") {
         console.warn('[FTP Import] Stock location import failed:', data.message);
-        return { success: false, error: data.message || 'Import failed' };
+        return { success: false, error: data.message || 'Import FTP fallito' };
       }
 
-      // Stock location file is uploaded to Storage, now download and process
-      const fileInfo = data.files?.stockLocationFile;
-      const url = fileInfo?.url;
-      const filename = fileInfo?.filename || '790813_StockFile.txt';
-
-      if (!url) {
-        console.warn('[FTP Import] No URL in stockLocation response');
-        return { success: false, error: 'No URL' };
-      }
-
+      // Step 2: Download from Storage (bucket is private, use download method)
+      // Source of truth: path "stock-location/latest.txt" in bucket "ftp-import"
+      const storagePath = 'stock-location/latest.txt';
+      console.log(`[FTP Import] Downloading stock location from Storage: ${storagePath}`);
+      
       try {
-        const file = await fetchFileFromUrl(url, filename);
-        console.log(`[FTP Import] Stock location file downloaded: ${file.name} (${file.size} bytes)`);
+        const { data: fileData, error: downloadError } = await supabase.storage
+          .from('ftp-import')
+          .download(storagePath);
         
-        // Read file content as text
-        const content = await file.text();
+        if (downloadError || !fileData) {
+          console.warn('[FTP Import] Storage download failed:', downloadError?.message);
+          return { success: false, error: downloadError?.message || 'Download da Storage fallito' };
+        }
         
-        // Call the existing handler for stock location with content string
+        // Read blob content as text
+        const content = await fileData.text();
+        const fileSize = fileData.size;
+        const filename = data.files?.stockLocationFile?.filename || '790813_StockFile.txt';
+        
+        console.log(`[FTP Import] Stock location file downloaded from Storage: ${filename} (${fileSize} bytes)`);
+        
+        // Parse the file and update state
         const warnings = createEmptyWarnings();
         handleStockLocationLoaded(content, warnings);
         
-        return { success: true, filename };
+        return { success: true, filename, size: fileSize };
       } catch (e) {
         console.warn('[FTP Import] Error processing stock location file:', e);
-        return { success: false, error: e instanceof Error ? e.message : 'Unknown error' };
+        return { success: false, error: e instanceof Error ? e.message : 'Errore elaborazione file' };
       }
     };
     
@@ -1473,12 +1480,12 @@ const AltersideCatalogGenerator: React.FC = () => {
       if (stockLocationResult.success) {
         toast({
           title: "Import FTP completato",
-          description: "I file Material, Stock, Price e Stock Location sono stati importati dal server FTP."
+          description: "4 file importati: Material, Stock, Price e Stock Location (IT/EU)."
         });
       } else {
         toast({
           title: "Import FTP completato (parziale)",
-          description: `I file Material, Stock e Price sono stati importati. Stock Location: ${stockLocationResult.error || 'non disponibile'}.`
+          description: "3 file importati: Material, Stock e Price. Stock Location non disponibile (fallback: StockIT=ExistingStock)."
         });
       }
     } catch (error) {
