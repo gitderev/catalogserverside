@@ -87,6 +87,11 @@ interface MediaworldExportParams {
     shippingCost: number;
   };
   prepDays: number;
+  // IT/EU stock config (optional for backward compatibility)
+  stockLocationIndex?: Record<string, { stockIT: number; stockEU: number }> | null;
+  includeEu?: boolean;
+  itDays?: number;
+  euDays?: number;
 }
 
 interface ValidationError {
