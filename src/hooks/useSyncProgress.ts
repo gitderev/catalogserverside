@@ -2,7 +2,7 @@ import { useState, useCallback, useRef, useEffect } from 'react';
 import { supabase } from '@/integrations/supabase/client';
 import { toast } from '@/hooks/use-toast';
 
-export type SyncStatus = 'idle' | 'starting' | 'running' | 'success' | 'failed' | 'cancelled';
+export type SyncStatus = 'idle' | 'starting' | 'running' | 'success' | 'failed' | 'cancelled' | 'waiting_retry';
 
 export interface SyncStep {
   status: string;
@@ -10,6 +10,14 @@ export interface SyncStep {
   details?: Record<string, any>;
   rows?: number;
   duration_ms?: number;
+  // parse_merge specific fields
+  phase?: string;
+  offset?: number;
+  productCount?: number;
+  chunkIndex?: number;
+  retry_count?: number;
+  next_retry_at?: string;
+  last_error?: string;
 }
 
 export interface ExportFiles {
@@ -46,7 +54,9 @@ const INITIAL_STATE: SyncRunState = {
   exportFiles: {},
 };
 
-const POLL_INTERVAL_MS = 2000;
+// Adaptive polling intervals
+const POLL_INTERVAL_RUNNING_MS = 2500; // 2.5s while running
+const POLL_INTERVAL_IDLE_MS = 12000;   // 12s when idle/waiting
 
 // All pipeline steps in order for UI display
 export const ALL_PIPELINE_STEPS = ['import_ftp', 'parse_merge', 'ean_mapping', 'pricing', 'export_ean', 'export_mediaworld', 'export_eprice', 'upload_sftp'];
@@ -62,6 +72,7 @@ export function useSyncProgress() {
   const [state, setState] = useState<SyncRunState>(INITIAL_STATE);
   const [isPolling, setIsPolling] = useState(false);
   const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const lastPollTimeRef = useRef<number>(0);
 
   // Cleanup polling on unmount
   useEffect(() => {
@@ -93,9 +104,12 @@ export function useSyncProgress() {
       // Extract export file paths from steps.exports.files
       const exportFiles: ExportFiles = steps.exports?.files || {};
 
+      // Determine if waiting for retry
+      const isWaitingRetry = steps[currentStep]?.phase === 'waiting_retry';
+
       setState(prev => ({
         ...prev,
-        status: data.status as SyncStatus,
+        status: isWaitingRetry ? 'waiting_retry' : data.status as SyncStatus,
         currentStep,
         steps: steps as Record<string, SyncStep>,
         errorMessage: data.error_message,
@@ -106,6 +120,10 @@ export function useSyncProgress() {
         exportFiles,
       }));
 
+      // Adjust polling interval based on status
+      const isActive = data.status === 'running' && !isWaitingRetry;
+      const desiredInterval = isActive ? POLL_INTERVAL_RUNNING_MS : POLL_INTERVAL_IDLE_MS;
+      
       // Stop polling when run is complete
       if (['success', 'failed', 'cancelled'].includes(data.status)) {
         if (pollIntervalRef.current) {
@@ -132,6 +150,20 @@ export function useSyncProgress() {
       console.error('[useSyncProgress] Poll exception:', err);
     }
   }, []);
+
+  // Start adaptive polling
+  const startPolling = useCallback((runId: string, isWaiting: boolean = false) => {
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+    }
+    
+    const interval = isWaiting ? POLL_INTERVAL_IDLE_MS : POLL_INTERVAL_RUNNING_MS;
+    pollIntervalRef.current = setInterval(() => pollStatus(runId), interval);
+    setIsPolling(true);
+    
+    // Initial poll
+    pollStatus(runId);
+  }, [pollStatus]);
 
   // Start server-side sync pipeline
   const startSync = useCallback(async (): Promise<boolean> => {
@@ -168,7 +200,7 @@ export function useSyncProgress() {
         return false;
       }
 
-      // Handle 409 Conflict (sync already running)
+      // Handle various response statuses
       if (data?.status === 'error' && data?.message?.includes('già in corso')) {
         setState(prev => ({
           ...prev,
@@ -180,6 +212,34 @@ export function useSyncProgress() {
           description: 'Attendere il completamento della pipeline corrente',
         });
         return false;
+      }
+
+      if (data?.status === 'busy' && data?.run_id) {
+        // Resume monitoring existing run
+        console.log('[useSyncProgress] Resuming existing run:', data.run_id);
+        setState(prev => ({
+          ...prev,
+          runId: data.run_id,
+          status: 'running',
+          startedAt: new Date(),
+        }));
+        startPolling(data.run_id, false);
+        return true;
+      }
+
+      if (data?.status === 'waiting_retry' && data?.run_id) {
+        console.log('[useSyncProgress] Run waiting for retry:', data.run_id);
+        setState(prev => ({
+          ...prev,
+          runId: data.run_id,
+          status: 'waiting_retry',
+        }));
+        startPolling(data.run_id, true);
+        toast({
+          title: 'Pipeline in attesa',
+          description: `Retry schedulato per ${data.next_retry_at || 'presto'}`,
+        });
+        return true;
       }
 
       if (data?.status === 'error') {
@@ -237,12 +297,8 @@ export function useSyncProgress() {
         finishedAt: null,
       }));
 
-      // Start polling
-      setIsPolling(true);
-      pollIntervalRef.current = setInterval(() => pollStatus(runId), POLL_INTERVAL_MS);
-      
-      // Initial poll
-      await pollStatus(runId);
+      // Start adaptive polling
+      startPolling(runId, false);
 
       toast({
         title: 'Pipeline avviata',
@@ -264,7 +320,7 @@ export function useSyncProgress() {
       });
       return false;
     }
-  }, [state.status, pollStatus]);
+  }, [state.status, startPolling]);
 
   // Download server-generated export file using paths from sync_runs.steps.exports.files
   const downloadExport = useCallback(async (fileKey: keyof typeof EXPORT_FILES): Promise<void> => {
@@ -298,7 +354,9 @@ export function useSyncProgress() {
       const url = URL.createObjectURL(data);
       const a = document.createElement('a');
       a.href = url;
-      a.download = downloadPath;
+      // Use just the filename for download
+      const fileName = downloadPath.split('/').pop() || fileInfo.path;
+      a.download = fileName;
       a.rel = 'noopener';
       a.style.display = 'none';
       document.body.appendChild(a);
@@ -333,12 +391,27 @@ export function useSyncProgress() {
 
   // Get progress percentage based on step
   const getProgress = useCallback((): number => {
-    const stepOrder = ['import_ftp', 'parse_merge', 'ean_mapping', 'pricing', 'export_ean', 'export_mediaworld', 'export_eprice', 'upload_sftp'];
-    const currentIdx = stepOrder.indexOf(state.currentStep);
+    const currentIdx = ALL_PIPELINE_STEPS.indexOf(state.currentStep);
     if (currentIdx < 0) return 0;
     if (state.status === 'success') return 100;
-    return Math.round(((currentIdx + 1) / stepOrder.length) * 100);
-  }, [state.currentStep, state.status]);
+    
+    // For parse_merge, add fractional progress based on offset
+    if (state.currentStep === 'parse_merge' && state.steps.parse_merge) {
+      const pm = state.steps.parse_merge;
+      const baseProgress = (currentIdx / ALL_PIPELINE_STEPS.length) * 100;
+      const stepProgress = 100 / ALL_PIPELINE_STEPS.length;
+      
+      // Estimate progress within parse_merge
+      if (pm.productCount && pm.offset) {
+        // Rough estimate - assume ~50k total rows typical
+        const estimatedTotal = 50000;
+        const fraction = Math.min(pm.offset / estimatedTotal, 0.95);
+        return Math.round(baseProgress + stepProgress * fraction);
+      }
+    }
+    
+    return Math.round(((currentIdx + 1) / ALL_PIPELINE_STEPS.length) * 100);
+  }, [state.currentStep, state.status, state.steps]);
 
   // Get step display name
   const getStepDisplayName = useCallback((step: string): string => {
@@ -363,8 +436,9 @@ export function useSyncProgress() {
     reset,
     getProgress,
     getStepDisplayName,
-    isRunning: state.status === 'running' || state.status === 'starting',
+    isRunning: state.status === 'running' || state.status === 'starting' || state.status === 'waiting_retry',
     isComplete: state.status === 'success',
     isFailed: state.status === 'failed',
+    isWaitingRetry: state.status === 'waiting_retry',
   };
 }

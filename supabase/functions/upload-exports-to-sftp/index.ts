@@ -4,26 +4,14 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
 /**
  * Edge Function: upload-exports-to-sftp
  * 
- * Uploads three export files from the "exports" bucket to an external SFTP server.
+ * Uploads export files from the "exports" bucket to an external SFTP server.
+ * Accepts dynamic file paths from sync_runs.steps.exports.files
  */
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
-
-// Expected file configuration - supports both XLSX and CSV formats
-const EXPECTED_FILES_XLSX = [
-  { bucket: 'exports', path: 'Catalogo EAN.xlsx', filename: 'Catalogo EAN.xlsx' },
-  { bucket: 'exports', path: 'Export ePrice.xlsx', filename: 'Export ePrice.xlsx' },
-  { bucket: 'exports', path: 'Export Mediaworld.xlsx', filename: 'Export Mediaworld.xlsx' }
-];
-
-const EXPECTED_FILES_CSV = [
-  { bucket: 'exports', path: 'Catalogo EAN.csv', filename: 'Catalogo EAN.csv' },
-  { bucket: 'exports', path: 'Export ePrice.csv', filename: 'Export ePrice.csv' },
-  { bucket: 'exports', path: 'Export Mediaworld.csv', filename: 'Export Mediaworld.csv' }
-];
 
 interface FileSpec {
   bucket: string;
@@ -115,18 +103,18 @@ serve(async (req) => {
       );
     }
 
-    if (!body.files || !Array.isArray(body.files) || body.files.length !== 3) {
+    if (!body.files || !Array.isArray(body.files) || body.files.length === 0) {
       console.log('[upload-exports-to-sftp] Invalid files array:', body.files);
       return new Response(
         JSON.stringify({ 
           status: 'error', 
-          message: 'Il campo "files" deve contenere esattamente 3 file.' 
+          message: 'Il campo "files" deve contenere almeno 1 file.' 
         }),
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
 
-    // Validate each file spec - accept both XLSX and CSV formats
+    // Validate each file spec - accept any valid path
     for (let i = 0; i < body.files.length; i++) {
       const file = body.files[i];
       
@@ -140,26 +128,9 @@ serve(async (req) => {
           { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
-
-      // Check if file matches expected XLSX or CSV format
-      const expectedXlsx = EXPECTED_FILES_XLSX[i];
-      const expectedCsv = EXPECTED_FILES_CSV[i];
-      const matchesXlsx = file.bucket === expectedXlsx?.bucket && file.path === expectedXlsx?.path && file.filename === expectedXlsx?.filename;
-      const matchesCsv = file.bucket === expectedCsv?.bucket && file.path === expectedCsv?.path && file.filename === expectedCsv?.filename;
-      
-      if (!matchesXlsx && !matchesCsv) {
-        console.log('[upload-exports-to-sftp] File spec mismatch:', { file, expectedXlsx, expectedCsv });
-        return new Response(
-          JSON.stringify({ 
-            status: 'error', 
-            message: `File ${i + 1}: configurazione non valida. Attesi formati XLSX o CSV.` 
-          }),
-          { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
     }
 
-    console.log('[upload-exports-to-sftp] Request body validated');
+    console.log('[upload-exports-to-sftp] Request body validated, files:', body.files.map(f => f.path));
 
     // =========================================================================
     // 3. READ FILES FROM BUCKET (using service role for guaranteed access)
@@ -168,7 +139,7 @@ serve(async (req) => {
     const fileContents: { filename: string; data: Uint8Array }[] = [];
     
     for (const fileSpec of body.files) {
-      console.log(`[upload-exports-to-sftp] Reading file: ${fileSpec.path}`);
+      console.log(`[upload-exports-to-sftp] Reading file: ${fileSpec.bucket}/${fileSpec.path}`);
       
       const { data: fileData, error: fileError } = await serviceClient.storage
         .from(fileSpec.bucket)
@@ -179,11 +150,11 @@ serve(async (req) => {
         return new Response(
           JSON.stringify({ 
             status: 'error', 
-            message: `Impossibile leggere il file "${fileSpec.filename}" dal bucket "${fileSpec.bucket}". Verifica che il file esista.`,
+            message: `Missing export path: ${fileSpec.bucket}/${fileSpec.path}`,
             results: body.files.map(f => ({
               filename: f.filename,
               uploaded: false,
-              error: f.filename === fileSpec.filename ? 'File non trovato nel bucket' : 'Upload non tentato'
+              error: f.path === fileSpec.path ? `File non trovato: ${fileSpec.bucket}/${fileSpec.path}` : 'Upload non tentato'
             }))
           }),
           { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
