@@ -10,9 +10,22 @@ import {
   createEmptyWarnings
 } from '@/utils/stockLocation';
 
+interface StockLocationMeta {
+  source: 'manual' | 'ftp';
+  filename?: string;
+  rowCount?: number;
+  bytes?: number;
+  importedAt?: string;
+}
+
 interface StockLocationUploadProps {
   disabled?: boolean;
   onFileLoaded?: (content: string, warnings: ReturnType<typeof createEmptyWarnings>) => void;
+  /** If provided and has entries, shows as "loaded from FTP" */
+  externallyLoaded?: boolean;
+  externalMeta?: StockLocationMeta;
+  /** Called when user clicks "Rimuovi" to clear externally loaded state */
+  onClear?: () => void;
 }
 
 interface UploadState {
@@ -29,10 +42,15 @@ interface UploadState {
  * Uploads to bucket 'ftp-import' with keys:
  * - stock-location/latest.txt (always overwritten)
  * - stock-location/manual/<timestamp>_<filename>.txt (versioned copy)
+ * 
+ * Can also display externally loaded state (e.g., from FTP import).
  */
 const StockLocationUpload: React.FC<StockLocationUploadProps> = ({ 
   disabled = false,
-  onFileLoaded 
+  onFileLoaded,
+  externallyLoaded = false,
+  externalMeta,
+  onClear
 }) => {
   const [state, setState] = useState<UploadState>({
     status: 'empty',
@@ -155,26 +173,37 @@ const StockLocationUpload: React.FC<StockLocationUploadProps> = ({
       rowCount: 0,
       error: null
     });
-  }, []);
+    // If externally loaded, notify parent to clear
+    if (externallyLoaded && onClear) {
+      onClear();
+    }
+  }, [externallyLoaded, onClear]);
+
+  // Determine effective display state: external takes priority if internal is empty
+  const isExternallyValid = externallyLoaded && externalMeta;
+  const effectiveStatus = isExternallyValid ? 'valid' : state.status;
+  const effectiveFilename = isExternallyValid ? (externalMeta?.filename || 'stock-location/latest.txt') : state.filename;
+  const effectiveRowCount = isExternallyValid ? (externalMeta?.rowCount || 0) : state.rowCount;
+  const sourceLabel = isExternallyValid ? (externalMeta?.source === 'ftp' ? 'Importato da FTP' : 'Sorgente esterna') : null;
 
   return (
     <div className="card border-strong">
       <div className="card-body">
         <div className="flex items-center justify-between mb-4">
           <h3 className="card-title">Stock Location (IT/EU)</h3>
-          {state.status === 'valid' && (
+          {effectiveStatus === 'valid' && (
             <div className="badge-ok">
               <CheckCircle className="w-4 h-4" />
               Caricato
             </div>
           )}
-          {state.status === 'uploading' && (
+          {effectiveStatus === 'uploading' && (
             <div className="badge-ok" style={{ background: '#e0f2fe', color: '#0369a1', border: '1px solid #7dd3fc' }}>
               <AlertCircle className="w-4 h-4 animate-pulse" />
               Caricamento...
             </div>
           )}
-          {state.status === 'error' && (
+          {effectiveStatus === 'error' && (
             <div className="badge-err">
               <XCircle className="w-4 h-4" />
               Errore
@@ -192,7 +221,7 @@ const StockLocationUpload: React.FC<StockLocationUploadProps> = ({
           <div><strong>Opzionali:</strong> ManufPartNo, NextDelDate, Category</div>
         </div>
 
-        {state.status === 'empty' ? (
+        {effectiveStatus === 'empty' ? (
           <div className={`dropzone text-center ${disabled ? 'opacity-50 cursor-not-allowed' : ''}`}>
             <Upload className="mx-auto h-12 w-12 icon-dark mb-4" />
             <div>
@@ -225,9 +254,10 @@ const StockLocationUpload: React.FC<StockLocationUploadProps> = ({
             <div className="flex items-center gap-3">
               <FileText className="h-6 w-6 icon-dark" />
               <div>
-                <p className="font-medium">{state.filename}</p>
+                <p className="font-medium">{effectiveFilename}</p>
                 <p className="text-sm text-muted">
-                  {state.rowCount > 0 ? `${state.rowCount} prodotti univoci` : 'Caricamento...'}
+                  {effectiveRowCount > 0 ? `${effectiveRowCount} prodotti univoci` : 'Caricamento...'}
+                  {sourceLabel && <span className="ml-2 text-blue-600">({sourceLabel})</span>}
                 </p>
               </div>
             </div>
@@ -241,13 +271,13 @@ const StockLocationUpload: React.FC<StockLocationUploadProps> = ({
           </div>
         )}
 
-        {state.status === 'error' && state.error && (
+        {effectiveStatus === 'error' && state.error && (
           <div className="mt-4 p-3 rounded-lg border-strong" style={{ background: 'var(--error-bg)', color: 'var(--error-fg)' }}>
             <p className="text-sm font-medium">{state.error}</p>
           </div>
         )}
 
-        {state.status === 'valid' && (
+        {effectiveStatus === 'valid' && (
           <div className="mt-4 p-3 rounded-lg border-strong bg-gray-50">
             <h4 className="text-sm font-medium mb-2">Informazioni</h4>
             <div className="text-xs text-muted">

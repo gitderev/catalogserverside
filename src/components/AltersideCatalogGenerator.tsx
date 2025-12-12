@@ -455,6 +455,13 @@ const AltersideCatalogGenerator: React.FC = () => {
   const [stockLocationIndex, setStockLocationIndex] = useState<StockLocationIndex | null>(null);
   const [stockLocationWarnings, setStockLocationWarnings] = useState<StockLocationWarningsState>(EMPTY_WARNINGS);
   const [stockLocationFileLoaded, setStockLocationFileLoaded] = useState(false);
+  const [stockLocationMeta, setStockLocationMeta] = useState<{
+    source: 'manual' | 'ftp';
+    filename?: string;
+    rowCount?: number;
+    bytes?: number;
+    importedAt?: string;
+  } | null>(null);
 
   // Load fee config from Supabase on mount (including IT/EU fields)
   useEffect(() => {
@@ -697,13 +704,21 @@ const AltersideCatalogGenerator: React.FC = () => {
     }
   };
   
-  // Handler for stock location file loaded from upload component
+  // Handler for stock location file loaded from upload component (manual upload)
   const handleStockLocationLoaded = useCallback((content: string, warnings: StockLocationWarningsState) => {
     const index = parseStockLocationFile(content, warnings);
+    const rowCount = Object.keys(index).length;
     setStockLocationIndex(index);
     setStockLocationWarnings(warnings);
     setStockLocationFileLoaded(true);
-    console.log(`[stockLocation] File loaded: ${Object.keys(index).length} products, warnings:`, warnings);
+    // Set meta for manual upload (source will be overwritten by FTP import if needed)
+    setStockLocationMeta({
+      source: 'manual',
+      rowCount,
+      bytes: content.length,
+      importedAt: new Date().toISOString()
+    });
+    console.log(`[stockLocation] File loaded: ${rowCount} products, warnings:`, warnings);
   }, []);
   
   // Handler for extended fee config changes
@@ -1455,13 +1470,30 @@ const AltersideCatalogGenerator: React.FC = () => {
         const fileSize = fileData.size;
         const filename = data.files?.stockLocationFile?.filename || '790813_StockFile.txt';
         
-        console.log(`[FTP Import] Stock location file downloaded from Storage: ${filename} (${fileSize} bytes)`);
+        console.log(`[FTP Import] StockLocation download ok, bytes=${fileSize}`);
         
         // Parse the file and update state
         const warnings = createEmptyWarnings();
-        handleStockLocationLoaded(content, warnings);
+        const index = parseStockLocationFile(content, warnings);
+        const rowCount = Object.keys(index).length;
         
-        return { success: true, filename, size: fileSize };
+        console.log(`[FTP Import] StockLocation parse ok, rows=${rowCount}, warnings=`, warnings);
+        
+        // Update all state
+        setStockLocationIndex(index);
+        setStockLocationWarnings(warnings);
+        setStockLocationFileLoaded(true);
+        setStockLocationMeta({
+          source: 'ftp',
+          filename,
+          rowCount,
+          bytes: fileSize,
+          importedAt: new Date().toISOString()
+        });
+        
+        console.log(`[FTP Import] StockLocation state updated`);
+        
+        return { success: true, filename, size: fileSize, rowCount };
       } catch (e) {
         console.warn('[FTP Import] Error processing stock location file:', e);
         return { success: false, error: e instanceof Error ? e.message : 'Errore elaborazione file' };
@@ -5435,6 +5467,14 @@ const AltersideCatalogGenerator: React.FC = () => {
           <StockLocationUpload
             disabled={pipelineRunning || isProcessing}
             onFileLoaded={handleStockLocationLoaded}
+            externallyLoaded={stockLocationFileLoaded}
+            externalMeta={stockLocationMeta || undefined}
+            onClear={() => {
+              setStockLocationIndex(null);
+              setStockLocationWarnings(EMPTY_WARNINGS);
+              setStockLocationFileLoaded(false);
+              setStockLocationMeta(null);
+            }}
           />
         </div>
         
