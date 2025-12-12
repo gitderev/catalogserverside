@@ -1332,7 +1332,7 @@ const AltersideCatalogGenerator: React.FC = () => {
     return `${minutes.toString().padStart(2, '0')}:${(seconds % 60).toString().padStart(2, '0')}`;
   };
 
-  // FTP automatic import handler - calls edge function 3 times sequentially
+  // FTP automatic import handler - calls edge function 4 times sequentially (material, stock, price, stockLocation)
   const handleFtpImport = async () => {
     setFtpImportLoading(true);
     
@@ -1363,7 +1363,7 @@ const AltersideCatalogGenerator: React.FC = () => {
       return new File([blob], filename, { type: "text/plain" });
     };
     
-    // Helper: import a single file type from FTP
+    // Helper: import a single file type from FTP (material, stock, price)
     const importSingleFileFromFtp = async (fileType: "material" | "stock" | "price") => {
       // Call edge function with Authorization header
       let res: Response;
@@ -1408,15 +1408,79 @@ const AltersideCatalogGenerator: React.FC = () => {
       }
     };
     
+    // Helper: import stock location file from FTP
+    const importStockLocationFromFtp = async () => {
+      console.log('[FTP Import] Importing stock location file...');
+      let res: Response;
+      try {
+        res = await fetch(edgeFunctionUrl, {
+          method: "POST",
+          headers: { 
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${accessToken}`
+          },
+          body: JSON.stringify({ fileType: "stockLocation" }),
+        });
+      } catch (e) {
+        console.warn('[FTP Import] Network error for stockLocation, continuing with fallback');
+        return { success: false, error: 'network' };
+      }
+
+      const data = await res.json();
+
+      if (!res.ok || data.status !== "ok") {
+        console.warn('[FTP Import] Stock location import failed:', data.message);
+        return { success: false, error: data.message || 'Import failed' };
+      }
+
+      // Stock location file is uploaded to Storage, now download and process
+      const fileInfo = data.files?.stockLocationFile;
+      const url = fileInfo?.url;
+      const filename = fileInfo?.filename || '790813_StockFile.txt';
+
+      if (!url) {
+        console.warn('[FTP Import] No URL in stockLocation response');
+        return { success: false, error: 'No URL' };
+      }
+
+      try {
+        const file = await fetchFileFromUrl(url, filename);
+        console.log(`[FTP Import] Stock location file downloaded: ${file.name} (${file.size} bytes)`);
+        
+        // Read file content as text
+        const content = await file.text();
+        
+        // Call the existing handler for stock location with content string
+        const warnings = createEmptyWarnings();
+        handleStockLocationLoaded(content, warnings);
+        
+        return { success: true, filename };
+      } catch (e) {
+        console.warn('[FTP Import] Error processing stock location file:', e);
+        return { success: false, error: e instanceof Error ? e.message : 'Unknown error' };
+      }
+    };
+    
     try {
+      // Import the 3 main files
       await importSingleFileFromFtp("material");
       await importSingleFileFromFtp("stock");
       await importSingleFileFromFtp("price");
 
-      toast({
-        title: "Import FTP completato",
-        description: "I file Material, Stock e Price sono stati importati dal server FTP."
-      });
+      // Import stock location file (4th file) - don't fail if this doesn't work
+      const stockLocationResult = await importStockLocationFromFtp();
+      
+      if (stockLocationResult.success) {
+        toast({
+          title: "Import FTP completato",
+          description: "I file Material, Stock, Price e Stock Location sono stati importati dal server FTP."
+        });
+      } else {
+        toast({
+          title: "Import FTP completato (parziale)",
+          description: `I file Material, Stock e Price sono stati importati. Stock Location: ${stockLocationResult.error || 'non disponibile'}.`
+        });
+      }
     } catch (error) {
       toast({
         title: "Errore import FTP",
