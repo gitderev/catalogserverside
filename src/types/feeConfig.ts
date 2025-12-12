@@ -44,6 +44,10 @@ export interface FeeConfigState {
 
 /**
  * Default fee config values
+ * 
+ * BACKWARD COMPATIBILITY: includeEu defaults to TRUE for both marketplaces
+ * because the previous behavior used ExistingStock (total), which is equivalent
+ * to "includeEU always ON". This preserves existing behavior until user changes it.
  */
 export const DEFAULT_FEE_CONFIG: FeeConfigState = {
   feeDrev: 1.05,
@@ -51,10 +55,11 @@ export const DEFAULT_FEE_CONFIG: FeeConfigState = {
   shippingCost: 6.00,
   mediaworldPreparationDays: 3,
   epricePreparationDays: 1,
-  mediaworldIncludeEu: false,
+  // Backward compatibility: default to TRUE (previously used total stock)
+  mediaworldIncludeEu: true,
   mediaworldItPreparationDays: 3,
   mediaworldEuPreparationDays: 5,
-  epriceIncludeEu: false,
+  epriceIncludeEu: true,
   epriceItPreparationDays: 1,
   epriceEuPreparationDays: 3
 };

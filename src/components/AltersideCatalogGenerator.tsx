@@ -495,16 +495,25 @@ const AltersideCatalogGenerator: React.FC = () => {
             setPrepDays(Number(row.eprice_preparation_days));
           }
           // Load extended IT/EU config
+          // BACKWARD COMPATIBILITY: if includeEu is null/undefined, default to TRUE
+          // (previous behavior used total stock which is equivalent to "includeEU always ON")
+          const mediaworldIncludeEu = row.mediaworld_include_eu === null || row.mediaworld_include_eu === undefined
+            ? true  // Default to true for backward compat
+            : Boolean(row.mediaworld_include_eu);
+          const epriceIncludeEu = row.eprice_include_eu === null || row.eprice_include_eu === undefined
+            ? true  // Default to true for backward compat
+            : Boolean(row.eprice_include_eu);
+          
           setExtendedFeeConfig({
             feeDrev: Number(row.fee_drev),
             feeMkt: Number(row.fee_mkt),
             shippingCost: Number(row.shipping_cost),
             mediaworldPreparationDays: Number(row.mediaworld_preparation_days || 3),
             epricePreparationDays: Number(row.eprice_preparation_days || 1),
-            mediaworldIncludeEu: Boolean(row.mediaworld_include_eu),
+            mediaworldIncludeEu,
             mediaworldItPreparationDays: Number(row.mediaworld_it_preparation_days || row.mediaworld_preparation_days || 3),
             mediaworldEuPreparationDays: Number(row.mediaworld_eu_preparation_days || 5),
-            epriceIncludeEu: Boolean(row.eprice_include_eu),
+            epriceIncludeEu,
             epriceItPreparationDays: Number(row.eprice_it_preparation_days || row.eprice_preparation_days || 1),
             epriceEuPreparationDays: Number(row.eprice_eu_preparation_days || 3)
           });
@@ -1620,6 +1629,11 @@ const AltersideCatalogGenerator: React.FC = () => {
       return;
     }
     
+    // =====================================================================
+    // RESET WARNINGS at the start of each manual run
+    // =====================================================================
+    setStockLocationWarnings(EMPTY_WARNINGS);
+    console.log('[manual-run] Stock location warnings reset');
     // CRITICAL VALIDATION: Test LP/CBP logic with fundamental cases
     if (typeof (globalThis as any).lpCbpValidationDone === 'undefined') {
       console.warn('=== VALIDATION: Testing LP/CBP logic ===');
@@ -2855,13 +2869,41 @@ const AltersideCatalogGenerator: React.FC = () => {
         }
       });
       
-      // Create worksheet from final dataset (with override applied if applicable)
-      const ws = XLSX.utils.json_to_sheet(finalDataset, { skipHeader: false });
+      // =====================================================================
+      // EXPLICIT HEADER ORDERING for EAN Catalog
+      // StockIT and StockEU must come immediately after ExistingStock
+      // =====================================================================
+      const EAN_CATALOG_HEADERS = [
+        'Matnr',
+        'ManufPartNr',
+        'EAN',
+        'ShortDescription',
+        'ExistingStock',
+        'StockIT',           // NEW: IT stock from location file
+        'StockEU',           // NEW: EU stock from location file
+        'CustBestPrice',
+        'Surcharge',
+        'Costo di Spedizione',
+        'IVA',
+        'Prezzo con spediz e IVA',
+        'FeeDeRev',
+        'Fee Marketplace',
+        'Subtotale post-fee',
+        'Prezzo Finale',
+        'ListPrice',
+        'ListPrice con Fee'
+      ];
+      
+      // Create worksheet with explicit header order using json_to_sheet with header option
+      const ws = XLSX.utils.json_to_sheet(finalDataset, { 
+        skipHeader: false,
+        header: EAN_CATALOG_HEADERS
+      });
       
       // Ensure !ref exists
       if (!ws['!ref']) {
         const rows = finalDataset.length + 1; // +1 for header
-        const cols = Object.keys(finalDataset[0] || {}).length;
+        const cols = EAN_CATALOG_HEADERS.length;
         ws['!ref'] = XLSX.utils.encode_range({s:{r:0,c:0}, e:{r:rows-1,c:cols-1}});
       }
       
@@ -3410,10 +3452,17 @@ const AltersideCatalogGenerator: React.FC = () => {
       // USA DIRETTAMENTE IL DATASET - già filtrato in onExportEAN
       const eanFilteredData = eanCatalogDataset;
       
-      // Log di inizio export standardizzato (senza console.warn fuorvianti)
+      // Log di inizio export standardizzato con IT/EU config
       console.log('%c[ePrice:export:start]', 'color: #9C27B0; font-weight: bold;', {
         rows_da_exportare: eanFilteredData.length,
         timestamp: new Date().toISOString(),
+        // Diagnostic: IT/EU config being used
+        config_IT_EU: {
+          includeEu: extendedFeeConfig.epriceIncludeEu,
+          itDays: extendedFeeConfig.epriceItPreparationDays,
+          euDays: extendedFeeConfig.epriceEuPreparationDays,
+          stockLocationIndex_present: !!stockLocationIndex
+        }
       });
       
       if (eanFilteredData.length === 0) {
@@ -3803,6 +3852,13 @@ const AltersideCatalogGenerator: React.FC = () => {
       console.log('%c[Mediaworld:export:start]', 'color: #00BCD4; font-weight: bold;', {
         rows_da_exportare: eanCatalogDataset.length,
         timestamp: new Date().toISOString(),
+        // Diagnostic: IT/EU config being used
+        config_IT_EU: {
+          includeEu: extendedFeeConfig.mediaworldIncludeEu,
+          itDays: extendedFeeConfig.mediaworldItPreparationDays,
+          euDays: extendedFeeConfig.mediaworldEuPreparationDays,
+          stockLocationIndex_present: !!stockLocationIndex
+        }
       });
       
       const result = await exportMediaworldCatalog({
@@ -5482,6 +5538,48 @@ const AltersideCatalogGenerator: React.FC = () => {
         {stockLocationFileLoaded && (
           <StockLocationWarningsDisplay warnings={stockLocationWarnings} />
         )}
+        
+        {/* IT/EU Stock Configuration - Always visible in manual path */}
+        <div className="mt-6">
+          <div className="card border-strong" style={{ background: '#f0fdf4' }}>
+            <div className="card-body">
+              <h3 className="card-title mb-4 flex items-center gap-2 text-green-800">
+                <Info className="h-5 w-5" />
+                Configurazione Stock IT/EU
+              </h3>
+              <p className="text-sm text-muted-foreground mb-4">
+                Configura il fallback EU e i giorni di preparazione per Mediaworld ed ePrice.
+                {!stockLocationFileLoaded && (
+                  <span className="block mt-1 text-amber-600">
+                    ⚠️ Nessun file Stock Location caricato. Fallback: StockIT=ExistingStock, StockEU=0
+                  </span>
+                )}
+              </p>
+              <StockLocationConfig
+                config={extendedFeeConfig}
+                onConfigChange={handleExtendedConfigChange}
+                disabled={pipelineRunning}
+              />
+              <div className="mt-4 flex justify-end">
+                <button
+                  type="button"
+                  onClick={handleSavePrepDays}
+                  disabled={isSavingPrepDays}
+                  className={`btn btn-primary text-sm px-6 py-2 ${isSavingPrepDays ? 'opacity-50 cursor-not-allowed' : ''}`}
+                >
+                  {isSavingPrepDays ? (
+                    <>
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin inline" />
+                      Salvataggio...
+                    </>
+                  ) : (
+                    'Salva configurazione IT/EU'
+                  )}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
 
         {/* Fee Configuration */}
         {allFilesValid && (
@@ -5826,16 +5924,7 @@ const AltersideCatalogGenerator: React.FC = () => {
               )}
             </div>
             
-            {/* Stock Location IT/EU Config Section - Only for EAN pipeline */}
-            {currentPipeline === 'EAN' && (
-              <div className="mt-8">
-                <StockLocationConfig
-                  config={extendedFeeConfig}
-                  onConfigChange={handleExtendedConfigChange}
-                  disabled={pipelineRunning}
-                />
-              </div>
-            )}
+            {/* Note: IT/EU Stock Config moved to file upload section for always-visible access */}
             
             {/* ePrice Export Section - Only for EAN pipeline */}
             {currentPipeline === 'EAN' && (
@@ -5881,28 +5970,7 @@ const AltersideCatalogGenerator: React.FC = () => {
               </div>
             )}
 
-            {/* Salva impostazioni giorni di preparazione - Only for EAN pipeline */}
-            {currentPipeline === 'EAN' && (
-              <div className="mt-4 flex justify-center">
-                <button
-                  type="button"
-                  onClick={handleSavePrepDays}
-                  disabled={isSavingPrepDays}
-                  className={`btn btn-secondary text-sm px-6 py-2 ${isSavingPrepDays ? 'opacity-50 cursor-not-allowed' : ''}`}
-                  style={{ background: '#6b7280', color: 'white' }}
-                >
-                  {isSavingPrepDays ? (
-                    <>
-                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                      Salvataggio...
-                    </>
-                  ) : (
-                    'Salva impostazioni giorni di preparazione'
-                  )}
-                </button>
-              </div>
-            )}
-
+            {/* Note: Save button moved to IT/EU config section in file upload area */}
             {/* SFTP Upload Status - Only for EAN pipeline */}
             {currentPipeline === 'EAN' && sftpUploadStatus.phase !== 'idle' && (
               <div className="mt-8 p-6 rounded-lg border-2" style={{ 
