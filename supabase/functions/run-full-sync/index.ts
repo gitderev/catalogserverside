@@ -285,140 +285,173 @@ serve(async (req) => {
     });
     console.log(`[orchestrator] Run created: ${runId}`);
 
-    // ========== STEP 1: FTP Import (including stock location) ==========
-    await updateRun(supabase, runId, { steps: { current_step: 'import_ftp' } });
-    console.log('[orchestrator] === STEP 1: FTP Import ===');
-    
-    for (const fileType of ['material', 'stock', 'price', 'stockLocation']) {
-      if (await isCancelRequested(supabase, runId)) {
-        await finalizeRun(supabase, runId, 'failed', startTime, 'Interrotta dall\'utente');
-        return new Response(JSON.stringify({ status: 'cancelled' }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-      }
-      
-      const result = await callStep(supabaseUrl, supabaseServiceKey, 'import-catalog-ftp', { 
-        fileType,
-        run_id: runId // Pass run_id for per-run stock location storage
-      });
-      
-      // Stock location failure is non-blocking - use fallback compatibility
-      if (!result.success && fileType !== 'stockLocation') {
-        await finalizeRun(supabase, runId, 'failed', startTime, `FTP ${fileType}: ${result.error}`);
-        return new Response(JSON.stringify({ status: 'failed', error: result.error }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-      }
-      
-      if (!result.success && fileType === 'stockLocation') {
-        console.log(`[orchestrator] Stock location import failed (non-blocking): ${result.error}`);
-        // Update location_warnings for missing file
-        const { data: run } = await supabase.from('sync_runs').select('location_warnings').eq('id', runId).single();
-        const warnings = run?.location_warnings || {};
-        warnings.missing_location_file = 1;
-        await supabase.from('sync_runs').update({ location_warnings: warnings }).eq('id', runId);
-      }
-    }
-
-    // ========== STEP 2: PARSE_MERGE (CHUNKED) ==========
-    await updateRun(supabase, runId, { steps: { current_step: 'parse_merge' } });
-    console.log('[orchestrator] === STEP 2: parse_merge (CHUNKED) ===');
-    
-    let parseMergeComplete = false;
-    let chunkCount = 0;
-    
-    while (!parseMergeComplete && chunkCount < MAX_PARSE_MERGE_CHUNKS) {
-      if (await isCancelRequested(supabase, runId)) {
-        await finalizeRun(supabase, runId, 'failed', startTime, 'Interrotta dall\'utente');
-        return new Response(JSON.stringify({ status: 'cancelled' }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-      }
-      
-      chunkCount++;
-      console.log(`[orchestrator] parse_merge chunk ${chunkCount}/${MAX_PARSE_MERGE_CHUNKS}...`);
-      
-      const result = await callStep(supabaseUrl, supabaseServiceKey, 'sync-step-runner', { 
-        run_id: runId, step: 'parse_merge', fee_config: feeConfig 
-      });
-      
-      if (!result.success) {
-        await finalizeRun(supabase, runId, 'failed', startTime, `parse_merge chunk ${chunkCount}: ${result.error}`);
-        return new Response(JSON.stringify({ status: 'failed', error: result.error }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-      }
-      
-      // Verify status in database
-      const verification = await verifyStepCompleted(supabase, runId, 'parse_merge');
-      
-      if (!verification.success) {
-        await finalizeRun(supabase, runId, 'failed', startTime, verification.error || 'parse_merge verification failed');
-        return new Response(JSON.stringify({ status: 'failed', error: verification.error }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-      }
-      
-      if (verification.status === 'completed') {
-        parseMergeComplete = true;
-        console.log(`[orchestrator] parse_merge completed after ${chunkCount} chunks`);
-      } else if (verification.status === 'in_progress') {
-        console.log(`[orchestrator] parse_merge in_progress, continuing to next chunk...`);
-        // Continue loop for next chunk
-      } else {
-        await finalizeRun(supabase, runId, 'failed', startTime, `parse_merge unexpected status: ${verification.status}`);
-        return new Response(JSON.stringify({ status: 'failed', error: `Unexpected status: ${verification.status}` }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-      }
-    }
-    
-    if (!parseMergeComplete) {
-      await finalizeRun(supabase, runId, 'failed', startTime, `parse_merge exceeded ${MAX_PARSE_MERGE_CHUNKS} chunks limit`);
-      return new Response(JSON.stringify({ status: 'failed', error: 'parse_merge chunk limit exceeded' }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-    }
-
-    // ========== STEPS 3-7: Processing via sync-step-runner ==========
-    const remainingSteps = ['ean_mapping', 'pricing', 'export_ean', 'export_mediaworld', 'export_eprice'];
-    
-    for (const step of remainingSteps) {
-      if (await isCancelRequested(supabase, runId)) {
-        await finalizeRun(supabase, runId, 'failed', startTime, 'Interrotta dall\'utente');
-        return new Response(JSON.stringify({ status: 'cancelled' }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-      }
-      
-      await updateRun(supabase, runId, { steps: { current_step: step } });
-      console.log(`[orchestrator] === STEP: ${step} ===`);
-      
-      const result = await callStep(supabaseUrl, supabaseServiceKey, 'sync-step-runner', { 
-        run_id: runId, step, fee_config: feeConfig 
-      });
-      
-      const verification = await verifyStepCompleted(supabase, runId, step);
-      
-      if (!result.success || !verification.success) {
-        const error = result.error || verification.error || `Step ${step} fallito`;
-        await finalizeRun(supabase, runId, 'failed', startTime, error);
-        return new Response(JSON.stringify({ status: 'failed', error }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-      }
-    }
-
-    // ========== STEP 8: SFTP Upload ==========
-    if (await isCancelRequested(supabase, runId)) {
-      await finalizeRun(supabase, runId, 'failed', startTime, 'Interrotta dall\'utente');
-      return new Response(JSON.stringify({ status: 'cancelled' }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-    }
-    
-    await updateRun(supabase, runId, { steps: { current_step: 'upload_sftp' } });
-    console.log('[orchestrator] === STEP 8: SFTP Upload ===');
-    
-    const sftpResult = await callStep(supabaseUrl, supabaseServiceKey, 'upload-exports-to-sftp', {
-      files: [
-        { bucket: 'exports', path: 'Catalogo EAN.csv', filename: 'Catalogo EAN.csv' },
-        { bucket: 'exports', path: 'Export ePrice.csv', filename: 'Export ePrice.csv' },
-        { bucket: 'exports', path: 'Export Mediaworld.csv', filename: 'Export Mediaworld.csv' }
-      ]
+    // Return immediately with run_id so UI can start polling
+    // Use EdgeRuntime.waitUntil to continue processing in background
+    const responseJson = JSON.stringify({ 
+      run_id: runId, 
+      queued: false, 
+      status: 'running', 
+      message: 'Pipeline avviata' 
     });
-    
-    if (!sftpResult.success) {
-      await finalizeRun(supabase, runId, 'failed', startTime, `SFTP: ${sftpResult.error}`);
-      return new Response(JSON.stringify({ status: 'failed', error: sftpResult.error }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    const immediateResponse = new Response(responseJson, { 
+      status: 200, 
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+    });
+
+    // Continue processing in background using waitUntil
+    const processPipeline = async () => {
+      try {
+        // ========== STEP 1: FTP Import (including stock location) ==========
+        await updateRun(supabase, runId!, { steps: { current_step: 'import_ftp' } });
+        console.log('[orchestrator] === STEP 1: FTP Import ===');
+        
+        for (const fileType of ['material', 'stock', 'price', 'stockLocation']) {
+          if (await isCancelRequested(supabase, runId!)) {
+            await finalizeRun(supabase, runId!, 'failed', startTime, 'Interrotta dall\'utente');
+            return;
+          }
+          
+          const result = await callStep(supabaseUrl, supabaseServiceKey, 'import-catalog-ftp', { 
+            fileType,
+            run_id: runId
+          });
+          
+          if (!result.success && fileType !== 'stockLocation') {
+            await finalizeRun(supabase, runId!, 'failed', startTime, `FTP ${fileType}: ${result.error}`);
+            return;
+          }
+          
+          if (!result.success && fileType === 'stockLocation') {
+            console.log(`[orchestrator] Stock location import failed (non-blocking): ${result.error}`);
+            const { data: run } = await supabase.from('sync_runs').select('location_warnings').eq('id', runId).single();
+            const warnings = run?.location_warnings || {};
+            warnings.missing_location_file = 1;
+            await supabase.from('sync_runs').update({ location_warnings: warnings }).eq('id', runId);
+          }
+        }
+
+        // ========== STEP 2: PARSE_MERGE (CHUNKED) ==========
+        await updateRun(supabase, runId!, { steps: { current_step: 'parse_merge' } });
+        console.log('[orchestrator] === STEP 2: parse_merge (CHUNKED) ===');
+        
+        let parseMergeComplete = false;
+        let chunkCount = 0;
+        
+        while (!parseMergeComplete && chunkCount < MAX_PARSE_MERGE_CHUNKS) {
+          if (await isCancelRequested(supabase, runId!)) {
+            await finalizeRun(supabase, runId!, 'failed', startTime, 'Interrotta dall\'utente');
+            return;
+          }
+          
+          chunkCount++;
+          console.log(`[orchestrator] parse_merge chunk ${chunkCount}/${MAX_PARSE_MERGE_CHUNKS}...`);
+          
+          const result = await callStep(supabaseUrl, supabaseServiceKey, 'sync-step-runner', { 
+            run_id: runId, step: 'parse_merge', fee_config: feeConfig 
+          });
+          
+          if (!result.success) {
+            await finalizeRun(supabase, runId!, 'failed', startTime, `parse_merge chunk ${chunkCount}: ${result.error}`);
+            return;
+          }
+          
+          const verification = await verifyStepCompleted(supabase, runId!, 'parse_merge');
+          
+          if (!verification.success) {
+            await finalizeRun(supabase, runId!, 'failed', startTime, verification.error || 'parse_merge verification failed');
+            return;
+          }
+          
+          if (verification.status === 'completed') {
+            parseMergeComplete = true;
+            console.log(`[orchestrator] parse_merge completed after ${chunkCount} chunks`);
+          } else if (verification.status === 'in_progress') {
+            console.log(`[orchestrator] parse_merge in_progress, continuing to next chunk...`);
+          } else {
+            await finalizeRun(supabase, runId!, 'failed', startTime, `parse_merge unexpected status: ${verification.status}`);
+            return;
+          }
+        }
+        
+        if (!parseMergeComplete) {
+          await finalizeRun(supabase, runId!, 'failed', startTime, `parse_merge exceeded ${MAX_PARSE_MERGE_CHUNKS} chunks limit`);
+          return;
+        }
+
+        // ========== STEPS 3-7: Processing via sync-step-runner ==========
+        const remainingSteps = ['ean_mapping', 'pricing', 'export_ean', 'export_mediaworld', 'export_eprice'];
+        
+        for (const step of remainingSteps) {
+          if (await isCancelRequested(supabase, runId!)) {
+            await finalizeRun(supabase, runId!, 'failed', startTime, 'Interrotta dall\'utente');
+            return;
+          }
+          
+          await updateRun(supabase, runId!, { steps: { current_step: step } });
+          console.log(`[orchestrator] === STEP: ${step} ===`);
+          
+          const result = await callStep(supabaseUrl, supabaseServiceKey, 'sync-step-runner', { 
+            run_id: runId, step, fee_config: feeConfig 
+          });
+          
+          const verification = await verifyStepCompleted(supabase, runId!, step);
+          
+          if (!result.success || !verification.success) {
+            const error = result.error || verification.error || `Step ${step} fallito`;
+            await finalizeRun(supabase, runId!, 'failed', startTime, error);
+            return;
+          }
+        }
+
+        // ========== STEP 8: SFTP Upload ==========
+        if (await isCancelRequested(supabase, runId!)) {
+          await finalizeRun(supabase, runId!, 'failed', startTime, 'Interrotta dall\'utente');
+          return;
+        }
+        
+        await updateRun(supabase, runId!, { steps: { current_step: 'upload_sftp' } });
+        console.log('[orchestrator] === STEP 8: SFTP Upload ===');
+        
+        const sftpResult = await callStep(supabaseUrl, supabaseServiceKey, 'upload-exports-to-sftp', {
+          files: [
+            { bucket: 'exports', path: 'Catalogo EAN.xlsx', filename: 'Catalogo EAN.xlsx' },
+            { bucket: 'exports', path: 'Export ePrice.xlsx', filename: 'Export ePrice.xlsx' },
+            { bucket: 'exports', path: 'Export Mediaworld.xlsx', filename: 'Export Mediaworld.xlsx' }
+          ]
+        });
+        
+        if (!sftpResult.success) {
+          await finalizeRun(supabase, runId!, 'failed', startTime, `SFTP: ${sftpResult.error}`);
+          return;
+        }
+
+        // ========== SUCCESS ==========
+        await finalizeRun(supabase, runId!, 'success', startTime);
+        console.log(`[orchestrator] Pipeline completed: ${runId}`);
+        
+      } catch (err: any) {
+        console.error('[orchestrator] Pipeline error:', err);
+        if (runId) {
+          try {
+            await finalizeRun(supabase, runId, 'failed', startTime, err.message);
+          } catch (e) {
+            console.error('[orchestrator] Failed to finalize:', e);
+          }
+        }
+      }
+    };
+
+    // Use EdgeRuntime.waitUntil if available, otherwise run synchronously
+    // @ts-ignore - EdgeRuntime may not be typed
+    if (typeof EdgeRuntime !== 'undefined' && EdgeRuntime.waitUntil) {
+      // @ts-ignore
+      EdgeRuntime.waitUntil(processPipeline());
+    } else {
+      // Fallback: fire-and-forget (don't await)
+      processPipeline().catch(err => console.error('[orchestrator] Background error:', err));
     }
 
-    // ========== SUCCESS ==========
-    await finalizeRun(supabase, runId, 'success', startTime);
-    console.log(`[orchestrator] Pipeline completed: ${runId}`);
-    
-    return new Response(JSON.stringify({ status: 'success', run_id: runId }), 
-      { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    return immediateResponse;
 
   } catch (err: any) {
     console.error('[orchestrator] Fatal error:', err);
@@ -431,7 +464,10 @@ serve(async (req) => {
       }
     }
     
-    return new Response(JSON.stringify({ status: 'error', message: err.message }), 
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ 
+      error: err.message, 
+      details: 'Errore durante l\'avvio della pipeline',
+      run_id: runId || null
+    }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   }
 });

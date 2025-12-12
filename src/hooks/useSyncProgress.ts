@@ -189,7 +189,8 @@ export function useSyncProgress() {
         return false;
       }
 
-      const runId = data?.run_id;
+      // Accept run_id, runId, or id for compatibility
+      const runId = data?.run_id || data?.runId || data?.id;
       if (!runId) {
         // If status is success but no run_id, pipeline completed instantly
         if (data?.status === 'success') {
@@ -205,11 +206,13 @@ export function useSyncProgress() {
           return true;
         }
         
+        // Show detailed debug info
+        const debugInfo = JSON.stringify(data, null, 2);
         console.error('[useSyncProgress] No run_id in response:', data);
         setState(prev => ({
           ...prev,
           status: 'failed',
-          errorMessage: 'Risposta run-full-sync non valida',
+          errorMessage: `Risposta run-full-sync non valida. Dettagli: ${debugInfo?.substring(0, 200) || 'vuoto'}`,
         }));
         return false;
       }

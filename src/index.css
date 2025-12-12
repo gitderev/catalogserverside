@@ -4,75 +4,75 @@
 
 @layer base {
   :root {
-    /* High contrast flat design colors */
-    --background: 250 250 250;
-    --foreground: 25 25 25;
+    /* High contrast flat design colors - HSL format */
+    --background: 0 0% 98%;
+    --foreground: 0 0% 10%;
 
-    --card: 255 255 255;
-    --card-foreground: 25 25 25;
+    --card: 0 0% 100%;
+    --card-foreground: 0 0% 10%;
 
-    --popover: 255 255 255;
-    --popover-foreground: 25 25 25;
+    --popover: 0 0% 100%;
+    --popover-foreground: 0 0% 10%;
 
     /* Primary blue for buttons and accents */
-    --primary: 37 99 235;
-    --primary-foreground: 255 255 255;
+    --primary: 217 91% 60%;
+    --primary-foreground: 0 0% 100%;
 
     /* Secondary gray for less important elements */
-    --secondary: 245 245 245;
-    --secondary-foreground: 60 60 60;
+    --secondary: 0 0% 96%;
+    --secondary-foreground: 0 0% 24%;
 
-    --muted: 245 245 245;
-    --muted-foreground: 100 100 100;
+    --muted: 0 0% 96%;
+    --muted-foreground: 0 0% 39%;
 
     /* High contrast accent colors */
-    --accent: 239 246 255;
-    --accent-foreground: 30 58 138;
+    --accent: 213 94% 97%;
+    --accent-foreground: 224 76% 33%;
 
     /* Success green for valid states */
-    --success: 34 197 94;
-    --success-foreground: 255 255 255;
+    --success: 142 71% 45%;
+    --success-foreground: 0 0% 100%;
 
     /* Destructive red for errors */
-    --destructive: 239 68 68;
-    --destructive-foreground: 255 255 255;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
 
     /* Strong borders for flat design */
-    --border: 200 200 200;
-    --input: 200 200 200;
-    --ring: 37 99 235;
+    --border: 0 0% 78%;
+    --input: 0 0% 78%;
+    --ring: 217 91% 60%;
 
     /* High contrast progress colors */
-    --progress-bg: 230 230 230;
-    --progress-fill: 34 197 94;
+    --progress-bg: 0 0% 90%;
+    --progress-fill: 142 71% 45%;
 
     --radius: 8px;
   }
 
   .dark {
-    --background: 15 15 15;
-    --foreground: 245 245 245;
-    --card: 25 25 25;
-    --card-foreground: 245 245 245;
-    --popover: 25 25 25;
-    --popover-foreground: 245 245 245;
-    --primary: 96 165 250;
-    --primary-foreground: 15 15 15;
-    --secondary: 35 35 35;
-    --secondary-foreground: 200 200 200;
-    --muted: 35 35 35;
-    --muted-foreground: 160 160 160;
-    --accent: 37 99 235;
-    --accent-foreground: 219 234 254;
-    --success: 34 197 94;
-    --success-foreground: 255 255 255;
-    --destructive: 239 68 68;
-    --destructive-foreground: 255 255 255;
-    --border: 60 60 60;
-    --input: 60 60 60;
-    --ring: 96 165 250;
-    --progress-bg: 60 60 60;
-    --progress-fill: 34 197 94;
+    --background: 0 0% 6%;
+    --foreground: 0 0% 96%;
+    --card: 0 0% 10%;
+    --card-foreground: 0 0% 96%;
+    --popover: 0 0% 10%;
+    --popover-foreground: 0 0% 96%;
+    --primary: 213 94% 68%;
+    --primary-foreground: 0 0% 6%;
+    --secondary: 0 0% 14%;
+    --secondary-foreground: 0 0% 78%;
+    --muted: 0 0% 14%;
+    --muted-foreground: 0 0% 63%;
+    --accent: 217 91% 60%;
+    --accent-foreground: 213 94% 90%;
+    --success: 142 71% 45%;
+    --success-foreground: 0 0% 100%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 0 0% 24%;
+    --input: 0 0% 24%;
+    --ring: 213 94% 68%;
+    --progress-bg: 0 0% 24%;
+    --progress-fill: 142 71% 45%;
     --sidebar-background: 240 5.9% 10%;
     --sidebar-foreground: 240 4.8% 95.9%;
     --sidebar-primary: 224.3 76.3% 48%;
