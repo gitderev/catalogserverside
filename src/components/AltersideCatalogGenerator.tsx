@@ -40,8 +40,7 @@ import {
   getStockForMatnr,
   checkSplitMismatch,
   STOCK_LOCATION_LATEST_KEY,
-  type StockLocationIndex,
-  type StockLocationWarnings
+  type StockLocationIndex
 } from '@/utils/stockLocation';
 import StockLocationUpload from '@/components/StockLocationUpload';
 import StockLocationConfig from '@/components/StockLocationConfig';
@@ -450,14 +449,20 @@ const AltersideCatalogGenerator: React.FC = () => {
   const [feeConfig, setFeeConfig] = useState<FeeConfig>(DEFAULT_FEES);
   const [isLoadingFees, setIsLoadingFees] = useState(true);
   const [isSavingFees, setIsSavingFees] = useState(false);
+  
+  // Stock Location IT/EU state
+  const [extendedFeeConfig, setExtendedFeeConfig] = useState<FeeConfigState>(DEFAULT_FEE_CONFIG);
+  const [stockLocationIndex, setStockLocationIndex] = useState<StockLocationIndex | null>(null);
+  const [stockLocationWarnings, setStockLocationWarnings] = useState<StockLocationWarningsState>(EMPTY_WARNINGS);
+  const [stockLocationFileLoaded, setStockLocationFileLoaded] = useState(false);
 
-  // Load fee config from Supabase on mount
+  // Load fee config from Supabase on mount (including IT/EU fields)
   useEffect(() => {
     const loadFeesFromSupabase = async () => {
       try {
         const { data, error } = await supabase
           .from('fee_config')
-          .select('fee_drev, fee_mkt, shipping_cost, mediaworld_preparation_days, eprice_preparation_days')
+          .select('*')
           .order('updated_at', { ascending: false })
           .limit(1);
         
@@ -469,7 +474,7 @@ const AltersideCatalogGenerator: React.FC = () => {
             variant: "destructive"
           });
         } else if (data && data.length > 0) {
-          const row = data[0];
+          const row = data[0] as any;
           setFeeConfig({
             feeDrev: Number(row.fee_drev),
             feeMkt: Number(row.fee_mkt),
@@ -482,7 +487,21 @@ const AltersideCatalogGenerator: React.FC = () => {
           if (row.eprice_preparation_days !== null && row.eprice_preparation_days !== undefined) {
             setPrepDays(Number(row.eprice_preparation_days));
           }
-          console.log('Fee config caricato da Supabase:', row);
+          // Load extended IT/EU config
+          setExtendedFeeConfig({
+            feeDrev: Number(row.fee_drev),
+            feeMkt: Number(row.fee_mkt),
+            shippingCost: Number(row.shipping_cost),
+            mediaworldPreparationDays: Number(row.mediaworld_preparation_days || 3),
+            epricePreparationDays: Number(row.eprice_preparation_days || 1),
+            mediaworldIncludeEu: Boolean(row.mediaworld_include_eu),
+            mediaworldItPreparationDays: Number(row.mediaworld_it_preparation_days || row.mediaworld_preparation_days || 3),
+            mediaworldEuPreparationDays: Number(row.mediaworld_eu_preparation_days || 5),
+            epriceIncludeEu: Boolean(row.eprice_include_eu),
+            epriceItPreparationDays: Number(row.eprice_it_preparation_days || row.eprice_preparation_days || 1),
+            epriceEuPreparationDays: Number(row.eprice_eu_preparation_days || 3)
+          });
+          console.log('Fee config caricato da Supabase (con IT/EU):', row);
         } else {
           console.log('Nessuna fee config trovata, utilizzo valori predefiniti');
         }
@@ -499,6 +518,40 @@ const AltersideCatalogGenerator: React.FC = () => {
     };
 
     loadFeesFromSupabase();
+    
+    // Run golden cases validation on mount
+    validateGoldenCases('[client]');
+  }, []);
+  
+  // Load stock location file from storage on mount
+  useEffect(() => {
+    const loadStockLocationFromStorage = async () => {
+      try {
+        const { data, error } = await supabase.storage
+          .from('ftp-import')
+          .download(STOCK_LOCATION_LATEST_KEY);
+        
+        if (error || !data) {
+          console.log('[stockLocation] No latest file found in storage');
+          return;
+        }
+        
+        const content = await data.text();
+        const warnings = createEmptyWarnings();
+        const index = parseStockLocationFile(content, warnings);
+        
+        if (Object.keys(index).length > 0) {
+          setStockLocationIndex(index);
+          setStockLocationWarnings(warnings);
+          setStockLocationFileLoaded(true);
+          console.log(`[stockLocation] Loaded from storage: ${Object.keys(index).length} products`);
+        }
+      } catch (err) {
+        console.error('[stockLocation] Error loading from storage:', err);
+      }
+    };
+    
+    loadStockLocationFromStorage();
   }, []);
 
   // Save fee config to Supabase
@@ -539,21 +592,21 @@ const AltersideCatalogGenerator: React.FC = () => {
     }
   };
 
-  // Save preparation days to Supabase (global settings)
+  // Save preparation days to Supabase (global settings) - including IT/EU config
   const handleSavePrepDays = async () => {
     // Validate inputs
-    if (!Number.isInteger(prepDays) || prepDays < 1) {
+    if (!Number.isInteger(extendedFeeConfig.epriceItPreparationDays) || extendedFeeConfig.epriceItPreparationDays < 1) {
       toast({
         title: "Errore validazione",
-        description: "I giorni di preparazione ePrice devono essere un numero intero >= 1",
+        description: "I giorni di preparazione ePrice IT devono essere un numero intero >= 1",
         variant: "destructive"
       });
       return;
     }
-    if (!Number.isInteger(prepDaysMediaworld) || prepDaysMediaworld < 1) {
+    if (!Number.isInteger(extendedFeeConfig.mediaworldItPreparationDays) || extendedFeeConfig.mediaworldItPreparationDays < 1) {
       toast({
         title: "Errore validazione",
-        description: "I giorni di preparazione Mediaworld devono essere un numero intero >= 1",
+        description: "I giorni di preparazione Mediaworld IT devono essere un numero intero >= 1",
         variant: "destructive"
       });
       return;
@@ -568,15 +621,23 @@ const AltersideCatalogGenerator: React.FC = () => {
         .order('updated_at', { ascending: false })
         .limit(1);
       
+      const updateData = {
+        mediaworld_preparation_days: extendedFeeConfig.mediaworldItPreparationDays,
+        eprice_preparation_days: extendedFeeConfig.epriceItPreparationDays,
+        mediaworld_include_eu: extendedFeeConfig.mediaworldIncludeEu,
+        mediaworld_it_preparation_days: extendedFeeConfig.mediaworldItPreparationDays,
+        mediaworld_eu_preparation_days: extendedFeeConfig.mediaworldEuPreparationDays,
+        eprice_include_eu: extendedFeeConfig.epriceIncludeEu,
+        eprice_it_preparation_days: extendedFeeConfig.epriceItPreparationDays,
+        eprice_eu_preparation_days: extendedFeeConfig.epriceEuPreparationDays,
+        updated_at: new Date().toISOString()
+      };
+      
       if (existingConfig && existingConfig.length > 0) {
         // Update existing record
         const { error } = await supabase
           .from('fee_config')
-          .update({
-            mediaworld_preparation_days: prepDaysMediaworld,
-            eprice_preparation_days: prepDays,
-            updated_at: new Date().toISOString()
-          })
+          .update(updateData)
           .eq('id', existingConfig[0].id);
         
         if (error) {
@@ -587,11 +648,14 @@ const AltersideCatalogGenerator: React.FC = () => {
             variant: "destructive"
           });
         } else {
+          // Sync legacy prepDays state
+          setPrepDaysMediaworld(extendedFeeConfig.mediaworldItPreparationDays);
+          setPrepDays(extendedFeeConfig.epriceItPreparationDays);
           toast({
             title: "Impostazioni salvate",
-            description: "I giorni di preparazione sono stati salvati come impostazioni globali."
+            description: "La configurazione IT/EU è stata salvata."
           });
-          console.log('Giorni preparazione salvati su Supabase');
+          console.log('Giorni preparazione IT/EU salvati su Supabase');
         }
       } else {
         // Insert new record with all defaults plus prep days
@@ -601,8 +665,7 @@ const AltersideCatalogGenerator: React.FC = () => {
             fee_drev: feeConfig.feeDrev,
             fee_mkt: feeConfig.feeMkt,
             shipping_cost: feeConfig.shippingCost,
-            mediaworld_preparation_days: prepDaysMediaworld,
-            eprice_preparation_days: prepDays
+            ...updateData
           });
         
         if (error) {
@@ -613,11 +676,13 @@ const AltersideCatalogGenerator: React.FC = () => {
             variant: "destructive"
           });
         } else {
+          setPrepDaysMediaworld(extendedFeeConfig.mediaworldItPreparationDays);
+          setPrepDays(extendedFeeConfig.epriceItPreparationDays);
           toast({
             title: "Impostazioni salvate",
-            description: "I giorni di preparazione sono stati salvati come impostazioni globali."
+            description: "La configurazione IT/EU è stata salvata."
           });
-          console.log('Giorni preparazione salvati su Supabase');
+          console.log('Giorni preparazione IT/EU salvati su Supabase');
         }
       }
     } catch (err) {
@@ -631,6 +696,20 @@ const AltersideCatalogGenerator: React.FC = () => {
       setIsSavingPrepDays(false);
     }
   };
+  
+  // Handler for stock location file loaded from upload component
+  const handleStockLocationLoaded = useCallback((content: string, warnings: StockLocationWarningsState) => {
+    const index = parseStockLocationFile(content, warnings);
+    setStockLocationIndex(index);
+    setStockLocationWarnings(warnings);
+    setStockLocationFileLoaded(true);
+    console.log(`[stockLocation] File loaded: ${Object.keys(index).length} products, warnings:`, warnings);
+  }, []);
+  
+  // Handler for extended fee config changes
+  const handleExtendedConfigChange = useCallback((updates: Partial<FeeConfigState>) => {
+    setExtendedFeeConfig(prev => ({ ...prev, ...updates }));
+  }, []);
 
   // Persist mapping file to Supabase Storage
   const persistMappingFile = async (file: File) => {
@@ -3245,7 +3324,7 @@ const AltersideCatalogGenerator: React.FC = () => {
       // Build AOA (Array of Arrays) with exact headers
       const aoa: (string | number)[][] = [headers];
       
-      // Add data rows with validation
+      // Add data rows with validation and IT/EU stock logic
       eanFilteredData.forEach((record, index) => {
         const rowErrors: string[] = [];
         
@@ -3261,33 +3340,49 @@ const AltersideCatalogGenerator: React.FC = () => {
           rowErrors.push(`Riga ${index + 1}: EAN non valido (${ean})`);
         }
         
-        // Validate quantity
-        const quantity = record.ExistingStock ?? 0;
-        if (!Number.isFinite(quantity) || quantity < 0) {
-          rowErrors.push(`Riga ${index + 1}: Quantità non valida (${quantity})`);
+        // Get Matnr for stock location lookup
+        const matnr = record.Matnr || '';
+        const existingStock = Number(record.ExistingStock) || 0;
+        
+        // Get IT/EU stock from location index (with fallback)
+        const { stockIT, stockEU } = getStockForMatnr(
+          stockLocationIndex,
+          matnr,
+          existingStock,
+          stockLocationWarnings,
+          true // useFallback
+        );
+        
+        // Check split mismatch if location file is loaded
+        if (stockLocationIndex) {
+          checkSplitMismatch(stockIT, stockEU, existingStock, stockLocationWarnings);
+        }
+        
+        // Use resolveMarketplaceStock for quantity and lead time
+        const stockResult = resolveMarketplaceStock(
+          stockIT,
+          stockEU,
+          extendedFeeConfig.epriceIncludeEu,
+          extendedFeeConfig.epriceItPreparationDays,
+          extendedFeeConfig.epriceEuPreparationDays
+        );
+        
+        // Skip if shouldn't export (min 2 threshold)
+        if (!stockResult.shouldExport) {
+          skippedCount++;
+          return; // Skip this row
         }
         
         // =====================================================================
-        // IMPORTANTE: I prezzi ePrice derivano DIRETTAMENTE dal Catalogo EAN.
-        // NON ricalcoliamo i prezzi. Usiamo il valore di "Prezzo Finale" già calcolato.
-        // La conversione avviene da stringa con virgola (es. "175,99") a numero (175.99).
-        // =====================================================================
-        
-        // =====================================================================
         // PREZZO FINALE DA CATALOGO EAN - SOLA LETTURA, NESSUN RICALCOLO
-        // Il valore viene letto ESATTAMENTE come è nel Catalogo EAN.
-        // Unica trasformazione: virgola -> punto e conversione a numero.
-        // NON usare Math.ceil, Math.floor, Math.round, toFixed, parseInt.
         // =====================================================================
         const prezzoFinaleRaw = record['Prezzo Finale'];
         let prezzoFinaleNumber: number | null = null;
         
         if (prezzoFinaleRaw != null) {
-          // Se già numero, usalo direttamente
           if (typeof prezzoFinaleRaw === 'number' && Number.isFinite(prezzoFinaleRaw)) {
             prezzoFinaleNumber = prezzoFinaleRaw;
           } else {
-            // Se stringa con virgola (es. "1238,99"), sostituisci e converti
             const s = String(prezzoFinaleRaw).trim().replace(',', '.');
             if (s) {
               const n = parseFloat(s);
@@ -3298,69 +3393,40 @@ const AltersideCatalogGenerator: React.FC = () => {
           }
         }
         
-        // LOG ESTESO per i primi 10 record - verifica COMPLETA coerenza prezzi
+        // LOG ESTESO for first 10 records
         if (index < 10) {
-          const rawValue = prezzoFinaleRaw;
-          const afterReplace = typeof rawValue === 'string' ? rawValue.replace(',', '.') : String(rawValue);
-          const terminaCon99 = prezzoFinaleNumber !== null && (Math.round(prezzoFinaleNumber * 100) % 100) === 99;
-          
           console.log(`%c[ePrice:export:row${index}]`, 'color: #9C27B0;', {
             EAN: ean,
             SKU: sku,
-            'RAW Prezzo Finale (da eanCatalogDataset)': rawValue,
-            'RAW type': typeof rawValue,
-            'dopo replace virgola': afterReplace,
-            'parseFloat result': prezzoFinaleNumber,
-            'valore scritto in Excel': prezzoFinaleNumber,
-            'termina_con_99': terminaCon99,
-            'ExistingStock RAW': record.ExistingStock,
-            'quantity esportato': quantity
+            stockIT, stockEU,
+            includeEU: extendedFeeConfig.epriceIncludeEu,
+            exportQty: stockResult.exportQty,
+            leadDays: stockResult.leadDays,
+            source: stockResult.source,
+            prezzoFinale: prezzoFinaleNumber
           });
-          
-          // ALERT se il prezzo non termina con .99
-          if (!terminaCon99 && prezzoFinaleNumber !== null) {
-            console.error(`%c[ePrice:warning:price-mismatch:row${index}] PREZZO NON TERMINA CON .99!`, 'color: red; font-weight: bold;', {
-              EAN: ean,
-              prezzoFinale: prezzoFinaleNumber,
-              raw: rawValue
-            });
-          }
         }
         
-        // Validate price exists and is valid
+        // Validate price
         if (prezzoFinaleNumber === null || prezzoFinaleNumber <= 0) {
-          rowErrors.push(`Riga ${index + 1}: Prezzo Finale mancante o non valido (SKU: ${sku}, raw: ${prezzoFinaleRaw})`);
+          rowErrors.push(`Riga ${index + 1}: Prezzo Finale mancante o non valido (SKU: ${sku})`);
         }
         
-        // If there are critical errors for this row, skip it
         if (rowErrors.length > 0) {
           validationErrors.push(...rowErrors);
           skippedCount++;
-          return; // Skip this row
+          return;
         }
         
-        // VERIFICA FINALE: il prezzo deve terminare con .99
-        if (prezzoFinaleNumber !== null) {
-          const cents = Math.round(prezzoFinaleNumber * 100) % 100;
-          if (cents !== 99) {
-            console.error(`%c[ePrice:warning:not99:row${index}] PREZZO NON TERMINA CON .99!`, 'color: red; font-weight: bold;', {
-              EAN: ean,
-              prezzoFinale: prezzoFinaleNumber,
-              cents: cents,
-              raw: prezzoFinaleRaw
-            });
-          }
-        }
-        
-        // Build row with exact template structure and fixed values
+        // Build row with IT/EU stock logic applied
         aoa.push([
           sku,                                        // sku
           ean,                                        // product-id
           EPRICE_TEMPLATE.fixedValues["product-id-type"], // product-id-type = "EAN"
-          prezzoFinaleNumber ?? 0,                    // price (NUMBER with dot, e.g., 175.99)
-          quantity,                                   // quantity - ESATTO dal Catalogo EAN
+          prezzoFinaleNumber ?? 0,                    // price
+          stockResult.exportQty,                      // quantity - from IT/EU logic
           EPRICE_TEMPLATE.fixedValues["state"],       // state = 11
-          prepDays,                                   // fulfillment-latency
+          stockResult.leadDays,                       // fulfillment-latency - from IT/EU logic
           EPRICE_TEMPLATE.fixedValues["logistic-class"] // logistic-class = "K"
         ]);
       });
@@ -5247,7 +5313,7 @@ const AltersideCatalogGenerator: React.FC = () => {
         </div>
 
         {/* File Upload Cards */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
           <FileUploadCard
             title="Material File"
             description="File principale con informazioni prodotto"
@@ -5269,7 +5335,16 @@ const AltersideCatalogGenerator: React.FC = () => {
             requiredHeaders={REQUIRED_HEADERS.price}
             optionalHeaders={OPTIONAL_HEADERS.price}
           />
+          <StockLocationUpload
+            disabled={pipelineRunning || isProcessing}
+            onFileLoaded={handleStockLocationLoaded}
+          />
         </div>
+        
+        {/* Stock Location Warnings */}
+        {stockLocationFileLoaded && (
+          <StockLocationWarningsDisplay warnings={stockLocationWarnings} />
+        )}
 
         {/* Fee Configuration */}
         {allFilesValid && (
@@ -5614,30 +5689,22 @@ const AltersideCatalogGenerator: React.FC = () => {
               )}
             </div>
             
+            {/* Stock Location IT/EU Config Section - Only for EAN pipeline */}
+            {currentPipeline === 'EAN' && (
+              <div className="mt-8">
+                <StockLocationConfig
+                  config={extendedFeeConfig}
+                  onConfigChange={handleExtendedConfigChange}
+                  disabled={pipelineRunning}
+                />
+              </div>
+            )}
+            
             {/* ePrice Export Section - Only for EAN pipeline */}
             {currentPipeline === 'EAN' && (
               <div className="mt-8 p-6 rounded-lg border" style={{ background: '#f0f9ff' }}>
                 <h4 className="text-lg font-semibold mb-4 text-blue-800">Esporta Catalogo ePrice</h4>
                 <div className="flex flex-wrap items-center justify-center gap-4">
-                  <div className="flex items-center gap-2">
-                    <Label htmlFor="prepDays" className="text-sm font-medium whitespace-nowrap">
-                      Giorni di preparazione dell'ordine:
-                    </Label>
-                    <Input
-                      id="prepDays"
-                      type="number"
-                      min={1}
-                      max={30}
-                      value={prepDays}
-                      onChange={(e) => {
-                        const val = parseInt(e.target.value, 10);
-                        if (!isNaN(val) && val >= 1 && val <= 30) {
-                          setPrepDays(val);
-                        }
-                      }}
-                      className="w-20 text-center"
-                    />
-                  </div>
                   <button 
                     type="button"
                     onClick={onExportEprice}
@@ -5650,7 +5717,7 @@ const AltersideCatalogGenerator: React.FC = () => {
                   </button>
                 </div>
                 <p className="text-xs text-muted-foreground mt-3">
-                  Genera il file "Tracciato_Pubblicazione_Offerte_new.xlsx" per ePrice
+                  Usa configurazione IT/EU sopra. Genera "Tracciato_Pubblicazione_Offerte_new.xlsx"
                 </p>
               </div>
             )}
@@ -5660,25 +5727,6 @@ const AltersideCatalogGenerator: React.FC = () => {
               <div className="mt-8 p-6 rounded-lg border" style={{ background: '#fef3c7' }}>
                 <h4 className="text-lg font-semibold mb-4 text-amber-800">Esporta Catalogo Mediaworld</h4>
                 <div className="flex flex-wrap items-center justify-center gap-4">
-                  <div className="flex items-center gap-2">
-                    <Label htmlFor="prepDaysMediaworld" className="text-sm font-medium whitespace-nowrap">
-                      Tempo di preparazione spedizione (giorni):
-                    </Label>
-                    <Input
-                      id="prepDaysMediaworld"
-                      type="number"
-                      min={1}
-                      max={45}
-                      value={prepDaysMediaworld}
-                      onChange={(e) => {
-                        const val = parseInt(e.target.value, 10);
-                        if (!isNaN(val) && val >= 1 && val <= 45) {
-                          setPrepDaysMediaworld(val);
-                        }
-                      }}
-                      className="w-20 text-center"
-                    />
-                  </div>
                   <button 
                     type="button"
                     onClick={onExportMediaworld}
@@ -5691,7 +5739,7 @@ const AltersideCatalogGenerator: React.FC = () => {
                   </button>
                 </div>
                 <p className="text-xs text-muted-foreground mt-3">
-                  Genera il file "mediaworld-offers-YYYYMMDD.xlsx" con formato Mediaworld
+                  Usa configurazione IT/EU sopra. Genera "mediaworld-offers-YYYYMMDD.xlsx"
                 </p>
               </div>
             )}
