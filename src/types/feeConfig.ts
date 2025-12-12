@@ -66,6 +66,10 @@ export const DEFAULT_FEE_CONFIG: FeeConfigState = {
 
 /**
  * Maps database row to client state
+ * 
+ * BACKWARD COMPATIBILITY: If includeEu is null/undefined, default to TRUE
+ * because previous behavior used ExistingStock (total) which is equivalent
+ * to "includeEU always ON". DO NOT use Boolean() as it converts null to false.
  */
 export function mapFeeConfigRowToState(row: FeeConfigExtendedRow): FeeConfigState {
   return {
@@ -74,10 +78,12 @@ export function mapFeeConfigRowToState(row: FeeConfigExtendedRow): FeeConfigStat
     shippingCost: Number(row.shipping_cost),
     mediaworldPreparationDays: Number(row.mediaworld_preparation_days),
     epricePreparationDays: Number(row.eprice_preparation_days),
-    mediaworldIncludeEu: Boolean(row.mediaworld_include_eu),
+    // CRITICAL: null/undefined → true (backward compat), explicit false → false
+    mediaworldIncludeEu: row.mediaworld_include_eu == null ? true : !!row.mediaworld_include_eu,
     mediaworldItPreparationDays: Number(row.mediaworld_it_preparation_days),
     mediaworldEuPreparationDays: Number(row.mediaworld_eu_preparation_days),
-    epriceIncludeEu: Boolean(row.eprice_include_eu),
+    // CRITICAL: null/undefined → true (backward compat), explicit false → false
+    epriceIncludeEu: row.eprice_include_eu == null ? true : !!row.eprice_include_eu,
     epriceItPreparationDays: Number(row.eprice_it_preparation_days),
     epriceEuPreparationDays: Number(row.eprice_eu_preparation_days)
   };
