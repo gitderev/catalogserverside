@@ -28,8 +28,9 @@ const FILE_CONFIG = {
 
 type FileType = keyof typeof FILE_CONFIG;
 
-// Stock location file pattern
-const STOCK_LOCATION_REGEX = /^790813_StockFile_(\d{8})\.txt$/;
+// Stock location file patterns
+const STOCK_LOCATION_EXACT = "790813_StockFile.txt"; // Priority: exact match first
+const STOCK_LOCATION_DATED_REGEX = /^790813_StockFile_(\d{8})\.txt$/; // Fallback: dated pattern
 
 const BUCKET_NAME = "ftp-import";
 
@@ -449,40 +450,67 @@ serve(async (req) => {
       let selectedFilename = '';
       
       try {
-        // List files and find latest stock location file
+        // List files in directory for diagnostic and selection
         const files = await client.listFiles();
-        console.log(`[import-catalog-ftp] Found ${files.length} files in directory`);
+        console.log(`[import-catalog-ftp] Directory listing - total files: ${files.length}`);
         
-        // Filter files matching the stock location pattern
-        const stockLocationFiles = files
-          .filter(f => STOCK_LOCATION_REGEX.test(f.name))
-          .map(f => {
-            const match = f.name.match(STOCK_LOCATION_REGEX);
-            return { name: f.name, date: match ? match[1] : '' };
-          })
-          .filter(f => f.date)
-          .sort((a, b) => {
-            // Sort by date descending, then by filename descending
-            if (a.date !== b.date) return b.date.localeCompare(a.date);
-            return b.name.localeCompare(a.name);
-          });
+        // Log all files for diagnosis
+        const allFilenames = files.map(f => f.name);
+        console.log(`[import-catalog-ftp] All files in directory: ${allFilenames.slice(0, 50).join(', ')}${allFilenames.length > 50 ? '...' : ''}`);
         
-        console.log(`[import-catalog-ftp] Stock location files found: ${stockLocationFiles.map(f => f.name).join(', ')}`);
+        // Find files containing "790813_StockFile"
+        const stockFileCandidates = files.filter(f => f.name.includes('790813_StockFile'));
+        console.log(`[import-catalog-ftp] Files containing '790813_StockFile': ${stockFileCandidates.length}`);
+        console.log(`[import-catalog-ftp] Stock file candidates: ${stockFileCandidates.map(f => f.name).join(', ')}`);
         
-        if (stockLocationFiles.length === 0) {
+        // Priority 1: Exact match "790813_StockFile.txt"
+        const exactMatch = files.find(f => f.name === STOCK_LOCATION_EXACT);
+        console.log(`[import-catalog-ftp] Exact match '${STOCK_LOCATION_EXACT}': ${exactMatch ? 'FOUND' : 'NOT FOUND'}`);
+        
+        if (exactMatch) {
+          selectedFilename = exactMatch.name;
+          console.log(`[import-catalog-ftp] Using exact match: ${selectedFilename}`);
+        } else {
+          // Priority 2: Fallback to dated pattern 790813_StockFile_YYYYMMDD.txt
+          console.log(`[import-catalog-ftp] Falling back to dated pattern...`);
+          
+          const datedFiles = files
+            .filter(f => STOCK_LOCATION_DATED_REGEX.test(f.name))
+            .map(f => {
+              const match = f.name.match(STOCK_LOCATION_DATED_REGEX);
+              return { name: f.name, date: match ? match[1] : '' };
+            })
+            .filter(f => f.date)
+            .sort((a, b) => {
+              // Sort by date descending, then by filename descending
+              if (a.date !== b.date) return b.date.localeCompare(a.date);
+              return b.name.localeCompare(a.name);
+            });
+          
+          console.log(`[import-catalog-ftp] Dated pattern matches: ${datedFiles.length}`);
+          console.log(`[import-catalog-ftp] Dated files found: ${datedFiles.map(f => `${f.name}(${f.date})`).join(', ')}`);
+          
+          if (datedFiles.length > 0) {
+            selectedFilename = datedFiles[0].name;
+            console.log(`[import-catalog-ftp] Selected latest dated file: ${selectedFilename} (date: ${datedFiles[0].date})`);
+          }
+        }
+        
+        // No file found at all
+        if (!selectedFilename) {
+          console.error(`[import-catalog-ftp] No stock location file found. Checked exact: ${STOCK_LOCATION_EXACT}, pattern: 790813_StockFile_YYYYMMDD.txt`);
           await client.close();
           return new Response(
             JSON.stringify({ 
               status: "error", 
               code: "FILE_NOT_FOUND", 
-              message: "Nessun file stock location (790813_StockFile_YYYYMMDD.txt) trovato sul server FTP" 
+              message: `Nessun file stock location trovato (cercato: ${STOCK_LOCATION_EXACT} o 790813_StockFile_YYYYMMDD.txt)` 
             } as ErrorResponse),
             { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
           );
         }
         
-        selectedFilename = stockLocationFiles[0].name;
-        console.log(`[import-catalog-ftp] Selected stock location file: ${selectedFilename} (date: ${stockLocationFiles[0].date})`);
+        console.log(`[import-catalog-ftp] Final selected stock location file: ${selectedFilename}`);
         
         // Download the selected file
         fileBuffer = await client.downloadFile(selectedFilename);
