@@ -3,6 +3,8 @@
  * 
  * IMPORTANTE: Questa funzionalità è un LIVELLO AGGIUNTIVO sopra la pipeline esistente.
  * NON modifica la logica di pricing, semplicemente sovrascrive i valori finali.
+ * 
+ * PRICE RULE EXCEPTION: Override products keep exact OfferPrice (no forceEnding99)
  */
 
 import * as XLSX from 'xlsx';
@@ -16,9 +18,14 @@ export interface OverrideItem {
   rawRowIndex: number;
   sku: string;
   ean: string;
-  quantity?: number;
-  listPrice?: number;
-  offerPrice?: number;
+  quantity: number; // Now mandatory
+  listPrice: number; // Now mandatory
+  offerPrice?: number; // Optional for existing product overrides, mandatory for new
+  // NEW optional fields for per-product stock/lead days
+  stockIT?: number;
+  stockEU?: number;
+  leadDaysIT?: number;
+  leadDaysEU?: number;
 }
 
 export interface OverrideIndex {
@@ -38,6 +45,7 @@ export interface ParseOverrideResult {
   success: boolean;
   index: OverrideIndex | null;
   errors: OverrideError[];
+  warnings: OverrideError[]; // NEW: separate warnings from errors
   validCount: number;
   invalidCount: number;
 }
@@ -56,32 +64,41 @@ export interface ApplyOverrideResult {
 }
 
 // =====================================================================
-// COLUMN NAMES - ESATTI, CASE-INSENSITIVE, SENZA ALIAS
+// COLUMN NAMES - REQUIRED and OPTIONAL, CASE-INSENSITIVE
 // =====================================================================
 
 const REQUIRED_COLUMNS = ['SKU', 'EAN', 'Quantity', 'ListPrice', 'OfferPrice'];
+const OPTIONAL_COLUMNS = ['StockIT', 'StockEU', 'LeadDaysIT', 'LeadDaysEU'];
 
 // =====================================================================
 // HELPER FUNCTIONS
 // =====================================================================
 
 /**
- * Trova l'indice delle colonne richieste nell'header
- * Ritorna null se una qualsiasi colonna manca
+ * Trova l'indice delle colonne nell'header
+ * Returns map with required and optional columns (optional may be -1 if not found)
  */
-function findColumnIndices(headers: string[]): Map<string, number> | null {
-  const normalizedHeaders = headers.map(h => h.trim().toLowerCase());
-  const indices = new Map<string, number>();
+function findColumnIndices(headers: string[]): { required: Map<string, number> | null; optional: Map<string, number> } {
+  const normalizedHeaders = headers.map(h => (h ?? '').toString().trim().toLowerCase());
+  const requiredIndices = new Map<string, number>();
+  const optionalIndices = new Map<string, number>();
   
+  // Check required columns
   for (const col of REQUIRED_COLUMNS) {
     const idx = normalizedHeaders.indexOf(col.toLowerCase());
     if (idx === -1) {
-      return null; // Colonna mancante - file invalido
+      return { required: null, optional: optionalIndices }; // Missing required column
     }
-    indices.set(col, idx);
+    requiredIndices.set(col, idx);
   }
   
-  return indices;
+  // Check optional columns (may not exist)
+  for (const col of OPTIONAL_COLUMNS) {
+    const idx = normalizedHeaders.indexOf(col.toLowerCase());
+    optionalIndices.set(col, idx); // -1 if not found
+  }
+  
+  return { required: requiredIndices, optional: optionalIndices };
 }
 
 /**
@@ -121,9 +138,9 @@ function parseNumericWithDecimals(raw: unknown): number | null {
 }
 
 /**
- * Parsa quantity come intero >= 0
+ * Parsa quantity/stock/leadDays come intero >= 0
  */
-function parseQuantity(raw: unknown): number | null {
+function parseInteger(raw: unknown): number | null {
   if (raw === null || raw === undefined || raw === '') return null;
   
   let value: number;
@@ -144,6 +161,7 @@ function parseQuantity(raw: unknown): number | null {
 
 /**
  * Forza ending ,99 sul prezzo (lavora in centesimi)
+ * NOTE: NOT used for override products
  */
 export function forceEnding99(price: number): number {
   const priceInCents = Math.round(price * 100);
@@ -168,10 +186,20 @@ export function forceEnding99(price: number): number {
 
 /**
  * Parsa il file override XLSX
- * Ritorna null per overrideIndex se il file è completamente invalido
+ * 
+ * PARSING RULES:
+ * - SKU: mandatory, non-empty
+ * - EAN: mandatory, valid via normalizeEAN
+ * - Quantity: mandatory, integer >= 0
+ * - ListPrice: mandatory, number with max 2 decimals
+ * - OfferPrice: header required, but value optional per row (empty allowed for existing product overrides)
+ * - StockIT/StockEU/LeadDaysIT/LeadDaysEU: headers optional, values optional integers >= 0
+ * 
+ * DUPLICATE HANDLING: Last row wins (no file invalidation)
  */
 export function parseOverrideFile(data: ArrayBuffer): ParseOverrideResult {
   const errors: OverrideError[] = [];
+  const warnings: OverrideError[] = [];
   
   try {
     const workbook = XLSX.read(data, { type: 'array' });
@@ -182,6 +210,7 @@ export function parseOverrideFile(data: ArrayBuffer): ParseOverrideResult {
         success: false,
         index: null,
         errors: [{ rowIndex: 0, field: 'file', value: '', reason: 'File vuoto o senza fogli' }],
+        warnings: [],
         validCount: 0,
         invalidCount: 0
       };
@@ -195,6 +224,7 @@ export function parseOverrideFile(data: ArrayBuffer): ParseOverrideResult {
         success: false,
         index: null,
         errors: [{ rowIndex: 0, field: 'file', value: '', reason: 'File senza righe dati' }],
+        warnings: [],
         validCount: 0,
         invalidCount: 0
       };
@@ -202,7 +232,7 @@ export function parseOverrideFile(data: ArrayBuffer): ParseOverrideResult {
     
     // Prima riga è header
     const headerRow = jsonData[0] as string[];
-    const columnIndices = findColumnIndices(headerRow);
+    const { required: columnIndices, optional: optionalIndices } = findColumnIndices(headerRow);
     
     if (!columnIndices) {
       const missingCols = REQUIRED_COLUMNS.filter(col => 
@@ -217,13 +247,20 @@ export function parseOverrideFile(data: ArrayBuffer): ParseOverrideResult {
           value: headerRow.join(', '), 
           reason: `Colonne mancanti: ${missingCols.join(', ')}. Richieste: ${REQUIRED_COLUMNS.join(', ')}` 
         }],
+        warnings: [],
         validCount: 0,
         invalidCount: 0
       };
     }
     
-    // Parsa le righe dati
-    const validItems: OverrideItem[] = [];
+    // Get optional column indices
+    const stockITIdx = optionalIndices.get('StockIT') ?? -1;
+    const stockEUIdx = optionalIndices.get('StockEU') ?? -1;
+    const leadDaysITIdx = optionalIndices.get('LeadDaysIT') ?? -1;
+    const leadDaysEUIdx = optionalIndices.get('LeadDaysEU') ?? -1;
+    
+    // Parsa le righe dati - collect ALL valid items first
+    const allValidItems: OverrideItem[] = [];
     let invalidCount = 0;
     
     for (let i = 1; i < jsonData.length; i++) {
@@ -238,7 +275,13 @@ export function parseOverrideFile(data: ArrayBuffer): ParseOverrideResult {
       const listPriceRaw = row[columnIndices.get('ListPrice')!];
       const offerPriceRaw = row[columnIndices.get('OfferPrice')!];
       
-      // Valida SKU (obbligatorio non vuoto)
+      // Optional columns
+      const stockITRaw = stockITIdx >= 0 ? row[stockITIdx] : undefined;
+      const stockEURaw = stockEUIdx >= 0 ? row[stockEUIdx] : undefined;
+      const leadDaysITRaw = leadDaysITIdx >= 0 ? row[leadDaysITIdx] : undefined;
+      const leadDaysEURaw = leadDaysEUIdx >= 0 ? row[leadDaysEUIdx] : undefined;
+      
+      // Valida SKU (mandatory non-empty)
       const sku = normalizeSku(skuRaw);
       if (!sku) {
         errors.push({ rowIndex, field: 'SKU', value: String(skuRaw ?? ''), reason: 'SKU vuoto o mancante' });
@@ -255,130 +298,155 @@ export function parseOverrideFile(data: ArrayBuffer): ParseOverrideResult {
       }
       const ean = eanResult.value;
       
-      // Parsa Quantity (opzionale ma se presente deve essere intero >= 0)
-      let quantity: number | undefined = undefined;
-      if (quantityRaw !== null && quantityRaw !== undefined && quantityRaw !== '') {
-        const parsedQty = parseQuantity(quantityRaw);
-        if (parsedQty === null) {
-          errors.push({ rowIndex, field: 'Quantity', value: String(quantityRaw), reason: 'Quantity non è un intero >= 0' });
-          invalidCount++;
-          continue;
-        }
-        quantity = parsedQty;
+      // Valida Quantity (mandatory integer >= 0)
+      const quantity = parseInteger(quantityRaw);
+      if (quantity === null) {
+        errors.push({ rowIndex, field: 'Quantity', value: String(quantityRaw ?? ''), reason: 'Quantity mancante o non è un intero >= 0' });
+        invalidCount++;
+        continue;
       }
       
-      // Parsa ListPrice (opzionale ma se presente deve essere numero con max 2 decimali)
-      let listPrice: number | undefined = undefined;
-      if (listPriceRaw !== null && listPriceRaw !== undefined && listPriceRaw !== '') {
-        const parsedLP = parseNumericWithDecimals(listPriceRaw);
-        if (parsedLP === null) {
-          errors.push({ rowIndex, field: 'ListPrice', value: String(listPriceRaw), reason: 'ListPrice non valido o ha più di 2 decimali' });
-          invalidCount++;
-          continue;
-        }
-        listPrice = parsedLP;
+      // Valida ListPrice (mandatory number with max 2 decimals)
+      const listPrice = parseNumericWithDecimals(listPriceRaw);
+      if (listPrice === null) {
+        errors.push({ rowIndex, field: 'ListPrice', value: String(listPriceRaw ?? ''), reason: 'ListPrice mancante o non valido (max 2 decimali)' });
+        invalidCount++;
+        continue;
       }
       
-      // Parsa OfferPrice (opzionale ma se presente deve essere numero con max 2 decimali)
+      // Parsa OfferPrice (optional per row - empty allowed)
       let offerPrice: number | undefined = undefined;
       if (offerPriceRaw !== null && offerPriceRaw !== undefined && offerPriceRaw !== '') {
         const parsedOP = parseNumericWithDecimals(offerPriceRaw);
         if (parsedOP === null) {
-          errors.push({ rowIndex, field: 'OfferPrice', value: String(offerPriceRaw), reason: 'OfferPrice non valido o ha più di 2 decimali' });
+          errors.push({ rowIndex, field: 'OfferPrice', value: String(offerPriceRaw), reason: 'OfferPrice non valido (max 2 decimali)' });
           invalidCount++;
           continue;
         }
         offerPrice = parsedOP;
       }
       
-      validItems.push({
+      // Parse optional StockIT
+      let stockIT: number | undefined = undefined;
+      if (stockITRaw !== null && stockITRaw !== undefined && stockITRaw !== '') {
+        const parsed = parseInteger(stockITRaw);
+        if (parsed === null) {
+          errors.push({ rowIndex, field: 'StockIT', value: String(stockITRaw), reason: 'StockIT non è un intero >= 0' });
+          invalidCount++;
+          continue;
+        }
+        stockIT = parsed;
+      }
+      
+      // Parse optional StockEU
+      let stockEU: number | undefined = undefined;
+      if (stockEURaw !== null && stockEURaw !== undefined && stockEURaw !== '') {
+        const parsed = parseInteger(stockEURaw);
+        if (parsed === null) {
+          errors.push({ rowIndex, field: 'StockEU', value: String(stockEURaw), reason: 'StockEU non è un intero >= 0' });
+          invalidCount++;
+          continue;
+        }
+        stockEU = parsed;
+      }
+      
+      // Parse optional LeadDaysIT
+      let leadDaysIT: number | undefined = undefined;
+      if (leadDaysITRaw !== null && leadDaysITRaw !== undefined && leadDaysITRaw !== '') {
+        const parsed = parseInteger(leadDaysITRaw);
+        if (parsed === null) {
+          errors.push({ rowIndex, field: 'LeadDaysIT', value: String(leadDaysITRaw), reason: 'LeadDaysIT non è un intero >= 0' });
+          invalidCount++;
+          continue;
+        }
+        leadDaysIT = parsed;
+      }
+      
+      // Parse optional LeadDaysEU
+      let leadDaysEU: number | undefined = undefined;
+      if (leadDaysEURaw !== null && leadDaysEURaw !== undefined && leadDaysEURaw !== '') {
+        const parsed = parseInteger(leadDaysEURaw);
+        if (parsed === null) {
+          errors.push({ rowIndex, field: 'LeadDaysEU', value: String(leadDaysEURaw), reason: 'LeadDaysEU non è un intero >= 0' });
+          invalidCount++;
+          continue;
+        }
+        leadDaysEU = parsed;
+      }
+      
+      allValidItems.push({
         rawRowIndex: rowIndex,
         sku,
         ean,
         quantity,
         listPrice,
-        offerPrice
+        offerPrice,
+        stockIT,
+        stockEU,
+        leadDaysIT,
+        leadDaysEU
       });
     }
     
-    // Controlla duplicati EAN
-    const eanCounts = new Map<string, number[]>();
-    for (const item of validItems) {
-      const rows = eanCounts.get(item.ean) || [];
+    // DUPLICATE HANDLING: Last row wins
+    // Track EAN duplicates
+    const eanToRows = new Map<string, number[]>();
+    for (const item of allValidItems) {
+      const rows = eanToRows.get(item.ean) || [];
       rows.push(item.rawRowIndex);
-      eanCounts.set(item.ean, rows);
+      eanToRows.set(item.ean, rows);
     }
     
-    const duplicateEans: string[] = [];
-    for (const [ean, rows] of eanCounts) {
-      if (rows.length > 1) {
-        duplicateEans.push(`EAN ${ean} alle righe ${rows.join(', ')}`);
-      }
-    }
-    
-    if (duplicateEans.length > 0) {
-      return {
-        success: false,
-        index: null,
-        errors: [{ 
-          rowIndex: 0, 
-          field: 'duplicati_ean', 
-          value: '', 
-          reason: `EAN duplicati nel file override. File completamente invalidato. Duplicati: ${duplicateEans.join('; ')}` 
-        }],
-        validCount: 0,
-        invalidCount: validItems.length + invalidCount
-      };
-    }
-    
-    // Controlla duplicati SKU
-    const skuCounts = new Map<string, number[]>();
-    for (const item of validItems) {
+    // Track SKU duplicates (case-insensitive)
+    const skuToRows = new Map<string, number[]>();
+    for (const item of allValidItems) {
       const normalizedSku = item.sku.toLowerCase();
-      const rows = skuCounts.get(normalizedSku) || [];
+      const rows = skuToRows.get(normalizedSku) || [];
       rows.push(item.rawRowIndex);
-      skuCounts.set(normalizedSku, rows);
+      skuToRows.set(normalizedSku, rows);
     }
     
-    const duplicateSkus: string[] = [];
-    for (const [sku, rows] of skuCounts) {
+    // Generate warnings for duplicates
+    for (const [ean, rows] of eanToRows) {
       if (rows.length > 1) {
-        duplicateSkus.push(`SKU ${sku} alle righe ${rows.join(', ')}`);
+        warnings.push({
+          rowIndex: rows[rows.length - 1], // Last row that was kept
+          field: 'EAN',
+          value: ean,
+          reason: `Warning: EAN duplicato alle righe ${rows.join(', ')}. Mantenuta riga ${rows[rows.length - 1]} (ultima).`
+        });
       }
     }
     
-    if (duplicateSkus.length > 0) {
-      return {
-        success: false,
-        index: null,
-        errors: [{ 
-          rowIndex: 0, 
-          field: 'duplicati_sku', 
-          value: '', 
-          reason: `SKU duplicati nel file override. File completamente invalidato. Duplicati: ${duplicateSkus.join('; ')}` 
-        }],
-        validCount: 0,
-        invalidCount: validItems.length + invalidCount
-      };
+    for (const [sku, rows] of skuToRows) {
+      if (rows.length > 1) {
+        warnings.push({
+          rowIndex: rows[rows.length - 1],
+          field: 'SKU',
+          value: sku,
+          reason: `Warning: SKU duplicato (case-insensitive) alle righe ${rows.join(', ')}. Mantenuta riga ${rows[rows.length - 1]} (ultima).`
+        });
+      }
     }
     
-    // Costruisci l'indice
+    // Build final index with last-row-wins logic
     const byEan = new Map<string, OverrideItem>();
     const bySku = new Map<string, OverrideItem>();
     
-    for (const item of validItems) {
+    // Process in order so last item for each key wins
+    for (const item of allValidItems) {
       byEan.set(item.ean, item);
       bySku.set(item.sku.toLowerCase(), item);
     }
     
+    // Build validItems from unique EANs (deduplicated)
+    const validItems = Array.from(byEan.values());
+    
     return {
       success: validItems.length > 0,
-      index: {
-        byEan,
-        bySku,
-        validItems
-      },
+      index: validItems.length > 0 ? { byEan, bySku, validItems } : null,
       errors,
+      warnings,
       validCount: validItems.length,
       invalidCount
     };
@@ -393,6 +461,7 @@ export function parseOverrideFile(data: ArrayBuffer): ParseOverrideResult {
         value: '', 
         reason: `Errore parsing file: ${error instanceof Error ? error.message : 'Errore sconosciuto'}` 
       }],
+      warnings: [],
       validCount: 0,
       invalidCount: 0
     };
@@ -401,6 +470,16 @@ export function parseOverrideFile(data: ArrayBuffer): ParseOverrideResult {
 
 /**
  * Applica l'override al catalogo base
+ * 
+ * PRICE RULE: Override OfferPrice is used EXACTLY as provided (no forceEnding99)
+ * 
+ * METADATA FIELDS added to each record:
+ * - __override: true
+ * - __overrideSource: 'existing' | 'new'
+ * - __overrideStockIT: number | null
+ * - __overrideStockEU: number | null
+ * - __overrideLeadDaysIT: number | null
+ * - __overrideLeadDaysEU: number | null
  */
 export function applyOverrideToCatalog(
   baseCatalog: any[],
@@ -415,7 +494,6 @@ export function applyOverrideToCatalog(
   };
   
   // Crea un set di EAN già processati per controllo duplicati nel baseCatalog
-  const processedEans = new Set<string>();
   const baseCatalogDuplicates = new Map<string, number>();
   
   // Controlla duplicati nel baseCatalog
@@ -480,27 +558,27 @@ export function applyOverrideToCatalog(
     
     // Applica overrides nell'ordine specificato
     
-    // 1. Quantity -> ExistingStock
-    if (overrideItem.quantity !== undefined) {
-      updatedRecord.ExistingStock = overrideItem.quantity;
-    }
+    // 1. Quantity -> ExistingStock (always provided, mandatory)
+    updatedRecord.ExistingStock = overrideItem.quantity;
     
-    // 2. ListPrice -> ListPrice e "ListPrice con Fee"
-    if (overrideItem.listPrice !== undefined) {
-      updatedRecord.ListPrice = overrideItem.listPrice;
-      updatedRecord['ListPrice con Fee'] = overrideItem.listPrice;
-    }
+    // 2. ListPrice -> ListPrice e "ListPrice con Fee" (always provided, mandatory)
+    updatedRecord.ListPrice = overrideItem.listPrice;
+    updatedRecord['ListPrice con Fee'] = overrideItem.listPrice;
     
-    // 3. OfferPrice -> "Prezzo Finale" con forceEnding99
+    // 3. OfferPrice -> "Prezzo Finale" WITHOUT forceEnding99
     if (overrideItem.offerPrice !== undefined) {
-      const finalPrice = forceEnding99(overrideItem.offerPrice);
-      // Formatta come stringa con virgola per coerenza con pipeline esistente
-      updatedRecord['Prezzo Finale'] = finalPrice.toFixed(2).replace('.', ',');
+      // Use exact OfferPrice - NO forceEnding99
+      // Format as string with 2 decimals and comma as decimal separator
+      updatedRecord['Prezzo Finale'] = overrideItem.offerPrice.toFixed(2).replace('.', ',');
     }
     
-    // Marca come override
+    // Add override metadata
     updatedRecord.__override = true;
     updatedRecord.__overrideSource = 'existing';
+    updatedRecord.__overrideStockIT = overrideItem.stockIT ?? null;
+    updatedRecord.__overrideStockEU = overrideItem.stockEU ?? null;
+    updatedRecord.__overrideLeadDaysIT = overrideItem.leadDaysIT ?? null;
+    updatedRecord.__overrideLeadDaysEU = overrideItem.leadDaysEU ?? null;
     
     catalogWithOverride.push(updatedRecord);
     stats.updatedExisting++;
@@ -522,42 +600,21 @@ export function applyOverrideToCatalog(
       continue;
     }
     
-    if (item.quantity === undefined) {
-      errors.push({
-        rowIndex: item.rawRowIndex,
-        field: 'nuovo_prodotto',
-        value: item.sku,
-        reason: 'Riga non idonea per nuovo prodotto: Quantity mancante'
-      });
-      stats.skippedRows++;
-      continue;
-    }
+    // Quantity and ListPrice are now mandatory in parsing, so always present
     
-    if (item.listPrice === undefined) {
-      errors.push({
-        rowIndex: item.rawRowIndex,
-        field: 'nuovo_prodotto',
-        value: item.sku,
-        reason: 'Riga non idonea per nuovo prodotto: ListPrice mancante'
-      });
-      stats.skippedRows++;
-      continue;
-    }
-    
+    // OfferPrice mandatory for NEW products
     if (item.offerPrice === undefined) {
       errors.push({
         rowIndex: item.rawRowIndex,
         field: 'nuovo_prodotto',
         value: item.sku,
-        reason: 'Riga non idonea per nuovo prodotto: OfferPrice mancante'
+        reason: 'Riga non idonea per nuovo prodotto: OfferPrice mancante (obbligatorio per nuovi prodotti)'
       });
       stats.skippedRows++;
       continue;
     }
     
-    // Crea nuovo record
-    const finalPrice = forceEnding99(item.offerPrice);
-    
+    // Create new record WITHOUT forceEnding99 - use exact OfferPrice
     const newRecord: any = {
       Matnr: `OVR-${item.sku}`,
       ManufPartNr: item.sku,
@@ -573,10 +630,16 @@ export function applyOverrideToCatalog(
       FeeDeRev: 0,
       'Fee Marketplace': 0,
       'Subtotale post-fee': '0,00',
-      'Prezzo Finale': finalPrice.toFixed(2).replace('.', ','),
+      // Use EXACT OfferPrice - NO forceEnding99
+      'Prezzo Finale': item.offerPrice.toFixed(2).replace('.', ','),
       'ListPrice con Fee': item.listPrice,
+      // Override metadata
       __override: true,
-      __overrideSource: 'new'
+      __overrideSource: 'new',
+      __overrideStockIT: item.stockIT ?? null,
+      __overrideStockEU: item.stockEU ?? null,
+      __overrideLeadDaysIT: item.leadDaysIT ?? null,
+      __overrideLeadDaysEU: item.leadDaysEU ?? null
     };
     
     catalogWithOverride.push(newRecord);
@@ -592,6 +655,8 @@ export function applyOverrideToCatalog(
 
 /**
  * Valida che tutti i prezzi finali terminino con ,99
+ * 
+ * IMPORTANT: Records with __override === true are SKIPPED (override products keep exact price)
  */
 export function validateEnding99Guard(catalog: any[]): { 
   valid: boolean; 
@@ -601,6 +666,12 @@ export function validateEnding99Guard(catalog: any[]): {
   
   for (let i = 0; i < catalog.length; i++) {
     const record = catalog[i];
+    
+    // SKIP override records - they keep exact price without ,99 enforcement
+    if (record.__override === true) {
+      continue;
+    }
+    
     const prezzoFinale = record['Prezzo Finale'];
     
     if (!prezzoFinale) continue;

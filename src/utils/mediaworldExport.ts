@@ -399,33 +399,59 @@ export async function buildMediaworldXlsxFromEanDataset({
         return;
       }
       
-      // Get IT/EU stock
-      const { stockIT, stockEU } = getStockForMatnr(
-        stockLocationIndex || null,
-        matnr,
-        existingStock,
-        warnings,
-        true
-      );
+      // OVERRIDE STOCK PRIORITY:
+      // 1. If __overrideStockIT or __overrideStockEU is non-null, use those (missing side = 0)
+      // 2. Else if __overrideSource === 'new', use ExistingStock as IT, EU = 0
+      // 3. Else use getStockForMatnr
+      let stockIT: number;
+      let stockEU: number;
       
-      if (stockLocationIndex) {
+      if (record.__overrideStockIT != null || record.__overrideStockEU != null) {
+        stockIT = record.__overrideStockIT != null ? Number(record.__overrideStockIT) : 0;
+        stockEU = record.__overrideStockEU != null ? Number(record.__overrideStockEU) : 0;
+      } else if (record.__overrideSource === 'new') {
+        stockIT = existingStock;
+        stockEU = 0;
+      } else {
+        const stockData = getStockForMatnr(
+          stockLocationIndex || null,
+          matnr,
+          existingStock,
+          warnings,
+          true
+        );
+        stockIT = stockData.stockIT;
+        stockEU = stockData.stockEU;
+      }
+      
+      // Apply includeEU rule: if false, treat EU as 0
+      const effectiveStockEU = effectiveIncludeEu ? stockEU : 0;
+      
+      // Check split mismatch for non-override records
+      if (stockLocationIndex && !record.__override) {
         checkSplitMismatch(stockIT, stockEU, existingStock, warnings);
       }
       
       // Track stock distribution
       const hasIT = stockIT >= 2;
-      const hasEU = stockEU >= 2;
+      const hasEU = effectiveStockEU >= 2;
       if (hasIT && hasEU) itAndEuCount++;
       else if (hasIT) itOnlyCount++;
       else if (hasEU) euOnlyTotal++;
       
+      // OVERRIDE LEAD DAYS PRIORITY:
+      const itDaysEff = record.__overrideLeadDaysIT != null ? Number(record.__overrideLeadDaysIT) : itDays;
+      const euDaysEff = effectiveIncludeEu && record.__overrideLeadDaysEU != null 
+        ? Number(record.__overrideLeadDaysEU) 
+        : euDays;
+      
       // Use resolveMarketplaceStock for quantity and lead time
       const stockResult = resolveMarketplaceStock(
         stockIT,
-        stockEU,
+        effectiveStockEU,
         effectiveIncludeEu,
-        itDays,
-        euDays
+        itDaysEff,
+        euDaysEff
       );
       
       // Filter 2: Stock threshold (min 2)
@@ -434,7 +460,7 @@ export async function buildMediaworldXlsxFromEanDataset({
           row: index + 1,
           sku,
           field: 'Quantità',
-          reason: `Stock insufficiente: IT=${stockIT}, EU=${stockEU}, includeEU=${effectiveIncludeEu}`
+          reason: `Stock insufficiente: IT=${stockIT}, EU=${effectiveStockEU}, includeEU=${effectiveIncludeEu}`
         });
         skippedCount++;
         return;
@@ -497,12 +523,13 @@ export async function buildMediaworldXlsxFromEanDataset({
       // Log first 20 records for diagnostics
       if (index < 20) {
         console.log(`%c[Mediaworld:row${index}]`, 'color: #00BCD4;', {
-          sku, ean, stockIT, stockEU,
+          sku, ean, stockIT, stockEU: effectiveStockEU,
           exportQty: stockResult.exportQty,
           leadDays: stockResult.leadDays,
           source: stockResult.source,
           listPriceConFee,
-          prezzoFinale
+          prezzoFinale,
+          isOverride: !!record.__override
         });
       }
       

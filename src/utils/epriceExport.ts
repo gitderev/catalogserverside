@@ -131,34 +131,63 @@ export function buildEpriceXlsxFromEanDataset({
       return;
     }
     
-    // Get IT/EU stock using getStockForMatnr
-    const { stockIT, stockEU } = getStockForMatnr(
-      stockLocationIndex,
-      matnr,
-      existingStock,
-      stockLocationWarnings,
-      true // useFallback: if matnr not found, stockIT=0, stockEU=0
-    );
+    // OVERRIDE STOCK PRIORITY:
+    // 1. If __overrideStockIT or __overrideStockEU is non-null, use those (missing side = 0)
+    // 2. Else if __overrideSource === 'new', use ExistingStock as IT, EU = 0
+    // 3. Else use getStockForMatnr
+    let stockIT: number;
+    let stockEU: number;
     
-    // Check split mismatch
-    if (stockLocationIndex) {
+    if (record.__overrideStockIT != null || record.__overrideStockEU != null) {
+      // Override provides explicit stock values
+      stockIT = record.__overrideStockIT != null ? Number(record.__overrideStockIT) : 0;
+      stockEU = record.__overrideStockEU != null ? Number(record.__overrideStockEU) : 0;
+    } else if (record.__overrideSource === 'new') {
+      // New override product without explicit stock: use ExistingStock as IT-only
+      stockIT = existingStock;
+      stockEU = 0;
+    } else {
+      // Standard catalog product: use getStockForMatnr
+      const stockData = getStockForMatnr(
+        stockLocationIndex,
+        matnr,
+        existingStock,
+        stockLocationWarnings,
+        true
+      );
+      stockIT = stockData.stockIT;
+      stockEU = stockData.stockEU;
+    }
+    
+    // Apply includeEU rule: if false, treat EU as 0
+    const effectiveStockEU = effectiveIncludeEu ? stockEU : 0;
+    
+    // Check split mismatch for non-override records
+    if (stockLocationIndex && !record.__override) {
       checkSplitMismatch(stockIT, stockEU, existingStock, stockLocationWarnings);
     }
     
     // Track stock distribution
     const hasIT = stockIT >= 2;
-    const hasEU = stockEU >= 2;
+    const hasEU = effectiveStockEU >= 2;
     if (hasIT && hasEU) itAndEuCount++;
     else if (hasIT) itOnlyCount++;
     else if (hasEU) euOnlyTotal++;
     
+    // OVERRIDE LEAD DAYS PRIORITY:
+    // Use per-record override if provided, else use global UI days
+    const itDaysEff = record.__overrideLeadDaysIT != null ? Number(record.__overrideLeadDaysIT) : itDays;
+    const euDaysEff = effectiveIncludeEu && record.__overrideLeadDaysEU != null 
+      ? Number(record.__overrideLeadDaysEU) 
+      : euDays;
+    
     // Use resolveMarketplaceStock for quantity and lead time
     const stockResult = resolveMarketplaceStock(
       stockIT,
-      stockEU,
+      effectiveStockEU,
       effectiveIncludeEu,
-      itDays,
-      euDays
+      itDaysEff,
+      euDaysEff
     );
     
     // Filter 3: Stock threshold (min 2)
@@ -167,7 +196,7 @@ export function buildEpriceXlsxFromEanDataset({
         row: index + 1, 
         sku, 
         field: 'quantity', 
-        reason: `Stock insufficiente: IT=${stockIT}, EU=${stockEU}, includeEU=${effectiveIncludeEu}` 
+        reason: `Stock insufficiente: IT=${stockIT}, EU=${effectiveStockEU}, includeEU=${effectiveIncludeEu}` 
       });
       skippedCount++;
       return;
@@ -190,11 +219,12 @@ export function buildEpriceXlsxFromEanDataset({
     // Log first 20 records for diagnostics
     if (index < 20) {
       console.log(`%c[ePrice:row${index}]`, 'color: #9C27B0;', {
-        sku, ean, stockIT, stockEU,
+        sku, ean, stockIT, stockEU: effectiveStockEU,
         exportQty: stockResult.exportQty,
         leadDays: stockResult.leadDays,
         source: stockResult.source,
-        price: prezzoFinale
+        price: prezzoFinale,
+        isOverride: !!record.__override
       });
     }
     
