@@ -369,13 +369,18 @@ export function parseStockLocationFile(
 
 /**
  * Gets stock IT/EU for a Matnr from the index.
- * Returns fallback values if Matnr not found.
  * 
- * @param index Stock location index
- * @param matnr Product Matnr
- * @param existingStock Original ExistingStock value (used for fallback)
+ * Behavior:
+ * - If index is null (file missing/failed): always returns { stockIT: existingStock, stockEU: 0 }
+ * - If matnr found in index: returns the indexed stockIT and stockEU values
+ * - If matnr NOT found and useFallback=true: returns { stockIT: existingStock, stockEU: 0 }
+ * - If matnr NOT found and useFallback=false: returns { stockIT: 0, stockEU: 0 }
+ * 
+ * @param index Stock location index (null if file missing/failed)
+ * @param matnr Product Matnr to look up
+ * @param existingStock Original ExistingStock value (used for fallback when useFallback=true)
  * @param warnings Warnings object to increment if data missing
- * @param useFallback If true and matnr not found, use existingStock as IT
+ * @param useFallback If true and matnr not found, use existingStock as stockIT with stockEU=0
  * @returns StockIT and StockEU values
  */
 export function getStockForMatnr(
@@ -385,7 +390,7 @@ export function getStockForMatnr(
   warnings: StockLocationWarnings,
   useFallback: boolean = false
 ): StockLocationResult {
-  // If no index (file missing or failed), use fallback
+  // If no index (file missing or failed), use existingStock as IT fallback
   if (!index) {
     return { stockIT: existingStock, stockEU: 0 };
   }
@@ -396,13 +401,15 @@ export function getStockForMatnr(
   }
   
   // Matnr not in location file
+  warnings.missing_location_data++;
+  
   if (useFallback) {
-    warnings.missing_location_data++;
-    return { stockIT: 0, stockEU: 0 };
+    // Use existingStock as IT, EU=0 - consistent with historical behavior when no location data
+    console.log(`[stockLocation] Matnr ${matnr} not in stock index, useFallback=true → using existingStock=${existingStock} as stockIT`);
+    return { stockIT: existingStock, stockEU: 0 };
   }
   
   // Strict mode: return zeros
-  warnings.missing_location_data++;
   return { stockIT: 0, stockEU: 0 };
 }
 
