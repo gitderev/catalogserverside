@@ -90,6 +90,7 @@ export function buildEpriceXlsxFromEanDataset({
 }: EpriceExportParams): EpriceExportResult {
   const errors: Array<{ row: number; sku: string; field: string; reason: string }> = [];
   let skippedCount = 0;
+  let skippedPerExportPricing = 0; // PART D: Counter for rows skipped due to missing per-export pricing
   
   // Diagnostic counters
   let euOnlyTotal = 0;
@@ -207,22 +208,39 @@ export function buildEpriceXlsxFromEanDataset({
       euOnlyExported++;
     }
     
-    // Get price from EAN catalog (NO recalculation)
-    const prezzoFinale = parsePrice(record['Prezzo Finale']);
+    // =====================================================================
+    // PART D: Use per-export price fields (calculated in Part C)
+    // Field: final_price_eprice
+    // If missing, SKIP row (do not fallback to legacy EAN fields)
+    // =====================================================================
+    const finalPriceEpRaw = record.final_price_eprice;
     
-    if (prezzoFinale === null || prezzoFinale <= 0) {
-      errors.push({ row: index + 1, sku, field: 'price', reason: `Prezzo Finale non valido: ${record['Prezzo Finale']}` });
+    // Check if per-export pricing is available
+    if (finalPriceEpRaw === null || finalPriceEpRaw === undefined) {
+      errors.push({ row: index + 1, sku, field: 'price', reason: `final_price_eprice mancante (pricing error flag o calcolo fallito)` });
       skippedCount++;
+      skippedPerExportPricing++;
       return;
     }
     
-    // Log first 20 records for diagnostics
+    // Parse price (convert comma to dot if string)
+    const prezzoFinale = parsePrice(finalPriceEpRaw);
+    
+    if (prezzoFinale === null || prezzoFinale <= 0) {
+      errors.push({ row: index + 1, sku, field: 'price', reason: `final_price_eprice non valido: ${finalPriceEpRaw}` });
+      skippedCount++;
+      skippedPerExportPricing++;
+      return;
+    }
+    
+    // Log first 20 records for diagnostics (PART D: shows per-export pricing source)
     if (index < 20) {
       console.log(`%c[ePrice:row${index}]`, 'color: #9C27B0;', {
         sku, ean, stockIT, stockEU: effectiveStockEU,
         exportQty: stockResult.exportQty,
         leadDays: stockResult.leadDays,
         source: stockResult.source,
+        priceSource: 'per-export (final_price_eprice)',
         price: prezzoFinale,
         isOverride: !!record.__override
       });
@@ -247,6 +265,7 @@ export function buildEpriceXlsxFromEanDataset({
     inputRows: eanDataset.length,
     exportedRows: rowCount,
     skippedRows: skippedCount,
+    skippedPerExportPricing, // PART D: rows skipped due to missing per-export pricing
     euOnlyTotal,
     euOnlyExported,
     itOnlyCount,
