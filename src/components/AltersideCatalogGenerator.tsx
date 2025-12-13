@@ -22,7 +22,8 @@ import { exportMediaworldCatalog, buildMediaworldXlsxFromEanDataset, downloadMed
 import { buildEpriceXlsxFromEanDataset, downloadEpriceBlob } from '@/utils/epriceExport';
 import { 
   toComma99Cents, 
-  validateEnding99, 
+  validateEnding99,
+  validateEnding99Cents,
   computeFromListPrice, 
   toCents, 
   formatCents, 
@@ -1981,8 +1982,68 @@ const AltersideCatalogGenerator: React.FC = () => {
         // Create local mutable warnings for this run
         const localWarnings = { ...EMPTY_WARNINGS };
         
+        // =====================================================================
+        // PER-EXPORT PRICING: Get effective pricing for each export type
+        // Uses getEffectivePricing with fallback to global values
+        // =====================================================================
+        const pEan = getEffectivePricing(extendedFeeConfig, 'ean');
+        const pMw = getEffectivePricing(extendedFeeConfig, 'mediaworld');
+        const pEp = getEffectivePricing(extendedFeeConfig, 'eprice');
+        
+        // Log per-export pricing for first 3 records
+        let perExportLogCount = 0;
+        
+        // =====================================================================
+        // Pure function to calculate final price and listprice with fee
+        // Given baseCents (already computed from CBP+Surcharge or LP) and pricing params
+        // Returns { finalCents, finalDisplay, listPriceWithFee, isValid }
+        // =====================================================================
+        const calculatePriceForExport = (
+          baseCents: number,
+          pricing: { feeDrev: number; feeMkt: number; shippingCost: number },
+          normListPrice: number | null,
+          normCustBestPrice: number | null
+        ): { 
+          finalCents: number; 
+          finalDisplay: string; 
+          listPriceWithFee: number | string;
+          isValid: boolean;
+        } => {
+          // Calculate final price using existing formula
+          const shippingCents = Math.round(pricing.shippingCost * 100);
+          const afterShippingCents = baseCents + shippingCents;
+          const afterIvaCents = Math.round(afterShippingCents * 1.22);
+          const afterFeeDeRevCents = Math.round(afterIvaCents * pricing.feeDrev);
+          const afterFeesCents = Math.round(afterFeeDeRevCents * pricing.feeMkt);
+          const finalCents = toComma99Cents(afterFeesCents);
+          const finalEuros = finalCents / 100;
+          const finalDisplay = finalEuros.toFixed(2).replace('.', ',');
+          
+          // Calculate ListPrice con Fee using existing override rule
+          let listPriceWithFee: number | string = '';
+          const shouldUseAltRule = normListPrice === null || normListPrice === 0 || 
+                                   (normCustBestPrice !== null && normListPrice < normCustBestPrice);
+          
+          if (shouldUseAltRule && normCustBestPrice !== null) {
+            const baseLP = normCustBestPrice * 1.25;
+            const valoreCandidat = ((baseLP + pricing.shippingCost) * 1.22) * pricing.feeDrev * pricing.feeMkt;
+            const candidatoCeil = Math.ceil(valoreCandidat);
+            const minimoConsentito = Math.ceil(finalEuros * 1.25);
+            listPriceWithFee = Math.max(candidatoCeil, minimoConsentito);
+          } else if (normListPrice !== null && normListPrice > 0) {
+            const subtotConIvaLP = (normListPrice + pricing.shippingCost) * 1.22;
+            const postFeeLP = subtotConIvaLP * pricing.feeDrev * pricing.feeMkt;
+            listPriceWithFee = Math.ceil(postFeeLP);
+          }
+          
+          // Validate ending ,99
+          const isValid = validateEnding99Cents(finalCents);
+          
+          return { finalCents, finalDisplay, listPriceWithFee, isValid };
+        };
+        
         // Costruisce il dataset formattato per l'export EAN
-        const formattedDataset = currentData.map((record: any) => {
+        const formattedDataset = currentData.map((record: any, recordIndex: number) => {
           // Determina la route e calcola baseCents correttamente (con Surcharge per CBP)
           const hasBest = Number.isFinite(record.CustBestPrice) && record.CustBestPrice > 0;
           const hasListPrice = Number.isFinite(record.ListPrice) && record.ListPrice > 0;
@@ -2002,34 +2063,67 @@ const AltersideCatalogGenerator: React.FC = () => {
             route = 'none';
           }
           
-          // Calcola prezzi usando la stessa logica dell'export
-          const shippingCents = Math.round(feeConfig.shippingCost * 100);
-          const afterShippingCents = baseCents + shippingCents;
-          const afterIvaCents = Math.round(afterShippingCents * 1.22);
-          const afterFeeDeRevCents = Math.round(afterIvaCents * feeConfig.feeDrev);
-          const afterFeesCents = Math.round(afterFeeDeRevCents * feeConfig.feeMkt);
-          const finalCents = toComma99Cents(afterFeesCents);
-          const finalEuros = finalCents / 100;
-          const prezzoFinaleString = finalEuros.toFixed(2).replace('.', ',');
-          
-          // ListPrice con Fee
-          let listPriceConFeeString: string | number = '';
+          // Normalized price fields for override rule
           const normListPrice = Number.isFinite(record.ListPrice) ? record.ListPrice : null;
           const normCustBestPrice = Number.isFinite(record.CustBestPrice) ? record.CustBestPrice : null;
           
-          const shouldUseAltRule = normListPrice === null || normListPrice === 0 || 
-                                   (normCustBestPrice !== null && normListPrice < normCustBestPrice);
+          // =====================================================================
+          // CALCULATE PER-EXPORT PRICES
+          // =====================================================================
+          const eanCalc = calculatePriceForExport(baseCents, pEan, normListPrice, normCustBestPrice);
+          const mwCalc = calculatePriceForExport(baseCents, pMw, normListPrice, normCustBestPrice);
+          const epCalc = calculatePriceForExport(baseCents, pEp, normListPrice, normCustBestPrice);
           
-          if (shouldUseAltRule && normCustBestPrice !== null) {
-            const baseLP = normCustBestPrice * 1.25;
-            const valoreCandidat = ((baseLP + feeConfig.shippingCost) * 1.22) * feeConfig.feeDrev * feeConfig.feeMkt;
-            const candidatoCeil = Math.ceil(valoreCandidat);
-            const minimoConsentito = Math.ceil(finalEuros * 1.25);
-            listPriceConFeeString = Math.max(candidatoCeil, minimoConsentito);
-          } else if (normListPrice !== null && normListPrice > 0) {
-            const subtotConIvaLP = (normListPrice + feeConfig.shippingCost) * 1.22;
-            const postFeeLP = subtotConIvaLP * feeConfig.feeDrev * feeConfig.feeMkt;
-            listPriceConFeeString = Math.ceil(postFeeLP);
+          // Diagnostic logging for first 3 records
+          if (perExportLogCount < 3 && baseCents > 0) {
+            console.log('%c[perExportPricing:sample]', 'color: #9C27B0; font-weight: bold;', {
+              recordIndex,
+              EAN: record.EAN,
+              route,
+              baseCents,
+              ean: { feeDrev: pEan.feeDrev, feeMkt: pEan.feeMkt, shippingCost: pEan.shippingCost, finalCents: eanCalc.finalCents, listPriceWithFee: eanCalc.listPriceWithFee },
+              mediaworld: { feeDrev: pMw.feeDrev, feeMkt: pMw.feeMkt, shippingCost: pMw.shippingCost, finalCents: mwCalc.finalCents, listPriceWithFee: mwCalc.listPriceWithFee },
+              eprice: { feeDrev: pEp.feeDrev, feeMkt: pEp.feeMkt, shippingCost: pEp.shippingCost, finalCents: epCalc.finalCents, listPriceWithFee: epCalc.listPriceWithFee }
+            });
+            perExportLogCount++;
+          }
+          
+          // Validate EAN pricing (CRITICAL: if EAN fails, row is invalid)
+          if (!eanCalc.isValid && baseCents > 0) {
+            console.error('[perExportPricing:EAN:INVALID]', {
+              recordIndex,
+              Matnr: record.Matnr,
+              EAN: record.EAN,
+              finalCents: eanCalc.finalCents,
+              reason: 'Final price does not end with ,99'
+            });
+            // Mark as invalid but still include - will be caught by existing guard
+          }
+          
+          // Prepare per-export pricing error flags
+          let mediaworldPricingError = false;
+          let epricePricingError = false;
+          
+          // Check Mediaworld pricing
+          if (!mwCalc.isValid && baseCents > 0) {
+            mediaworldPricingError = true;
+            console.warn('[perExportPricing:Mediaworld:INVALID]', {
+              recordIndex,
+              Matnr: record.Matnr,
+              finalCents: mwCalc.finalCents,
+              reason: 'Final price does not end with ,99'
+            });
+          }
+          
+          // Check ePrice pricing
+          if (!epCalc.isValid && baseCents > 0) {
+            epricePricingError = true;
+            console.warn('[perExportPricing:ePrice:INVALID]', {
+              recordIndex,
+              Matnr: record.Matnr,
+              finalCents: epCalc.finalCents,
+              reason: 'Final price does not end with ,99'
+            });
           }
           
           // =====================================================================
@@ -2063,28 +2157,49 @@ const AltersideCatalogGenerator: React.FC = () => {
             stockEU = 0;
           }
           
+          // Calculate legacy fields for display (using EAN pricing as the "default")
+          const eanShippingCents = Math.round(pEan.shippingCost * 100);
+          const eanAfterShippingCents = baseCents + eanShippingCents;
+          const eanAfterIvaCents = Math.round(eanAfterShippingCents * 1.22);
+          const eanAfterFeesCents = Math.round(Math.round(eanAfterIvaCents * pEan.feeDrev) * pEan.feeMkt);
+          
           return {
             Matnr: record.Matnr,
             ManufPartNr: record.ManufPartNr,
             EAN: record.EAN,
             ShortDescription: record.ShortDescription,
             ExistingStock: record.ExistingStock,
-            StockIT: stockIT,      // NEW: IT stock
-            StockEU: stockEU,      // NEW: EU stock
+            StockIT: stockIT,
+            StockEU: stockEU,
             ListPrice: record.ListPrice,
             CustBestPrice: record.CustBestPrice,
             Surcharge: record.Surcharge,
             basePriceCents: baseCents,
-            'Costo di Spedizione': feeConfig.shippingCost,
-            IVA: afterIvaCents / 100 - afterShippingCents / 100,
-            'Prezzo con spediz e IVA': afterIvaCents / 100,
-            FeeDeRev: feeConfig.feeDrev,
-            'Fee Marketplace': feeConfig.feeMkt,
-            'Subtotale post-fee': afterFeesCents / 100,
-            'Prezzo Finale': prezzoFinaleString,
-            'ListPrice con Fee': listPriceConFeeString,
+            // Legacy EAN fields (using EAN per-export pricing)
+            'Costo di Spedizione': pEan.shippingCost,
+            IVA: eanAfterIvaCents / 100 - eanAfterShippingCents / 100,
+            'Prezzo con spediz e IVA': eanAfterIvaCents / 100,
+            FeeDeRev: pEan.feeDrev,
+            'Fee Marketplace': pEan.feeMkt,
+            'Subtotale post-fee': eanAfterFeesCents / 100,
+            'Prezzo Finale': eanCalc.finalDisplay,
+            'ListPrice con Fee': eanCalc.listPriceWithFee,
+            // Per-export pricing fields (new)
+            final_price_ean: eanCalc.finalDisplay,
+            listprice_with_fee_ean: eanCalc.listPriceWithFee,
+            final_price_mediaworld: mediaworldPricingError ? null : mwCalc.finalDisplay,
+            listprice_with_fee_mediaworld: mediaworldPricingError ? null : mwCalc.listPriceWithFee,
+            final_price_eprice: epricePricingError ? null : epCalc.finalDisplay,
+            listprice_with_fee_eprice: epricePricingError ? null : epCalc.listPriceWithFee,
+            // Numeric versions for internal use
+            _finalCents_ean: eanCalc.finalCents,
+            _finalCents_mediaworld: mediaworldPricingError ? null : mwCalc.finalCents,
+            _finalCents_eprice: epricePricingError ? null : epCalc.finalCents,
+            // Error flags
+            mediaworldPricingError,
+            epricePricingError,
             _route: route,
-            _finalCents: finalCents
+            _finalCents: eanCalc.finalCents
           };
         });
         
