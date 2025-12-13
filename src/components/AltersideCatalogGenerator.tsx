@@ -2566,7 +2566,10 @@ const AltersideCatalogGenerator: React.FC = () => {
       // direttamente senza ricalcolare. Altrimenti, crea il dataset da zero.
       // =====================================================================
       let finalDataset: any[];
-      let shouldApplyOverride = false; // Dichiarato qui per visibilità in entrambi i branch
+      
+      // IMPORTANTE: usa la const shouldApplyOverride definita nel componente (linea ~4385)
+      // NON dichiarare una variabile locale che fa shadowing!
+      // shouldApplyOverride = overrideState.file !== null && overrideState.index !== null && !overrideState.disabled
       
       // Controlla se i dati sono già formattati (provengono dalla ref o dallo state)
       const dataIsAlreadyFormatted = (datasetFromRef && datasetFromRef.length > 0) || 
