@@ -58,7 +58,7 @@ import {
 } from '@/types/feeConfig';
 import * as XLSX from 'xlsx';
 import Papa from 'papaparse';
-import SyncScheduler from '@/components/SyncScheduler';
+import { PipelineStepsDisplay, type PipelineStep, type StepStatus } from '@/components/PipelineStepsDisplay';
 
 // Helper functions for MPN calculations
 function asNum(v: any): number {
@@ -1105,6 +1105,31 @@ const AltersideCatalogGenerator: React.FC = () => {
   const [pipelineStatus, setPipelineStatus] = useState<string>('');
   const [pipelineProgress, setPipelineProgress] = useState<number>(0);
   const [pipelineStepLabel, setPipelineStepLabel] = useState<string>('In attesa');
+  
+  // Pipeline steps state for always-visible display
+  const [pipelineSteps, setPipelineSteps] = useState<PipelineStep[]>([
+    { id: 'import_ftp', label: 'Import FTP', status: 'idle' },
+    { id: 'ean_prefill', label: 'EAN Prefill', status: 'idle' },
+    { id: 'process_ean', label: 'Elaborazione EAN', status: 'idle' },
+    { id: 'export_upload', label: 'Export e Upload SFTP', status: 'idle' }
+  ]);
+  
+  // Helper to update a single pipeline step
+  const updatePipelineStep = useCallback((stepId: string, updates: Partial<PipelineStep>) => {
+    setPipelineSteps(prev => prev.map(step => 
+      step.id === stepId ? { ...step, ...updates } : step
+    ));
+  }, []);
+  
+  // Reset all pipeline steps to idle
+  const resetPipelineSteps = useCallback(() => {
+    setPipelineSteps([
+      { id: 'import_ftp', label: 'Import FTP', status: 'idle' },
+      { id: 'ean_prefill', label: 'EAN Prefill', status: 'idle' },
+      { id: 'process_ean', label: 'Elaborazione EAN', status: 'idle' },
+      { id: 'export_upload', label: 'Export e Upload SFTP', status: 'idle' }
+    ]);
+  }, []);
 
   const workerRef = useRef<Worker | null>(null);
 
@@ -5062,6 +5087,7 @@ const AltersideCatalogGenerator: React.FC = () => {
     setPipelineStatus('');
     setPipelineProgress(0);
     setPipelineStepLabel('Inizializzazione pipeline…');
+    resetPipelineSteps();
     
     try {
       // =====================================================================
@@ -5070,6 +5096,7 @@ const AltersideCatalogGenerator: React.FC = () => {
       setPipelineProgress(0);
       setPipelineStepLabel('Import FTP in corso…');
       setPipelineStatus('Import FTP in corso…');
+      updatePipelineStep('import_ftp', { status: 'running', summary: 'Connessione al server FTP…' });
       console.log('[Pipeline Master] Step 1: handleFtpImport');
       
       // Call handleFtpImport and wait for completion
@@ -5101,6 +5128,7 @@ const AltersideCatalogGenerator: React.FC = () => {
       console.log('[Pipeline Master] Step 1 completato: file importati');
       setPipelineProgress(25);
       setPipelineStepLabel('Import FTP completato. Esecuzione EAN Prefill…');
+      updatePipelineStep('import_ftp', { status: 'done', summary: 'File importati correttamente' });
       
       // =====================================================================
       // STEP 2: EAN Prefill (se non già completato)
@@ -5124,17 +5152,21 @@ const AltersideCatalogGenerator: React.FC = () => {
         prefillStatus: currentPrefillState.status
       });
       
+      updatePipelineStep('ean_prefill', { status: 'running', summary: 'Verifica mapping EAN…' });
+      
       if (currentPrefillState.status === 'done') {
         // Prefill già completato in questa sessione
         console.log('[Pipeline Master] Step 2 saltato: prefill già completato');
         setPipelineStatus('EAN Prefill già completato, proseguo…');
         setPipelineProgress(50);
         setPipelineStepLabel('EAN Prefill già completato. Elaborazione pipeline EAN…');
+        updatePipelineStep('ean_prefill', { status: 'done', summary: 'Prefill già completato in questa sessione' });
       } else if (currentFilesForPrefill.eanMapping.file && hasMaterial) {
         // File mapping presente in memoria e Material valido, eseguo il prefill
         setPipelineStatus('EAN Prefill in corso…');
         setPipelineStepLabel('EAN Prefill in corso…');
         console.log('[Pipeline Master] Step 2: processEANPrefill (file in memoria)');
+        updatePipelineStep('ean_prefill', { status: 'running', summary: 'Elaborazione associazioni EAN…' });
         
         try {
           await processEANPrefill();
@@ -5163,13 +5195,36 @@ const AltersideCatalogGenerator: React.FC = () => {
             }, checkInterval);
           });
           
+          // Get prefill counters for summary
+          const prefillCounters = prefillStateRef.current.counters;
+          const prefillSummary = prefillCounters 
+            ? `EAN riempiti: ${prefillCounters.filled_now}, conflitti: ${prefillCounters.skipped_due_to_conflict}`
+            : 'Prefill completato';
+          
           console.log('[Pipeline Master] Step 2 completato: prefill eseguito');
           setPipelineProgress(50);
           setPipelineStepLabel('EAN Prefill completato. Elaborazione pipeline EAN…');
+          
+          // Check for warnings in prefill
+          const hasWarnings = prefillCounters && (prefillCounters.skipped_due_to_conflict > 0 || prefillCounters.duplicate_mpn_rows > 0);
+          updatePipelineStep('ean_prefill', { 
+            status: hasWarnings ? 'warning' : 'done', 
+            summary: prefillSummary,
+            details: hasWarnings && prefillCounters ? {
+              counters: {
+                'EAN riempiti': prefillCounters.filled_now,
+                'Già popolati': prefillCounters.already_populated,
+                'Conflitti': prefillCounters.skipped_due_to_conflict,
+                'MPN duplicati': prefillCounters.duplicate_mpn_rows
+              },
+              warnings: prefillCounters.skipped_due_to_conflict > 0 ? [`${prefillCounters.skipped_due_to_conflict} conflitti rilevati`] : []
+            } : undefined
+          });
         } catch (prefillError) {
           // Errore reale durante il prefill con file mapping presente: blocca la pipeline
           const errorMessage = prefillError instanceof Error ? prefillError.message : 'Errore sconosciuto';
           console.error('[Pipeline Master] Errore EAN Prefill:', errorMessage);
+          updatePipelineStep('ean_prefill', { status: 'error', summary: errorMessage, details: { errors: [errorMessage] } });
           throw new Error(`EAN Prefill fallito o interrotto: ${errorMessage}`);
         }
       } else if (!currentFilesForPrefill.eanMapping.file && mappingInfo) {
@@ -5180,12 +5235,14 @@ const AltersideCatalogGenerator: React.FC = () => {
         setPipelineStatus('Mapping EAN già configurato, proseguo…');
         setPipelineProgress(50);
         setPipelineStepLabel('Mapping EAN già salvato. Elaborazione pipeline EAN…');
+        updatePipelineStep('ean_prefill', { status: 'done', summary: `Mapping salvato: ${mappingInfo.filename}` });
       } else {
         // Nessun mapping configurato (né in memoria né salvato)
         console.log('[Pipeline Master] Step 2 saltato: nessun mapping configurato');
         setPipelineStatus('Nessun mapping EAN, proseguo senza prefill…');
         setPipelineProgress(50);
         setPipelineStepLabel('Nessun mapping EAN configurato, prefill saltato. Elaborazione pipeline EAN…');
+        updatePipelineStep('ean_prefill', { status: 'done', summary: 'Nessun mapping configurato, step saltato' });
       }
       
       // =====================================================================
@@ -5193,6 +5250,7 @@ const AltersideCatalogGenerator: React.FC = () => {
       // =====================================================================
       setPipelineStatus('Elaborazione EAN in corso…');
       setPipelineStepLabel('Elaborazione EAN in corso…');
+      updatePipelineStep('process_ean', { status: 'running', summary: 'Elaborazione dati catalogo…' });
       console.log('[Pipeline Master] Step 3: processDataPipeline(EAN)');
       
       await processDataPipeline('EAN');
@@ -5224,11 +5282,30 @@ const AltersideCatalogGenerator: React.FC = () => {
       setPipelineProgress(75);
       setPipelineStepLabel('Elaborazione EAN completata. Export e upload in corso…');
       
+      // Get stats for summary
+      const stats = currentStats;
+      const eanSummary = stats 
+        ? `${stats.validRecordsEAN} righe valide, ${stats.filteredRecordsEAN} scartate`
+        : 'Elaborazione completata';
+      updatePipelineStep('process_ean', { 
+        status: 'done', 
+        summary: eanSummary,
+        details: stats ? {
+          counters: {
+            'Righe totali': stats.totalRecords,
+            'Valide EAN': stats.validRecordsEAN,
+            'Scartate': stats.filteredRecordsEAN,
+            'Duplicati': stats.stockDuplicates + stats.priceDuplicates
+          }
+        } : undefined
+      });
+      
       // =====================================================================
       // STEP 4: downloadExcel('ean') che include salvataggio bucket e SFTP
       // =====================================================================
       setPipelineStatus('Export e upload in corso…');
       setPipelineStepLabel('Export e upload SFTP in corso…');
+      updatePipelineStep('export_upload', { status: 'running', summary: 'Generazione file export…' });
       console.log('[Pipeline Master] Step 4: downloadExcel(ean)');
       
       // Reset SFTP status before starting export
@@ -5262,6 +5339,19 @@ const AltersideCatalogGenerator: React.FC = () => {
       
       console.log('[Pipeline Master] Step 4 completato: export e upload SFTP eseguiti');
       
+      // Get SFTP results for summary
+      const sftpResults = sftpUploadStatusRef.current.results;
+      const uploadedCount = sftpResults?.filter(r => r.uploaded).length ?? 0;
+      const failedCount = sftpResults?.filter(r => !r.uploaded).length ?? 0;
+      
+      updatePipelineStep('export_upload', { 
+        status: failedCount > 0 ? 'warning' : 'done', 
+        summary: `${uploadedCount} file caricati` + (failedCount > 0 ? `, ${failedCount} falliti` : ''),
+        details: failedCount > 0 ? {
+          warnings: sftpResults?.filter(r => !r.uploaded).map(r => `${r.filename}: ${r.error || 'errore'}`) || []
+        } : undefined
+      });
+      
       // =====================================================================
       // SUCCESSO COMPLETO
       // =====================================================================
@@ -5278,6 +5368,14 @@ const AltersideCatalogGenerator: React.FC = () => {
       console.error('[Pipeline Master] Errore:', errorMessage);
       setPipelineStepLabel(`Errore: ${errorMessage}`);
       setPipelineStatus(`Errore: ${errorMessage}`);
+      
+      // Mark current running step as error
+      setPipelineSteps(prev => prev.map(step => 
+        step.status === 'running' 
+          ? { ...step, status: 'error' as StepStatus, summary: errorMessage, details: { errors: [errorMessage] } }
+          : step
+      ));
+      
       toast({
         title: "Pipeline interrotta",
         description: errorMessage,
@@ -5466,8 +5564,8 @@ const AltersideCatalogGenerator: React.FC = () => {
           </p>
         </div>
 
-        {/* Sync Scheduler */}
-        <SyncScheduler />
+        {/* Always-visible Pipeline Steps */}
+        <PipelineStepsDisplay steps={pipelineSteps} isRunning={pipelineRunning} />
 
         {/* Pipeline Master Button */}
         <div className="card border-strong" style={{ background: '#1e3a5f' }}>
@@ -6107,23 +6205,6 @@ const AltersideCatalogGenerator: React.FC = () => {
                   </>
                 )}
               </button>
-              <button
-                onClick={() => processDataPipeline('MPN')}
-                disabled={!canProcess || isProcessing || pipelineRunning}
-                className={`btn btn-primary text-lg px-12 py-4 ${!canProcess || isProcessing || pipelineRunning ? 'is-disabled' : ''}`}
-              >
-                {isProcessing && currentPipeline === 'MPN' ? (
-                  <>
-                    <Activity className="mr-3 h-5 w-5 animate-spin" />
-                    Elaborazione ManufPartNr...
-                  </>
-                ) : (
-                  <>
-                    <Upload className="mr-3 h-5 w-5" />
-                    GENERA EXCEL (ManufPartNr)
-                  </>
-                )}
-              </button>
             </div>
           </div>
         )}
@@ -6583,36 +6664,7 @@ const AltersideCatalogGenerator: React.FC = () => {
           </div>
         )}
 
-        {/* Data Preview */}
-        {currentProcessedData.length > 0 && (
-          <div className="card border-strong">
-            <div className="card-body">
-              <h3 className="card-title mb-6">Anteprima Export {currentPipeline} (Prime 10 Righe)</h3>
-              <div className="overflow-x-auto">
-                <table className="table-zebra">
-                  <thead>
-                    <tr>
-                      {Object.keys(currentProcessedData[0]).map((header, index) => (
-                        <th key={index}>{header}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {currentProcessedData.slice(0, 10).map((row, rowIndex) => (
-                      <tr key={rowIndex}>
-                        {Object.values(row).map((value, colIndex) => (
-                          <td key={colIndex}>
-                            {typeof value === 'number' ? value.toLocaleString('it-IT') : String(value)}
-                          </td>
-                        ))}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </div>
-        )}
+        {/* Data Preview section removed per Part A requirement */}
       </div>
     </div>
   );
