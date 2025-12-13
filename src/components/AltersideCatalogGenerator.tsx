@@ -2576,17 +2576,21 @@ const AltersideCatalogGenerator: React.FC = () => {
                                       (datasetFromState && datasetFromState.length > 0);
       
       if (dataIsAlreadyFormatted) {
-        // FONTE UNICA: eanCatalogDataset è già filtrato, validato e con override applicato
-        // CRITICAL: Ensure StockIT/StockEU are populated for each row
+        // Dataset già formattato - rimuovi eventuali override precedenti per riapplicare
+        // CRITICAL: L'override viene SEMPRE riapplicato per garantire coerenza
         finalDataset = eanFilteredData.map((record: any) => {
+          // Remove old override metadata if present (will be reapplied)
+          const { __override, __overrideSource, __overrideStockIT, __overrideStockEU, 
+                  __overrideLeadDaysIT, __overrideLeadDaysEU, ...cleanRecord } = record;
+          
           // If StockIT/StockEU already present and numeric, use them
-          if (typeof record.StockIT === 'number' && typeof record.StockEU === 'number') {
-            return record;
+          if (typeof cleanRecord.StockIT === 'number' && typeof cleanRecord.StockEU === 'number') {
+            return cleanRecord;
           }
           
           // Otherwise, calculate from stockLocationIndex
-          const matnr = record.Matnr || '';
-          const existingStock = Number(record.ExistingStock) || 0;
+          const matnr = cleanRecord.Matnr || '';
+          const existingStock = Number(cleanRecord.ExistingStock) || 0;
           const localWarnings = createEmptyWarnings();
           
           const locationStock = getStockForMatnr(
@@ -2602,13 +2606,13 @@ const AltersideCatalogGenerator: React.FC = () => {
           const stockEU = stockLocationIndex ? locationStock.stockEU : 0;
           
           return {
-            ...record,
+            ...cleanRecord,
             StockIT: stockIT,
             StockEU: stockEU
           };
         });
         
-        console.log('%c[onExportEAN:SKIP-CREATION] Uso dataset già formattato + StockIT/StockEU popolati', 'color: #4CAF50; font-weight: bold;', {
+        console.log('%c[onExportEAN:FORMATTED-BRANCH] Dataset formattato, preparato per override', 'color: #4CAF50; font-weight: bold;', {
           rows: finalDataset.length,
           sample_EAN: finalDataset[0]?.EAN,
           sample_PrezzoFinale: finalDataset[0]?.['Prezzo Finale'],
@@ -2898,15 +2902,32 @@ const AltersideCatalogGenerator: React.FC = () => {
       // =====================================================================
       setEanCatalogBase(cleanDataset);
       
-      // =====================================================================
-      // APPLICA OVERRIDE SE PRESENTE E ABILITATO
-      // =====================================================================
+      // Imposta finalDataset per l'applicazione override
       finalDataset = cleanDataset;
       
+      } // Fine del branch else (creazione dataset da currentProcessedData)
+      
+      // =====================================================================
+      // APPLICA OVERRIDE SE PRESENTE E ABILITATO
+      // CRITICAL: Questo blocco viene eseguito SEMPRE, qualunque sia il branch
+      // (dataIsAlreadyFormatted o creazione nuova)
+      // =====================================================================
+      console.log('%c[Override:check] === VERIFICA OVERRIDE ===', 'color: #9C27B0; font-weight: bold;', {
+        dataIsAlreadyFormatted,
+        shouldApplyOverride,
+        hasOverrideIndex: !!overrideState.index,
+        overrideDisabled: overrideState.disabled,
+        overrideFile: overrideState.filename
+      });
+      
       if (shouldApplyOverride && overrideState.index) {
-        console.log('%c[Override:applying] === APPLICAZIONE OVERRIDE ===', 'color: #E91E63; font-weight: bold; font-size: 14px;');
+        console.log('%c[Override:applying] === APPLICAZIONE OVERRIDE ===', 'color: #E91E63; font-weight: bold; font-size: 14px;', {
+          dataIsAlreadyFormatted,
+          finalDatasetRows: finalDataset.length,
+          overrideValidItems: overrideState.index.validItems.length
+        });
         
-        const overrideResult = applyOverrideToCatalog(cleanDataset, overrideState.index);
+        const overrideResult = applyOverrideToCatalog(finalDataset, overrideState.index);
         
         // Valida che tutti i prezzi finali terminino con ,99
         // NOTE: validateEnding99Guard already SKIPS __override records
@@ -2946,11 +2967,13 @@ const AltersideCatalogGenerator: React.FC = () => {
         }));
         
         console.log('%c[Override:applied]', 'color: #E91E63; font-weight: bold;', {
+          dataIsAlreadyFormatted,
           updatedExisting: overrideResult.stats.updatedExisting,
           addedNew: overrideResult.stats.addedNew,
           skippedRows: overrideResult.stats.skippedRows,
           warnings: applyWarnings.length,
-          errors: applyErrors.length
+          errors: applyErrors.length,
+          finalDatasetRows: finalDataset.length
         });
         
         toast({
@@ -2963,11 +2986,10 @@ const AltersideCatalogGenerator: React.FC = () => {
       // SALVA IL DATASET FINALE PER RIUTILIZZO IN EPRICE E MEDIAWORLD
       // Questo dataset contiene i prezzi formattati "NN,99" e sarà usato
       // come UNICA FONTE DI VERITÀ per tutti gli export.
+      // CRITICAL: Questo salvataggio avviene SEMPRE dopo l'override
       // =====================================================================
       setEanCatalogDataset(finalDataset);
       eanCatalogDatasetRef.current = finalDataset;
-      
-      } // Fine del branch else (creazione dataset da currentProcessedData)
       
       // =====================================================================
       // LOG ESTESO: SALVATAGGIO eanCatalogDataset

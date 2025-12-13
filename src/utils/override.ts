@@ -531,8 +531,17 @@ export function applyOverrideToCatalog(
       continue;
     }
     
-    // Cerca override per questo EAN
-    const overrideItem = overrideIndex.byEan.get(normalizedEan);
+    // MATCHING PRIORITY: SKU first, then EAN fallback
+    // 1. Try to match by SKU (ManufPartNr) - case-insensitive
+    const recordSku = String(record.ManufPartNr || '').trim().toLowerCase();
+    let overrideItem = recordSku ? overrideIndex.bySku.get(recordSku) : undefined;
+    let matchType = 'sku';
+    
+    // 2. Fallback to EAN match if SKU didn't match
+    if (!overrideItem) {
+      overrideItem = overrideIndex.byEan.get(normalizedEan);
+      matchType = 'ean';
+    }
     
     if (!overrideItem) {
       catalogWithOverride.push({ ...record });
@@ -544,22 +553,31 @@ export function applyOverrideToCatalog(
     // Crea copia del record per applicare override
     const updatedRecord = { ...record };
     
-    // Verifica SKU match (warning se non coincide)
-    const recordSku = String(record.ManufPartNr || '').trim();
-    if (recordSku && overrideItem.sku && recordSku.toLowerCase() !== overrideItem.sku.toLowerCase()) {
-      errors.push({
-        rowIndex: overrideItem.rawRowIndex,
-        field: 'SKU',
-        value: `${overrideItem.sku} vs ${recordSku}`,
-        reason: `Warning: SKU override "${overrideItem.sku}" non coincide con ManufPartNr del record "${recordSku}". Override applicato comunque.`
+    // Log match type for debugging (first 5 only)
+    if (stats.updatedExisting < 5) {
+      console.log('%c[Override:match]', 'color: #9C27B0;', {
+        matchType,
+        recordSku,
+        overrideSku: overrideItem.sku,
+        recordEAN: normalizedEan,
+        overrideEAN: overrideItem.ean
       });
-      stats.warnings++;
     }
     
     // Applica overrides nell'ordine specificato
     
-    // 1. Quantity -> ExistingStock (always provided, mandatory)
-    updatedRecord.ExistingStock = overrideItem.quantity;
+    // STOCK PRIORITY: If StockIT or StockEU is present, Quantity is ignored
+    // Quantity is only used as fallback (interpreted as StockIT=Quantity, StockEU=0)
+    const hasExplicitStock = overrideItem.stockIT !== undefined || overrideItem.stockEU !== undefined;
+    if (hasExplicitStock) {
+      // Use explicit stock values - ExistingStock = StockIT + StockEU
+      const stockIT = overrideItem.stockIT ?? 0;
+      const stockEU = overrideItem.stockEU ?? 0;
+      updatedRecord.ExistingStock = stockIT + stockEU;
+    } else {
+      // Fallback: Quantity → ExistingStock (interpreted as IT-only)
+      updatedRecord.ExistingStock = overrideItem.quantity;
+    }
     
     // 2. ListPrice -> ListPrice e "ListPrice con Fee" (always provided, mandatory)
     updatedRecord.ListPrice = overrideItem.listPrice;
@@ -614,13 +632,19 @@ export function applyOverrideToCatalog(
       continue;
     }
     
+    // STOCK PRIORITY for new products: If StockIT or StockEU is present, Quantity is ignored
+    const hasExplicitStock = item.stockIT !== undefined || item.stockEU !== undefined;
+    const stockITValue = item.stockIT ?? 0;
+    const stockEUValue = item.stockEU ?? 0;
+    const existingStockValue = hasExplicitStock ? (stockITValue + stockEUValue) : item.quantity;
+    
     // Create new record WITHOUT forceEnding99 - use exact OfferPrice
     const newRecord: any = {
       Matnr: `OVR-${item.sku}`,
       ManufPartNr: item.sku,
       EAN: item.ean,
       ShortDescription: `Override item ${item.sku}`,
-      ExistingStock: item.quantity,
+      ExistingStock: existingStockValue,
       ListPrice: item.listPrice,
       CustBestPrice: 0,
       Surcharge: 0,
