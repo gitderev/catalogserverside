@@ -673,9 +673,9 @@ const AltersideCatalogGenerator: React.FC = () => {
     }
   };
 
-  // Save preparation days to Supabase (global settings) - including IT/EU config
-  const handleSavePrepDays = async () => {
-    // Validate inputs
+  // Save export configuration to Supabase (IT/EU stock + per-export pricing)
+  const handleSaveExportConfig = async () => {
+    // Validate IT/EU days inputs
     if (!Number.isInteger(extendedFeeConfig.epriceItPreparationDays) || extendedFeeConfig.epriceItPreparationDays < 1) {
       toast({
         title: "Errore validazione",
@@ -692,10 +692,47 @@ const AltersideCatalogGenerator: React.FC = () => {
       });
       return;
     }
+    
+    // Validate per-export fees (null is allowed, but if set must be > 0)
+    const validateFee = (val: number | null, name: string): boolean => {
+      if (val !== null && val <= 0) {
+        toast({
+          title: "Errore validazione",
+          description: `${name} deve essere > 0`,
+          variant: "destructive"
+        });
+        return false;
+      }
+      return true;
+    };
+    
+    const validateShipping = (val: number | null, name: string): boolean => {
+      if (val !== null && val < 0) {
+        toast({
+          title: "Errore validazione",
+          description: `${name} deve essere >= 0`,
+          variant: "destructive"
+        });
+        return false;
+      }
+      return true;
+    };
+    
+    // Validate all per-export pricing
+    if (!validateFee(extendedFeeConfig.eanFeeDrev, 'EAN Fee DeRev')) return;
+    if (!validateFee(extendedFeeConfig.eanFeeMkt, 'EAN Fee Marketplace')) return;
+    if (!validateShipping(extendedFeeConfig.eanShippingCost, 'EAN Costo spedizione')) return;
+    if (!validateFee(extendedFeeConfig.mediaworldFeeDrev, 'Mediaworld Fee DeRev')) return;
+    if (!validateFee(extendedFeeConfig.mediaworldFeeMkt, 'Mediaworld Fee Marketplace')) return;
+    if (!validateShipping(extendedFeeConfig.mediaworldShippingCost, 'Mediaworld Costo spedizione')) return;
+    if (!validateFee(extendedFeeConfig.epriceFeeDrev, 'ePrice Fee DeRev')) return;
+    if (!validateFee(extendedFeeConfig.epriceFeeMkt, 'ePrice Fee Marketplace')) return;
+    if (!validateShipping(extendedFeeConfig.epriceShippingCost, 'ePrice Costo spedizione')) return;
 
     setIsSavingPrepDays(true);
     try {
       const updateData = {
+        // IT/EU stock config
         mediaworld_preparation_days: extendedFeeConfig.mediaworldItPreparationDays,
         eprice_preparation_days: extendedFeeConfig.epriceItPreparationDays,
         mediaworld_include_eu: extendedFeeConfig.mediaworldIncludeEu,
@@ -704,6 +741,16 @@ const AltersideCatalogGenerator: React.FC = () => {
         eprice_include_eu: extendedFeeConfig.epriceIncludeEu,
         eprice_it_preparation_days: extendedFeeConfig.epriceItPreparationDays,
         eprice_eu_preparation_days: extendedFeeConfig.epriceEuPreparationDays,
+        // Per-export pricing
+        ean_fee_drev: extendedFeeConfig.eanFeeDrev,
+        ean_fee_mkt: extendedFeeConfig.eanFeeMkt,
+        ean_shipping_cost: extendedFeeConfig.eanShippingCost,
+        mediaworld_fee_drev: extendedFeeConfig.mediaworldFeeDrev,
+        mediaworld_fee_mkt: extendedFeeConfig.mediaworldFeeMkt,
+        mediaworld_shipping_cost: extendedFeeConfig.mediaworldShippingCost,
+        eprice_fee_drev: extendedFeeConfig.epriceFeeDrev,
+        eprice_fee_mkt: extendedFeeConfig.epriceFeeMkt,
+        eprice_shipping_cost: extendedFeeConfig.epriceShippingCost,
         updated_at: new Date().toISOString()
       };
       
@@ -714,10 +761,10 @@ const AltersideCatalogGenerator: React.FC = () => {
         .eq('id', FEE_CONFIG_SINGLETON_ID);
       
       if (error) {
-        console.error('Errore salvataggio giorni preparazione:', error);
+        console.error('Errore salvataggio configurazione export:', error);
         toast({
           title: "Errore salvataggio",
-          description: "Impossibile salvare i giorni di preparazione sul server.",
+          description: "Impossibile salvare la configurazione export sul server.",
           variant: "destructive"
         });
       } else {
@@ -725,16 +772,16 @@ const AltersideCatalogGenerator: React.FC = () => {
         setPrepDaysMediaworld(extendedFeeConfig.mediaworldItPreparationDays);
         setPrepDays(extendedFeeConfig.epriceItPreparationDays);
         toast({
-          title: "Impostazioni salvate",
-          description: "La configurazione IT/EU è stata salvata."
+          title: "Configurazione export salvata",
+          description: "Stock IT/EU e pricing per-export salvati correttamente."
         });
-        console.log('Giorni preparazione IT/EU salvati su Supabase (singleton ID)');
+        console.log('Export config salvato su Supabase (singleton ID)', updateData);
       }
     } catch (err) {
-      console.error('Errore handleSavePrepDays:', err);
+      console.error('Errore handleSaveExportConfig:', err);
       toast({
         title: "Errore salvataggio",
-        description: "Impossibile salvare i giorni di preparazione sul server.",
+        description: "Impossibile salvare la configurazione export sul server.",
         variant: "destructive"
       });
     } finally {
@@ -5800,7 +5847,7 @@ const AltersideCatalogGenerator: React.FC = () => {
               <div className="mt-4 flex justify-end">
                 <button
                   type="button"
-                  onClick={handleSavePrepDays}
+                  onClick={handleSaveExportConfig}
                   disabled={isSavingPrepDays}
                   className={`btn btn-primary text-sm px-6 py-2 ${isSavingPrepDays ? 'opacity-50 cursor-not-allowed' : ''}`}
                 >
@@ -5810,7 +5857,7 @@ const AltersideCatalogGenerator: React.FC = () => {
                       Salvataggio...
                     </>
                   ) : (
-                    'Salva configurazione IT/EU'
+                    'Salva configurazione export'
                   )}
                 </button>
               </div>
