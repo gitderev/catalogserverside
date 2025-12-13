@@ -32,49 +32,76 @@ export type Database = {
       fee_config: {
         Row: {
           created_at: string | null
+          ean_fee_drev: number | null
+          ean_fee_mkt: number | null
+          ean_shipping_cost: number | null
           eprice_eu_preparation_days: number
+          eprice_fee_drev: number | null
+          eprice_fee_mkt: number | null
           eprice_include_eu: boolean
           eprice_it_preparation_days: number
           eprice_preparation_days: number
+          eprice_shipping_cost: number | null
           fee_drev: number
           fee_mkt: number
           id: string
           mediaworld_eu_preparation_days: number
+          mediaworld_fee_drev: number | null
+          mediaworld_fee_mkt: number | null
           mediaworld_include_eu: boolean
           mediaworld_it_preparation_days: number
           mediaworld_preparation_days: number
+          mediaworld_shipping_cost: number | null
           shipping_cost: number
           updated_at: string | null
         }
         Insert: {
           created_at?: string | null
+          ean_fee_drev?: number | null
+          ean_fee_mkt?: number | null
+          ean_shipping_cost?: number | null
           eprice_eu_preparation_days?: number
+          eprice_fee_drev?: number | null
+          eprice_fee_mkt?: number | null
           eprice_include_eu?: boolean
           eprice_it_preparation_days?: number
           eprice_preparation_days?: number
+          eprice_shipping_cost?: number | null
           fee_drev: number
           fee_mkt: number
           id?: string
           mediaworld_eu_preparation_days?: number
+          mediaworld_fee_drev?: number | null
+          mediaworld_fee_mkt?: number | null
           mediaworld_include_eu?: boolean
           mediaworld_it_preparation_days?: number
           mediaworld_preparation_days?: number
+          mediaworld_shipping_cost?: number | null
           shipping_cost: number
           updated_at?: string | null
         }
         Update: {
           created_at?: string | null
+          ean_fee_drev?: number | null
+          ean_fee_mkt?: number | null
+          ean_shipping_cost?: number | null
           eprice_eu_preparation_days?: number
+          eprice_fee_drev?: number | null
+          eprice_fee_mkt?: number | null
           eprice_include_eu?: boolean
           eprice_it_preparation_days?: number
           eprice_preparation_days?: number
+          eprice_shipping_cost?: number | null
           fee_drev?: number
           fee_mkt?: number
           id?: string
           mediaworld_eu_preparation_days?: number
+          mediaworld_fee_drev?: number | null
+          mediaworld_fee_mkt?: number | null
           mediaworld_include_eu?: boolean
           mediaworld_it_preparation_days?: number
           mediaworld_preparation_days?: number
+          mediaworld_shipping_cost?: number | null
           shipping_cost?: number
           updated_at?: string | null
         }

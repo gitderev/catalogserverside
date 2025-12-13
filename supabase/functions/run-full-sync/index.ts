@@ -180,11 +180,15 @@ serve(async (req) => {
       }
     }
 
-    const { data: feeData } = await supabase.from('fee_config').select('*').limit(1).single();
+    // Use singleton row for deterministic fee_config read
+    const FEE_CONFIG_SINGLETON_ID = '00000000-0000-0000-0000-000000000001';
+    const { data: feeData } = await supabase.from('fee_config').select('*').eq('id', FEE_CONFIG_SINGLETON_ID).maybeSingle();
     const feeConfig = {
+      // Global fees
       feeDrev: feeData?.fee_drev ?? 1.05,
       feeMkt: feeData?.fee_mkt ?? 1.08,
       shippingCost: feeData?.shipping_cost ?? 6.00,
+      // Prep days
       mediaworldPrepDays: feeData?.mediaworld_preparation_days ?? 3,
       epricePrepDays: feeData?.eprice_preparation_days ?? 1,
       // IT/EU stock config
@@ -193,7 +197,17 @@ serve(async (req) => {
       mediaworldEuPrepDays: feeData?.mediaworld_eu_preparation_days ?? 5,
       epriceIncludeEu: feeData?.eprice_include_eu ?? false,
       epriceItPrepDays: feeData?.eprice_it_preparation_days ?? 1,
-      epriceEuPrepDays: feeData?.eprice_eu_preparation_days ?? 3
+      epriceEuPrepDays: feeData?.eprice_eu_preparation_days ?? 3,
+      // Per-export pricing (null = use global)
+      eanFeeDrev: feeData?.ean_fee_drev ?? null,
+      eanFeeMkt: feeData?.ean_fee_mkt ?? null,
+      eanShippingCost: feeData?.ean_shipping_cost ?? null,
+      mediaworldFeeDrev: feeData?.mediaworld_fee_drev ?? null,
+      mediaworldFeeMkt: feeData?.mediaworld_fee_mkt ?? null,
+      mediaworldShippingCost: feeData?.mediaworld_shipping_cost ?? null,
+      epriceFeeDrev: feeData?.eprice_fee_drev ?? null,
+      epriceFeeMkt: feeData?.eprice_fee_mkt ?? null,
+      epriceShippingCost: feeData?.eprice_shipping_cost ?? null
     };
 
     runId = crypto.randomUUID();

@@ -51,7 +51,9 @@ import {
   type StockLocationWarningsState,
   DEFAULT_FEE_CONFIG,
   EMPTY_WARNINGS,
-  mapFeeConfigRowToState
+  mapFeeConfigRowToState,
+  FEE_CONFIG_SINGLETON_ID,
+  getEffectivePricing
 } from '@/types/feeConfig';
 import * as XLSX from 'xlsx';
 import Papa from 'papaparse';
@@ -466,15 +468,16 @@ const AltersideCatalogGenerator: React.FC = () => {
     importedAt?: string;
   } | null>(null);
 
-  // Load fee config from Supabase on mount (including IT/EU fields)
+  // Load fee config from Supabase on mount (using singleton ID)
   useEffect(() => {
     const loadFeesFromSupabase = async () => {
       try {
+        // Always load from singleton row
         const { data, error } = await supabase
           .from('fee_config')
           .select('*')
-          .order('updated_at', { ascending: false })
-          .limit(1);
+          .eq('id', FEE_CONFIG_SINGLETON_ID)
+          .maybeSingle();
         
         if (error) {
           console.error('Errore caricamento fee config:', error);
@@ -483,8 +486,8 @@ const AltersideCatalogGenerator: React.FC = () => {
             description: "Impossibile caricare le regole di calcolo dal server. Utilizzati valori predefiniti.",
             variant: "destructive"
           });
-        } else if (data && data.length > 0) {
-          const row = data[0] as any;
+        } else if (data) {
+          const row = data as any;
           setFeeConfig({
             feeDrev: Number(row.fee_drev),
             feeMkt: Number(row.fee_mkt),
@@ -515,7 +518,17 @@ const AltersideCatalogGenerator: React.FC = () => {
             mediaworldEuPreparationDays: Number(row.mediaworld_eu_preparation_days || 5),
             epriceIncludeEu,
             epriceItPreparationDays: Number(row.eprice_it_preparation_days || row.eprice_preparation_days || 1),
-            epriceEuPreparationDays: Number(row.eprice_eu_preparation_days || 3)
+            epriceEuPreparationDays: Number(row.eprice_eu_preparation_days || 3),
+            // Per-export pricing (null = use global)
+            eanFeeDrev: row.ean_fee_drev != null ? Number(row.ean_fee_drev) : null,
+            eanFeeMkt: row.ean_fee_mkt != null ? Number(row.ean_fee_mkt) : null,
+            eanShippingCost: row.ean_shipping_cost != null ? Number(row.ean_shipping_cost) : null,
+            mediaworldFeeDrev: row.mediaworld_fee_drev != null ? Number(row.mediaworld_fee_drev) : null,
+            mediaworldFeeMkt: row.mediaworld_fee_mkt != null ? Number(row.mediaworld_fee_mkt) : null,
+            mediaworldShippingCost: row.mediaworld_shipping_cost != null ? Number(row.mediaworld_shipping_cost) : null,
+            epriceFeeDrev: row.eprice_fee_drev != null ? Number(row.eprice_fee_drev) : null,
+            epriceFeeMkt: row.eprice_fee_mkt != null ? Number(row.eprice_fee_mkt) : null,
+            epriceShippingCost: row.eprice_shipping_cost != null ? Number(row.eprice_shipping_cost) : null
           };
           
           setExtendedFeeConfig(loadedConfig);
@@ -589,17 +602,50 @@ const AltersideCatalogGenerator: React.FC = () => {
     loadStockLocationFromStorage();
   }, []);
 
-  // Save fee config to Supabase
+  // Save fee config to Supabase (using singleton pattern)
   const handleSaveFees = async () => {
+    // Validate fee inputs
+    if (feeConfig.feeDrev <= 0 || feeConfig.feeMkt <= 0) {
+      toast({
+        title: "Errore validazione",
+        description: "I moltiplicatori Fee DeRev e Fee Marketplace devono essere > 0",
+        variant: "destructive"
+      });
+      return;
+    }
+    if (feeConfig.shippingCost < 0) {
+      toast({
+        title: "Errore validazione",
+        description: "Il costo di spedizione deve essere >= 0",
+        variant: "destructive"
+      });
+      return;
+    }
+
     setIsSavingFees(true);
     try {
+      const updateData = {
+        fee_drev: feeConfig.feeDrev,
+        fee_mkt: feeConfig.feeMkt,
+        shipping_cost: feeConfig.shippingCost,
+        // Per-export pricing (null = use global)
+        ean_fee_drev: extendedFeeConfig.eanFeeDrev,
+        ean_fee_mkt: extendedFeeConfig.eanFeeMkt,
+        ean_shipping_cost: extendedFeeConfig.eanShippingCost,
+        mediaworld_fee_drev: extendedFeeConfig.mediaworldFeeDrev,
+        mediaworld_fee_mkt: extendedFeeConfig.mediaworldFeeMkt,
+        mediaworld_shipping_cost: extendedFeeConfig.mediaworldShippingCost,
+        eprice_fee_drev: extendedFeeConfig.epriceFeeDrev,
+        eprice_fee_mkt: extendedFeeConfig.epriceFeeMkt,
+        eprice_shipping_cost: extendedFeeConfig.epriceShippingCost,
+        updated_at: new Date().toISOString()
+      };
+
+      // Always update singleton row
       const { error } = await supabase
         .from('fee_config')
-        .insert({
-          fee_drev: feeConfig.feeDrev,
-          fee_mkt: feeConfig.feeMkt,
-          shipping_cost: feeConfig.shippingCost
-        });
+        .update(updateData)
+        .eq('id', FEE_CONFIG_SINGLETON_ID);
       
       if (error) {
         console.error('Errore salvataggio fee config:', error);
@@ -611,9 +657,9 @@ const AltersideCatalogGenerator: React.FC = () => {
       } else {
         toast({
           title: "Regole salvate",
-          description: "Le regole di calcolo sono state salvate con successo."
+          description: "Le regole di calcolo (globali e per-export) sono state salvate."
         });
-        console.log('Fee config salvato su Supabase');
+        console.log('Fee config salvato su Supabase (singleton ID)');
       }
     } catch (err) {
       console.error('Errore handleSaveFees:', err);
@@ -649,13 +695,6 @@ const AltersideCatalogGenerator: React.FC = () => {
 
     setIsSavingPrepDays(true);
     try {
-      // Get existing config to update (or insert new)
-      const { data: existingConfig } = await supabase
-        .from('fee_config')
-        .select('id')
-        .order('updated_at', { ascending: false })
-        .limit(1);
-      
       const updateData = {
         mediaworld_preparation_days: extendedFeeConfig.mediaworldItPreparationDays,
         eprice_preparation_days: extendedFeeConfig.epriceItPreparationDays,
@@ -668,57 +707,28 @@ const AltersideCatalogGenerator: React.FC = () => {
         updated_at: new Date().toISOString()
       };
       
-      if (existingConfig && existingConfig.length > 0) {
-        // Update existing record
-        const { error } = await supabase
-          .from('fee_config')
-          .update(updateData)
-          .eq('id', existingConfig[0].id);
-        
-        if (error) {
-          console.error('Errore salvataggio giorni preparazione:', error);
-          toast({
-            title: "Errore salvataggio",
-            description: "Impossibile salvare i giorni di preparazione sul server.",
-            variant: "destructive"
-          });
-        } else {
-          // Sync legacy prepDays state
-          setPrepDaysMediaworld(extendedFeeConfig.mediaworldItPreparationDays);
-          setPrepDays(extendedFeeConfig.epriceItPreparationDays);
-          toast({
-            title: "Impostazioni salvate",
-            description: "La configurazione IT/EU è stata salvata."
-          });
-          console.log('Giorni preparazione IT/EU salvati su Supabase');
-        }
+      // Always update singleton row
+      const { error } = await supabase
+        .from('fee_config')
+        .update(updateData)
+        .eq('id', FEE_CONFIG_SINGLETON_ID);
+      
+      if (error) {
+        console.error('Errore salvataggio giorni preparazione:', error);
+        toast({
+          title: "Errore salvataggio",
+          description: "Impossibile salvare i giorni di preparazione sul server.",
+          variant: "destructive"
+        });
       } else {
-        // Insert new record with all defaults plus prep days
-        const { error } = await supabase
-          .from('fee_config')
-          .insert({
-            fee_drev: feeConfig.feeDrev,
-            fee_mkt: feeConfig.feeMkt,
-            shipping_cost: feeConfig.shippingCost,
-            ...updateData
-          });
-        
-        if (error) {
-          console.error('Errore salvataggio giorni preparazione:', error);
-          toast({
-            title: "Errore salvataggio",
-            description: "Impossibile salvare i giorni di preparazione sul server.",
-            variant: "destructive"
-          });
-        } else {
-          setPrepDaysMediaworld(extendedFeeConfig.mediaworldItPreparationDays);
-          setPrepDays(extendedFeeConfig.epriceItPreparationDays);
-          toast({
-            title: "Impostazioni salvate",
-            description: "La configurazione IT/EU è stata salvata."
-          });
-          console.log('Giorni preparazione IT/EU salvati su Supabase');
-        }
+        // Sync legacy prepDays state
+        setPrepDaysMediaworld(extendedFeeConfig.mediaworldItPreparationDays);
+        setPrepDays(extendedFeeConfig.epriceItPreparationDays);
+        toast({
+          title: "Impostazioni salvate",
+          description: "La configurazione IT/EU è stata salvata."
+        });
+        console.log('Giorni preparazione IT/EU salvati su Supabase (singleton ID)');
       }
     } catch (err) {
       console.error('Errore handleSavePrepDays:', err);
