@@ -155,6 +155,7 @@ interface OverrideState {
   uploadedAt: Date | null;
   index: OverrideIndex | null;
   errors: OverrideError[];
+  warnings: OverrideError[]; // Separate warnings from errors
   disabled: boolean;
   validCount: number;
   invalidCount: number;
@@ -430,6 +431,7 @@ const AltersideCatalogGenerator: React.FC = () => {
     uploadedAt: null,
     index: null,
     errors: [],
+    warnings: [],
     disabled: false,
     validCount: 0,
     invalidCount: 0,
@@ -902,6 +904,7 @@ const AltersideCatalogGenerator: React.FC = () => {
           uploadedAt: new Date(),
           index: result.index,
           errors: result.errors,
+          warnings: result.warnings || [],
           disabled: false,
           validCount: result.validCount,
           invalidCount: result.invalidCount,
@@ -2903,52 +2906,54 @@ const AltersideCatalogGenerator: React.FC = () => {
         const overrideResult = applyOverrideToCatalog(cleanDataset, overrideState.index);
         
         // Valida che tutti i prezzi finali terminino con ,99
+        // NOTE: validateEnding99Guard already SKIPS __override records
+        // So this only validates non-override records
         const guardResult = validateEnding99Guard(overrideResult.catalog);
         
+        // NON-BLOCKING: Override is ALWAYS applied, guard failures are just warnings
+        finalDataset = overrideResult.catalog;
+        
+        // Collect errors and warnings
+        const applyErrors = overrideResult.errors.filter(e => !e.reason.startsWith('Warning:'));
+        const applyWarnings = overrideResult.errors.filter(e => e.reason.startsWith('Warning:'));
+        
+        // If guard fails for non-override records, add as warnings (not blocking)
         if (!guardResult.valid) {
-          console.error('%c[Override:guard:FAIL]', 'color: red; font-weight: bold;', {
-            failures: guardResult.failures.slice(0, 10)
+          console.warn('%c[Override:guard:warning]', 'color: orange; font-weight: bold;', {
+            nonOverrideFailures: guardResult.failures.slice(0, 10),
+            note: 'These are NON-override records that failed ,99 validation'
           });
-          toast({
-            title: "Errore validazione Override",
-            description: `${guardResult.failures.length} prezzi override non terminano con ,99. Override non applicato.`,
-            variant: "destructive"
-          });
-          // Usa il dataset base senza override
-          finalDataset = cleanDataset;
-          setOverrideState(prev => ({
-            ...prev,
-            errors: [...prev.errors, ...guardResult.failures.map(f => ({
-              rowIndex: f.index,
-              field: 'Prezzo Finale',
-              value: f.price,
-              reason: `Prezzo non termina con ,99 per EAN ${f.ean}`
-            }))]
+          
+          // Add guard failures as warnings, not errors
+          const guardWarnings = guardResult.failures.map(f => ({
+            rowIndex: f.index,
+            field: 'Prezzo Finale',
+            value: f.price,
+            reason: `Warning: Prezzo non termina con ,99 per EAN ${f.ean} (record non-override)`
           }));
-        } else {
-          // Override applicato con successo
-          finalDataset = overrideResult.catalog;
-          
-          // Aggiorna stats e errori nello state
-          setOverrideState(prev => ({
-            ...prev,
-            errors: [...prev.errors, ...overrideResult.errors],
-            lastApplyStats: overrideResult.stats
-          }));
-          
-          console.log('%c[Override:applied]', 'color: #E91E63; font-weight: bold;', {
-            updatedExisting: overrideResult.stats.updatedExisting,
-            addedNew: overrideResult.stats.addedNew,
-            skippedRows: overrideResult.stats.skippedRows,
-            warnings: overrideResult.stats.warnings,
-            totalErrors: overrideResult.errors.length
-          });
-          
-          toast({
-            title: "Override applicato",
-            description: `${overrideResult.stats.updatedExisting} aggiornati, ${overrideResult.stats.addedNew} nuovi prodotti`
-          });
+          applyWarnings.push(...guardWarnings);
         }
+        
+        // Aggiorna stats, errori e warnings nello state
+        setOverrideState(prev => ({
+          ...prev,
+          errors: [...prev.errors, ...applyErrors],
+          warnings: [...prev.warnings, ...applyWarnings],
+          lastApplyStats: overrideResult.stats
+        }));
+        
+        console.log('%c[Override:applied]', 'color: #E91E63; font-weight: bold;', {
+          updatedExisting: overrideResult.stats.updatedExisting,
+          addedNew: overrideResult.stats.addedNew,
+          skippedRows: overrideResult.stats.skippedRows,
+          warnings: applyWarnings.length,
+          errors: applyErrors.length
+        });
+        
+        toast({
+          title: "Override applicato",
+          description: `${overrideResult.stats.updatedExisting} aggiornati, ${overrideResult.stats.addedNew} nuovi prodotti`
+        });
       }
       
       // =====================================================================
@@ -4301,6 +4306,7 @@ const AltersideCatalogGenerator: React.FC = () => {
         uploadedAt: new Date(),
         index: result.index,
         errors: result.errors,
+        warnings: result.warnings || [],
         disabled: false,
         validCount: result.validCount,
         invalidCount: result.invalidCount,
@@ -4363,6 +4369,7 @@ const AltersideCatalogGenerator: React.FC = () => {
       uploadedAt: null,
       index: null,
       errors: [],
+      warnings: [],
       disabled: false,
       validCount: 0,
       invalidCount: 0,
@@ -5599,20 +5606,41 @@ const AltersideCatalogGenerator: React.FC = () => {
                       </div>
                     </div>
                     
-                    {/* Override Errors */}
+                    {/* Override Errors (blocking) */}
                     {overrideState.errors.length > 0 && (
                       <div className="p-3 rounded-lg border-strong mb-3" style={{ background: '#fef2f2' }}>
                         <h4 className="text-sm font-semibold mb-2" style={{ color: '#dc2626' }}>
-                          Errori/Warning ({overrideState.errors.length})
+                          <XCircle className="inline h-4 w-4 mr-1" />
+                          Errori ({overrideState.errors.length})
                         </h4>
                         <div className="max-h-32 overflow-y-auto text-xs space-y-1">
                           {overrideState.errors.slice(0, 20).map((err, idx) => (
                             <div key={idx} className="text-red-700">
-                              Riga {err.rowIndex}: {err.field} - {err.reason}
+                              Riga {err.rowIndex}: <strong>{err.field}</strong> = "{err.value}" - {err.reason}
                             </div>
                           ))}
                           {overrideState.errors.length > 20 && (
                             <div className="text-muted">...e altri {overrideState.errors.length - 20} errori</div>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                    
+                    {/* Override Warnings (non-blocking) */}
+                    {overrideState.warnings.length > 0 && (
+                      <div className="p-3 rounded-lg border-strong mb-3" style={{ background: '#fffbeb' }}>
+                        <h4 className="text-sm font-semibold mb-2" style={{ color: '#d97706' }}>
+                          <AlertCircle className="inline h-4 w-4 mr-1" />
+                          Avvisi ({overrideState.warnings.length})
+                        </h4>
+                        <div className="max-h-32 overflow-y-auto text-xs space-y-1">
+                          {overrideState.warnings.slice(0, 20).map((warn, idx) => (
+                            <div key={idx} className="text-amber-700">
+                              Riga {warn.rowIndex}: <strong>{warn.field}</strong> = "{warn.value}" - {warn.reason}
+                            </div>
+                          ))}
+                          {overrideState.warnings.length > 20 && (
+                            <div className="text-muted">...e altri {overrideState.warnings.length - 20} avvisi</div>
                           )}
                         </div>
                       </div>
