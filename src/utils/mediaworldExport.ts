@@ -339,6 +339,7 @@ export async function buildMediaworldXlsxFromEanDataset({
   try {
     const validationErrors: ValidationError[] = [];
     let skippedCount = 0;
+    let skippedPerExportPricing = 0; // PART D: Counter for rows skipped due to missing per-export pricing
     
     // Diagnostic counters
     let euOnlyTotal = 0;
@@ -494,16 +495,49 @@ export async function buildMediaworldXlsxFromEanDataset({
         return;
       }
       
-      // Get prices from EAN catalog (NO recalculation)
-      const listPriceConFee = parsePrice(record['ListPrice con Fee']);
-      const prezzoFinale = parsePrice(record['Prezzo Finale']);
+      // =====================================================================
+      // PART D: Use per-export price fields (calculated in Part C)
+      // Fields: final_price_mediaworld, listprice_with_fee_mediaworld
+      // If missing, SKIP row (do not fallback to legacy EAN fields)
+      // =====================================================================
+      const finalPriceMwRaw = record.final_price_mediaworld;
+      const listPriceFeeMwRaw = record.listprice_with_fee_mediaworld;
+      
+      // Check if per-export pricing is available
+      if (finalPriceMwRaw === null || finalPriceMwRaw === undefined) {
+        validationErrors.push({
+          row: index + 1,
+          sku,
+          field: 'Prezzo scontato',
+          reason: `final_price_mediaworld mancante (pricing error flag o calcolo fallito)`
+        });
+        skippedCount++;
+        skippedPerExportPricing++;
+        return;
+      }
+      
+      if (listPriceFeeMwRaw === null || listPriceFeeMwRaw === undefined || listPriceFeeMwRaw === '') {
+        validationErrors.push({
+          row: index + 1,
+          sku,
+          field: "Prezzo dell'offerta",
+          reason: `listprice_with_fee_mediaworld mancante (pricing error flag o calcolo fallito)`
+        });
+        skippedCount++;
+        skippedPerExportPricing++;
+        return;
+      }
+      
+      // Parse prices (convert comma to dot if string)
+      const prezzoFinale = parsePrice(finalPriceMwRaw);
+      const listPriceConFee = parsePrice(listPriceFeeMwRaw);
       
       if (listPriceConFee === null || listPriceConFee <= 0) {
         validationErrors.push({
           row: index + 1,
           sku,
           field: "Prezzo dell'offerta",
-          reason: `ListPrice con Fee non valido: ${record['ListPrice con Fee']}`
+          reason: `listprice_with_fee_mediaworld non valido: ${listPriceFeeMwRaw}`
         });
         skippedCount++;
         return;
@@ -514,19 +548,20 @@ export async function buildMediaworldXlsxFromEanDataset({
           row: index + 1,
           sku,
           field: 'Prezzo scontato',
-          reason: `Prezzo Finale non valido: ${record['Prezzo Finale']}`
+          reason: `final_price_mediaworld non valido: ${finalPriceMwRaw}`
         });
         skippedCount++;
         return;
       }
       
-      // Log first 20 records for diagnostics
+      // Log first 20 records for diagnostics (PART D: shows per-export pricing source)
       if (index < 20) {
         console.log(`%c[Mediaworld:row${index}]`, 'color: #00BCD4;', {
           sku, ean, stockIT, stockEU: effectiveStockEU,
           exportQty: stockResult.exportQty,
           leadDays: stockResult.leadDays,
           source: stockResult.source,
+          priceSource: 'per-export (final_price_mediaworld, listprice_with_fee_mediaworld)',
           listPriceConFee,
           prezzoFinale,
           isOverride: !!record.__override
@@ -566,6 +601,7 @@ export async function buildMediaworldXlsxFromEanDataset({
       inputRows: processedData.length,
       exportedRows: rowCount,
       skippedRows: skippedCount,
+      skippedPerExportPricing, // PART D: rows skipped due to missing per-export pricing
       euOnlyTotal,
       euOnlyExported,
       itOnlyCount,
@@ -849,33 +885,53 @@ export async function exportMediaworldCatalog({
       
       // SKU con "/" sono ora accettati (es. KVR16N11/8, SNA-DC2/35)
       
-      // === GET PRICES FROM ALREADY CALCULATED EAN DATA ===
-      // IMPORTANTE: NON ricalcoliamo i prezzi, usiamo DIRETTAMENTE quelli già calcolati nel catalogo EAN.
-      // I prezzi vengono letti come stringhe con virgola (es. "175,99") e convertiti in numeri (175.99).
-      // NON viene applicato alcun arrotondamento a interi.
+      // =====================================================================
+      // PART D: Use per-export price fields (calculated in Part C)
+      // Fields: final_price_mediaworld, listprice_with_fee_mediaworld
+      // If missing, SKIP row (do not fallback to legacy EAN fields)
+      // =====================================================================
+      const finalPriceMwRaw = record.final_price_mediaworld;
+      const listPriceFeeMwRaw = record.listprice_with_fee_mediaworld;
       
-      // "ListPrice con Fee" - already calculated in EAN pipeline
-      const listPriceConFeeRaw = record['ListPrice con Fee'];
-      const listPriceConFee = parsePrice(listPriceConFeeRaw);
+      // Check if per-export pricing is available
+      if (finalPriceMwRaw === null || finalPriceMwRaw === undefined) {
+        validationErrors.push({
+          row: index + 1,
+          sku,
+          field: 'Prezzo scontato',
+          reason: `final_price_mediaworld mancante (pricing error flag o calcolo fallito)`
+        });
+        skippedCount++;
+        return;
+      }
       
-      // "Prezzo Finale" - already calculated in EAN pipeline (format "NN,99" or number)
-      const prezzoFinaleRaw = record['Prezzo Finale'];
-      const prezzoFinale = parsePrice(prezzoFinaleRaw);
+      if (listPriceFeeMwRaw === null || listPriceFeeMwRaw === undefined || listPriceFeeMwRaw === '') {
+        validationErrors.push({
+          row: index + 1,
+          sku,
+          field: "Prezzo dell'offerta",
+          reason: `listprice_with_fee_mediaworld mancante (pricing error flag o calcolo fallito)`
+        });
+        skippedCount++;
+        return;
+      }
       
-      // LOG ESTESO per i primi 10 record - traccia COMPLETA della conversione
+      // Parse prices (convert comma to dot if string)
+      const prezzoFinale = parsePrice(finalPriceMwRaw);
+      const listPriceConFee = parsePrice(listPriceFeeMwRaw);
+      
+      // LOG ESTESO per i primi 10 record - traccia COMPLETA della conversione (PART D)
       if (debugLogCount < 10) {
         const terminaCon99 = prezzoFinale !== null && (Math.round(prezzoFinale * 100) % 100) === 99;
         
         console.log(`%c[Mediaworld:export:row${index}]`, 'color: #00BCD4;', {
           EAN: ean,
           SKU: sku,
-          'Prezzo Finale RAW (fonte Catalogo EAN)': prezzoFinaleRaw,
-          'Prezzo Finale RAW type': typeof prezzoFinaleRaw,
+          priceSource: 'per-export (final_price_mediaworld, listprice_with_fee_mediaworld)',
+          'Prezzo Finale RAW': finalPriceMwRaw,
           'parseFloat result': prezzoFinale,
-          'valore finale in Prezzo scontato': prezzoFinale,
           'termina_con_99': terminaCon99,
-          'ListPrice con Fee RAW': listPriceConFeeRaw,
-          'ListPrice con Fee RAW type': typeof listPriceConFeeRaw,
+          'ListPrice con Fee RAW': listPriceFeeMwRaw,
           'valore in Prezzo offerta': listPriceConFee,
           'ExistingStock RAW': existingStock,
           'quantità esportata': stockResult.exportQty
@@ -886,7 +942,7 @@ export async function exportMediaworldCatalog({
           console.error(`%c[Mediaworld:warning:price-mismatch:row${index}] PREZZO NON TERMINA CON .99!`, 'color: red; font-weight: bold;', {
             EAN: ean,
             prezzoFinale: prezzoFinale,
-            raw: prezzoFinaleRaw
+            raw: finalPriceMwRaw
           });
         }
         
@@ -899,7 +955,7 @@ export async function exportMediaworldCatalog({
           row: index + 1,
           sku,
           field: "Prezzo dell'offerta",
-          reason: `ListPrice con Fee non valido: ${record['ListPrice con Fee']}`
+          reason: `listprice_with_fee_mediaworld non valido: ${listPriceFeeMwRaw}`
         });
         skippedCount++;
         return;
@@ -910,7 +966,7 @@ export async function exportMediaworldCatalog({
           row: index + 1,
           sku,
           field: 'Prezzo scontato',
-          reason: `Prezzo Finale non valido: ${record['Prezzo Finale']}`
+          reason: `final_price_mediaworld non valido: ${finalPriceMwRaw}`
         });
         skippedCount++;
         return;
@@ -973,7 +1029,7 @@ export async function exportMediaworldCatalog({
             EAN: ean,
             prezzoFinale: prezzoFinale,
             cents: cents,
-            raw: prezzoFinaleRaw
+            raw: finalPriceMwRaw
           });
         }
       }
