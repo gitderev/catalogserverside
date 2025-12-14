@@ -72,16 +72,6 @@ import {
 import * as XLSX from 'xlsx';
 import Papa from 'papaparse';
 import { PipelineStepsDisplay, type PipelineStep, type StepStatus } from '@/components/PipelineStepsDisplay';
-import {
-  scanRawFile,
-  createEmptyDiagnostics,
-  hasSourceFileCorruption,
-  generateSourceCorruptionWarning,
-  generateDiagnosticsSummary,
-  formatBytes,
-  type RawFileDiagnostics,
-  type RawScanResult
-} from '@/utils/rawFileDiagnostics';
 
 // Helper functions for MPN calculations
 function asNum(v: any): number {
@@ -473,12 +463,6 @@ const AltersideCatalogGenerator: React.FC = () => {
     bytes?: number;
     importedAt?: string;
   } | null>(null);
-
-  // Raw file diagnostics state (pre-parse E+ detection)
-  const [rawFileDiagnostics, setRawFileDiagnostics] = useState<RawFileDiagnostics>(createEmptyDiagnostics());
-  
-  // Force fresh import flag
-  const [forceFreshImport, setForceFreshImport] = useState(false);
 
   // Load fee config from Supabase on mount (using singleton ID)
   useEffect(() => {
@@ -1274,48 +1258,13 @@ const AltersideCatalogGenerator: React.FC = () => {
     };
   };
 
-  const parseCSV = async (file: File, fileType?: string): Promise<{ data: any[]; headers: string[]; rawScan?: RawScanResult }> => {
-    // =========================================================================
-    // RAW SCAN PRE-PARSE: Scan file content BEFORE parsing to detect E+ notation
-    // This helps identify if E+ exists in the SOURCE file vs introduced by parsing
-    // =========================================================================
-    const rawContent = await file.text();
-    const rawScan = scanRawFile(rawContent, file.name, file.size);
-    
-    // Log raw scan results
-    console.log('%c[parseCSV:rawScan:preParse]', 'color: #E91E63; font-weight: bold;', {
-      fileType: fileType || 'unknown',
-      filename: file.name,
-      fileSize: formatBytes(file.size),
-      fingerprint: rawScan.fingerprint,
-      rawContainsEPlus: rawScan.rawContainsEPlus,
-      rawEPlusCount: rawScan.rawEPlusCount,
-      sampleLines: rawScan.rawEPlusSampleLines
-    });
-    
-    // Update diagnostics state for material file
-    if (fileType === 'material') {
-      setRawFileDiagnostics(prev => ({
-        ...prev,
-        material: rawScan
-      }));
-    }
-    
+  const parseCSV = async (file: File): Promise<{ data: any[]; headers: string[] }> => {
     return new Promise((resolve, reject) => {
       Papa.parse(file, {
         header: true,
         delimiter: ';',
         encoding: 'UTF-8',
         skipEmptyLines: true,
-        // CRITICAL: Disable dynamic typing to prevent MPN/EAN from being converted to numbers
-        // This prevents scientific notation (E+) issues with long numeric strings
-        dynamicTyping: false,
-        // Transform all values to strings to ensure MPN/EAN are never numbers
-        transform: (value: string, field: string) => {
-          // Sanitize string: trim and remove non-printable characters
-          const trimmed = (value || '').trim().replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
-          return trimmed;
-        },
         complete: (results) => {
           if (results.errors.length > 0) {
             reject(new Error(`Errore parsing: ${results.errors[0].message}`));
@@ -1323,38 +1272,9 @@ const AltersideCatalogGenerator: React.FC = () => {
           }
           
           const headers = results.meta.fields || [];
-          
-          // DEBUG: Log if any MPN/EAN values contain scientific notation AFTER parsing
-          let scientificNotationCount = 0;
-          const scientificPattern = /[0-9]\.?[0-9]*e[+-]?[0-9]+/i;
-          for (const row of results.data as any[]) {
-            if (row.ManufPartNr && scientificPattern.test(String(row.ManufPartNr))) {
-              scientificNotationCount++;
-            }
-            if (row.EAN && scientificPattern.test(String(row.EAN))) {
-              scientificNotationCount++;
-            }
-          }
-          
-          // Compare raw vs parsed E+ counts
-          console.log('%c[parseCSV:rawScan:postParse]', 'color: #E91E63;', {
-            fileType: fileType || 'unknown',
-            rawEPlusCount: rawScan.rawEPlusCount,
-            parsedEPlusCount: scientificNotationCount,
-            eplusIntroducedByParsing: scientificNotationCount > rawScan.rawEPlusCount,
-            eplusFromSourceFile: rawScan.rawContainsEPlus
-          });
-          
-          if (scientificNotationCount > rawScan.rawEPlusCount) {
-            console.error('[parseCSV] CRITICAL: Parser introduced E+ notation! This indicates a parsing bug.');
-          } else if (scientificNotationCount > 0 && rawScan.rawContainsEPlus) {
-            console.warn(`[parseCSV] E+ in source file: ${scientificNotationCount} values with E+ notation from source`);
-          }
-          
           resolve({
             data: results.data,
-            headers,
-            rawScan
+            headers
           });
         },
         error: (error) => {
@@ -1366,7 +1286,7 @@ const AltersideCatalogGenerator: React.FC = () => {
 
   const handleFileUpload = async (file: File, type: keyof FileUploadState) => {
     try {
-      const parsed = await parseCSV(file, type);
+      const parsed = await parseCSV(file);
       const validation = validateHeaders(parsed.headers, REQUIRED_HEADERS[type], OPTIONAL_HEADERS[type]);
       
       if (!validation.valid) {
@@ -1537,52 +1457,6 @@ const AltersideCatalogGenerator: React.FC = () => {
   // FTP automatic import handler - calls edge function 4 times sequentially (material, stock, price, stockLocation)
   const handleFtpImport = async () => {
     setFtpImportLoading(true);
-    
-    // =========================================================================
-    // FORCE FRESH IMPORT: Clear all cached/intermediate data if flag is set
-    // =========================================================================
-    if (forceFreshImport) {
-      console.log('%c[FTP Import] Force Fresh Import enabled - clearing cached data', 'color: #FF5722; font-weight: bold;');
-      
-      // Clear raw file diagnostics
-      setRawFileDiagnostics(createEmptyDiagnostics());
-      
-      // Clear all file states
-      setFiles({
-        material: { file: null, status: 'empty' },
-        stock: { file: null, status: 'empty' },
-        price: { file: null, status: 'empty' },
-        eanMapping: { file: null, status: 'empty' }
-      });
-      
-      // Clear prefill state
-      setPrefillState({ status: 'idle', counters: null, reports: null });
-      
-      // Clear material rows
-      setMaterialRows([]);
-      setMaterialVersion(0);
-      
-      // Clear processing state
-      setProcessingState('idle');
-      setCurrentProcessedData([]);
-      setCurrentLogEntries([]);
-      setCurrentStats(null);
-      setEanCatalogDataset([]);
-      eanCatalogDatasetRef.current = [];
-      setEanCatalogBase([]);
-      
-      // Clear stock location
-      setStockLocationIndex(null);
-      setStockLocationWarnings(EMPTY_WARNINGS);
-      setStockLocationFileLoaded(false);
-      setStockLocationMeta(null);
-      
-      console.log('[FTP Import] Cached data cleared, proceeding with fresh import');
-      toast({
-        title: "Fresh Import attivo",
-        description: "Cache locale pulita, scaricamento file freschi da FTP"
-      });
-    }
     
     // Check authentication - session should already exist after password gate
     const { data: { session }, error: sessionError } = await supabase.auth.getSession();
@@ -4786,42 +4660,6 @@ const AltersideCatalogGenerator: React.FC = () => {
       // Read mapping file as text (usa currentFiles per coerenza)
       const mappingText = await currentFiles.eanMapping.file!.text();
       
-      // =========================================================================
-      // RAW SCAN PRE-PARSE: Scan mapping file content BEFORE parsing
-      // This helps identify if E+ exists in the mapping SOURCE file
-      // =========================================================================
-      const mappingFile = currentFiles.eanMapping.file!;
-      const mappingRawScan = scanRawFile(mappingText, mappingFile.name, mappingFile.size);
-      
-      // Update diagnostics state for mapping file
-      setRawFileDiagnostics(prev => ({
-        ...prev,
-        codiciOK: mappingRawScan
-      }));
-      
-      // Log raw scan results for mapping file
-      console.log('%c[processEANPrefill:rawScan:mappingFile]', 'color: #E91E63; font-weight: bold;', {
-        filename: mappingFile.name,
-        fileSize: formatBytes(mappingFile.size),
-        fingerprint: mappingRawScan.fingerprint,
-        rawContainsEPlus: mappingRawScan.rawContainsEPlus,
-        rawEPlusCount: mappingRawScan.rawEPlusCount,
-        sampleLines: mappingRawScan.rawEPlusSampleLines
-      });
-      
-      // Also log material diagnostics if available
-      const materialDiag = rawFileDiagnostics.material;
-      if (materialDiag) {
-        console.log('%c[processEANPrefill:rawScan:materialFile]', 'color: #E91E63; font-weight: bold;', {
-          filename: materialDiag.filename,
-          fileSize: formatBytes(materialDiag.fileSize),
-          fingerprint: materialDiag.fingerprint,
-          rawContainsEPlus: materialDiag.rawContainsEPlus,
-          rawEPlusCount: materialDiag.rawEPlusCount,
-          sampleLines: materialDiag.rawEPlusSampleLines
-        });
-      }
-      
       // Validate header (case-insensitive)
       const lines = mappingText.split('\n');
       const header = lines[0]?.trim().toLowerCase();
@@ -5298,16 +5136,11 @@ const AltersideCatalogGenerator: React.FC = () => {
           const hasConflicts = prefillCounters && (prefillCounters.ambiguousMapping > 0 || prefillCounters.materialWinsDifferentEan > 0);
           const hasWarnings = hasScientificWarning || hasConflicts;
           
-          // Build raw diagnostics for display
-          const currentRawDiag = rawFileDiagnostics;
-          const hasSourceCorruption = hasSourceFileCorruption(currentRawDiag);
-          const showDetails = hasWarnings || hasSourceCorruption;
-          
           updatePipelineStep('ean_prefill', { 
-            status: (hasWarnings || hasSourceCorruption) ? 'warning' : 'done', 
-            summary: prefillSummary + (hasScientificWarning ? ' ⚠️ MPN E+' : '') + (hasSourceCorruption ? ' 🔴 E+ in sorgente!' : ''),
-            details: showDetails ? {
-              counters: prefillCounters ? {
+            status: hasWarnings ? 'warning' : 'done', 
+            summary: prefillSummary + (hasScientificWarning ? ' ⚠️ MPN E+' : ''),
+            details: hasWarnings && prefillCounters ? {
+              counters: {
                 'EAN riempiti': prefillCounters.filled_now,
                 'Già popolati': prefillCounters.already_populated,
                 'Vince Material (diverso)': prefillCounters.materialWinsDifferentEan,
@@ -5315,30 +5148,11 @@ const AltersideCatalogGenerator: React.FC = () => {
                 'Ambigui (non prefillati)': prefillCounters.ambiguousMapping,
                 'MPN E+ Material': prefillCounters.mpnScientificNotationFoundMaterial,
                 'MPN E+ Mapping': prefillCounters.mpnScientificNotationFoundMapping
-              } : {},
+              },
               warnings: [
-                ...(hasScientificWarning && prefillCounters ? [generateScientificNotationWarning(prefillCounters) || ''] : []),
-                ...(prefillCounters?.ambiguousMapping && prefillCounters.ambiguousMapping > 0 ? [`${prefillCounters.ambiguousMapping} mapping ambigui`] : []),
-                ...(hasSourceCorruption ? [generateSourceCorruptionWarning(currentRawDiag) || ''] : [])
-              ].filter(Boolean),
-              rawDiagnostics: {
-                material: currentRawDiag.material ? {
-                  filename: currentRawDiag.material.filename,
-                  fileSize: formatBytes(currentRawDiag.material.fileSize),
-                  fingerprint: currentRawDiag.material.fingerprint,
-                  rawContainsEPlus: currentRawDiag.material.rawContainsEPlus,
-                  rawEPlusCount: currentRawDiag.material.rawEPlusCount,
-                  sampleLines: currentRawDiag.material.rawEPlusSampleLines
-                } : undefined,
-                mapping: currentRawDiag.codiciOK ? {
-                  filename: currentRawDiag.codiciOK.filename,
-                  fileSize: formatBytes(currentRawDiag.codiciOK.fileSize),
-                  fingerprint: currentRawDiag.codiciOK.fingerprint,
-                  rawContainsEPlus: currentRawDiag.codiciOK.rawContainsEPlus,
-                  rawEPlusCount: currentRawDiag.codiciOK.rawEPlusCount,
-                  sampleLines: currentRawDiag.codiciOK.rawEPlusSampleLines
-                } : undefined
-              }
+                ...(hasScientificWarning ? [generateScientificNotationWarning(prefillCounters) || ''] : []),
+                ...(prefillCounters.ambiguousMapping > 0 ? [`${prefillCounters.ambiguousMapping} mapping ambigui`] : [])
+              ].filter(Boolean)
             } : undefined
           });
         } catch (prefillError) {
@@ -5722,17 +5536,6 @@ const AltersideCatalogGenerator: React.FC = () => {
                     </>
                   )}
                 </Button>
-                {/* Force Fresh Import Checkbox */}
-                <label className="flex items-center gap-2 text-sm text-white mt-2 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={forceFreshImport}
-                    onChange={(e) => setForceFreshImport(e.target.checked)}
-                    className="w-4 h-4 rounded border-white"
-                    disabled={pipelineRunning}
-                  />
-                  Force Fresh Import (svuota cache locale)
-                </label>
                 {/* Progress Bar */}
                 {(pipelineRunning || pipelineProgress > 0) && (
                   <div className="w-full mt-3">

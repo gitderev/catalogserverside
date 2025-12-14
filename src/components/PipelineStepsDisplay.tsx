@@ -4,15 +4,6 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/component
 
 export type StepStatus = 'idle' | 'running' | 'done' | 'warning' | 'error';
 
-export interface RawFileDiagnosticsInfo {
-  filename: string;
-  fileSize: string;
-  fingerprint: string;
-  rawContainsEPlus: boolean;
-  rawEPlusCount: number;
-  sampleLines?: string[];
-}
-
 export interface PipelineStep {
   id: string;
   label: string;
@@ -22,10 +13,6 @@ export interface PipelineStep {
     warnings?: string[];
     errors?: string[];
     counters?: Record<string, number>;
-    rawDiagnostics?: {
-      material?: RawFileDiagnosticsInfo;
-      mapping?: RawFileDiagnosticsInfo;
-    };
   };
 }
 
@@ -73,74 +60,16 @@ const getStatusBadge = (status: StepStatus) => {
   );
 };
 
-const RawDiagnosticsDisplay: React.FC<{ diagnostics: PipelineStep['details']['rawDiagnostics'] }> = ({ diagnostics }) => {
-  if (!diagnostics) return null;
-  
-  const renderFileDiag = (label: string, info: RawFileDiagnosticsInfo | undefined) => {
-    if (!info) return null;
-    
-    return (
-      <div className={`text-xs p-2 rounded border ${
-        info.rawContainsEPlus ? 'bg-red-50 border-red-300' : 'bg-gray-50 border-gray-200'
-      }`}>
-        <div className="font-medium mb-1 flex items-center gap-2">
-          {label}
-          {info.rawContainsEPlus && (
-            <span className="text-xs px-1.5 py-0.5 bg-red-200 text-red-800 rounded">E+ in sorgente!</span>
-          )}
-        </div>
-        <div className="space-y-1 text-gray-600">
-          <div><span className="text-gray-500">File:</span> {info.filename}</div>
-          <div><span className="text-gray-500">Size:</span> {info.fileSize}</div>
-          <div><span className="text-gray-500">Fingerprint:</span> <code className="bg-white px-1 rounded">{info.fingerprint}</code></div>
-          {info.rawContainsEPlus && (
-            <>
-              <div className="text-red-700">
-                <span className="font-medium">E+ trovati nel file sorgente:</span> {info.rawEPlusCount} occorrenze
-              </div>
-              {info.sampleLines && info.sampleLines.length > 0 && (
-                <div className="mt-1">
-                  <div className="font-medium text-red-600 mb-1">Righe esempio:</div>
-                  <div className="max-h-20 overflow-y-auto bg-white p-1 rounded border text-[10px] font-mono">
-                    {info.sampleLines.slice(0, 5).map((line, i) => (
-                      <div key={i} className="truncate">{line}</div>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </>
-          )}
-        </div>
-      </div>
-    );
-  };
-  
-  return (
-    <div className="space-y-2 mt-2">
-      <div className="text-xs font-medium text-purple-700 flex items-center gap-1">
-        📊 Diagnostica sorgente (pre-parse)
-      </div>
-      <div className="grid gap-2">
-        {renderFileDiag('Material', diagnostics.material)}
-        {renderFileDiag('Mapping (codiciOK)', diagnostics.mapping)}
-      </div>
-    </div>
-  );
-};
-
 const StepDetails: React.FC<{ details: PipelineStep['details'] }> = ({ details }) => {
   if (!details) return null;
   
-  const { warnings = [], errors = [], counters = {}, rawDiagnostics } = details;
-  const hasContent = warnings.length > 0 || errors.length > 0 || Object.keys(counters).length > 0 || rawDiagnostics;
+  const { warnings = [], errors = [], counters = {} } = details;
+  const hasContent = warnings.length > 0 || errors.length > 0 || Object.keys(counters).length > 0;
   
   if (!hasContent) return null;
   
   return (
     <div className="mt-2 ml-8 space-y-2">
-      {/* Raw Diagnostics */}
-      {rawDiagnostics && <RawDiagnosticsDisplay diagnostics={rawDiagnostics} />}
-      
       {/* Counters */}
       {Object.keys(counters).length > 0 && (
         <div className="flex flex-wrap gap-2">
@@ -202,8 +131,8 @@ export const PipelineStepsDisplay: React.FC<PipelineStepsDisplayProps> = ({ step
   
   const hasDetails = (step: PipelineStep): boolean => {
     if (!step.details) return false;
-    const { warnings = [], errors = [], counters = {}, rawDiagnostics } = step.details;
-    return warnings.length > 0 || errors.length > 0 || Object.keys(counters).length > 0 || !!rawDiagnostics;
+    const { warnings = [], errors = [], counters = {} } = step.details;
+    return warnings.length > 0 || errors.length > 0 || Object.keys(counters).length > 0;
   };
   
   return (
