@@ -25,15 +25,15 @@ interface PipelineStepsDisplayProps {
 const getStatusIcon = (status: StepStatus) => {
   switch (status) {
     case 'running':
-      return <Loader2 className="h-5 w-5 text-blue-600 animate-spin" />;
+      return <Loader2 className="h-5 w-5 text-info animate-spin" />;
     case 'done':
-      return <CheckCircle className="h-5 w-5 text-green-600" />;
+      return <CheckCircle className="h-5 w-5 text-success" />;
     case 'warning':
-      return <AlertTriangle className="h-5 w-5 text-amber-500" />;
+      return <AlertTriangle className="h-5 w-5 text-warning" />;
     case 'error':
-      return <XCircle className="h-5 w-5 text-red-600" />;
+      return <XCircle className="h-5 w-5 text-error" />;
     default:
-      return <Circle className="h-5 w-5 text-gray-300" />;
+      return <Circle className="h-5 w-5 alt-text-muted" />;
   }
 };
 
@@ -46,16 +46,16 @@ const getStatusBadge = (status: StepStatus) => {
     error: 'Errore'
   };
   
-  const statusColors: Record<StepStatus, string> = {
-    idle: 'bg-gray-100 text-gray-600',
-    running: 'bg-blue-100 text-blue-700',
-    done: 'bg-green-100 text-green-700',
-    warning: 'bg-amber-100 text-amber-700',
-    error: 'bg-red-100 text-red-700'
+  const badgeClass: Record<StepStatus, string> = {
+    idle: 'alt-badge alt-badge-idle',
+    running: 'alt-badge alt-badge-info',
+    done: 'alt-badge alt-badge-success',
+    warning: 'alt-badge alt-badge-warning',
+    error: 'alt-badge alt-badge-error'
   };
   
   return (
-    <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${statusColors[status]}`}>
+    <span className={badgeClass[status]}>
       {statusLabels[status]}
     </span>
   );
@@ -75,7 +75,7 @@ const StepDetails: React.FC<{ details: PipelineStep['details'] }> = ({ details }
       {Object.keys(counters).length > 0 && (
         <div className="flex flex-wrap gap-2">
           {Object.entries(counters).map(([key, value]) => (
-            <span key={key} className="text-xs px-2 py-1 bg-gray-50 rounded border">
+            <span key={key} className="alt-step-counter">
               <span className="font-medium">{key}:</span> {value}
             </span>
           ))}
@@ -85,13 +85,13 @@ const StepDetails: React.FC<{ details: PipelineStep['details'] }> = ({ details }
       {/* Errors */}
       {errors.length > 0 && (
         <div className="text-xs space-y-1">
-          <div className="font-medium text-red-700">Errori ({errors.length}):</div>
-          <ul className="list-disc list-inside text-red-600 max-h-24 overflow-y-auto">
+          <div className="font-medium text-error">Errori ({errors.length}):</div>
+          <ul className="list-disc list-inside text-error max-h-24 overflow-y-auto">
             {errors.slice(0, 5).map((err, i) => (
               <li key={i}>{err}</li>
             ))}
             {errors.length > 5 && (
-              <li className="text-gray-500">...e altri {errors.length - 5}</li>
+              <li className="alt-text-muted">...e altri {errors.length - 5}</li>
             )}
           </ul>
         </div>
@@ -100,13 +100,13 @@ const StepDetails: React.FC<{ details: PipelineStep['details'] }> = ({ details }
       {/* Warnings */}
       {warnings.length > 0 && (
         <div className="text-xs space-y-1">
-          <div className="font-medium text-amber-700">Avvisi ({warnings.length}):</div>
-          <ul className="list-disc list-inside text-amber-600 max-h-24 overflow-y-auto">
+          <div className="font-medium text-warning">Avvisi ({warnings.length}):</div>
+          <ul className="list-disc list-inside text-warning max-h-24 overflow-y-auto">
             {warnings.slice(0, 5).map((warn, i) => (
               <li key={i}>{warn}</li>
             ))}
             {warnings.length > 5 && (
-              <li className="text-gray-500">...e altri {warnings.length - 5}</li>
+              <li className="alt-text-muted">...e altri {warnings.length - 5}</li>
             )}
           </ul>
         </div>
@@ -115,8 +115,8 @@ const StepDetails: React.FC<{ details: PipelineStep['details'] }> = ({ details }
       {/* Info (informative, not warnings) */}
       {info.length > 0 && (
         <div className="text-xs space-y-1">
-          <div className="font-medium text-blue-700">Info:</div>
-          <ul className="list-disc list-inside text-blue-600 max-h-24 overflow-y-auto">
+          <div className="font-medium text-info">Info:</div>
+          <ul className="list-disc list-inside text-info max-h-24 overflow-y-auto">
             {info.map((msg, i) => (
               <li key={i}>{msg}</li>
             ))}
@@ -149,70 +149,65 @@ export const PipelineStepsDisplay: React.FC<PipelineStepsDisplayProps> = ({ step
   };
   
   return (
-    <div className="card border-strong">
-      <div className="card-body">
-        <h3 className="card-title mb-4 flex items-center gap-2">
-          {isRunning ? (
-            <Loader2 className="h-5 w-5 animate-spin text-blue-600" />
-          ) : (
-            <CheckCircle className="h-5 w-5 text-gray-400" />
-          )}
-          Pipeline Steps
-        </h3>
-        
-        <div className="space-y-3">
-          {steps.map((step) => {
-            // Allow expansion for warning/error or when there's info content to show
-            const hasInfoContent = step.details?.info && step.details.info.length > 0;
-            const canExpand = hasDetails(step) && (step.status === 'warning' || step.status === 'error' || hasInfoContent);
-            const isExpanded = expandedSteps.has(step.id);
-            
-            return (
-              <div 
-                key={step.id} 
-                className={`p-3 rounded-lg border transition-colors ${
-                  step.status === 'running' ? 'bg-blue-50 border-blue-200' :
-                  step.status === 'done' ? 'bg-green-50 border-green-200' :
-                  step.status === 'warning' ? 'bg-amber-50 border-amber-200' :
-                  step.status === 'error' ? 'bg-red-50 border-red-200' :
-                  'bg-gray-50 border-gray-200'
-                }`}
-              >
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-3">
-                    {getStatusIcon(step.status)}
-                    <div>
-                      <div className="flex items-center gap-2">
-                        <span className="font-medium text-sm">{step.label}</span>
-                        {getStatusBadge(step.status)}
-                      </div>
-                      {step.summary && (
-                        <p className="text-xs text-muted-foreground mt-0.5 line-clamp-2">
-                          {step.summary}
-                        </p>
-                      )}
+    <div className="alt-card">
+      <h3 className="alt-section-title">
+        {isRunning ? (
+          <Loader2 className="h-5 w-5 animate-spin text-info" />
+        ) : (
+          <CheckCircle className="h-5 w-5 alt-text-muted" />
+        )}
+        Pipeline Steps
+      </h3>
+      
+      <div className="space-y-3">
+        {steps.map((step) => {
+          const hasInfoContent = step.details?.info && step.details.info.length > 0;
+          const canExpand = hasDetails(step) && (step.status === 'warning' || step.status === 'error' || hasInfoContent);
+          const isExpanded = expandedSteps.has(step.id);
+          
+          const stepClass = 
+            step.status === 'running' ? 'alt-step alt-step--progress' :
+            step.status === 'done' ? 'alt-step alt-step--done' :
+            step.status === 'warning' ? 'alt-step alt-step--warning' :
+            step.status === 'error' ? 'alt-step alt-step--error' :
+            'alt-step alt-step--idle';
+          
+          return (
+            <div key={step.id} className={stepClass}>
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  {getStatusIcon(step.status)}
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <span className="font-medium text-sm">{step.label}</span>
+                      {getStatusBadge(step.status)}
                     </div>
+                    {step.summary && (
+                      <p className="text-xs alt-text-muted mt-0.5 line-clamp-2">
+                        {step.summary}
+                      </p>
+                    )}
                   </div>
-                  
-                  {canExpand && (
-                    <button
-                      onClick={() => toggleStep(step.id)}
-                      className="p-1 hover:bg-white/50 rounded transition-colors"
-                    >
-                      {isExpanded ? (
-                        <ChevronDown className="h-4 w-4 text-gray-500" />
-                      ) : (
-                        <ChevronRight className="h-4 w-4 text-gray-500" />
-                      )}
-                    </button>
-                  )}
                 </div>
                 
-                {canExpand && isExpanded && <StepDetails details={step.details} />}
+                {canExpand && (
+                  <button
+                    onClick={() => toggleStep(step.id)}
+                    className="p-1 alt-step-expand-btn rounded transition-colors"
+                  >
+                    {isExpanded ? (
+                      <ChevronDown className="h-4 w-4 alt-text-muted" />
+                    ) : (
+                      <ChevronRight className="h-4 w-4 alt-text-muted" />
+                    )}
+                  </button>
+                )}
               </div>
-            );
-          })}
-        </div>
+              
+              {canExpand && isExpanded && <StepDetails details={step.details} />}
+            </div>
+          );
+        })}
       </div>
     </div>
   );

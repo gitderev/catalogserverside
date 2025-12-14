@@ -622,3 +622,79 @@ tbody td {
 .alt-action-link:hover {
   opacity: 0.8;
 }
+
+/* ========== Pipeline Steps (always dark) ========== */
+.alt-step {
+  padding: 0.75rem 1rem;
+  border-radius: 10px;
+  background: var(--alt-surface);
+  border: 1px solid var(--alt-border);
+  transition: all 0.2s ease;
+}
+
+.alt-step:hover {
+  background: var(--alt-surface-hover);
+  border-color: var(--alt-border-hover);
+}
+
+.alt-step--idle {
+  background: var(--alt-input-surface);
+  border-color: var(--alt-border);
+}
+
+.alt-step--progress {
+  background: var(--alt-surface);
+  border-color: var(--alt-info);
+  border-left: 3px solid var(--alt-info);
+}
+
+.alt-step--done {
+  background: var(--alt-surface);
+  border-color: hsla(142, 71%, 45%, 0.4);
+  border-left: 3px solid var(--alt-success);
+}
+
+.alt-step--warning {
+  background: var(--alt-surface);
+  border-color: hsla(38, 92%, 50%, 0.4);
+  border-left: 3px solid var(--alt-warning);
+}
+
+.alt-step--error {
+  background: var(--alt-surface);
+  border-color: hsla(0, 84%, 60%, 0.4);
+  border-left: 3px solid var(--alt-error);
+}
+
+.alt-step--disabled {
+  background: var(--alt-input-surface);
+  border-color: var(--alt-border);
+  opacity: 0.5;
+}
+
+.alt-step-counter {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.25rem 0.5rem;
+  border-radius: 6px;
+  font-size: 0.75rem;
+  background: var(--alt-input-surface);
+  border: 1px solid var(--alt-border);
+  color: var(--alt-text);
+}
+
+.alt-step-expand-btn {
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+
+.alt-step-expand-btn:hover {
+  background: var(--alt-surface-hover);
+}
+
+/* ========== Muted text helper ========== */
+.alt-text-muted {
+  color: var(--alt-muted) !important;
+}
