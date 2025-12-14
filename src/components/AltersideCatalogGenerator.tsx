@@ -5674,123 +5674,272 @@ const AltersideCatalogGenerator: React.FC = () => {
     (files.price.status === 'valid' || files.price.status === 'warning');
 
   return (
-    <div className="min-h-screen p-6" style={{ background: 'var(--bg)', color: 'var(--fg)' }}>
-      <div className="max-w-7xl mx-auto space-y-8">
-        {/* Header */}
-        <div className="relative text-center">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={logout}
-            className="absolute right-0 top-0"
-          >
-            <LogOut className="h-4 w-4 mr-2" />
-            Esci
-          </Button>
-          <h1 className="text-5xl font-bold mb-4">
-            Alterside Catalog Generator
-          </h1>
-          <p className="text-muted text-xl max-w-3xl mx-auto">
-            Genera due cataloghi Excel distinti (EAN e ManufPartNr) con calcoli avanzati di prezzo e commissioni
-          </p>
+    <div className="min-h-screen bg-background text-foreground">
+      {/* Top Bar */}
+      <header className="alt-topbar">
+        <div className="max-w-7xl mx-auto flex items-center justify-between">
+          <div className="flex items-center gap-4">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-xl flex items-center justify-center" style={{ background: 'var(--gradient-primary)' }}>
+                <FileText className="h-5 w-5 text-white" />
+              </div>
+              <div>
+                <h1 className="text-lg font-bold text-foreground">Alterside</h1>
+                <p className="text-xs text-muted-foreground">Catalog Generator</p>
+              </div>
+            </div>
+            <div className="hidden md:flex items-center gap-2 ml-4">
+              <span className="alt-badge alt-badge-info">EAN</span>
+              <span className="alt-badge alt-badge-warning">MediaWorld</span>
+              <span className="alt-badge alt-badge-info">ePrice</span>
+            </div>
+          </div>
+          
+          <div className="flex items-center gap-4">
+            {/* Pipeline status pill */}
+            {pipelineRunning ? (
+              <span className="alt-badge" style={{ background: 'hsla(300, 100%, 43%, 0.15)', color: 'hsl(300, 100%, 65%)', border: '1px solid hsla(300, 100%, 43%, 0.3)' }}>
+                <Activity className="h-3 w-3 animate-spin" />
+                Pipeline attiva
+              </span>
+            ) : isCompleted ? (
+              <span className="alt-badge alt-badge-success">
+                <CheckCircle className="h-3 w-3" />
+                Completato
+              </span>
+            ) : allFilesValid ? (
+              <span className="alt-badge alt-badge-success">
+                <CheckCircle className="h-3 w-3" />
+                Pronto
+              </span>
+            ) : (
+              <span className="alt-badge alt-badge-idle">
+                <Clock className="h-3 w-3" />
+                In attesa file
+              </span>
+            )}
+            
+            <Button
+              onClick={handleFullPipeline}
+              disabled={pipelineRunning || isProcessing || ftpImportLoading || isExportingEAN}
+              className="alt-btn-primary"
+            >
+              {pipelineRunning ? (
+                <>
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  Esecuzione...
+                </>
+              ) : (
+                <>
+                  <Cloud className="mr-2 h-4 w-4" />
+                  Esegui pipeline completa
+                </>
+              )}
+            </Button>
+            
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={logout}
+              className="alt-btn-secondary"
+            >
+              <LogOut className="h-4 w-4 mr-2" />
+              Esci
+            </Button>
+          </div>
         </div>
+      </header>
 
-        {/* Always-visible Pipeline Steps */}
+      <div className="max-w-7xl mx-auto px-6 py-8 space-y-8">
+        {/* Pipeline Steps */}
         <PipelineStepsDisplay steps={pipelineSteps} isRunning={pipelineRunning} />
 
-        {/* Pipeline Master Button */}
-        <div className="card border-strong" style={{ background: '#1e3a5f' }}>
-          <div className="card-body">
-            <div className="flex flex-col md:flex-row items-center justify-between gap-4">
-              <div className="text-white">
-                <h3 className="text-xl font-bold mb-1">Pipeline Completa Automatica</h3>
-                <p className="text-sm opacity-80">
-                  Import FTP → Prefill EAN → Elaborazione → Export e Upload SFTP
-                </p>
-              </div>
-              <div className="flex flex-col items-center gap-2">
-                <Button
-                  onClick={handleFullPipeline}
-                  disabled={pipelineRunning || isProcessing || ftpImportLoading || isExportingEAN}
-                  size="lg"
-                  className="px-8 py-3 text-lg font-semibold"
-                  style={{ 
-                    background: pipelineRunning ? '#6b7280' : '#10b981', 
-                    color: 'white',
-                    opacity: (pipelineRunning || isProcessing || ftpImportLoading || isExportingEAN) ? 0.6 : 1
-                  }}
-                >
-                  {pipelineRunning ? (
-                    <>
-                      <Loader2 className="mr-2 h-5 w-5 animate-spin" />
-                      Pipeline in esecuzione…
-                    </>
-                  ) : (
-                    <>
-                      <Cloud className="mr-2 h-5 w-5" />
-                      Esegui Pipeline Completa
-                    </>
-                  )}
-                </Button>
-                {/* Progress Bar */}
-                {(pipelineRunning || pipelineProgress > 0) && (
-                  <div className="w-full mt-3">
-                    <div className="flex items-center justify-between mb-1">
-                      <span className="text-sm text-white font-medium">{pipelineStepLabel}</span>
-                      <span className="text-sm text-white font-bold">{pipelineProgress}%</span>
-                    </div>
-                    <div className="w-full h-3 bg-gray-300 rounded-full overflow-hidden">
-                      <div 
-                        className="h-full transition-all duration-300 ease-out"
-                        style={{ 
-                          width: `${pipelineProgress}%`,
-                          background: pipelineStepLabel.includes('Errore') 
-                            ? '#ef4444' 
-                            : pipelineProgress === 100 
-                              ? '#22c55e' 
-                              : '#3b82f6'
-                        }}
-                      />
-                    </div>
+        {/* Pipeline Master Section */}
+        <div className="alt-pipeline-master">
+          <div className="flex flex-col md:flex-row items-center justify-between gap-4">
+            <div>
+              <h3 className="text-xl font-bold text-foreground mb-1">Pipeline Completa Automatica</h3>
+              <p className="text-sm text-muted-foreground">
+                Import FTP - Prefill EAN - Elaborazione - Export e Upload SFTP
+              </p>
+            </div>
+            <div className="flex flex-col items-center gap-3 min-w-[300px]">
+              {(pipelineRunning || pipelineProgress > 0) && (
+                <div className="w-full">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-sm text-foreground font-medium">{pipelineStepLabel}</span>
+                    <span className="text-sm text-foreground font-bold">{pipelineProgress}%</span>
                   </div>
-                )}
-                {pipelineStatus && !pipelineRunning && pipelineProgress === 0 && (
-                  <div className={`text-sm px-3 py-1 rounded ${
-                    pipelineStatus.includes('Errore') 
-                      ? 'bg-red-100 text-red-700' 
-                      : pipelineStatus.includes('successo') 
-                        ? 'bg-green-100 text-green-700'
-                        : 'bg-blue-100 text-blue-700'
-                  }`}>
-                    {pipelineStatus}
+                  <div className="alt-progress">
+                    <div 
+                      className="alt-progress-fill"
+                      style={{ 
+                        width: `${pipelineProgress}%`,
+                        background: pipelineStepLabel.includes('Errore') 
+                          ? 'hsl(0, 84%, 60%)' 
+                          : pipelineProgress === 100 
+                            ? 'hsl(142, 71%, 45%)' 
+                            : 'var(--gradient-primary)'
+                      }}
+                    />
                   </div>
-                )}
-              </div>
+                </div>
+              )}
+              {pipelineStatus && !pipelineRunning && pipelineProgress === 0 && (
+                <div className={`text-sm px-4 py-2 rounded-lg ${
+                  pipelineStatus.includes('Errore') 
+                    ? 'alt-box-error' 
+                    : pipelineStatus.includes('successo') 
+                      ? 'alt-box-success'
+                      : 'alt-box-info'
+                }`}>
+                  {pipelineStatus}
+                </div>
+              )}
             </div>
           </div>
         </div>
 
-        {/* Instructions */}
-        <div className="card border-strong">
-          <div className="card-body">
-            <div className="flex items-start gap-4">
-              <AlertCircle className="h-6 w-6 icon-dark mt-1 flex-shrink-0" />
-              <div>
-                <h3 className="card-title mb-3">Specifiche di Elaborazione</h3>
-                <ul className="text-sm text-muted space-y-2">
-                  <li>• <strong>Filtri comuni:</strong> ExistingStock &gt; 1, prezzi numerici validi</li>
-                  <li>• <strong>Export EAN:</strong> solo record con EAN non vuoto</li>
-                  <li>• <strong>Export ManufPartNr:</strong> solo record con ManufPartNr non vuoto</li>
-                  <li>• <strong>Prezzi:</strong> Base + spedizione (€6), IVA 22%, fee sequenziali configurabili</li>
-                  <li>• <strong>Prezzo finale EAN:</strong> ending ,99; <strong>ManufPartNr:</strong> arrotondamento intero superiore</li>
-                </ul>
+        {/* Two Column Layout */}
+        <div className="alt-grid-2">
+          {/* Left Column - Sources and Configuration */}
+          <div className="space-y-6">
+            <h2 className="text-xl font-bold text-foreground flex items-center gap-2">
+              <Upload className="h-5 w-5 text-primary" />
+              Sorgenti e File
+            </h2>
+            
+            {/* FTP Import Button */}
+            <div className="flex justify-end">
+              <Button
+                variant="outline"
+                onClick={handleFtpImport}
+                disabled={ftpImportLoading || isProcessing || pipelineRunning}
+                className="alt-btn-secondary"
+              >
+                {ftpImportLoading ? (
+                  <>
+                    <Activity className="mr-2 h-4 w-4 animate-spin" />
+                    Import da FTP in corso...
+                  </>
+                ) : (
+                  <>
+                    <Download className="mr-2 h-4 w-4" />
+                    Importa automaticamente da FTP
+                  </>
+                )}
+              </Button>
+            </div>
+
+            {/* File Upload Cards */}
+            <div className="space-y-4">
+              <FileUploadCard
+                title="Material File"
+                description="File principale con informazioni prodotto"
+                type="material"
+                requiredHeaders={REQUIRED_HEADERS.material}
+                optionalHeaders={OPTIONAL_HEADERS.material}
+              />
+              <FileUploadCard
+                title="Stock File Data"
+                description="Dati scorte e disponibilita"
+                type="stock"
+                requiredHeaders={REQUIRED_HEADERS.stock}
+                optionalHeaders={OPTIONAL_HEADERS.stock}
+              />
+              <FileUploadCard
+                title="Price File Data"
+                description="Listini prezzi e scontistiche"
+                type="price"
+                requiredHeaders={REQUIRED_HEADERS.price}
+                optionalHeaders={OPTIONAL_HEADERS.price}
+              />
+              <StockLocationUpload
+                disabled={pipelineRunning || isProcessing}
+                onFileLoaded={handleStockLocationLoaded}
+                externallyLoaded={stockLocationFileLoaded}
+                externalMeta={stockLocationMeta || undefined}
+                onClear={() => {
+                  setStockLocationIndex(null);
+                  setStockLocationWarnings(EMPTY_WARNINGS);
+                  setStockLocationFileLoaded(false);
+                  setStockLocationMeta(null);
+                }}
+              />
+            </div>
+            
+            {/* Stock Location Warnings */}
+            {stockLocationFileLoaded && (
+              <StockLocationWarningsDisplay warnings={stockLocationWarnings} />
+            )}
+
+            {/* Stock IT/EU Configuration */}
+            <div className="alt-card">
+              <h3 className="alt-section-title">
+                <Info className="h-5 w-5 text-primary" />
+                Configurazione Stock IT/EU
+              </h3>
+              <p className="text-sm text-muted-foreground mb-4">
+                Configura il fallback EU e i giorni di preparazione per Mediaworld ed ePrice.
+                {!stockLocationFileLoaded && (
+                  <span className="block mt-2 text-warning">
+                    Nessun file Stock Location caricato. Fallback: StockIT=ExistingStock, StockEU=0
+                  </span>
+                )}
+              </p>
+              <StockLocationConfig
+                config={extendedFeeConfig}
+                onConfigChange={handleExtendedConfigChange}
+                disabled={pipelineRunning}
+              />
+              <div className="mt-4 flex justify-end">
+                <button
+                  type="button"
+                  onClick={handleSaveExportConfig}
+                  disabled={isSavingPrepDays}
+                  className={`alt-btn-primary text-sm px-6 py-2 ${isSavingPrepDays ? 'opacity-50 cursor-not-allowed' : ''}`}
+                >
+                  {isSavingPrepDays ? (
+                    <>
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin inline" />
+                      Salvataggio...
+                    </>
+                  ) : (
+                    'Salva configurazione export'
+                  )}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {/* Right Column - Pipeline, Export, Diagnostics */}
+          <div className="space-y-6">
+            <h2 className="text-xl font-bold text-foreground flex items-center gap-2">
+              <Activity className="h-5 w-5 text-primary" />
+              Pipeline ed Export
+            </h2>
+
+            {/* Instructions */}
+            <div className="alt-card">
+              <div className="flex items-start gap-4">
+                <AlertCircle className="h-5 w-5 text-muted-foreground mt-0.5 flex-shrink-0" />
+                <div>
+                  <h3 className="font-semibold text-foreground mb-2">Specifiche di Elaborazione</h3>
+                  <ul className="text-sm text-muted-foreground space-y-1">
+                    <li>Filtri comuni: ExistingStock maggiore di 1, prezzi numerici validi</li>
+                    <li>Export EAN: solo record con EAN non vuoto</li>
+                    <li>Export ManufPartNr: solo record con ManufPartNr non vuoto</li>
+                    <li>Prezzi: Base + spedizione, IVA 22%, fee sequenziali configurabili</li>
+                    <li>Prezzo finale EAN: ending ,99 - ManufPartNr: arrotondamento intero superiore</li>
+                  </ul>
+                </div>
               </div>
             </div>
           </div>
         </div>
 
         {/* EAN Pre-fill Section (Optional) */}
-        <div className="card border-strong" style={{ background: '#f8fafc' }}>
+        <div className="alt-card">
           <div className="card-body">
             <div className="flex items-start gap-4 mb-4">
               <Info className="h-6 w-6 icon-dark mt-1 flex-shrink-0" />
@@ -5954,7 +6103,7 @@ const AltersideCatalogGenerator: React.FC = () => {
         </div>
 
         {/* Override Prodotti Section (Optional) */}
-        <div className="card border-strong" style={{ background: '#fef3c7' }}>
+        <div className="alt-card">
           <div className="card-body">
             <div className="flex items-start gap-4 mb-4">
               <Info className="h-6 w-6 icon-dark mt-1 flex-shrink-0" />
