@@ -5620,7 +5620,7 @@ const AltersideCatalogGenerator: React.FC = () => {
               </div>
             </div>
           ) : (
-            <div className="flex items-center justify-between p-4 bg-white rounded-lg border-strong">
+            <div className="flex items-center justify-between p-4 rounded-lg border-strong" style={{ background: 'var(--alt-surface)' }}>
               <div className="flex items-center gap-3">
                 <FileText className="h-6 w-6 icon-dark" />
                 <div>
@@ -5646,13 +5646,13 @@ const AltersideCatalogGenerator: React.FC = () => {
           )}
 
           {fileState.status === 'warning' && fileState.warning && (
-            <div className="mt-4 p-3 rounded-lg border-strong" style={{ background: '#fff3cd', color: '#856404' }}>
+            <div className="mt-4 p-3 rounded-lg alt-box-warning">
               <p className="text-sm font-medium">{fileState.warning}</p>
             </div>
           )}
 
           {fileState.file && 'data' in fileState.file && (
-            <div className="mt-4 p-3 rounded-lg border-strong bg-gray-50">
+            <div className="mt-4 p-3 rounded-lg border-strong alt-debug-panel">
               <h4 className="text-sm font-medium mb-2">Diagnostica</h4>
               <div className="text-xs text-muted">
                 <div><strong>Header rilevati:</strong> {(fileState.file as FileData).headers.join(', ')}</div>
@@ -5950,7 +5950,7 @@ const AltersideCatalogGenerator: React.FC = () => {
                 </p>
                 
                 {/* Always visible mapping info */}
-                <div className="mb-4 p-3 rounded-lg" style={{ background: mappingInfo ? '#e8f5e9' : '#fff3e0', color: mappingInfo ? '#2e7d32' : '#e65100' }}>
+                <div className={`mb-4 p-3 rounded-lg ${mappingInfo ? 'alt-box-success' : 'alt-box-warning'}`}>
                   <p className="text-sm">
                     {mappingInfo ? (
                       <>
@@ -5993,7 +5993,7 @@ const AltersideCatalogGenerator: React.FC = () => {
                   </div>
                 ) : (
                   <div className="mt-4">
-                    <div className="flex items-center justify-between p-4 bg-white rounded-lg border-strong mb-3">
+                    <div className="flex items-center justify-between p-4 rounded-lg border-strong mb-3" style={{ background: 'var(--alt-surface)' }}>
                       <div className="flex items-center gap-3">
                         <FileText className="h-6 w-6 icon-dark" />
                         <div>
@@ -6016,7 +6016,7 @@ const AltersideCatalogGenerator: React.FC = () => {
                     </div>
                     
                     {files.eanMapping.status === 'error' && files.eanMapping.error && (
-                      <div className="p-3 rounded-lg border-strong mb-3" style={{ background: 'var(--error-bg)', color: 'var(--error-fg)' }}>
+                      <div className="p-3 rounded-lg mb-3 alt-box-error">
                         <p className="text-sm font-medium">{files.eanMapping.error}</p>
                       </div>
                     )}
@@ -6056,43 +6056,43 @@ const AltersideCatalogGenerator: React.FC = () => {
                 )}
                 
                 {prefillState.status === 'done' && prefillState.counters && (
-                  <div className="mt-4 p-4 rounded-lg border-strong" style={{ background: '#e8f5e9' }}>
-                    <h4 className="text-sm font-semibold mb-3" style={{ color: '#2e7d32' }}>
-                      <CheckCircle className="inline h-4 w-4 mr-1" />
+                  <div className="mt-4 p-4 rounded-lg alt-box-success">
+                    <h4 className="text-sm font-semibold mb-3 text-success flex items-center gap-1">
+                      <CheckCircle className="h-4 w-4" />
                       EAN pre-fill completato
                     </h4>
                     <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
-                      <div className="p-2 bg-white rounded">
-                        <div className="font-bold text-lg text-green-600">{prefillState.counters.filled_now}</div>
-                        <div className="text-muted">EAN riempiti ora</div>
+                      <div className="p-2 rounded alt-stat-card-success">
+                        <div className="font-bold text-lg text-success">{prefillState.counters.filled_now}</div>
+                        <div className="text-muted-foreground">EAN riempiti ora</div>
                       </div>
-                      <div className="p-2 bg-white rounded">
+                      <div className="p-2 rounded alt-stat-card">
                         <div className="font-bold text-lg">{prefillState.counters.already_populated}</div>
-                        <div className="text-muted">Già popolati</div>
+                        <div className="text-muted-foreground">Gia popolati</div>
                       </div>
-                      <div className="p-2 bg-white rounded">
-                        <div className="font-bold text-lg text-orange-600">{prefillState.counters.skipped_due_to_conflict}</div>
-                        <div className="text-muted">Conflitti</div>
+                      <div className="p-2 rounded alt-stat-card-warning">
+                        <div className="font-bold text-lg text-warning">{prefillState.counters.skipped_due_to_conflict}</div>
+                        <div className="text-muted-foreground">Conflitti</div>
                       </div>
-                      <div className="p-2 bg-white rounded">
-                        <div className="font-bold text-lg text-blue-600">{prefillState.counters.missing_mapping_in_new_file}</div>
-                        <div className="text-muted">Senza mapping</div>
+                      <div className="p-2 rounded alt-stat-card-info">
+                        <div className="font-bold text-lg text-info">{prefillState.counters.missing_mapping_in_new_file}</div>
+                        <div className="text-muted-foreground">Senza mapping</div>
                       </div>
-                      <div className="p-2 bg-white rounded">
-                        <div className="font-bold text-lg text-red-600">{prefillState.counters.duplicate_mpn_rows}</div>
-                        <div className="text-muted">MPN duplicati</div>
+                      <div className="p-2 rounded alt-stat-card-error">
+                        <div className="font-bold text-lg text-error">{prefillState.counters.duplicate_mpn_rows}</div>
+                        <div className="text-muted-foreground">MPN duplicati</div>
                       </div>
-                      <div className="p-2 bg-white rounded">
-                        <div className="font-bold text-lg text-red-600">{prefillState.counters.mpn_not_in_material}</div>
-                        <div className="text-muted">MPN non in Material</div>
+                      <div className="p-2 rounded alt-stat-card-error">
+                        <div className="font-bold text-lg text-error">{prefillState.counters.mpn_not_in_material}</div>
+                        <div className="text-muted-foreground">MPN non in Material</div>
                       </div>
-                      <div className="p-2 bg-white rounded">
-                        <div className="font-bold text-lg text-yellow-600">{prefillState.counters.empty_ean_rows}</div>
-                        <div className="text-muted">EAN vuoti nel mapping</div>
+                      <div className="p-2 rounded alt-stat-card-warning">
+                        <div className="font-bold text-lg text-warning">{prefillState.counters.empty_ean_rows}</div>
+                        <div className="text-muted-foreground">EAN vuoti nel mapping</div>
                       </div>
-                      <div className="p-2 bg-white rounded">
-                        <div className="font-bold text-lg text-gray-600">{prefillState.counters.errori_formali}</div>
-                        <div className="text-muted">Errori formali</div>
+                      <div className="p-2 rounded alt-stat-card">
+                        <div className="font-bold text-lg">{prefillState.counters.errori_formali}</div>
+                        <div className="text-muted-foreground">Errori formali</div>
                       </div>
                     </div>
                   </div>
@@ -6142,7 +6142,7 @@ const AltersideCatalogGenerator: React.FC = () => {
                   </div>
                 ) : (
                   <div className="mt-4">
-                    <div className="flex items-center justify-between p-4 bg-white rounded-lg border-strong mb-3">
+                    <div className="flex items-center justify-between p-4 rounded-lg border-strong mb-3" style={{ background: 'var(--alt-surface)' }}>
                       <div className="flex items-center gap-3">
                         <FileText className="h-6 w-6 icon-dark" />
                         <div>
@@ -6183,8 +6183,8 @@ const AltersideCatalogGenerator: React.FC = () => {
                     
                     {/* Override Errors (blocking) */}
                     {overrideState.errors.length > 0 && (
-                      <div className="p-3 rounded-lg border-strong mb-3" style={{ background: '#fef2f2' }}>
-                        <h4 className="text-sm font-semibold mb-2" style={{ color: '#dc2626' }}>
+                      <div className="p-3 rounded-lg mb-3 alt-box-error">
+                        <h4 className="text-sm font-semibold mb-2 text-error">
                           <XCircle className="inline h-4 w-4 mr-1" />
                           Errori ({overrideState.errors.length})
                         </h4>
@@ -6203,19 +6203,19 @@ const AltersideCatalogGenerator: React.FC = () => {
                     
                     {/* Override Warnings (non-blocking) */}
                     {overrideState.warnings.length > 0 && (
-                      <div className="p-3 rounded-lg border-strong mb-3" style={{ background: '#fffbeb' }}>
-                        <h4 className="text-sm font-semibold mb-2" style={{ color: '#d97706' }}>
+                      <div className="p-3 rounded-lg mb-3 alt-box-warning">
+                        <h4 className="text-sm font-semibold mb-2 text-warning">
                           <AlertCircle className="inline h-4 w-4 mr-1" />
                           Avvisi ({overrideState.warnings.length})
                         </h4>
                         <div className="max-h-32 overflow-y-auto text-xs space-y-1">
                           {overrideState.warnings.slice(0, 20).map((warn, idx) => (
-                            <div key={idx} className="text-amber-700">
+                            <div key={idx} className="text-warning">
                               Riga {warn.rowIndex}: <strong>{warn.field}</strong> = "{warn.value}" - {warn.reason}
                             </div>
                           ))}
                           {overrideState.warnings.length > 20 && (
-                            <div className="text-muted">...e altri {overrideState.warnings.length - 20} avvisi</div>
+                            <div className="text-muted-foreground">...e altri {overrideState.warnings.length - 20} avvisi</div>
                           )}
                         </div>
                       </div>
@@ -6223,27 +6223,27 @@ const AltersideCatalogGenerator: React.FC = () => {
                     
                     {/* Override Apply Stats */}
                     {overrideState.lastApplyStats && (
-                      <div className="p-4 rounded-lg border-strong" style={{ background: '#ecfdf5' }}>
-                        <h4 className="text-sm font-semibold mb-3" style={{ color: '#059669' }}>
-                          <CheckCircle className="inline h-4 w-4 mr-1" />
+                      <div className="p-4 rounded-lg alt-box-success">
+                        <h4 className="text-sm font-semibold mb-3 text-success flex items-center gap-1">
+                          <CheckCircle className="h-4 w-4" />
                           Override applicato nell'ultima generazione
                         </h4>
                         <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
-                          <div className="p-2 bg-white rounded">
-                            <div className="font-bold text-lg text-green-600">{overrideState.lastApplyStats.updatedExisting}</div>
-                            <div className="text-muted">Prodotti aggiornati</div>
+                          <div className="p-2 rounded alt-stat-card-success">
+                            <div className="font-bold text-lg text-success">{overrideState.lastApplyStats.updatedExisting}</div>
+                            <div className="text-muted-foreground">Prodotti aggiornati</div>
                           </div>
-                          <div className="p-2 bg-white rounded">
-                            <div className="font-bold text-lg text-blue-600">{overrideState.lastApplyStats.addedNew}</div>
-                            <div className="text-muted">Nuovi prodotti</div>
+                          <div className="p-2 rounded alt-stat-card-info">
+                            <div className="font-bold text-lg text-info">{overrideState.lastApplyStats.addedNew}</div>
+                            <div className="text-muted-foreground">Nuovi prodotti</div>
                           </div>
-                          <div className="p-2 bg-white rounded">
-                            <div className="font-bold text-lg text-orange-600">{overrideState.lastApplyStats.skippedRows}</div>
-                            <div className="text-muted">Righe scartate</div>
+                          <div className="p-2 rounded alt-stat-card-warning">
+                            <div className="font-bold text-lg text-warning">{overrideState.lastApplyStats.skippedRows}</div>
+                            <div className="text-muted-foreground">Righe scartate</div>
                           </div>
-                          <div className="p-2 bg-white rounded">
-                            <div className="font-bold text-lg text-yellow-600">{overrideState.lastApplyStats.warnings}</div>
-                            <div className="text-muted">Warning</div>
+                          <div className="p-2 rounded alt-stat-card-warning">
+                            <div className="font-bold text-lg text-warning">{overrideState.lastApplyStats.warnings}</div>
+                            <div className="text-muted-foreground">Warning</div>
                           </div>
                         </div>
                       </div>
@@ -6587,25 +6587,25 @@ const AltersideCatalogGenerator: React.FC = () => {
             <div className="card-body">
               <h3 className="card-title mb-6">Statistiche Elaborazione - Pipeline {currentPipeline}</h3>
               <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
-                <div className="text-center p-4 rounded-lg border-strong" style={{ background: '#f8fafc' }}>
+                <div className="alt-stat-card">
                   <div className="text-2xl font-bold">{currentStats.totalRecords.toLocaleString()}</div>
-                  <div className="text-sm text-muted">Righe Totali</div>
+                  <div className="text-sm text-muted-foreground">Righe Totali</div>
                 </div>
-                <div className="text-center p-4 rounded-lg border-strong" style={{ background: 'var(--success-bg)' }}>
-                  <div className="text-2xl font-bold" style={{ color: 'var(--success-fg)' }}>
+                <div className="alt-stat-card-success">
+                  <div className="text-2xl font-bold text-success">
                     {currentPipeline === 'EAN' ? currentStats.validRecordsEAN.toLocaleString() : currentStats.validRecordsManufPartNr.toLocaleString()}
                   </div>
-                  <div className="text-sm text-muted">Valide {currentPipeline}</div>
+                  <div className="text-sm text-muted-foreground">Valide {currentPipeline}</div>
                 </div>
-                <div className="text-center p-4 rounded-lg border-strong" style={{ background: 'var(--error-bg)' }}>
-                  <div className="text-2xl font-bold" style={{ color: 'var(--error-fg)' }}>
+                <div className="alt-stat-card-error">
+                  <div className="text-2xl font-bold text-error">
                     {currentPipeline === 'EAN' ? currentStats.filteredRecordsEAN.toLocaleString() : currentStats.filteredRecordsManufPartNr.toLocaleString()}
                   </div>
-                  <div className="text-sm text-muted">Scartate {currentPipeline}</div>
+                  <div className="text-sm text-muted-foreground">Scartate {currentPipeline}</div>
                 </div>
-                <div className="text-center p-4 rounded-lg border-strong" style={{ background: '#fff3cd' }}>
-                  <div className="text-2xl font-bold" style={{ color: '#856404' }}>{currentStats.stockDuplicates + currentStats.priceDuplicates}</div>
-                  <div className="text-sm text-muted">Duplicati</div>
+                <div className="alt-stat-card-warning">
+                  <div className="text-2xl font-bold text-warning">{currentStats.stockDuplicates + currentStats.priceDuplicates}</div>
+                  <div className="text-sm text-muted-foreground">Duplicati</div>
                 </div>
               </div>
               
@@ -6613,36 +6613,36 @@ const AltersideCatalogGenerator: React.FC = () => {
                 <div className="mt-6">
                   <h4 className="text-lg font-semibold mb-3">Validazione EAN</h4>
                   <div className="grid grid-cols-4 gap-4 text-sm">
-                    <div className="text-center p-3 rounded-lg border" style={{ background: '#f0f9ff' }}>
-                      <div className="text-lg font-bold text-green-600">{eanStats.ean_validi_13}</div>
+                    <div className="alt-stat-card-success text-center p-3">
+                      <div className="text-lg font-bold text-success">{eanStats.ean_validi_13}</div>
                       <div className="text-muted-foreground">EAN validi (13 cifre)</div>
                     </div>
-                    <div className="text-center p-3 rounded-lg border" style={{ background: '#eff6ff' }}>
-                      <div className="text-lg font-bold text-blue-600">{eanStats.ean_padded_12_to_13}</div>
-                      <div className="text-muted-foreground">EAN padded (12→13)</div>
+                    <div className="alt-stat-card-info text-center p-3">
+                      <div className="text-lg font-bold text-info">{eanStats.ean_padded_12_to_13}</div>
+                      <div className="text-muted-foreground">EAN padded (12-13)</div>
                     </div>
-                    <div className="text-center p-3 rounded-lg border" style={{ background: '#f0fdf4' }}>
-                      <div className="text-lg font-bold text-emerald-600">{eanStats.ean_trimmed_14_to_13}</div>
-                      <div className="text-muted-foreground">EAN trimmed (14→13)</div>
+                    <div className="alt-stat-card-success text-center p-3">
+                      <div className="text-lg font-bold text-success">{eanStats.ean_trimmed_14_to_13}</div>
+                      <div className="text-muted-foreground">EAN trimmed (14-13)</div>
                     </div>
-                    <div className="text-center p-3 rounded-lg border" style={{ background: '#fefce8' }}>
-                      <div className="text-lg font-bold text-yellow-600">{eanStats.ean_validi_14}</div>
+                    <div className="alt-stat-card-warning text-center p-3">
+                      <div className="text-lg font-bold text-warning">{eanStats.ean_validi_14}</div>
                       <div className="text-muted-foreground">EAN validi (14 cifre)</div>
                     </div>
-                    <div className="text-center p-3 rounded-lg border" style={{ background: '#fff7ed' }}>
-                      <div className="text-lg font-bold text-orange-600">{eanStats.ean_duplicati_risolti}</div>
+                    <div className="alt-stat-card-warning text-center p-3">
+                      <div className="text-lg font-bold text-warning">{eanStats.ean_duplicati_risolti}</div>
                       <div className="text-muted-foreground">Duplicati risolti</div>
                     </div>
-                    <div className="text-center p-3 rounded-lg border" style={{ background: '#fef2f2' }}>
-                      <div className="text-lg font-bold text-red-600">{eanStats.ean_mancanti}</div>
+                    <div className="alt-stat-card-error text-center p-3">
+                      <div className="text-lg font-bold text-error">{eanStats.ean_mancanti}</div>
                       <div className="text-muted-foreground">EAN mancanti</div>
                     </div>
-                    <div className="text-center p-3 rounded-lg border" style={{ background: '#fef2f2' }}>
-                      <div className="text-lg font-bold text-red-600">{eanStats.ean_non_numerici}</div>
+                    <div className="alt-stat-card-error text-center p-3">
+                      <div className="text-lg font-bold text-error">{eanStats.ean_non_numerici}</div>
                       <div className="text-muted-foreground">EAN non numerici</div>
                     </div>
-                    <div className="text-center p-3 rounded-lg border" style={{ background: '#fef2f2' }}>
-                      <div className="text-lg font-bold text-red-600">{eanStats.ean_lunghezze_invalid}</div>
+                    <div className="alt-stat-card-error text-center p-3">
+                      <div className="text-lg font-bold text-error">{eanStats.ean_lunghezze_invalid}</div>
                       <div className="text-muted-foreground">Lunghezze non valide</div>
                     </div>
                   </div>
@@ -6688,15 +6688,14 @@ const AltersideCatalogGenerator: React.FC = () => {
             
             {/* ePrice Export Section - Only for EAN pipeline */}
             {currentPipeline === 'EAN' && (
-              <div className="mt-8 p-6 rounded-lg border" style={{ background: '#f0f9ff' }}>
-                <h4 className="text-lg font-semibold mb-4 text-blue-800">Esporta Catalogo ePrice</h4>
+              <div className="mt-8 p-6 rounded-lg alt-export-card alt-export-card-eprice">
+                <h4 className="text-lg font-semibold mb-4 text-info">Esporta Catalogo ePrice</h4>
                 <div className="flex flex-wrap items-center justify-center gap-4">
                   <button 
                     type="button"
                     onClick={onExportEprice}
                     disabled={isExportingEprice || pipelineRunning}
-                    className={`btn btn-primary text-lg px-8 py-3 ${isExportingEprice || pipelineRunning ? 'opacity-50 cursor-not-allowed' : ''}`}
-                    style={{ background: '#0369a1' }}
+                    className={`alt-btn-primary text-lg px-8 py-3 ${isExportingEprice || pipelineRunning ? 'opacity-50 cursor-not-allowed' : ''}`}
                   >
                     <Download className="mr-3 h-5 w-5" />
                     {isExportingEprice ? 'ESPORTAZIONE...' : 'Esporta catalogo ePrice'}
@@ -6708,17 +6707,15 @@ const AltersideCatalogGenerator: React.FC = () => {
               </div>
             )}
             
-            {/* Mediaworld Export Section - Only for EAN pipeline */}
             {currentPipeline === 'EAN' && (
-              <div className="mt-8 p-6 rounded-lg border" style={{ background: '#fef3c7' }}>
-                <h4 className="text-lg font-semibold mb-4 text-amber-800">Esporta Catalogo Mediaworld</h4>
+              <div className="mt-8 p-6 rounded-lg alt-export-card alt-export-card-mediaworld">
+                <h4 className="text-lg font-semibold mb-4 text-warning">Esporta Catalogo Mediaworld</h4>
                 <div className="flex flex-wrap items-center justify-center gap-4">
                   <button 
                     type="button"
                     onClick={onExportMediaworld}
                     disabled={isExportingMediaworld || pipelineRunning}
-                    className={`btn btn-primary text-lg px-8 py-3 ${isExportingMediaworld || pipelineRunning ? 'opacity-50 cursor-not-allowed' : ''}`}
-                    style={{ background: '#d97706' }}
+                    className={`alt-btn-primary text-lg px-8 py-3 ${isExportingMediaworld || pipelineRunning ? 'opacity-50 cursor-not-allowed' : ''}`}
                   >
                     <Download className="mr-3 h-5 w-5" />
                     {isExportingMediaworld ? 'ESPORTAZIONE...' : 'Genera catalogo Mediaworld (.xlsx)'}
@@ -6730,18 +6727,29 @@ const AltersideCatalogGenerator: React.FC = () => {
               </div>
             )}
 
+            {/* Amazon Export Section - Coming Soon */}
+            {currentPipeline === 'EAN' && (
+              <div className="mt-8 p-6 rounded-lg alt-export-card alt-export-card-amazon">
+                <h4 className="text-lg font-semibold mb-2 flex items-center gap-2">
+                  Esporta Catalogo Amazon
+                  <span className="alt-badge alt-badge-idle text-xs">In arrivo</span>
+                </h4>
+                <p className="text-xs text-muted-foreground">
+                  Export per Amazon Seller Central sara disponibile prossimamente.
+                </p>
+              </div>
+            )}
+
             {/* Note: Save button moved to IT/EU config section in file upload area */}
             {/* SFTP Upload Status - Only for EAN pipeline */}
             {currentPipeline === 'EAN' && sftpUploadStatus.phase !== 'idle' && (
-              <div className="mt-8 p-6 rounded-lg border-2" style={{ 
-                background: sftpUploadStatus.phase === 'complete' ? '#f0fdf4' : 
-                            sftpUploadStatus.phase === 'error' ? '#fef2f2' : '#f0f9ff', 
-                borderColor: sftpUploadStatus.phase === 'complete' ? '#22c55e' : 
-                             sftpUploadStatus.phase === 'error' ? '#ef4444' : '#3b82f6'
-              }}>
+              <div className={`mt-8 p-6 rounded-lg border-2 ${
+                sftpUploadStatus.phase === 'complete' ? 'alt-box-success' : 
+                sftpUploadStatus.phase === 'error' ? 'alt-box-error' : 'alt-box-info'
+              }`}>
                 <h4 className={`text-lg font-semibold mb-4 flex items-center gap-2 ${
-                  sftpUploadStatus.phase === 'complete' ? 'text-green-800' :
-                  sftpUploadStatus.phase === 'error' ? 'text-red-800' : 'text-blue-800'
+                  sftpUploadStatus.phase === 'complete' ? 'text-success' :
+                  sftpUploadStatus.phase === 'error' ? 'text-error' : 'text-info'
                 }`}>
                   {sftpUploadStatus.phase === 'complete' && <CheckCircle className="h-5 w-5" />}
                   {sftpUploadStatus.phase === 'error' && <XCircle className="h-5 w-5" />}
@@ -6751,11 +6759,7 @@ const AltersideCatalogGenerator: React.FC = () => {
                 </h4>
                 
                 <div className="flex items-center gap-2 mb-2">
-                  <span className={`font-medium ${
-                    sftpUploadStatus.phase === 'complete' ? 'text-green-700' :
-                    sftpUploadStatus.phase === 'error' ? 'text-red-700' :
-                    'text-blue-700'
-                  }`}>
+                  <span className="font-medium">
                     {sftpUploadStatus.message}
                   </span>
                 </div>
@@ -6765,12 +6769,12 @@ const AltersideCatalogGenerator: React.FC = () => {
                     {sftpUploadStatus.results.map((result, idx) => (
                       <div key={idx} className="flex items-center gap-2 text-sm">
                         {result.uploaded ? (
-                          <CheckCircle className="h-4 w-4 text-green-600" />
+                          <CheckCircle className="h-4 w-4 text-success" />
                         ) : (
-                          <XCircle className="h-4 w-4 text-red-600" />
+                          <XCircle className="h-4 w-4 text-error" />
                         )}
                         <span>{result.filename}</span>
-                        {result.error && <span className="text-red-600 text-xs">({result.error})</span>}
+                        {result.error && <span className="text-error text-xs">({result.error})</span>}
                       </div>
                     ))}
                   </div>
@@ -6792,13 +6796,13 @@ const AltersideCatalogGenerator: React.FC = () => {
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                 {/* ePrice Validation Summary */}
                 {lastEpriceValidation && (
-                  <div className={`p-4 rounded-lg border-2 ${lastEpriceValidation.success ? 'border-green-500 bg-green-50' : 'border-red-500 bg-red-50'}`}>
+                  <div className={`p-4 rounded-lg alt-validation-card ${lastEpriceValidation.success ? 'alt-validation-card-success' : 'alt-validation-card-error'}`}>
                     <div className="flex items-center justify-between mb-3">
                       <h4 className="font-semibold text-lg flex items-center gap-2">
                         {lastEpriceValidation.success ? (
-                          <CheckCircle className="h-5 w-5 text-green-600" />
+                          <CheckCircle className="h-5 w-5 text-success" />
                         ) : (
-                          <XCircle className="h-5 w-5 text-red-600" />
+                          <XCircle className="h-5 w-5 text-error" />
                         )}
                         ePrice
                       </h4>
@@ -6808,24 +6812,24 @@ const AltersideCatalogGenerator: React.FC = () => {
                     </div>
                     
                     <div className="grid grid-cols-3 gap-3 mb-3">
-                      <div className="text-center p-2 bg-white rounded border">
-                        <div className="text-lg font-bold text-blue-600">{lastEpriceValidation.totalRows}</div>
+                      <div className="alt-stat-card-info text-center p-2">
+                        <div className="text-lg font-bold text-info">{lastEpriceValidation.totalRows}</div>
                         <div className="text-xs text-muted-foreground">Totali</div>
                       </div>
-                      <div className="text-center p-2 bg-white rounded border">
-                        <div className="text-lg font-bold text-green-600">{lastEpriceValidation.validRows}</div>
+                      <div className="alt-stat-card-success text-center p-2">
+                        <div className="text-lg font-bold text-success">{lastEpriceValidation.validRows}</div>
                         <div className="text-xs text-muted-foreground">Valide</div>
                       </div>
-                      <div className="text-center p-2 bg-white rounded border">
-                        <div className="text-lg font-bold text-red-600">{lastEpriceValidation.skippedRows}</div>
+                      <div className="alt-stat-card-error text-center p-2">
+                        <div className="text-lg font-bold text-error">{lastEpriceValidation.skippedRows}</div>
                         <div className="text-xs text-muted-foreground">Scartate</div>
                       </div>
                     </div>
                     
                     {lastEpriceValidation.structureErrors.length > 0 && (
                       <div className="mb-2">
-                        <div className="text-sm font-medium text-red-700 mb-1">Errori struttura:</div>
-                        <ul className="text-xs text-red-600 list-disc list-inside max-h-24 overflow-y-auto">
+                        <div className="text-sm font-medium text-error mb-1">Errori struttura:</div>
+                        <ul className="text-xs text-error list-disc list-inside max-h-24 overflow-y-auto">
                           {lastEpriceValidation.structureErrors.slice(0, 5).map((err, i) => (
                             <li key={i}>{err}</li>
                           ))}
@@ -6868,13 +6872,13 @@ const AltersideCatalogGenerator: React.FC = () => {
                 
                 {/* Mediaworld Validation Summary */}
                 {lastMediaworldValidation && (
-                  <div className={`p-4 rounded-lg border-2 ${lastMediaworldValidation.success ? 'border-green-500 bg-green-50' : 'border-red-500 bg-red-50'}`}>
+                  <div className={`p-4 rounded-lg alt-validation-card ${lastMediaworldValidation.success ? 'alt-validation-card-success' : 'alt-validation-card-error'}`}>
                     <div className="flex items-center justify-between mb-3">
                       <h4 className="font-semibold text-lg flex items-center gap-2">
                         {lastMediaworldValidation.success ? (
-                          <CheckCircle className="h-5 w-5 text-green-600" />
+                          <CheckCircle className="h-5 w-5 text-success" />
                         ) : (
-                          <XCircle className="h-5 w-5 text-red-600" />
+                          <XCircle className="h-5 w-5 text-error" />
                         )}
                         Mediaworld
                       </h4>
@@ -6884,16 +6888,16 @@ const AltersideCatalogGenerator: React.FC = () => {
                     </div>
                     
                     <div className="grid grid-cols-3 gap-3 mb-3">
-                      <div className="text-center p-2 bg-white rounded border">
-                        <div className="text-lg font-bold text-blue-600">{lastMediaworldValidation.totalRows}</div>
+                      <div className="alt-stat-card-info text-center p-2">
+                        <div className="text-lg font-bold text-info">{lastMediaworldValidation.totalRows}</div>
                         <div className="text-xs text-muted-foreground">Totali</div>
                       </div>
-                      <div className="text-center p-2 bg-white rounded border">
-                        <div className="text-lg font-bold text-green-600">{lastMediaworldValidation.validRows}</div>
+                      <div className="alt-stat-card-success text-center p-2">
+                        <div className="text-lg font-bold text-success">{lastMediaworldValidation.validRows}</div>
                         <div className="text-xs text-muted-foreground">Valide</div>
                       </div>
-                      <div className="text-center p-2 bg-white rounded border">
-                        <div className="text-lg font-bold text-red-600">{lastMediaworldValidation.skippedRows}</div>
+                      <div className="alt-stat-card-error text-center p-2">
+                        <div className="text-lg font-bold text-error">{lastMediaworldValidation.skippedRows}</div>
                         <div className="text-xs text-muted-foreground">Scartate</div>
                       </div>
                     </div>
