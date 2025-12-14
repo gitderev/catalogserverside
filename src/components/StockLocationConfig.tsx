@@ -69,8 +69,8 @@ const StockLocationConfig: React.FC<StockLocationConfigProps> = ({
   return (
     <div className="space-y-6">
       {/* EAN Export Configuration */}
-      <Card className="p-4 border-green-200">
-        <h4 className="text-lg font-semibold mb-4 text-green-800">Catalogo EAN - Configurazione Pricing</h4>
+      <Card className="alt-config-card alt-config-card--ean">
+        <h4 className="text-lg font-semibold mb-4 text-success">Catalogo EAN - Configurazione Pricing</h4>
         
         <div className="space-y-4">
           {/* Per-export pricing fields */}
@@ -165,15 +165,15 @@ const StockLocationConfig: React.FC<StockLocationConfigProps> = ({
             </div>
           </div>
           
-          <p className="text-xs text-green-600 bg-green-50 p-2 rounded">
+          <p className="text-xs text-success alt-info-box p-2 rounded">
             Questi valori determinano "Prezzo Finale" e "ListPrice con Fee" nel Catalogo EAN
           </p>
         </div>
       </Card>
 
       {/* Mediaworld Configuration */}
-      <Card className="p-4 border-amber-200">
-        <h4 className="text-lg font-semibold mb-4 text-amber-800">Mediaworld - Configurazione Stock IT/EU e Pricing</h4>
+      <Card className="alt-config-card alt-config-card--mediaworld">
+        <h4 className="text-lg font-semibold mb-4 text-warning">Mediaworld - Configurazione Stock IT/EU e Pricing</h4>
         
         <div className="space-y-4">
           {/* Per-export pricing fields */}
@@ -268,7 +268,7 @@ const StockLocationConfig: React.FC<StockLocationConfigProps> = ({
           </div>
 
           {/* Include EU Toggle */}
-          <div className="flex items-center justify-between p-3 rounded-lg bg-amber-50">
+          <div className="alt-toggle-row">
             <div>
               <Label htmlFor="mediaworld-include-eu" className="text-sm font-medium">
                 Includi magazzino EU per Mediaworld
@@ -340,8 +340,8 @@ const StockLocationConfig: React.FC<StockLocationConfigProps> = ({
       </Card>
 
       {/* ePrice Configuration */}
-      <Card className="p-4 border-blue-200">
-        <h4 className="text-lg font-semibold mb-4 text-blue-800">ePrice - Configurazione Stock IT/EU e Pricing</h4>
+      <Card className="alt-config-card alt-config-card--eprice">
+        <h4 className="text-lg font-semibold mb-4 text-info">ePrice - Configurazione Stock IT/EU e Pricing</h4>
         
         <div className="space-y-4">
           {/* Per-export pricing fields */}
@@ -436,7 +436,7 @@ const StockLocationConfig: React.FC<StockLocationConfigProps> = ({
           </div>
 
           {/* Include EU Toggle */}
-          <div className="flex items-center justify-between p-3 rounded-lg bg-blue-50">
+          <div className="alt-toggle-row">
             <div>
               <Label htmlFor="eprice-include-eu" className="text-sm font-medium">
                 Includi magazzino EU per ePrice
@@ -508,9 +508,9 @@ const StockLocationConfig: React.FC<StockLocationConfigProps> = ({
       </Card>
 
       {/* Legend */}
-      <div className="text-xs text-muted-foreground p-3 bg-gray-50 rounded-lg">
+      <div className="text-xs alt-text-muted p-3 alt-info-box rounded-lg">
         <p><strong>Pricing per-export:</strong> Ogni export usa i suoi Fee DeRev, Fee Marketplace e Costo Spedizione per calcolare i prezzi finali</p>
-        <p className="mt-1"><strong>Logica stock:</strong> Se IT ≥ 2 → usa IT; altrimenti se EU abilitato e IT+EU ≥ 2 → usa combinato con lead time EU</p>
+        <p className="mt-1"><strong>Logica stock:</strong> Se IT &gt;= 2 - usa IT; altrimenti se EU abilitato e IT+EU &gt;= 2 - usa combinato con lead time EU</p>
         <p className="mt-1"><strong>Lead time:</strong> export = giorni preparazione configurati (nessun offset)</p>
       </div>
     </div>

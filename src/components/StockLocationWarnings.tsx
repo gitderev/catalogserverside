@@ -107,10 +107,10 @@ const StockLocationWarnings: React.FC<StockLocationWarningsProps> = ({
         {items.map(item => (
           <div 
             key={item.key} 
-            className="text-center p-2 rounded bg-white/50"
+            className="text-center p-2 rounded alt-warning-stat"
           >
-            <div className="text-lg font-bold text-amber-700">{item.value}</div>
-            <div className="text-xs text-amber-600">{item.label}</div>
+            <div className="text-lg font-bold text-warning">{item.value}</div>
+            <div className="text-xs alt-text-muted">{item.label}</div>
           </div>
         ))}
       </div>
@@ -121,8 +121,8 @@ const StockLocationWarnings: React.FC<StockLocationWarningsProps> = ({
     <div className="mt-4 space-y-4">
       {/* Manual Run Warnings */}
       {hasManualWarnings && (
-        <div className="p-4 rounded-lg border" style={{ background: '#fef3c7', borderColor: '#f59e0b' }}>
-          <h4 className="text-sm font-semibold mb-3 flex items-center gap-2 text-amber-800">
+        <div className="p-4 rounded-lg alt-alert alt-alert-warning">
+          <h4 className="text-sm font-semibold mb-3 flex items-center gap-2 text-warning">
             <HardDrive className="h-4 w-4" />
             Avvisi Stock Location (Run Manuale)
           </h4>
@@ -132,12 +132,12 @@ const StockLocationWarnings: React.FC<StockLocationWarningsProps> = ({
 
       {/* Server Run Warnings */}
       {hasServerWarnings && serverWarnings && (
-        <div className="p-4 rounded-lg border" style={{ background: '#dbeafe', borderColor: '#3b82f6' }}>
-          <h4 className="text-sm font-semibold mb-3 flex items-center gap-2 text-blue-800">
+        <div className="p-4 rounded-lg alt-alert alt-alert-info">
+          <h4 className="text-sm font-semibold mb-3 flex items-center gap-2 text-info">
             <Server className="h-4 w-4" />
             Avvisi Stock Location (Ultima Run Server)
             {serverWarnings.finishedAt && (
-              <span className="text-xs font-normal text-blue-600 ml-2">
+              <span className="text-xs font-normal alt-text-muted ml-2">
                 {new Date(serverWarnings.finishedAt).toLocaleString('it-IT')}
               </span>
             )}

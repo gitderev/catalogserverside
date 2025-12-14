@@ -250,7 +250,7 @@ const StockLocationUpload: React.FC<StockLocationUploadProps> = ({
             </div>
           </div>
         ) : (
-          <div className="flex items-center justify-between p-4 bg-white rounded-lg border-strong">
+          <div className="flex items-center justify-between p-4 alt-file-loaded rounded-lg">
             <div className="flex items-center gap-3">
               <FileText className="h-6 w-6 icon-dark" />
               <div>
@@ -278,12 +278,12 @@ const StockLocationUpload: React.FC<StockLocationUploadProps> = ({
         )}
 
         {effectiveStatus === 'valid' && (
-          <div className="mt-4 p-3 rounded-lg border-strong bg-gray-50">
+          <div className="mt-4 p-3 rounded-lg alt-info-box">
             <h4 className="text-sm font-medium mb-2">Informazioni</h4>
-            <div className="text-xs text-muted">
+            <div className="text-xs alt-text-muted">
               <div>Lo stock IT proviene da LocationID 4242</div>
               <div>Lo stock EU proviene da LocationID 4254</div>
-              <div className="mt-1 text-amber-600">LocationID 4255 viene ignorato (duplicato EU)</div>
+              <div className="mt-1 text-warning">LocationID 4255 viene ignorato (duplicato EU)</div>
             </div>
           </div>
         )}

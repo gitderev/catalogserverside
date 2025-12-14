@@ -5570,7 +5570,7 @@ const AltersideCatalogGenerator: React.FC = () => {
               </div>
             )}
             {fileState.status === 'warning' && (
-              <div className="badge-ok" style={{ background: '#fff3cd', color: '#856404', border: '1px solid #ffeaa7' }}>
+              <div className="alt-badge alt-badge-warning">
                 <AlertCircle className="w-4 h-4" />
                 Caricato (con avviso)
               </div>
@@ -6318,13 +6318,13 @@ const AltersideCatalogGenerator: React.FC = () => {
         
         {/* IT/EU Stock Configuration - Always visible in manual path */}
         <div className="mt-6">
-          <div className="card border-strong" style={{ background: '#f0fdf4' }}>
+          <div className="alt-card">
             <div className="card-body">
-              <h3 className="card-title mb-4 flex items-center gap-2 text-green-800">
-                <Info className="h-5 w-5" />
+              <h3 className="alt-section-title flex items-center gap-2">
+                <Info className="h-5 w-5 text-success" />
                 Configurazione Stock IT/EU
               </h3>
-              <p className="text-sm text-muted-foreground mb-4">
+              <p className="text-sm alt-text-muted mb-4">
                 Configura il fallback EU e i giorni di preparazione per Mediaworld ed ePrice.
                 {!stockLocationFileLoaded && (
                   <span className="block mt-1 text-amber-600">

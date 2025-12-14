@@ -184,11 +184,11 @@ const getStatusBadge = (status: string, size: 'sm' | 'md' = 'sm') => {
   const baseClasses = size === 'md' ? 'px-3 py-1.5 text-sm font-semibold' : 'px-2 py-1 text-xs font-medium';
   
   const statusStyles: Record<string, string> = {
-    running: 'bg-blue-100 text-blue-800 border-blue-200',
-    success: 'bg-emerald-100 text-emerald-800 border-emerald-200',
-    failed: 'bg-red-100 text-red-800 border-red-200',
-    timeout: 'bg-amber-100 text-amber-800 border-amber-200',
-    skipped: 'bg-slate-100 text-slate-600 border-slate-200'
+    running: 'alt-sync-badge alt-sync-badge--running',
+    success: 'alt-sync-badge alt-sync-badge--success',
+    failed: 'alt-sync-badge alt-sync-badge--failed',
+    timeout: 'alt-sync-badge alt-sync-badge--timeout',
+    skipped: 'alt-sync-badge alt-sync-badge--skipped'
   };
 
   const icons: Record<string, React.ReactNode> = {
@@ -504,7 +504,7 @@ export const SyncScheduler: React.FC = () => {
 
   if (isLoading) {
     return (
-      <Card className="mb-6 bg-slate-50 border-slate-200">
+      <Card className="mb-6 alt-card">
         <CardContent className="flex items-center justify-center py-12">
           <Loader2 className="h-8 w-8 animate-spin text-primary" />
         </CardContent>
@@ -515,13 +515,13 @@ export const SyncScheduler: React.FC = () => {
   return (
     <>
       {/* Main Scheduling Card */}
-      <Card className="mb-6 bg-slate-50/80 border-slate-200 shadow-sm">
+      <Card className="mb-6 alt-card">
         <CardHeader className="pb-4">
-          <CardTitle className="flex items-center gap-2 text-xl font-bold text-slate-900">
+          <CardTitle className="flex items-center gap-2 text-xl font-bold">
             <RefreshCw className="h-5 w-5 text-primary" />
             Pianificazione della sincronizzazione
           </CardTitle>
-          <CardDescription className="text-slate-600">
+          <CardDescription className="alt-text-muted">
             Gestisci la sincronizzazione automatica dei cataloghi verso i marketplace
           </CardDescription>
         </CardHeader>
@@ -529,32 +529,32 @@ export const SyncScheduler: React.FC = () => {
         <CardContent className="space-y-6">
           {/* Warning for max retries */}
           {hasMaxRetriesWarning() && (
-            <div className="bg-red-50 border-2 border-red-200 rounded-lg p-4 flex items-start gap-3">
-              <AlertTriangle className="h-5 w-5 text-red-600 flex-shrink-0 mt-0.5" />
+            <div className="alt-alert alt-alert-error">
+              <AlertTriangle className="h-5 w-5 text-error flex-shrink-0 mt-0.5" />
               <div>
-                <p className="font-semibold text-red-800">
+                <p className="font-semibold text-error">
                   Attenzione: la sincronizzazione automatica ha fallito 5 volte consecutive.
                 </p>
-                <p className="text-sm text-red-600 mt-1">
+                <p className="text-sm alt-text-muted mt-1">
                   Controlla i log per verificare il problema e correggerlo.
                 </p>
                 <Button
                   variant="link"
-                  className="p-0 h-auto text-red-700 hover:text-red-900 font-medium"
+                  className="p-0 h-auto text-error hover:text-error/80 font-medium"
                   onClick={() => {
                     const failedRun = runs.find(r => r.trigger_type === 'cron' && r.attempt === 5);
                     if (failedRun) setSelectedRun(failedRun);
                   }}
                 >
-                  Visualizza ultimo job fallito →
+                  Visualizza ultimo job fallito -&gt;
                 </Button>
               </div>
             </div>
           )}
 
           {/* Configuration Section */}
-          <div className="bg-white rounded-lg border border-slate-200 p-5">
-            <h3 className="text-sm font-semibold text-slate-700 uppercase tracking-wide mb-4">Configurazione</h3>
+          <div className="alt-panel rounded-lg p-5">
+            <h3 className="text-sm font-semibold alt-text-muted uppercase tracking-wide mb-4">Configurazione</h3>
             
             <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
               {/* Enable/Disable Toggle */}
@@ -565,35 +565,35 @@ export const SyncScheduler: React.FC = () => {
                     checked={config?.enabled || false}
                     onCheckedChange={(checked) => saveConfig({ enabled: checked })}
                     disabled={isSaving}
-                    className="data-[state=checked]:bg-emerald-500"
+                    className="data-[state=checked]:bg-primary"
                   />
                   <div>
-                    <Label htmlFor="sync-enabled" className="font-semibold text-slate-800 cursor-pointer">
+                    <Label htmlFor="sync-enabled" className="font-semibold cursor-pointer">
                       Sincronizzazione automatica
                     </Label>
                     <span className={`ml-2 inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${
                       config?.enabled 
-                        ? 'bg-emerald-100 text-emerald-700' 
-                        : 'bg-slate-100 text-slate-600'
+                        ? 'bg-success/20 text-success' 
+                        : 'alt-badge alt-badge-idle'
                     }`}>
                       {config?.enabled ? 'Attivata' : 'Disattivata'}
                     </span>
                   </div>
                 </div>
-                <p className="text-xs text-slate-500 leading-relaxed">
+                <p className="text-xs alt-text-muted leading-relaxed">
                   Quando attiva, la pipeline viene eseguita automaticamente in base alla frequenza scelta.
                 </p>
               </div>
 
               {/* Frequency */}
               <div className="space-y-2">
-                <Label className="font-semibold text-slate-700">Frequenza</Label>
+                <Label className="font-semibold">Frequenza</Label>
                 <Select
                   value={String(config?.frequency_minutes || 60)}
                   onValueChange={(value) => saveConfig({ frequency_minutes: parseInt(value) })}
                   disabled={isSaving}
                 >
-                  <SelectTrigger className="bg-white border-slate-300 focus:border-primary focus:ring-primary">
+                  <SelectTrigger className="alt-input">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -609,13 +609,13 @@ export const SyncScheduler: React.FC = () => {
               {/* Daily time (only for daily frequency) */}
               {config?.frequency_minutes === 1440 && (
                 <div className="space-y-2">
-                  <Label className="font-semibold text-slate-700">Orario giornaliero</Label>
+                  <Label className="font-semibold">Orario giornaliero</Label>
                   <Input
                     type="time"
                     value={config?.daily_time || '08:00'}
                     onChange={(e) => saveConfig({ daily_time: e.target.value })}
                     disabled={isSaving}
-                    className="bg-white border-slate-300 focus:border-primary focus:ring-primary"
+                    className="alt-input"
                   />
                 </div>
               )}
@@ -624,15 +624,13 @@ export const SyncScheduler: React.FC = () => {
 
           {/* Current step indicator for running sync */}
           {currentRun && currentRun.status === 'running' && (
-            <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
-              <div className="flex items-center gap-3">
-                <Loader2 className="h-5 w-5 animate-spin text-blue-600" />
-                <div>
-                  <p className="font-semibold text-blue-800">Sincronizzazione in corso</p>
-                  <p className="text-sm text-blue-600">
-                    Step corrente: {STEP_LABELS[(currentRun.steps as any)?.current_step] || (currentRun.steps as any)?.current_step || 'Avvio...'}
-                  </p>
-                </div>
+            <div className="alt-alert alt-alert-info">
+              <Loader2 className="h-5 w-5 animate-spin text-info" />
+              <div>
+                <p className="font-semibold text-info">Sincronizzazione in corso</p>
+                <p className="text-sm alt-text-muted">
+                  Step corrente: {STEP_LABELS[(currentRun.steps as any)?.current_step] || (currentRun.steps as any)?.current_step || 'Avvio...'}
+                </p>
               </div>
             </div>
           )}
@@ -640,17 +638,17 @@ export const SyncScheduler: React.FC = () => {
           {/* Status Summary Section */}
           <div className="grid gap-4 md:grid-cols-3">
             {/* Last sync */}
-            <div className="bg-white rounded-lg border border-slate-200 p-4">
+            <div className="alt-panel rounded-lg p-4">
               <div className="flex items-center gap-2 mb-2">
-                <Activity className="h-4 w-4 text-slate-500" />
-                <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Ultima sincronizzazione</span>
+                <Activity className="h-4 w-4 alt-text-muted" />
+                <span className="text-xs font-semibold alt-text-muted uppercase tracking-wide">Ultima sincronizzazione</span>
               </div>
               {runs.length > 0 ? (
                 <div className="space-y-2">
                   <div className="flex items-center gap-2">
                     {getStatusBadge(runs[0].status, 'md')}
                   </div>
-                  <p className="text-sm text-slate-600">
+                  <p className="text-sm alt-text-muted">
                     {new Date(runs[0].started_at).toLocaleString('it-IT', {
                       day: '2-digit',
                       month: '2-digit',
@@ -659,48 +657,48 @@ export const SyncScheduler: React.FC = () => {
                     })}
                   </p>
                   {runs[0].error_message && runs[0].status === 'failed' && (
-                    <p className="text-xs text-red-600 bg-red-50 px-2 py-1 rounded">
+                    <p className="text-xs text-error alt-info-box px-2 py-1 rounded">
                       {getFriendlyErrorMessage(runs[0].error_message, runs[0].error_details)}
                     </p>
                   )}
                 </div>
               ) : (
-                <p className="text-sm text-slate-400">Nessuna esecuzione</p>
+                <p className="text-sm alt-text-muted">Nessuna esecuzione</p>
               )}
             </div>
 
             {/* Metrics summary */}
-            <div className="bg-white rounded-lg border border-slate-200 p-4">
+            <div className="alt-panel rounded-lg p-4">
               <div className="flex items-center gap-2 mb-2">
-                <Server className="h-4 w-4 text-slate-500" />
-                <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Riepilogo</span>
+                <Server className="h-4 w-4 alt-text-muted" />
+                <span className="text-xs font-semibold alt-text-muted uppercase tracking-wide">Riepilogo</span>
               </div>
               {runs.length > 0 && runs[0].metrics ? (
                 <div className="space-y-1">
                   <div className="flex justify-between">
-                    <span className="text-sm text-slate-500">Prodotti</span>
-                    <span className="text-sm font-semibold text-slate-800">{runs[0].metrics.products_processed || 0}</span>
+                    <span className="text-sm alt-text-muted">Prodotti</span>
+                    <span className="text-sm font-semibold">{runs[0].metrics.products_processed || 0}</span>
                   </div>
                   <div className="flex justify-between">
-                    <span className="text-sm text-slate-500">File caricati</span>
-                    <span className="text-sm font-semibold text-slate-800">{runs[0].metrics.sftp_uploaded_files || 0}</span>
+                    <span className="text-sm alt-text-muted">File caricati</span>
+                    <span className="text-sm font-semibold">{runs[0].metrics.sftp_uploaded_files || 0}</span>
                   </div>
                 </div>
               ) : (
-                <p className="text-sm text-slate-400">-</p>
+                <p className="text-sm alt-text-muted">-</p>
               )}
             </div>
 
             {/* Next sync */}
-            <div className="bg-white rounded-lg border border-slate-200 p-4">
+            <div className="alt-panel rounded-lg p-4">
               <div className="flex items-center gap-2 mb-2">
-                <Calendar className="h-4 w-4 text-slate-500" />
-                <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Prossima sincronizzazione</span>
+                <Calendar className="h-4 w-4 alt-text-muted" />
+                <span className="text-xs font-semibold alt-text-muted uppercase tracking-wide">Prossima sincronizzazione</span>
               </div>
               {config?.enabled ? (
-                <p className="text-sm font-medium text-slate-700">{getNextSyncTime() || '-'}</p>
+                <p className="text-sm font-medium">{getNextSyncTime() || '-'}</p>
               ) : (
-                <span className="inline-flex items-center px-2 py-1 rounded text-xs font-medium bg-slate-100 text-slate-500">
+                <span className="alt-badge alt-badge-idle">
                   Disattivata
                 </span>
               )}
@@ -730,7 +728,7 @@ export const SyncScheduler: React.FC = () => {
                 variant="outline"
                 onClick={forceResetSync}
                 disabled={isResetting}
-                className="border-amber-400 text-amber-700 hover:bg-amber-50 hover:border-amber-500 font-semibold"
+                className="border-warning text-warning hover:bg-warning/10 hover:border-warning font-semibold"
               >
                 {isResetting ? (
                   <Loader2 className="h-4 w-4 animate-spin mr-2" />
@@ -744,7 +742,7 @@ export const SyncScheduler: React.FC = () => {
                 variant="outline"
                 onClick={() => stopSync(false)}
                 disabled={isStopping || !currentRun}
-                className="border-red-300 text-red-600 hover:bg-red-50 hover:border-red-400 font-semibold disabled:border-slate-200 disabled:text-slate-400 disabled:bg-transparent"
+                className="border-error/50 text-error hover:bg-error/10 hover:border-error font-semibold disabled:border-muted disabled:text-muted disabled:bg-transparent"
               >
                 {isStopping ? (
                   <Loader2 className="h-4 w-4 animate-spin mr-2" />
@@ -761,7 +759,7 @@ export const SyncScheduler: React.FC = () => {
                 variant="ghost"
                 onClick={() => stopSync(true)}
                 disabled={isStopping}
-                className="text-amber-600 hover:text-amber-700 hover:bg-amber-50 font-medium"
+                className="text-warning hover:text-warning hover:bg-warning/10 font-medium"
                 title="Forza l'interruzione immediata senza attendere il prossimo step"
               >
                 <AlertTriangle className="h-4 w-4 mr-2" />
@@ -782,14 +780,14 @@ export const SyncScheduler: React.FC = () => {
 
           {/* Warning per run bloccata */}
           {isStaleRun && currentRun && (
-            <div className="bg-amber-50 border-2 border-amber-200 rounded-lg p-4 flex items-start gap-3">
-              <AlertTriangle className="h-5 w-5 text-amber-600 flex-shrink-0 mt-0.5" />
+            <div className="alt-alert alt-alert-warning">
+              <AlertTriangle className="h-5 w-5 text-warning flex-shrink-0 mt-0.5" />
               <div>
-                <p className="font-semibold text-amber-800">
+                <p className="font-semibold text-warning">
                   Sincronizzazione bloccata
                 </p>
-                <p className="text-sm text-amber-600 mt-1">
-                  La sincronizzazione è in esecuzione da più di 15 minuti e potrebbe essere bloccata.
+                <p className="text-sm alt-text-muted mt-1">
+                  La sincronizzazione e in esecuzione da piu di 15 minuti e potrebbe essere bloccata.
                   Usa il pulsante "Sblocca sincronizzazione" per resettare lo stato e poter avviare una nuova run.
                 </p>
               </div>
@@ -799,13 +797,13 @@ export const SyncScheduler: React.FC = () => {
           {/* Sync Logs */}
           {showLogs && (
             <div className="bg-white rounded-lg border border-slate-200 overflow-hidden">
-              <div className="px-4 py-3 border-b border-slate-200 bg-slate-50">
-                <h4 className="font-semibold text-slate-800">Log sincronizzazioni</h4>
+              <div className="px-4 py-3 border-b border-border alt-panel">
+                <h4 className="font-semibold">Log sincronizzazioni</h4>
               </div>
               <ScrollArea className="h-[350px]">
-                <div className="divide-y divide-slate-100">
+                <div className="divide-y divide-border">
                   {runs.map(run => (
-                    <div key={run.id} className="hover:bg-slate-50 transition-colors">
+                    <div key={run.id} className="hover:bg-muted/10 transition-colors">
                       <div
                         className="p-4 cursor-pointer"
                         onClick={() => setSelectedRun(run)}
@@ -813,7 +811,7 @@ export const SyncScheduler: React.FC = () => {
                         <div className="flex flex-wrap items-center justify-between gap-2">
                           <div className="flex flex-wrap items-center gap-2">
                             {getStatusBadge(run.status)}
-                            <span className="text-sm font-medium text-slate-700">
+                            <span className="text-sm font-medium">
                               {new Date(run.started_at).toLocaleString('it-IT', {
                                 day: '2-digit',
                                 month: '2-digit',
@@ -824,8 +822,8 @@ export const SyncScheduler: React.FC = () => {
                             </span>
                             <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium ${
                               run.trigger_type === 'cron' 
-                                ? 'bg-purple-100 text-purple-700' 
-                                : 'bg-blue-100 text-blue-700'
+                                ? 'alt-badge alt-badge-info' 
+                                : 'alt-badge alt-badge-success'
                             }`}>
                               {run.trigger_type === 'cron' ? (
                                 <><Zap className="h-3 w-3" /> Cron</>
@@ -834,12 +832,12 @@ export const SyncScheduler: React.FC = () => {
                               )}
                             </span>
                             {run.attempt > 1 && (
-                              <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-amber-100 text-amber-700">
+                              <span className="alt-badge alt-badge-warning">
                                 Tentativo {run.attempt}
                               </span>
                             )}
                           </div>
-                          <span className="text-sm font-medium text-slate-500">
+                          <span className="text-sm font-medium alt-text-muted">
                             {formatDuration(run.runtime_ms)}
                           </span>
                         </div>
@@ -847,7 +845,7 @@ export const SyncScheduler: React.FC = () => {
                         {/* Error message with friendly text */}
                         {run.error_message && (
                           <div className="mt-2">
-                            <p className="text-sm text-red-600 font-medium">
+                            <p className="text-sm text-error font-medium">
                               {getFriendlyErrorMessage(run.error_message, run.error_details)}
                             </p>
                             
@@ -858,7 +856,7 @@ export const SyncScheduler: React.FC = () => {
                                 onOpenChange={(open) => setExpandedLogDetails(open ? run.id : null)}
                               >
                                 <CollapsibleTrigger 
-                                  className="text-xs text-slate-500 hover:text-slate-700 mt-1 flex items-center gap-1"
+                                  className="text-xs alt-text-muted hover:text-foreground mt-1 flex items-center gap-1"
                                   onClick={(e) => e.stopPropagation()}
                                 >
                                   {expandedLogDetails === run.id ? (
@@ -868,7 +866,7 @@ export const SyncScheduler: React.FC = () => {
                                   )}
                                 </CollapsibleTrigger>
                                 <CollapsibleContent onClick={(e) => e.stopPropagation()}>
-                                  <pre className="mt-2 p-2 bg-slate-100 rounded text-xs text-slate-600 overflow-x-auto max-h-32">
+                                  <pre className="mt-2 p-2 alt-info-box rounded text-xs overflow-x-auto max-h-32">
                                     {JSON.stringify(run.error_details, null, 2)}
                                   </pre>
                                 </CollapsibleContent>
@@ -880,7 +878,7 @@ export const SyncScheduler: React.FC = () => {
                     </div>
                   ))}
                   {runs.length === 0 && (
-                    <div className="p-12 text-center text-slate-400">
+                    <div className="p-12 text-center alt-text-muted">
                       <FileText className="h-8 w-8 mx-auto mb-2 opacity-50" />
                       Nessuna sincronizzazione eseguita
                     </div>
