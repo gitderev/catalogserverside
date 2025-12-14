@@ -5673,102 +5673,99 @@ const AltersideCatalogGenerator: React.FC = () => {
     (files.stock.status === 'valid' || files.stock.status === 'warning') && 
     (files.price.status === 'valid' || files.price.status === 'warning');
 
+  // Compute pipeline status pill
+  const getPipelineStatusPill = () => {
+    if (pipelineRunning) return { label: 'In esecuzione', className: 'pill-running' };
+    if (pipelineStatus?.includes('Errore')) return { label: 'Errore', className: 'pill-error' };
+    if (pipelineStatus?.includes('successo') || pipelineProgress === 100) return { label: 'Completato', className: 'pill-success' };
+    return { label: 'Idle', className: 'pill-idle' };
+  };
+  
+  const statusPill = getPipelineStatusPill();
+
   return (
-    <div className="min-h-screen p-6" style={{ background: 'var(--bg)', color: 'var(--fg)' }}>
-      <div className="max-w-7xl mx-auto space-y-8">
-        {/* Header */}
-        <div className="relative text-center">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={logout}
-            className="absolute right-0 top-0"
-          >
-            <LogOut className="h-4 w-4 mr-2" />
-            Esci
-          </Button>
-          <h1 className="text-5xl font-bold mb-4">
-            Alterside Catalog Generator
-          </h1>
-          <p className="text-muted text-xl max-w-3xl mx-auto">
-            Genera due cataloghi Excel distinti (EAN e ManufPartNr) con calcoli avanzati di prezzo e commissioni
-          </p>
-        </div>
-
-        {/* Always-visible Pipeline Steps */}
-        <PipelineStepsDisplay steps={pipelineSteps} isRunning={pipelineRunning} />
-
-        {/* Pipeline Master Button */}
-        <div className="card border-strong" style={{ background: '#1e3a5f' }}>
-          <div className="card-body">
-            <div className="flex flex-col md:flex-row items-center justify-between gap-4">
-              <div className="text-white">
-                <h3 className="text-xl font-bold mb-1">Pipeline Completa Automatica</h3>
-                <p className="text-sm opacity-80">
-                  Import FTP → Prefill EAN → Elaborazione → Export e Upload SFTP
-                </p>
+    <div className="min-h-screen bg-background text-foreground">
+      {/* ========== STICKY TOP BAR ========== */}
+      <header className="sticky top-0 z-50 border-b border-border bg-card/95 backdrop-blur-sm">
+        <div className="max-w-[1600px] mx-auto px-4 sm:px-6 py-3">
+          <div className="flex items-center justify-between gap-4">
+            {/* Left: Brand */}
+            <div className="flex items-center gap-3">
+              <div className="w-8 h-8 rounded-lg gradient-brand flex items-center justify-center">
+                <span className="text-white font-bold text-sm">A</span>
               </div>
-              <div className="flex flex-col items-center gap-2">
-                <Button
-                  onClick={handleFullPipeline}
-                  disabled={pipelineRunning || isProcessing || ftpImportLoading || isExportingEAN}
-                  size="lg"
-                  className="px-8 py-3 text-lg font-semibold"
-                  style={{ 
-                    background: pipelineRunning ? '#6b7280' : '#10b981', 
-                    color: 'white',
-                    opacity: (pipelineRunning || isProcessing || ftpImportLoading || isExportingEAN) ? 0.6 : 1
-                  }}
-                >
-                  {pipelineRunning ? (
-                    <>
-                      <Loader2 className="mr-2 h-5 w-5 animate-spin" />
-                      Pipeline in esecuzione…
-                    </>
-                  ) : (
-                    <>
-                      <Cloud className="mr-2 h-5 w-5" />
-                      Esegui Pipeline Completa
-                    </>
-                  )}
-                </Button>
-                {/* Progress Bar */}
-                {(pipelineRunning || pipelineProgress > 0) && (
-                  <div className="w-full mt-3">
-                    <div className="flex items-center justify-between mb-1">
-                      <span className="text-sm text-white font-medium">{pipelineStepLabel}</span>
-                      <span className="text-sm text-white font-bold">{pipelineProgress}%</span>
-                    </div>
-                    <div className="w-full h-3 bg-gray-300 rounded-full overflow-hidden">
-                      <div 
-                        className="h-full transition-all duration-300 ease-out"
-                        style={{ 
-                          width: `${pipelineProgress}%`,
-                          background: pipelineStepLabel.includes('Errore') 
-                            ? '#ef4444' 
-                            : pipelineProgress === 100 
-                              ? '#22c55e' 
-                              : '#3b82f6'
-                        }}
-                      />
-                    </div>
-                  </div>
-                )}
-                {pipelineStatus && !pipelineRunning && pipelineProgress === 0 && (
-                  <div className={`text-sm px-3 py-1 rounded ${
-                    pipelineStatus.includes('Errore') 
-                      ? 'bg-red-100 text-red-700' 
-                      : pipelineStatus.includes('successo') 
-                        ? 'bg-green-100 text-green-700'
-                        : 'bg-blue-100 text-blue-700'
-                  }`}>
-                    {pipelineStatus}
-                  </div>
-                )}
+              <div>
+                <h1 className="text-lg font-bold text-foreground">Catalog Generator</h1>
+                <p className="text-xs text-muted-foreground">EAN · MediaWorld · ePrice</p>
               </div>
             </div>
+            
+            {/* Center: Status & Info */}
+            <div className="hidden md:flex items-center gap-4">
+              <div className={`pill ${statusPill.className}`}>
+                {pipelineRunning && <Loader2 className="h-3 w-3 animate-spin" />}
+                {statusPill.label}
+              </div>
+              {pipelineStatus && !pipelineRunning && pipelineProgress === 100 && (
+                <span className="text-xs text-muted-foreground">
+                  Ultimo run: completato
+                </span>
+              )}
+            </div>
+            
+            {/* Right: CTA + Logout */}
+            <div className="flex items-center gap-3">
+              <button
+                onClick={handleFullPipeline}
+                disabled={pipelineRunning || isProcessing || ftpImportLoading || isExportingEAN}
+                className="neon-btn-primary text-sm px-4 py-2"
+              >
+                {pipelineRunning ? (
+                  <>
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    In esecuzione…
+                  </>
+                ) : (
+                  <>
+                    <Cloud className="mr-2 h-4 w-4" />
+                    Esegui pipeline completa
+                  </>
+                )}
+              </button>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={logout}
+                className="text-muted-foreground hover:text-foreground"
+              >
+                <LogOut className="h-4 w-4" />
+              </Button>
+            </div>
           </div>
+          
+          {/* Progress bar under header when running */}
+          {(pipelineRunning || (pipelineProgress > 0 && pipelineProgress < 100)) && (
+            <div className="mt-3">
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-xs text-muted-foreground">{pipelineStepLabel}</span>
+                <span className="text-xs font-semibold text-foreground">{pipelineProgress}%</span>
+              </div>
+              <div className="neon-progress">
+                <div 
+                  className="neon-progress-fill"
+                  style={{ width: `${pipelineProgress}%` }}
+                />
+              </div>
+            </div>
+          )}
         </div>
+      </header>
+
+      {/* ========== MAIN CONTENT ========== */}
+      <main className="max-w-[1600px] mx-auto px-4 sm:px-6 py-6">
+        <div className="space-y-6">
+          {/* Pipeline Steps - Always visible */}
+          <PipelineStepsDisplay steps={pipelineSteps} isRunning={pipelineRunning} />
 
         {/* Instructions */}
         <div className="card border-strong">
@@ -6503,131 +6500,149 @@ const AltersideCatalogGenerator: React.FC = () => {
           </div>
         )}
 
-        {/* Download Buttons */}
+        {/* ========== EXPORT SECTION ========== */}
         {isCompleted && currentProcessedData.length > 0 && (
-          <div className="text-center">
-            <h3 className="text-2xl font-bold mb-6">Download Pipeline {currentPipeline}</h3>
-            <div className="flex flex-wrap justify-center gap-4">
-              <button 
-                type="button"
-                onClick={currentPipeline === 'EAN' ? onExportEAN : () => downloadExcel('manufpartnr')} 
-                disabled={(isExportingEAN && currentPipeline === 'EAN') || pipelineRunning}
-                className={`btn btn-primary text-lg px-8 py-3 ${(isExportingEAN && currentPipeline === 'EAN') || pipelineRunning ? 'opacity-50 cursor-not-allowed' : ''}`}
-              >
-                <Download className="mr-3 h-5 w-5" />
-                {isExportingEAN && currentPipeline === 'EAN' ? 'ESPORTAZIONE...' : `SCARICA EXCEL (${currentPipeline})`}
-              </button>
-              <button 
-                onClick={() => downloadLog(currentPipeline === 'EAN' ? 'ean' : 'manufpartnr')} 
-                className="btn btn-secondary text-lg px-8 py-3"
-              >
-                <Download className="mr-3 h-5 w-5" />
-                SCARICA LOG ({currentPipeline})
-              </button>
-              {discardedRows.length > 0 && currentPipeline === 'EAN' && (
-                <button 
-                  onClick={downloadDiscardedRows}
-                  className="btn btn-secondary text-lg px-8 py-3"
-                >
-                  <Download className="mr-3 h-5 w-5" />
-                  SCARTI EAN ({discardedRows.length})
-                </button>
-              )}
+          <div className="neon-card">
+            <div className="neon-card-header">
+              <h3 className="section-title">Export</h3>
+              <p className="section-helper">Generazione file Excel (senza ricalcolo per MediaWorld ed ePrice).</p>
             </div>
-            
-            {/* Note: IT/EU Stock Config moved to file upload section for always-visible access */}
-            
-            {/* ePrice Export Section - Only for EAN pipeline */}
-            {currentPipeline === 'EAN' && (
-              <div className="mt-8 p-6 rounded-lg border" style={{ background: '#f0f9ff' }}>
-                <h4 className="text-lg font-semibold mb-4 text-blue-800">Esporta Catalogo ePrice</h4>
-                <div className="flex flex-wrap items-center justify-center gap-4">
+            <div className="neon-card-body">
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                {/* EAN Export Card */}
+                <div className="neon-card p-4">
+                  <div className="flex items-center justify-between mb-3">
+                    <span className="export-tag export-tag-ean">EAN</span>
+                    {isExportingEAN && <Loader2 className="h-4 w-4 animate-spin text-primary" />}
+                  </div>
+                  <h4 className="font-semibold text-foreground mb-2">Catalogo EAN</h4>
+                  <p className="text-xs text-muted-foreground mb-4">Export principale con prezzi ,99</p>
                   <button 
                     type="button"
-                    onClick={onExportEprice}
-                    disabled={isExportingEprice || pipelineRunning}
-                    className={`btn btn-primary text-lg px-8 py-3 ${isExportingEprice || pipelineRunning ? 'opacity-50 cursor-not-allowed' : ''}`}
-                    style={{ background: '#0369a1' }}
+                    onClick={currentPipeline === 'EAN' ? onExportEAN : () => downloadExcel('manufpartnr')} 
+                    disabled={(isExportingEAN && currentPipeline === 'EAN') || pipelineRunning}
+                    className="neon-btn-primary w-full text-sm py-2"
                   >
-                    <Download className="mr-3 h-5 w-5" />
-                    {isExportingEprice ? 'ESPORTAZIONE...' : 'Esporta catalogo ePrice'}
+                    <Download className="mr-2 h-4 w-4" />
+                    {isExportingEAN ? 'Esportazione...' : 'Scarica Excel'}
                   </button>
                 </div>
-                <p className="text-xs text-muted-foreground mt-3">
-                  Usa configurazione IT/EU sopra. Genera "Tracciato_Pubblicazione_Offerte_new.xlsx"
-                </p>
-              </div>
-            )}
-            
-            {/* Mediaworld Export Section - Only for EAN pipeline */}
-            {currentPipeline === 'EAN' && (
-              <div className="mt-8 p-6 rounded-lg border" style={{ background: '#fef3c7' }}>
-                <h4 className="text-lg font-semibold mb-4 text-amber-800">Esporta Catalogo Mediaworld</h4>
-                <div className="flex flex-wrap items-center justify-center gap-4">
+                
+                {/* MediaWorld Export Card */}
+                <div className="neon-card p-4">
+                  <div className="flex items-center justify-between mb-3">
+                    <span className="export-tag export-tag-mediaworld">MW</span>
+                    {isExportingMediaworld && <Loader2 className="h-4 w-4 animate-spin text-warning" />}
+                  </div>
+                  <h4 className="font-semibold text-foreground mb-2">MediaWorld</h4>
+                  <p className="text-xs text-muted-foreground mb-4">Template ufficiale MW</p>
                   <button 
                     type="button"
                     onClick={onExportMediaworld}
-                    disabled={isExportingMediaworld || pipelineRunning}
-                    className={`btn btn-primary text-lg px-8 py-3 ${isExportingMediaworld || pipelineRunning ? 'opacity-50 cursor-not-allowed' : ''}`}
-                    style={{ background: '#d97706' }}
+                    disabled={isExportingMediaworld || pipelineRunning || currentPipeline !== 'EAN'}
+                    className="neon-btn-secondary w-full text-sm py-2"
                   >
-                    <Download className="mr-3 h-5 w-5" />
-                    {isExportingMediaworld ? 'ESPORTAZIONE...' : 'Genera catalogo Mediaworld (.xlsx)'}
+                    <Download className="mr-2 h-4 w-4" />
+                    {isExportingMediaworld ? 'Esportazione...' : 'Scarica Excel'}
                   </button>
                 </div>
-                <p className="text-xs text-muted-foreground mt-3">
-                  Usa configurazione IT/EU sopra. Genera "mediaworld-offers-YYYYMMDD.xlsx"
-                </p>
-              </div>
-            )}
-
-            {/* Note: Save button moved to IT/EU config section in file upload area */}
-            {/* SFTP Upload Status - Only for EAN pipeline */}
-            {currentPipeline === 'EAN' && sftpUploadStatus.phase !== 'idle' && (
-              <div className="mt-8 p-6 rounded-lg border-2" style={{ 
-                background: sftpUploadStatus.phase === 'complete' ? '#f0fdf4' : 
-                            sftpUploadStatus.phase === 'error' ? '#fef2f2' : '#f0f9ff', 
-                borderColor: sftpUploadStatus.phase === 'complete' ? '#22c55e' : 
-                             sftpUploadStatus.phase === 'error' ? '#ef4444' : '#3b82f6'
-              }}>
-                <h4 className={`text-lg font-semibold mb-4 flex items-center gap-2 ${
-                  sftpUploadStatus.phase === 'complete' ? 'text-green-800' :
-                  sftpUploadStatus.phase === 'error' ? 'text-red-800' : 'text-blue-800'
-                }`}>
-                  {sftpUploadStatus.phase === 'complete' && <CheckCircle className="h-5 w-5" />}
-                  {sftpUploadStatus.phase === 'error' && <XCircle className="h-5 w-5" />}
-                  {['saving', 'uploading'].includes(sftpUploadStatus.phase) && <Loader2 className="h-5 w-5 animate-spin" />}
-                  <Cloud className="h-5 w-5" />
-                  Stato Upload Bucket/SFTP
-                </h4>
                 
-                <div className="flex items-center gap-2 mb-2">
-                  <span className={`font-medium ${
-                    sftpUploadStatus.phase === 'complete' ? 'text-green-700' :
-                    sftpUploadStatus.phase === 'error' ? 'text-red-700' :
-                    'text-blue-700'
-                  }`}>
-                    {sftpUploadStatus.message}
-                  </span>
+                {/* ePrice Export Card */}
+                <div className="neon-card p-4">
+                  <div className="flex items-center justify-between mb-3">
+                    <span className="export-tag export-tag-eprice">ePrice</span>
+                    {isExportingEprice && <Loader2 className="h-4 w-4 animate-spin text-info" />}
+                  </div>
+                  <h4 className="font-semibold text-foreground mb-2">ePrice</h4>
+                  <p className="text-xs text-muted-foreground mb-4">Tracciato pubblicazione</p>
+                  <button 
+                    type="button"
+                    onClick={onExportEprice}
+                    disabled={isExportingEprice || pipelineRunning || currentPipeline !== 'EAN'}
+                    className="neon-btn-secondary w-full text-sm py-2"
+                  >
+                    <Download className="mr-2 h-4 w-4" />
+                    {isExportingEprice ? 'Esportazione...' : 'Scarica Excel'}
+                  </button>
                 </div>
                 
-                {sftpUploadStatus.results && (
-                  <div className="mt-2 space-y-1">
-                    {sftpUploadStatus.results.map((result, idx) => (
-                      <div key={idx} className="flex items-center gap-2 text-sm">
-                        {result.uploaded ? (
-                          <CheckCircle className="h-4 w-4 text-green-600" />
-                        ) : (
-                          <XCircle className="h-4 w-4 text-red-600" />
-                        )}
-                        <span>{result.filename}</span>
-                        {result.error && <span className="text-red-600 text-xs">({result.error})</span>}
-                      </div>
-                    ))}
+                {/* Amazon Export Card - PLACEHOLDER */}
+                <div className="neon-card p-4 opacity-60">
+                  <div className="flex items-center justify-between mb-3">
+                    <span className="export-tag export-tag-amazon">Amazon</span>
                   </div>
+                  <h4 className="font-semibold text-foreground mb-2">Amazon</h4>
+                  <p className="text-xs text-muted-foreground mb-4">In arrivo</p>
+                  <button 
+                    type="button"
+                    disabled
+                    className="neon-btn-secondary w-full text-sm py-2 cursor-not-allowed"
+                  >
+                    <Download className="mr-2 h-4 w-4" />
+                    In arrivo
+                  </button>
+                </div>
+              </div>
+              
+              {/* Secondary actions row */}
+              <div className="flex flex-wrap gap-3 mt-4 pt-4 border-t border-border">
+                <button 
+                  onClick={() => downloadLog(currentPipeline === 'EAN' ? 'ean' : 'manufpartnr')} 
+                  className="neon-btn-secondary text-sm px-4 py-2"
+                >
+                  <Download className="mr-2 h-4 w-4" />
+                  Scarica Log
+                </button>
+                {discardedRows.length > 0 && currentPipeline === 'EAN' && (
+                  <button 
+                    onClick={downloadDiscardedRows}
+                    className="neon-btn-secondary text-sm px-4 py-2"
+                  >
+                    <Download className="mr-2 h-4 w-4" />
+                    Scarti EAN ({discardedRows.length})
+                  </button>
                 )}
               </div>
-            )}
+            </div>
+          </div>
+        )}
+
+        {/* SFTP Upload Status */}
+        {currentPipeline === 'EAN' && sftpUploadStatus.phase !== 'idle' && (
+          <div className="neon-card">
+            <div className="neon-card-body">
+              <div className="flex items-center gap-3 mb-3">
+                {sftpUploadStatus.phase === 'complete' && <CheckCircle className="h-5 w-5 text-success" />}
+                {sftpUploadStatus.phase === 'error' && <XCircle className="h-5 w-5 text-destructive" />}
+                {['saving', 'uploading'].includes(sftpUploadStatus.phase) && <Loader2 className="h-5 w-5 animate-spin text-primary" />}
+                <Cloud className="h-5 w-5 text-muted-foreground" />
+                <span className="font-semibold text-foreground">Stato Upload Bucket/SFTP</span>
+              </div>
+              
+              <p className={`text-sm ${
+                sftpUploadStatus.phase === 'complete' ? 'text-success' :
+                sftpUploadStatus.phase === 'error' ? 'text-destructive' :
+                'text-info'
+              }`}>
+                {sftpUploadStatus.message}
+              </p>
+              
+              {sftpUploadStatus.results && (
+                <div className="mt-3 space-y-1">
+                  {sftpUploadStatus.results.map((result, idx) => (
+                    <div key={idx} className="flex items-center gap-2 text-sm">
+                      {result.uploaded ? (
+                        <CheckCircle className="h-4 w-4 text-success" />
+                      ) : (
+                        <XCircle className="h-4 w-4 text-destructive" />
+                      )}
+                      <span className="text-foreground">{result.filename}</span>
+                      {result.error && <span className="text-destructive text-xs">({result.error})</span>}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
         )}
 
@@ -6796,7 +6811,8 @@ const AltersideCatalogGenerator: React.FC = () => {
         )}
 
         {/* Data Preview section removed per Part A requirement */}
-      </div>
+        </div>
+      </main>
     </div>
   );
 };

@@ -4,83 +4,100 @@
 
 @layer base {
   :root {
-    /* High contrast flat design colors */
+    /* Neon Dark Ops - Light mode fallback (not primary) */
     --background: 250 250 250;
     --foreground: 25 25 25;
-
     --card: 255 255 255;
     --card-foreground: 25 25 25;
-
     --popover: 255 255 255;
     --popover-foreground: 25 25 25;
-
-    /* Primary blue for buttons and accents */
-    --primary: 37 99 235;
-    --primary-foreground: 255 255 255;
-
-    /* Secondary gray for less important elements */
+    --primary: 280 100% 50%;
+    --primary-foreground: 0 0% 100%;
     --secondary: 245 245 245;
     --secondary-foreground: 60 60 60;
-
     --muted: 245 245 245;
     --muted-foreground: 100 100 100;
-
-    /* High contrast accent colors */
-    --accent: 239 246 255;
-    --accent-foreground: 30 58 138;
-
-    /* Success green for valid states */
-    --success: 34 197 94;
-    --success-foreground: 255 255 255;
-
-    /* Destructive red for errors */
-    --destructive: 239 68 68;
-    --destructive-foreground: 255 255 255;
-
-    /* Strong borders for flat design */
+    --accent: 280 80% 60%;
+    --accent-foreground: 0 0% 100%;
+    --success: 142 71% 45%;
+    --success-foreground: 0 0% 100%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+    --warning: 38 92% 50%;
+    --warning-foreground: 0 0% 100%;
+    --info: 199 89% 48%;
+    --info-foreground: 0 0% 100%;
     --border: 200 200 200;
     --input: 200 200 200;
-    --ring: 37 99 235;
-
-    /* High contrast progress colors */
+    --ring: 280 100% 50%;
     --progress-bg: 230 230 230;
-    --progress-fill: 34 197 94;
-
-    --radius: 8px;
+    --progress-fill: 280 100% 50%;
+    --radius: 14px;
   }
 
-  .dark {
-    --background: 15 15 15;
-    --foreground: 245 245 245;
-    --card: 25 25 25;
-    --card-foreground: 245 245 245;
-    --popover: 25 25 25;
-    --popover-foreground: 245 245 245;
-    --primary: 96 165 250;
-    --primary-foreground: 15 15 15;
-    --secondary: 35 35 35;
-    --secondary-foreground: 200 200 200;
-    --muted: 35 35 35;
-    --muted-foreground: 160 160 160;
-    --accent: 37 99 235;
-    --accent-foreground: 219 234 254;
-    --success: 34 197 94;
-    --success-foreground: 255 255 255;
-    --destructive: 239 68 68;
-    --destructive-foreground: 255 255 255;
-    --border: 60 60 60;
-    --input: 60 60 60;
-    --ring: 96 165 250;
-    --progress-bg: 60 60 60;
-    --progress-fill: 34 197 94;
-    --sidebar-background: 240 5.9% 10%;
-    --sidebar-foreground: 240 4.8% 95.9%;
-    --sidebar-primary: 224.3 76.3% 48%;
+  /* ========== NEON DARK OPS THEME (PRIMARY) ========== */
+  .dark, :root {
+    /* Core backgrounds */
+    --background: 240 20% 4%;          /* #0B0B12 */
+    --foreground: 240 20% 98%;         /* #F4F5FF */
+    
+    /* Card/Surface */
+    --card: 240 30% 7%;                /* #121225 */
+    --card-foreground: 240 20% 98%;    /* #F4F5FF */
+    --card-hover: 240 30% 10%;         /* #1A1A33 */
+    
+    /* Popover */
+    --popover: 240 30% 7%;
+    --popover-foreground: 240 20% 98%;
+    
+    /* Brand gradient colors (magenta → purple) */
+    --primary: 300 100% 43%;           /* #D800DA */
+    --primary-foreground: 0 0% 100%;
+    --primary-glow: 280 100% 48%;      /* #9300F6 */
+    
+    /* Secondary */
+    --secondary: 240 30% 10%;          /* #1A1A33 */
+    --secondary-foreground: 240 20% 85%; /* #B7B9D6 */
+    
+    /* Muted */
+    --muted: 240 30% 10%;
+    --muted-foreground: 240 20% 70%;   /* #B7B9D6 */
+    
+    /* Accent */
+    --accent: 280 100% 48%;            /* #9300F6 */
+    --accent-foreground: 0 0% 100%;
+    
+    /* Status colors */
+    --success: 142 71% 45%;            /* #22C55E */
+    --success-foreground: 0 0% 100%;
+    --destructive: 0 84% 60%;          /* #EF4444 */
+    --destructive-foreground: 0 0% 100%;
+    --warning: 38 92% 50%;             /* #F59E0B */
+    --warning-foreground: 0 0% 100%;
+    --info: 199 89% 48%;               /* #38BDF8 */
+    --info-foreground: 0 0% 100%;
+    
+    /* Borders */
+    --border: 240 30% 18%;             /* #24244A */
+    --input: 240 30% 18%;
+    --ring: 300 100% 43%;
+    
+    /* Progress */
+    --progress-bg: 240 30% 18%;
+    --progress-fill: 300 100% 43%;
+    
+    /* Radius */
+    --radius: 14px;
+    
+    /* Sidebar (keeping compatibility) */
+    --sidebar-background: 240 30% 4%;
+    --sidebar-foreground: 240 20% 98%;
+    --sidebar-primary: 300 100% 43%;
     --sidebar-primary-foreground: 0 0% 100%;
-    --sidebar-accent: 240 3.7% 15.9%;
-    --sidebar-accent-foreground: 240 4.8% 95.9%;
-    --sidebar-border: 240 3.7% 15.9%;
-    --sidebar-ring: 217.2 91.2% 59.8%;
+    --sidebar-accent: 240 30% 10%;
+    --sidebar-accent-foreground: 240 20% 98%;
+    --sidebar-border: 240 30% 18%;
+    --sidebar-ring: 300 100% 43%;
   }
 }
 
@@ -94,37 +111,315 @@
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;
     font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
   }
+}
 
-  /* High contrast utility classes for flat design */
+@layer components {
+  /* ========== NEON DARK OPS COMPONENTS ========== */
+  
+  /* Brand gradient */
+  .gradient-brand {
+    background: linear-gradient(135deg, hsl(300 100% 43%) 0%, hsl(280 100% 48%) 100%);
+  }
+  
+  .gradient-brand-subtle {
+    background: linear-gradient(135deg, hsl(300 100% 43% / 0.15) 0%, hsl(280 100% 48% / 0.15) 100%);
+  }
+  
+  .gradient-brand-text {
+    background: linear-gradient(135deg, hsl(300 100% 43%) 0%, hsl(280 100% 48%) 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+  
+  /* Neon glow effects */
+  .glow-brand {
+    box-shadow: 0 0 20px hsl(300 100% 43% / 0.3), 0 0 40px hsl(280 100% 48% / 0.15);
+  }
+  
+  .glow-success {
+    box-shadow: 0 0 20px hsl(142 71% 45% / 0.3);
+  }
+  
+  .glow-info {
+    box-shadow: 0 0 20px hsl(199 89% 48% / 0.3);
+  }
+  
+  /* Status pills */
+  .pill {
+    @apply inline-flex items-center gap-1.5 px-3 py-1 text-xs font-semibold rounded-full;
+  }
+  
+  .pill-idle {
+    @apply bg-secondary text-secondary-foreground;
+  }
+  
+  .pill-running {
+    @apply text-white;
+    background: linear-gradient(135deg, hsl(300 100% 43%) 0%, hsl(280 100% 48%) 100%);
+  }
+  
+  .pill-success {
+    @apply bg-success text-success-foreground;
+  }
+  
+  .pill-error {
+    @apply bg-destructive text-destructive-foreground;
+  }
+  
+  .pill-warning {
+    @apply bg-warning text-warning-foreground;
+  }
+  
+  .pill-info {
+    @apply bg-info text-info-foreground;
+  }
+  
+  /* Export tag pills */
+  .export-tag {
+    @apply inline-flex items-center px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider rounded;
+  }
+  
+  .export-tag-ean {
+    background: linear-gradient(135deg, hsl(300 100% 43%) 0%, hsl(280 100% 48%) 100%);
+    @apply text-white;
+  }
+  
+  .export-tag-mediaworld {
+    @apply bg-warning text-warning-foreground;
+  }
+  
+  .export-tag-eprice {
+    @apply bg-info text-info-foreground;
+  }
+  
+  .export-tag-amazon {
+    @apply bg-secondary text-muted-foreground;
+  }
+  
+  /* Neon cards */
+  .neon-card {
+    @apply bg-card border border-border rounded-[14px] transition-all duration-200;
+  }
+  
+  .neon-card:hover {
+    background: hsl(var(--card-hover));
+    border-color: hsl(300 100% 43% / 0.3);
+  }
+  
+  .neon-card-header {
+    @apply p-4 border-b border-border;
+  }
+  
+  .neon-card-body {
+    @apply p-4;
+  }
+  
+  /* Neon buttons */
+  .neon-btn-primary {
+    @apply relative inline-flex items-center justify-center px-6 py-3 font-semibold text-white rounded-lg transition-all duration-200;
+    background: linear-gradient(135deg, hsl(300 100% 43%) 0%, hsl(280 100% 48%) 100%);
+  }
+  
+  .neon-btn-primary:hover:not(:disabled) {
+    box-shadow: 0 0 20px hsl(300 100% 43% / 0.4), 0 0 40px hsl(280 100% 48% / 0.2);
+    transform: translateY(-1px);
+  }
+  
+  .neon-btn-primary:disabled {
+    @apply opacity-50 cursor-not-allowed;
+  }
+  
+  .neon-btn-secondary {
+    @apply inline-flex items-center justify-center px-4 py-2 font-medium text-foreground bg-secondary border border-border rounded-lg transition-all duration-200;
+  }
+  
+  .neon-btn-secondary:hover:not(:disabled) {
+    background: hsl(var(--card-hover));
+    @apply border-primary/30;
+  }
+  
+  .neon-btn-secondary:disabled {
+    @apply opacity-50 cursor-not-allowed;
+  }
+  
+  /* Neon input */
+  .neon-input {
+    @apply w-full px-3 py-2 bg-secondary border border-border rounded-lg text-foreground placeholder:text-muted-foreground transition-all duration-200;
+  }
+  
+  .neon-input:focus {
+    @apply outline-none border-primary ring-2 ring-primary/20;
+  }
+  
+  /* Progress bar neon */
+  .neon-progress {
+    @apply w-full h-2 bg-secondary rounded-full overflow-hidden;
+  }
+  
+  .neon-progress-fill {
+    @apply h-full transition-all duration-300 ease-out;
+    background: linear-gradient(90deg, hsl(300 100% 43%) 0%, hsl(280 100% 48%) 100%);
+  }
+  
+  /* Dropzone neon */
+  .neon-dropzone {
+    @apply border-2 border-dashed border-border rounded-[14px] p-6 text-center transition-all duration-200 cursor-pointer;
+    background: hsl(var(--card) / 0.5);
+  }
+  
+  .neon-dropzone:hover {
+    @apply border-primary/50;
+    background: hsl(var(--card));
+  }
+  
+  /* Badge variants */
+  .neon-badge {
+    @apply inline-flex items-center gap-1.5 px-2 py-1 text-xs font-medium rounded-md;
+  }
+  
+  .neon-badge-success {
+    @apply bg-success/20 text-success;
+  }
+  
+  .neon-badge-error {
+    @apply bg-destructive/20 text-destructive;
+  }
+  
+  .neon-badge-warning {
+    @apply bg-warning/20 text-warning;
+  }
+  
+  .neon-badge-info {
+    @apply bg-info/20 text-info;
+  }
+  
+  /* Section headers */
+  .section-title {
+    @apply text-lg font-semibold text-foreground;
+  }
+  
+  .section-helper {
+    @apply text-sm text-muted-foreground mt-1;
+  }
+  
+  /* ========== LEGACY COMPATIBILITY (keeping old classes working) ========== */
   .flat-card {
-    @apply bg-card border-2 border-border rounded-lg shadow-none;
+    @apply neon-card;
   }
   
   .flat-button {
-    @apply bg-primary text-primary-foreground border-2 border-primary rounded-lg px-6 py-3 text-base font-semibold transition-all duration-200 hover:bg-primary/90 hover:shadow-lg active:scale-95;
+    @apply neon-btn-primary;
   }
   
   .flat-button-success {
-    @apply bg-success text-success-foreground border-2 border-success rounded-lg px-6 py-3 text-base font-semibold transition-all duration-200 hover:bg-success/90 hover:shadow-lg active:scale-95;
+    @apply neon-btn-primary bg-success;
   }
   
   .flat-upload-box {
-    @apply border-4 border-dashed border-border rounded-lg p-8 transition-all duration-200 hover:border-primary hover:bg-accent/50;
+    @apply neon-dropzone;
   }
   
   .flat-badge-success {
-    @apply inline-flex items-center gap-2 px-3 py-1 bg-success text-success-foreground text-sm font-semibold rounded-full;
+    @apply neon-badge-success;
   }
   
   .flat-badge-error {
-    @apply inline-flex items-center gap-2 px-3 py-1 bg-destructive text-destructive-foreground text-sm font-semibold rounded-full;
+    @apply neon-badge-error;
   }
   
   .flat-progress {
-    @apply w-full h-4 bg-[hsl(var(--progress-bg))] rounded-full overflow-hidden;
+    @apply neon-progress;
   }
   
   .flat-progress-fill {
-    @apply h-full bg-[hsl(var(--progress-fill))] transition-all duration-300 ease-out;
+    @apply neon-progress-fill;
+  }
+  
+  /* Legacy card classes */
+  .card {
+    @apply neon-card;
+  }
+  
+  .card-body {
+    @apply p-5;
+  }
+  
+  .card-title {
+    @apply text-lg font-semibold text-foreground;
+  }
+  
+  /* Legacy button classes */
+  .btn {
+    @apply inline-flex items-center justify-center font-medium transition-all duration-200 rounded-lg;
+  }
+  
+  .btn-primary {
+    @apply neon-btn-primary;
+  }
+  
+  .btn-secondary {
+    @apply neon-btn-secondary;
+  }
+  
+  .is-disabled {
+    @apply opacity-50 cursor-not-allowed pointer-events-none;
+  }
+  
+  /* Legacy dropzone */
+  .dropzone {
+    @apply neon-dropzone;
+  }
+  
+  /* Legacy badge */
+  .badge-ok {
+    @apply neon-badge-success;
+  }
+  
+  .badge-err {
+    @apply neon-badge-error;
+  }
+  
+  /* Legacy border-strong */
+  .border-strong {
+    @apply border border-border;
+  }
+  
+  /* Legacy text-muted */
+  .text-muted {
+    @apply text-muted-foreground;
+  }
+  
+  /* Legacy icon-dark */
+  .icon-dark {
+    @apply text-muted-foreground;
+  }
+  
+  /* Legacy progress */
+  .progress {
+    @apply neon-progress relative;
+  }
+  
+  .progress span {
+    @apply neon-progress-fill absolute inset-y-0 left-0;
+  }
+  
+  /* Scrollbar styling */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  
+  ::-webkit-scrollbar-track {
+    background: hsl(var(--background));
+  }
+  
+  ::-webkit-scrollbar-thumb {
+    background: hsl(var(--border));
+    border-radius: 4px;
+  }
+  
+  ::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--muted-foreground) / 0.5);
   }
 }
