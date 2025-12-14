@@ -2,13 +2,32 @@
 // Enhanced with: scientific notation detection, EAN normalization, proper conflict classification
 
 /**
- * Detects if an MPN value contains scientific notation (E+ or E-)
- * This indicates the MPN was incorrectly parsed as a number
+ * Detects if an MPN value is in TRUE scientific notation format
+ * This means the ENTIRE string is a number in scientific notation (e.g., 1.23E+05, 5e-3)
+ * 
+ * This indicates the MPN was incorrectly parsed/coerced from a number during import.
+ * 
+ * Valid SKUs like "ABC1234E+XYZ" will NOT be flagged - they contain "E+" as a substring
+ * but are NOT in scientific notation format.
+ * 
+ * @returns true only if the entire string matches scientific notation pattern
  */
-function detectScientificNotation(value) {
+function isScientificNotation(value) {
   if (!value || typeof value !== 'string') return false;
-  // Pattern: digits followed by e+/e- and more digits (case insensitive)
-  return /[0-9]\.?[0-9]*e[+-]?[0-9]+/i.test(value);
+  // Pattern: entire string must be a scientific notation number
+  // Examples that match: "1.23E+05", "5e-3", "-2.5e+10", "123e5"
+  // Examples that DON'T match: "ABC1234E+XYZ", "SKU-E+123", "1234E+ABC"
+  return /^[+-]?\d+(?:[.,]\d+)?[eE][+-]?\d+$/.test(value.trim());
+}
+
+/**
+ * Checks if MPN contains "E+" as a substring (case-insensitive)
+ * This is for informative purposes - valid SKUs like "ABC1234E+XYZ"
+ * @returns true if contains E+ substring
+ */
+function countEPlusSubstring(value) {
+  if (!value || typeof value !== 'string') return false;
+  return /e\+/i.test(value);
 }
 
 /**
@@ -17,7 +36,7 @@ function detectScientificNotation(value) {
  */
 function sanitizeMPN(value) {
   if (value === null || value === undefined) return '';
-  // Convert to string and trim
+  // CRITICAL: Always convert to string first to prevent number coercion
   let str = String(value).trim();
   // Remove non-printable characters except space
   str = str.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
@@ -82,7 +101,7 @@ self.onmessage = function(e) {
       return;
     }
     
-    // Initialize counters
+    // Initialize counters - ALL counters must be initialized to 0 to avoid NaN
     const counters = {
       already_populated: 0,
       filled_now: 0,
@@ -92,9 +111,13 @@ self.onmessage = function(e) {
       empty_ean_rows: 0,
       missing_mapping_in_new_file: 0,
       errori_formali: 0,
-      // NEW counters
+      // MPN with "E+" substring (valid SKUs) - informative only
+      mpnWithEPlusSubstringMaterial: 0,
+      mpnWithEPlusSubstringMapping: 0,
+      // TRUE scientific notation (coercion) - warning
       mpnScientificNotationFoundMaterial: 0,
       mpnScientificNotationFoundMapping: 0,
+      // Conflict classification
       materialWinsDifferentEan: 0,
       materialNormalizedMatchesMapping: 0,
       ambiguousMapping: 0
@@ -110,12 +133,16 @@ self.onmessage = function(e) {
       skipped_due_to_conflict: [],
       mpn_not_in_material: [],
       missing_mapping_in_new_file: [],
-      // NEW reports
+      // Conflict classification reports
       materialWinsDifferentEan: [],
       materialNormalizedMatchesMapping: [],
       ambiguousMapping: [],
+      // Scientific notation reports (coercion warning)
       mpnScientificNotationMaterial: [],
-      mpnScientificNotationMapping: []
+      mpnScientificNotationMapping: [],
+      // E+ substring reports (informative only)
+      mpnWithEPlusSubstringMaterial: [],
+      mpnWithEPlusSubstringMapping: []
     };
     
     // Build mapping index: MPN → list of EAN candidates
@@ -141,11 +168,22 @@ self.onmessage = function(e) {
       const mpn = sanitizeMPN(parts[0]);
       const ean_raw = (parts[1] ?? '').trim();
       
-      // Detect scientific notation in MPN from mapping
-      if (detectScientificNotation(mpn)) {
+      // Detect TRUE scientific notation in MPN from mapping (parser coercion - WARNING)
+      if (isScientificNotation(mpn)) {
         counters.mpnScientificNotationFoundMapping++;
-        if (reports.mpnScientificNotationMapping.length < 10) {
+        if (reports.mpnScientificNotationMapping.length < 20) {
           reports.mpnScientificNotationMapping.push({
+            mpn,
+            ean: ean_raw,
+            row_index: i + 1
+          });
+        }
+      }
+      // Detect "E+" substring (valid SKUs - informative only)
+      else if (countEPlusSubstring(mpn)) {
+        counters.mpnWithEPlusSubstringMapping++;
+        if (reports.mpnWithEPlusSubstringMapping.length < 10) {
+          reports.mpnWithEPlusSubstringMapping.push({
             mpn,
             ean: ean_raw,
             row_index: i + 1
@@ -207,11 +245,21 @@ self.onmessage = function(e) {
       if (mpn) {
         materialMPNs.add(mpn);
         
-        // Detect scientific notation in MPN from material
-        if (detectScientificNotation(mpn)) {
+        // Detect TRUE scientific notation in MPN from material (parser coercion - WARNING)
+        if (isScientificNotation(mpn)) {
           counters.mpnScientificNotationFoundMaterial++;
-          if (reports.mpnScientificNotationMaterial.length < 10) {
+          if (reports.mpnScientificNotationMaterial.length < 20) {
             reports.mpnScientificNotationMaterial.push({
+              ManufPartNr: mpn,
+              row_index: index + 1
+            });
+          }
+        }
+        // Detect "E+" substring (valid SKUs - informative only)
+        else if (countEPlusSubstring(mpn)) {
+          counters.mpnWithEPlusSubstringMaterial++;
+          if (reports.mpnWithEPlusSubstringMaterial.length < 10) {
+            reports.mpnWithEPlusSubstringMaterial.push({
               ManufPartNr: mpn,
               row_index: index + 1
             });

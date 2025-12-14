@@ -500,20 +500,26 @@ export function processEANPrefillWithNormalization(
 export function generatePrefillSummary(counters: EANPrefillExtendedCounters): string {
   const parts: string[] = [];
   
-  if (counters.filled_now > 0) {
-    parts.push(`${counters.filled_now} EAN riempiti`);
+  // Use ?? 0 to prevent NaN when counters are undefined
+  const filledNow = counters.filled_now ?? 0;
+  const materialWins = counters.materialWinsDifferentEan ?? 0;
+  const normalizedMatches = counters.materialNormalizedMatchesMapping ?? 0;
+  const ambiguous = counters.ambiguousMapping ?? 0;
+  
+  if (filledNow > 0) {
+    parts.push(`${filledNow} EAN riempiti`);
   }
   
-  if (counters.materialWinsDifferentEan > 0) {
-    parts.push(`${counters.materialWinsDifferentEan} vince Material`);
+  if (materialWins > 0) {
+    parts.push(`${materialWins} vince Material`);
   }
   
-  if (counters.materialNormalizedMatchesMapping > 0) {
-    parts.push(`${counters.materialNormalizedMatchesMapping} match normalizzati`);
+  if (normalizedMatches > 0) {
+    parts.push(`${normalizedMatches} match normalizzati`);
   }
   
-  if (counters.ambiguousMapping > 0) {
-    parts.push(`${counters.ambiguousMapping} ambigui`);
+  if (ambiguous > 0) {
+    parts.push(`${ambiguous} ambigui`);
   }
   
   return parts.length > 0 ? parts.join(', ') : 'Prefill completato';
@@ -524,8 +530,10 @@ export function generatePrefillSummary(counters: EANPrefillExtendedCounters): st
  * This does NOT flag "E+" substrings in valid SKUs
  */
 export function hasScientificNotationWarnings(counters: EANPrefillExtendedCounters): boolean {
-  return counters.mpnScientificNotationFoundMaterial > 0 || 
-         counters.mpnScientificNotationFoundMapping > 0;
+  // Use ?? 0 to prevent undefined issues
+  const materialSci = counters.mpnScientificNotationFoundMaterial ?? 0;
+  const mappingSci = counters.mpnScientificNotationFoundMapping ?? 0;
+  return materialSci > 0 || mappingSci > 0;
 }
 
 /**
@@ -535,15 +543,21 @@ export function hasScientificNotationWarnings(counters: EANPrefillExtendedCounte
 export function generateScientificNotationWarning(counters: EANPrefillExtendedCounters): string | null {
   if (!hasScientificNotationWarnings(counters)) return null;
   
-  return `⚠️ MPN in formato scientifico (es: 1.23E+05) rilevati. Probabile coercizione numerica durante import/parsing. (Material: ${counters.mpnScientificNotationFoundMaterial}, Mapping: ${counters.mpnScientificNotationFoundMapping})`;
+  const materialSci = counters.mpnScientificNotationFoundMaterial ?? 0;
+  const mappingSci = counters.mpnScientificNotationFoundMapping ?? 0;
+  
+  return `⚠️ MPN in formato scientifico (es: 1.23E+05) rilevati. Probabile coercizione numerica durante import/parsing. (Material: ${materialSci}, Mapping: ${mappingSci})`;
 }
 
 /**
  * Generates info message for "E+" substring (valid SKUs) - NOT a warning
  */
 export function generateEPlusSubstringInfo(counters: EANPrefillExtendedCounters): string | null {
-  const total = counters.mpnWithEPlusSubstringMaterial + counters.mpnWithEPlusSubstringMapping;
-  if (total === 0) return null;
+  // Use ?? 0 to prevent NaN when counters are undefined
+  const materialCount = counters.mpnWithEPlusSubstringMaterial ?? 0;
+  const mappingCount = counters.mpnWithEPlusSubstringMapping ?? 0;
+  const total = materialCount + mappingCount;
+  if (total === 0 || isNaN(total)) return null;
   
   return `MPN con stringa "E+" (SKU validi): ${total}`;
 }

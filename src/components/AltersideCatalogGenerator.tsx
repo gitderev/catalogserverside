@@ -1266,6 +1266,13 @@ const AltersideCatalogGenerator: React.FC = () => {
         delimiter: ';',
         encoding: 'UTF-8',
         skipEmptyLines: true,
+        // CRITICAL: Disable dynamic typing to prevent MPN/SKU numeric coercion
+        dynamicTyping: false,
+        // Transform all values to strings to prevent any numeric coercion
+        transform: (value: string, field: string) => {
+          // Always return as string, trimmed
+          return String(value ?? '').trim();
+        },
         complete: (results) => {
           if (results.errors.length > 0) {
             reject(new Error(`Errore parsing: ${results.errors[0].message}`));
@@ -1273,8 +1280,46 @@ const AltersideCatalogGenerator: React.FC = () => {
           }
           
           const headers = results.meta.fields || [];
+          
+          // Post-parse integrity check: verify no MPN/SKU was coerced to number
+          const data = results.data as any[];
+          let coercedCount = 0;
+          const coercedExamples: Array<{value: any, type: string, rowIndex: number, field: string}> = [];
+          
+          // Check identifier fields for type integrity
+          const identifierFields = ['ManufPartNr', 'Matnr', 'ManufacturerPartNo', 'EAN', 'SKU', 'mpn', 'ean'];
+          
+          data.forEach((row, idx) => {
+            for (const field of identifierFields) {
+              if (field in row) {
+                const val = row[field];
+                if (typeof val === 'number') {
+                  coercedCount++;
+                  if (coercedExamples.length < 20) {
+                    coercedExamples.push({
+                      value: val,
+                      type: typeof val,
+                      rowIndex: idx + 1,
+                      field
+                    });
+                  }
+                  // Force to string
+                  row[field] = String(val);
+                }
+              }
+            }
+          });
+          
+          if (coercedCount > 0) {
+            console.error('[parseCSV:coercion_detected]', {
+              coercedCount,
+              examples: coercedExamples,
+              message: 'MPN/SKU coerced to number - forced back to string'
+            });
+          }
+          
           resolve({
-            data: results.data,
+            data,
             headers
           });
         },
@@ -5160,13 +5205,13 @@ const AltersideCatalogGenerator: React.FC = () => {
             summary: prefillSummary + (hasScientificWarning ? ' ⚠️ Parser coercion' : ''),
             details: (hasWarnings || ePlusInfo) && prefillCounters ? {
               counters: {
-                'EAN riempiti': prefillCounters.filled_now,
-                'Già popolati': prefillCounters.already_populated,
-                'Vince Material (diverso)': prefillCounters.materialWinsDifferentEan,
-                'Match normalizzati': prefillCounters.materialNormalizedMatchesMapping,
-                'Ambigui (non prefillati)': prefillCounters.ambiguousMapping,
-                'MPN con E+ (SKU validi)': prefillCounters.mpnWithEPlusSubstringMaterial + prefillCounters.mpnWithEPlusSubstringMapping,
-                'MPN formato scientifico (coercizione)': prefillCounters.mpnScientificNotationFoundMaterial + prefillCounters.mpnScientificNotationFoundMapping
+                'EAN riempiti': prefillCounters.filled_now ?? 0,
+                'Già popolati': prefillCounters.already_populated ?? 0,
+                'Vince Material (diverso)': prefillCounters.materialWinsDifferentEan ?? 0,
+                'Match normalizzati': prefillCounters.materialNormalizedMatchesMapping ?? 0,
+                'Ambigui (non prefillati)': prefillCounters.ambiguousMapping ?? 0,
+                'MPN con E+ (SKU validi)': (prefillCounters.mpnWithEPlusSubstringMaterial ?? 0) + (prefillCounters.mpnWithEPlusSubstringMapping ?? 0),
+                'MPN formato scientifico (coercizione)': (prefillCounters.mpnScientificNotationFoundMaterial ?? 0) + (prefillCounters.mpnScientificNotationFoundMapping ?? 0)
               },
               warnings: [
                 ...(hasScientificWarning ? [generateScientificNotationWarning(prefillCounters) || ''] : []),

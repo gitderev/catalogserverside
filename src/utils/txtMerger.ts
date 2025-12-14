@@ -36,8 +36,10 @@ export const parseTXT = (file: File): Promise<ParsedTXT> => {
         delimiter: delimiter,
         header: true,
         skipEmptyLines: true,
+        // CRITICAL: Disable dynamic typing to prevent MPN/SKU numeric coercion
+        dynamicTyping: false,
         transformHeader: (header: string) => header.trim(),
-        transform: (value: string) => value.trim(),
+        transform: (value: string) => String(value ?? '').trim(),
         complete: (results) => {
           if (results.errors.length > 0) {
             reject(new Error('Errore nel parsing del TXT: ' + results.errors[0].message));
@@ -46,6 +48,16 @@ export const parseTXT = (file: File): Promise<ParsedTXT> => {
           
           const data = results.data as any[];
           const headers = Object.keys(data[0] || {});
+          
+          // Post-parse integrity check
+          const identifierFields = ['ManufPartNr', 'Matnr', 'ManufacturerPartNo', 'EAN', 'SKU', 'mpn', 'ean'];
+          data.forEach((row) => {
+            for (const field of identifierFields) {
+              if (field in row && typeof row[field] === 'number') {
+                row[field] = String(row[field]);
+              }
+            }
+          });
           
           resolve({ data, headers });
         },
