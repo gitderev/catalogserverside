@@ -11,6 +11,14 @@ export const parseCSV = (file: File): Promise<ParsedCSV> => {
     Papa.parse(file, {
       header: true,
       skipEmptyLines: true,
+      // CRITICAL: Disable dynamic typing to prevent MPN/EAN from being converted to numbers
+      // This prevents scientific notation (E+) issues with long numeric strings
+      dynamicTyping: false,
+      // Transform all values to strings to ensure MPN/EAN are never numbers
+      transform: (value: string) => {
+        // Sanitize string: trim and remove non-printable characters
+        return (value || '').trim().replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
+      },
       complete: (results) => {
         if (results.errors.length > 0) {
           reject(new Error('Errore nel parsing del CSV: ' + results.errors[0].message));

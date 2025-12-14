@@ -1265,6 +1265,15 @@ const AltersideCatalogGenerator: React.FC = () => {
         delimiter: ';',
         encoding: 'UTF-8',
         skipEmptyLines: true,
+        // CRITICAL: Disable dynamic typing to prevent MPN/EAN from being converted to numbers
+        // This prevents scientific notation (E+) issues with long numeric strings
+        dynamicTyping: false,
+        // Transform all values to strings to ensure MPN/EAN are never numbers
+        transform: (value: string, field: string) => {
+          // Sanitize string: trim and remove non-printable characters
+          const trimmed = (value || '').trim().replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
+          return trimmed;
+        },
         complete: (results) => {
           if (results.errors.length > 0) {
             reject(new Error(`Errore parsing: ${results.errors[0].message}`));
@@ -1272,6 +1281,22 @@ const AltersideCatalogGenerator: React.FC = () => {
           }
           
           const headers = results.meta.fields || [];
+          
+          // DEBUG: Log if any MPN/EAN values contain scientific notation (should be 0 after this fix)
+          let scientificNotationCount = 0;
+          const scientificPattern = /[0-9]\.?[0-9]*e[+-]?[0-9]+/i;
+          for (const row of results.data as any[]) {
+            if (row.ManufPartNr && scientificPattern.test(String(row.ManufPartNr))) {
+              scientificNotationCount++;
+            }
+            if (row.EAN && scientificPattern.test(String(row.EAN))) {
+              scientificNotationCount++;
+            }
+          }
+          if (scientificNotationCount > 0) {
+            console.warn(`[parseCSV] WARNING: ${scientificNotationCount} MPN/EAN values still contain scientific notation in source file`);
+          }
+          
           resolve({
             data: results.data,
             headers
