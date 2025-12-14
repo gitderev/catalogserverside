@@ -1,36 +1,28 @@
 // Web Worker for EAN Pre-fill processing
 // Enhanced with: scientific notation detection, EAN normalization, proper conflict classification
-// BUILD_VERSION for cache busting
-const BUILD_VERSION = '2025-12-14-v2';
+// BUILD_VERSION for cache busting - INCREMENT THIS WHEN CHANGING WORKER CODE
+const BUILD_VERSION = '2025-12-14-v4';
 console.log('[ean-prefill-worker] Started, BUILD_VERSION:', BUILD_VERSION);
 
 /**
  * Detects if an MPN value is in TRUE scientific notation format
  * This means the ENTIRE string is a number in scientific notation (e.g., 1.23E+05, 5e-3)
  * 
- * This indicates the MPN was incorrectly parsed/coerced from a number during import.
- * 
- * Valid SKUs like "ABC1234E+XYZ" will NOT be flagged - they contain "E+" as a substring
- * but are NOT in scientific notation format.
- * 
  * @returns true only if the entire string matches scientific notation pattern
  */
 function isScientificNotation(value) {
   if (!value || typeof value !== 'string') return false;
-  // Pattern: entire string must be a scientific notation number
-  // Examples that match: "1.23E+05", "5e-3", "-2.5e+10", "123e5"
-  // Examples that DON'T match: "ABC1234E+XYZ", "SKU-E+123", "1234E+ABC"
   return /^[+-]?\d+(?:[.,]\d+)?[eE][+-]?\d+$/.test(value.trim());
 }
 
 /**
  * Checks if MPN contains "E+" as a substring (case-insensitive)
- * This is for informative purposes - valid SKUs like "ABC1234E+XYZ"
- * @returns true if contains E+ substring
+ * AND is NOT in scientific notation format (valid SKUs like "ABC1234E+XYZ")
+ * @returns true if contains E+ substring but NOT scientific notation
  */
-function countEPlusSubstring(value) {
+function containsEPlusSubstring(value) {
   if (!value || typeof value !== 'string') return false;
-  return /e\+/i.test(value);
+  return /e\+/i.test(value) && !isScientificNotation(value);
 }
 
 /**
@@ -48,13 +40,6 @@ function sanitizeMPN(value) {
 
 /**
  * Normalizes an EAN for comparison purposes
- * Uses the same algorithm as the EAN pipeline:
- * - 12 digits → pad with leading "0" to get 13
- * - 13 digits → keep as-is
- * - 14 digits starting with "0" → trim first digit to get 13
- * - 14 digits not starting with "0" → keep as-is (valid GTIN-14)
- * 
- * Returns object with normalized value, validity, and reason
  */
 function normalizeEANForComparison(raw) {
   const original = (raw ?? '').toString().trim();
@@ -62,10 +47,8 @@ function normalizeEANForComparison(raw) {
     return { normalized: null, isValid: false, reason: 'empty' };
   }
 
-  // Remove spaces and dashes
   const compact = original.replace(/[\s-]+/g, '');
 
-  // Must be only numeric
   if (!/^\d+$/.test(compact)) {
     return { normalized: null, isValid: false, reason: 'non_numeric' };
   }
@@ -104,7 +87,7 @@ self.onmessage = function(e) {
       return;
     }
     
-    // Initialize counters - ALL counters must be initialized to 0 to avoid NaN
+    // Initialize ALL counters to 0 explicitly to avoid NaN
     const counters = {
       already_populated: 0,
       filled_now: 0,
@@ -114,10 +97,10 @@ self.onmessage = function(e) {
       empty_ean_rows: 0,
       missing_mapping_in_new_file: 0,
       errori_formali: 0,
-      // MPN with "E+" substring (valid SKUs) - informative only
+      // RAW E+ substring (valid SKUs) - informative only, based on mapping file parse
       mpnWithEPlusSubstringMaterial: 0,
       mpnWithEPlusSubstringMapping: 0,
-      // TRUE scientific notation (coercion) - warning
+      // TRUE scientific notation (potential coercion) - will be compared with raw later
       mpnScientificNotationFoundMaterial: 0,
       mpnScientificNotationFoundMapping: 0,
       // Conflict classification
@@ -126,7 +109,7 @@ self.onmessage = function(e) {
       ambiguousMapping: 0
     };
     
-    // Initialize reports
+    // Initialize reports with all arrays
     const reports = {
       duplicate_mpn_rows: [],
       empty_ean_rows: [],
@@ -140,7 +123,7 @@ self.onmessage = function(e) {
       materialWinsDifferentEan: [],
       materialNormalizedMatchesMapping: [],
       ambiguousMapping: [],
-      // Scientific notation reports (coercion warning)
+      // Scientific notation reports
       mpnScientificNotationMaterial: [],
       mpnScientificNotationMapping: [],
       // E+ substring reports (informative only)
@@ -149,7 +132,6 @@ self.onmessage = function(e) {
     };
     
     // Build mapping index: MPN → list of EAN candidates
-    // Use list to detect ambiguous mappings
     const mappingIndex = new Map();
     
     for (let i = 1; i < lines.length; i++) {
@@ -158,7 +140,7 @@ self.onmessage = function(e) {
       
       const parts = line.split(';');
       if (parts.length < 2) {
-        counters.errori_formali++;
+        counters.errori_formali = (counters.errori_formali || 0) + 1;
         reports.errori_formali.push({
           raw_line: line,
           reason: 'formato_errato',
@@ -171,9 +153,9 @@ self.onmessage = function(e) {
       const mpn = sanitizeMPN(parts[0]);
       const ean_raw = (parts[1] ?? '').trim();
       
-      // Detect TRUE scientific notation in MPN from mapping (parser coercion - WARNING)
+      // Detect TRUE scientific notation in MPN from mapping (post-parse)
       if (isScientificNotation(mpn)) {
-        counters.mpnScientificNotationFoundMapping++;
+        counters.mpnScientificNotationFoundMapping = (counters.mpnScientificNotationFoundMapping || 0) + 1;
         if (reports.mpnScientificNotationMapping.length < 20) {
           reports.mpnScientificNotationMapping.push({
             mpn,
@@ -183,9 +165,9 @@ self.onmessage = function(e) {
         }
       }
       // Detect "E+" substring (valid SKUs - informative only)
-      else if (countEPlusSubstring(mpn)) {
-        counters.mpnWithEPlusSubstringMapping++;
-        if (reports.mpnWithEPlusSubstringMapping.length < 10) {
+      else if (containsEPlusSubstring(mpn)) {
+        counters.mpnWithEPlusSubstringMapping = (counters.mpnWithEPlusSubstringMapping || 0) + 1;
+        if (reports.mpnWithEPlusSubstringMapping.length < 20) {
           reports.mpnWithEPlusSubstringMapping.push({
             mpn,
             ean: ean_raw,
@@ -195,7 +177,7 @@ self.onmessage = function(e) {
       }
       
       if (!ean_raw) {
-        counters.empty_ean_rows++;
+        counters.empty_ean_rows = (counters.empty_ean_rows || 0) + 1;
         reports.empty_ean_rows.push({
           mpn,
           row_index: i + 1
@@ -218,7 +200,6 @@ self.onmessage = function(e) {
       } else {
         const existing = mappingIndex.get(mpn);
         
-        // Check if this EAN (normalized) is different from existing ones
         const isDuplicate = existing.some(e => 
           e.ean_normalized === entry.ean_normalized || 
           e.ean_raw === ean_raw
@@ -227,8 +208,7 @@ self.onmessage = function(e) {
         if (!isDuplicate) {
           existing.push(entry);
         } else {
-          // Log as duplicate but don't add to index
-          counters.duplicate_mpn_rows++;
+          counters.duplicate_mpn_rows = (counters.duplicate_mpn_rows || 0) + 1;
           const firstEntry = existing[0];
           reports.duplicate_mpn_rows.push({
             mpn,
@@ -248,9 +228,9 @@ self.onmessage = function(e) {
       if (mpn) {
         materialMPNs.add(mpn);
         
-        // Detect TRUE scientific notation in MPN from material (parser coercion - WARNING)
+        // Detect TRUE scientific notation in MPN from material (post-parse)
         if (isScientificNotation(mpn)) {
-          counters.mpnScientificNotationFoundMaterial++;
+          counters.mpnScientificNotationFoundMaterial = (counters.mpnScientificNotationFoundMaterial || 0) + 1;
           if (reports.mpnScientificNotationMaterial.length < 20) {
             reports.mpnScientificNotationMaterial.push({
               ManufPartNr: mpn,
@@ -259,9 +239,9 @@ self.onmessage = function(e) {
           }
         }
         // Detect "E+" substring (valid SKUs - informative only)
-        else if (countEPlusSubstring(mpn)) {
-          counters.mpnWithEPlusSubstringMaterial++;
-          if (reports.mpnWithEPlusSubstringMaterial.length < 10) {
+        else if (containsEPlusSubstring(mpn)) {
+          counters.mpnWithEPlusSubstringMaterial = (counters.mpnWithEPlusSubstringMaterial || 0) + 1;
+          if (reports.mpnWithEPlusSubstringMaterial.length < 20) {
             reports.mpnWithEPlusSubstringMaterial.push({
               ManufPartNr: mpn,
               row_index: index + 1
@@ -274,7 +254,7 @@ self.onmessage = function(e) {
     // Check for MPNs in mapping that don't exist in material
     for (const [mpn, entries] of mappingIndex.entries()) {
       if (!materialMPNs.has(mpn)) {
-        counters.mpn_not_in_material++;
+        counters.mpn_not_in_material = (counters.mpn_not_in_material || 0) + 1;
         reports.mpn_not_in_material.push({
           mpn,
           ean: entries[0].ean_raw,
@@ -291,32 +271,26 @@ self.onmessage = function(e) {
       const mpn = sanitizeMPN(row.ManufPartNr);
       const currentEAN_raw = (row.EAN ?? '').toString().trim();
       
-      // Normalize current EAN from material
       const currentEAN_norm = normalizeEANForComparison(currentEAN_raw);
       
-      // Check if material already has a valid EAN
       const materialHasValidEAN = currentEAN_raw !== '' && currentEAN_norm.isValid;
       
-      // Get mapping entries for this MPN
       const mappingEntries = mpn ? mappingIndex.get(mpn) : undefined;
       const hasMapping = mappingEntries && mappingEntries.length > 0;
       
       if (materialHasValidEAN) {
-        // Material already has an EAN
-        counters.already_populated++;
+        counters.already_populated = (counters.already_populated || 0) + 1;
         reports.already_populated.push({
           ManufPartNr: mpn,
           EAN_existing: currentEAN_raw
         });
         
         if (hasMapping) {
-          // Compare with mapping
-          const mappingEntry = mappingEntries[0]; // Use first entry for comparison
+          const mappingEntry = mappingEntries[0];
           const mappingEAN_norm = mappingEntry.ean_normalized;
           
           if (mappingEAN_norm && currentEAN_norm.normalized === mappingEAN_norm) {
-            // Case 2B/2C: EANs match after normalization → resolved automatically
-            counters.materialNormalizedMatchesMapping++;
+            counters.materialNormalizedMatchesMapping = (counters.materialNormalizedMatchesMapping || 0) + 1;
             if (reports.materialNormalizedMatchesMapping.length < 20) {
               reports.materialNormalizedMatchesMapping.push({
                 ManufPartNr: mpn,
@@ -326,8 +300,7 @@ self.onmessage = function(e) {
               });
             }
           } else {
-            // Case 2A: EANs differ after normalization → Material wins
-            counters.materialWinsDifferentEan++;
+            counters.materialWinsDifferentEan = (counters.materialWinsDifferentEan || 0) + 1;
             if (reports.materialWinsDifferentEan.length < 20) {
               reports.materialWinsDifferentEan.push({
                 ManufPartNr: mpn,
@@ -340,12 +313,7 @@ self.onmessage = function(e) {
           }
         }
         
-        // Material EAN is preserved (no change to newRow.EAN)
-        
       } else if (hasMapping) {
-        // Material has no valid EAN, but mapping exists
-        
-        // Check for ambiguous mapping (multiple different normalized EANs)
         const uniqueNormalizedEANs = new Set(
           mappingEntries
             .map(e => e.ean_normalized)
@@ -353,9 +321,8 @@ self.onmessage = function(e) {
         );
         
         if (uniqueNormalizedEANs.size > 1) {
-          // Case 3: Ambiguous mapping → don't prefill
-          counters.ambiguousMapping++;
-          counters.skipped_due_to_conflict++; // Increment for backward compatibility
+          counters.ambiguousMapping = (counters.ambiguousMapping || 0) + 1;
+          counters.skipped_due_to_conflict = (counters.skipped_due_to_conflict || 0) + 1;
           if (reports.ambiguousMapping.length < 20) {
             reports.ambiguousMapping.push({
               ManufPartNr: mpn,
@@ -363,16 +330,13 @@ self.onmessage = function(e) {
               candidates_normalized: mappingEntries.map(e => e.ean_normalized || e.ean_raw)
             });
           }
-          // Don't prefill - leave EAN empty
           
         } else {
-          // Single unique normalized EAN → prefill
           const mappingEntry = mappingEntries[0];
           const ean_to_use = mappingEntry.ean_normalized || mappingEntry.ean_raw;
           
-          // Prefill with normalized EAN
           newRow.EAN = ean_to_use;
-          counters.filled_now++;
+          counters.filled_now = (counters.filled_now || 0) + 1;
           reports.updated.push({
             ManufPartNr: mpn,
             EAN_old: currentEAN_raw || '',
@@ -381,8 +345,7 @@ self.onmessage = function(e) {
         }
         
       } else {
-        // No mapping found for this MPN
-        counters.missing_mapping_in_new_file++;
+        counters.missing_mapping_in_new_file = (counters.missing_mapping_in_new_file || 0) + 1;
         reports.missing_mapping_in_new_file.push({
           ManufPartNr: mpn || ''
         });
@@ -390,6 +353,13 @@ self.onmessage = function(e) {
       
       updatedMaterial.push(newRow);
     }
+    
+    // Ensure all counters are numbers (not undefined/NaN)
+    Object.keys(counters).forEach(key => {
+      if (typeof counters[key] !== 'number' || isNaN(counters[key])) {
+        counters[key] = 0;
+      }
+    });
     
     // Send results back
     self.postMessage({

@@ -1,17 +1,27 @@
 /**
  * MPN Diagnostics - Raw vs Post-Parse Analysis
  * 
- * This module provides diagnostic utilities to detect if scientific notation
+ * Provides diagnostic utilities to detect if scientific notation
  * in MPN/SKU fields is present in the raw file or introduced by parsing/import.
+ * 
+ * DEFINITIONS:
+ * - "Scientific notation" = entire string matches regex: ^[+-]?\d+(?:[.,]\d+)?[eE][+-]?\d+$
+ * - "E+ substring" = contains "E+" but does NOT match scientific notation regex (valid SKUs)
+ * 
+ * WARNING GATING:
+ * - coercion = (rawSci=0 && postSci>0) → WARNING: parser introduced scientific notation
+ * - divergence = (rawSci>0 && postSci!=rawSci) → WARNING: parser altered distribution
+ * - rawSci>0 && divergence=0 → INFO: format exists in source file
+ * - E+ substring → INFO only (valid SKUs, never warning)
  */
 
 // Build version for cache busting workers
-export const MPN_DIAGNOSTICS_VERSION = '2025-12-14-v1';
+export const MPN_DIAGNOSTICS_VERSION = '2025-12-14-v3';
 
-// Known MPN/SKU column names (case-insensitive)
+// Known MPN/SKU column names (case-insensitive, in order of priority)
 const MPN_COLUMN_ALIASES = [
-  'mpn', 'manufpartnr', 'manufacturerpartno', 'manufpartno', 
-  'sku', 'partno', 'partnumber', 'articlenumber'
+  'mpn', 'manufacturerpartno', 'manufpartno', 'manufacturerpartno3',
+  'sku', 'partno', 'manufpartnr', 'partnumber', 'articlenumber'
 ];
 
 /**
@@ -26,11 +36,11 @@ export function isScientificNotation(value: string): boolean {
 
 /**
  * Checks if a string contains "E+" as a substring (case-insensitive)
- * This is for valid SKUs like "ABC1234E+XYZ"
+ * AND is NOT in scientific notation format (valid SKUs like "ABC1234E+XYZ")
  */
 export function containsEPlusSubstring(value: string): boolean {
   if (!value || typeof value !== 'string') return false;
-  return /e\+/i.test(value);
+  return /e\+/i.test(value) && !isScientificNotation(value);
 }
 
 /**
@@ -41,22 +51,67 @@ export interface MPNColumnDetection {
   columnIndex: number;
   columnName: string;
   allHeaders: string[];
+  delimiter: string;
+  delimiterMethod: 'tab' | 'semicolon' | 'fallback';
   error?: string;
 }
 
 /**
- * Finds the MPN column index from headers (case-insensitive)
+ * Detects the delimiter used in a raw file by analyzing consistency
+ * of column count across the first N non-empty lines
  */
-export function findMPNColumn(headers: string[]): MPNColumnDetection {
-  const lowerHeaders = headers.map(h => h.toLowerCase().trim());
+export function detectDelimiter(rawContent: string, sampleLines: number = 50): { delimiter: string; method: 'tab' | 'semicolon' | 'fallback' } {
+  const lines = rawContent.split('\n').filter(l => l.trim()).slice(0, sampleLines);
+  if (lines.length === 0) return { delimiter: ';', method: 'fallback' };
   
-  for (let i = 0; i < lowerHeaders.length; i++) {
-    if (MPN_COLUMN_ALIASES.includes(lowerHeaders[i])) {
+  // Count columns for tab delimiter
+  const tabCounts = lines.map(l => l.split('\t').length);
+  const tabStdDev = calculateStdDev(tabCounts);
+  const tabAvg = tabCounts.reduce((a, b) => a + b, 0) / tabCounts.length;
+  
+  // Count columns for semicolon delimiter
+  const semicolonCounts = lines.map(l => l.split(';').length);
+  const semicolonStdDev = calculateStdDev(semicolonCounts);
+  const semicolonAvg = semicolonCounts.reduce((a, b) => a + b, 0) / semicolonCounts.length;
+  
+  // Choose delimiter with lowest standard deviation (most consistent column count)
+  // and at least 2 columns on average
+  if (tabAvg >= 2 && tabStdDev <= semicolonStdDev) {
+    return { delimiter: '\t', method: 'tab' };
+  } else if (semicolonAvg >= 2) {
+    return { delimiter: ';', method: 'semicolon' };
+  } else if (tabAvg >= 2) {
+    return { delimiter: '\t', method: 'tab' };
+  }
+  
+  return { delimiter: ';', method: 'fallback' };
+}
+
+function calculateStdDev(values: number[]): number {
+  if (values.length === 0) return Infinity;
+  const avg = values.reduce((a, b) => a + b, 0) / values.length;
+  const variance = values.reduce((sum, val) => sum + Math.pow(val - avg, 2), 0) / values.length;
+  return Math.sqrt(variance);
+}
+
+/**
+ * Finds the MPN column index from headers (case-insensitive)
+ * Uses priority order from MPN_COLUMN_ALIASES
+ */
+export function findMPNColumn(headers: string[], delimiter: string): MPNColumnDetection {
+  const lowerHeaders = headers.map(h => h.toLowerCase().trim().replace(/"/g, ''));
+  
+  // Search in priority order
+  for (const alias of MPN_COLUMN_ALIASES) {
+    const index = lowerHeaders.indexOf(alias);
+    if (index >= 0) {
       return {
         found: true,
-        columnIndex: i,
-        columnName: headers[i],
-        allHeaders: headers
+        columnIndex: index,
+        columnName: headers[index].replace(/"/g, ''),
+        allHeaders: headers,
+        delimiter,
+        delimiterMethod: delimiter === '\t' ? 'tab' : 'semicolon'
       };
     }
   }
@@ -66,7 +121,9 @@ export function findMPNColumn(headers: string[]): MPNColumnDetection {
     columnIndex: -1,
     columnName: '',
     allHeaders: headers,
-    error: `MPN column not found. Headers: ${headers.join(', ')}`
+    delimiter,
+    delimiterMethod: delimiter === '\t' ? 'tab' : 'semicolon',
+    error: `MPN column not found. Searched for: ${MPN_COLUMN_ALIASES.join(', ')}. Headers found: ${headers.join(', ')}`
   };
 }
 
@@ -105,34 +162,44 @@ export interface PostParseMPNScanResult {
 }
 
 /**
- * Combined diagnostics result
+ * Combined diagnostics result with WARNING/INFO classification
  */
 export interface MPNDiagnosticsResult {
   fileType: 'material' | 'mapping';
   filename: string;
   raw: RawMPNScanResult;
   post: PostParseMPNScanResult;
-  coercionDetected: boolean; // true if rawSci=0 but postSci>0
-  coercionMessage?: string;
+  // Derived warning indicators
+  coercionSciInMpn: number; // rawSci=0 && postSci>0 → parser introduced
+  divergenceSciInMpn: number; // rawSci>0 && postSci!=rawSci → parser altered
+  hasWarning: boolean; // coercion>0 OR divergence>0
+  warningMessages: string[];
+  infoMessages: string[];
 }
 
 /**
  * Performs raw scan on MPN column BEFORE parsing
  * @param rawContent Raw file content as string
- * @param delimiter Field delimiter (';' for CSV, '\t' for TSV)
+ * @param explicitDelimiter Optional explicit delimiter (auto-detected if not provided)
  * @returns Raw scan results
  */
 export function performRawMPNScan(
   rawContent: string,
-  delimiter: string = ';'
+  explicitDelimiter?: string
 ): RawMPNScanResult {
+  // Detect delimiter if not provided
+  const delimiterResult = explicitDelimiter 
+    ? { delimiter: explicitDelimiter, method: explicitDelimiter === '\t' ? 'tab' as const : 'semicolon' as const }
+    : detectDelimiter(rawContent);
+  const delimiter = delimiterResult.delimiter;
+  
   const lines = rawContent.split('\n');
   
   // Get headers from first line
   const headerLine = lines[0] || '';
   const headers = headerLine.split(delimiter).map(h => h.trim().replace(/"/g, ''));
   
-  const columnDetection = findMPNColumn(headers);
+  const columnDetection = findMPNColumn(headers, delimiter);
   
   if (!columnDetection.found) {
     return {
@@ -163,7 +230,7 @@ export function performRawMPNScan(
     if (!mpnValue) continue;
     
     const isSci = isScientificNotation(mpnValue);
-    const hasEPlus = containsEPlusSubstring(mpnValue) && !isSci;
+    const hasEPlus = containsEPlusSubstring(mpnValue);
     
     if (isSci) {
       rawSciInMpn++;
@@ -171,7 +238,7 @@ export function performRawMPNScan(
         sciExamples.push({
           rowIndex: i + 1, // 1-indexed
           mpnValue,
-          rawLineSnippet: line.substring(0, 100)
+          rawLineSnippet: line.substring(0, 200)
         });
       }
     } else if (hasEPlus) {
@@ -180,7 +247,7 @@ export function performRawMPNScan(
         ePlusExamples.push({
           rowIndex: i + 1,
           mpnValue,
-          rawLineSnippet: line.substring(0, 100)
+          rawLineSnippet: line.substring(0, 200)
         });
       }
     }
@@ -232,7 +299,7 @@ export function performPostParseMPNScan(
     if (!mpnValue) return;
     
     const isSci = isScientificNotation(mpnValue);
-    const hasEPlus = containsEPlusSubstring(mpnValue) && !isSci;
+    const hasEPlus = containsEPlusSubstring(mpnValue);
     
     if (isSci) {
       postSciInMpn++;
@@ -268,17 +335,18 @@ export function performPostParseMPNScan(
 
 /**
  * Performs full MPN diagnostics comparing raw vs post-parse
+ * with proper WARNING/INFO classification
  */
 export function performMPNDiagnostics(
   rawContent: string,
   parsedData: any[],
   fileType: 'material' | 'mapping',
   filename: string,
-  delimiter: string = ';',
+  explicitDelimiter?: string,
   mpnFieldName?: string
 ): MPNDiagnosticsResult {
   // Raw scan
-  const raw = performRawMPNScan(rawContent, delimiter);
+  const raw = performRawMPNScan(rawContent, explicitDelimiter);
   
   // Determine MPN field name for parsed data
   const fieldName = mpnFieldName || (raw.columnDetection.found ? raw.columnDetection.columnName : 'ManufPartNr');
@@ -286,12 +354,33 @@ export function performMPNDiagnostics(
   // Post-parse scan
   const post = performPostParseMPNScan(parsedData, fieldName);
   
-  // Detect coercion
-  const coercionDetected = raw.rawSciInMpn === 0 && post.postSciInMpn > 0;
+  // Calculate warning indicators
+  const coercionSciInMpn = (raw.rawSciInMpn === 0 && post.postSciInMpn > 0) ? post.postSciInMpn : 0;
+  const divergenceSciInMpn = (raw.rawSciInMpn > 0 && post.postSciInMpn !== raw.rawSciInMpn) 
+    ? Math.abs(post.postSciInMpn - raw.rawSciInMpn) 
+    : 0;
   
-  let coercionMessage: string | undefined;
-  if (coercionDetected) {
-    coercionMessage = `⚠️ COERCION DETECTED: Raw file has 0 scientific notation in MPN, but post-parse has ${post.postSciInMpn}. Parser is converting MPN to numbers!`;
+  const hasWarning = coercionSciInMpn > 0 || divergenceSciInMpn > 0;
+  
+  // Build warning messages
+  const warningMessages: string[] = [];
+  if (coercionSciInMpn > 0) {
+    warningMessages.push(`⚠️ COERCIZIONE: Il parser ha introdotto ${coercionSciInMpn} MPN in notazione scientifica (RAW: 0, POST: ${post.postSciInMpn})`);
+  }
+  if (divergenceSciInMpn > 0) {
+    warningMessages.push(`⚠️ DIVERGENZA: Il parser ha alterato la distribuzione (RAW: ${raw.rawSciInMpn}, POST: ${post.postSciInMpn}, diff: ${divergenceSciInMpn})`);
+  }
+  if (post.typeErrors > 0) {
+    warningMessages.push(`⚠️ ${post.typeErrors} MPN convertiti a numero dal parser (type coercion)`);
+  }
+  
+  // Build info messages
+  const infoMessages: string[] = [];
+  if (raw.rawSciInMpn > 0 && divergenceSciInMpn === 0) {
+    infoMessages.push(`ℹ️ ${raw.rawSciInMpn} MPN in formato scientifico presenti nel file sorgente (non è un errore del tool)`);
+  }
+  if (raw.rawEPlusInMpn > 0) {
+    infoMessages.push(`ℹ️ ${raw.rawEPlusInMpn} SKU validi con "E+" nel file sorgente`);
   }
   
   return {
@@ -299,8 +388,11 @@ export function performMPNDiagnostics(
     filename,
     raw,
     post,
-    coercionDetected,
-    coercionMessage
+    coercionSciInMpn,
+    divergenceSciInMpn,
+    hasWarning,
+    warningMessages,
+    infoMessages
   };
 }
 
@@ -312,9 +404,14 @@ export function logMPNDiagnostics(diagnostics: MPNDiagnosticsResult): void {
   
   console.group(`%c${prefix} ${diagnostics.filename}`, 'color: #E91E63; font-weight: bold;');
   
-  console.log('Column detection:', diagnostics.raw.columnDetection);
+  console.log('Column detection:', {
+    found: diagnostics.raw.columnDetection.found,
+    columnName: diagnostics.raw.columnDetection.columnName,
+    columnIndex: diagnostics.raw.columnDetection.columnIndex,
+    delimiter: diagnostics.raw.columnDetection.delimiterMethod
+  });
   
-  console.log('%cRaw Scan:', 'color: #2196F3; font-weight: bold;', {
+  console.log('%cRaw Scan (MPN column only):', 'color: #2196F3; font-weight: bold;', {
     totalRows: diagnostics.raw.totalRows,
     rawSciInMpn: diagnostics.raw.rawSciInMpn,
     rawEPlusInMpn: diagnostics.raw.rawEPlusInMpn
@@ -341,9 +438,24 @@ export function logMPNDiagnostics(diagnostics: MPNDiagnosticsResult): void {
     console.log('Type error examples:', diagnostics.post.typeErrorExamples);
   }
   
-  if (diagnostics.coercionDetected) {
-    console.error('%c' + diagnostics.coercionMessage, 'color: #F44336; font-weight: bold; font-size: 14px;');
-  } else if (diagnostics.raw.rawSciInMpn === 0 && diagnostics.post.postSciInMpn === 0) {
+  // WARNING/INFO classification
+  console.log('%cClassification:', 'color: #FF9800; font-weight: bold;', {
+    coercionSciInMpn: diagnostics.coercionSciInMpn,
+    divergenceSciInMpn: diagnostics.divergenceSciInMpn,
+    hasWarning: diagnostics.hasWarning
+  });
+  
+  if (diagnostics.warningMessages.length > 0) {
+    console.warn('%cWARNINGS:', 'color: #F44336; font-weight: bold;');
+    diagnostics.warningMessages.forEach(msg => console.warn(msg));
+  }
+  
+  if (diagnostics.infoMessages.length > 0) {
+    console.info('%cINFO:', 'color: #2196F3; font-weight: bold;');
+    diagnostics.infoMessages.forEach(msg => console.info(msg));
+  }
+  
+  if (!diagnostics.hasWarning && diagnostics.raw.rawSciInMpn === 0 && diagnostics.post.postSciInMpn === 0) {
     console.log('%c✅ No coercion: Raw and Post both have 0 scientific notation', 'color: #4CAF50; font-weight: bold;');
   }
   
@@ -351,7 +463,7 @@ export function logMPNDiagnostics(diagnostics: MPNDiagnosticsResult): void {
 }
 
 /**
- * Formats diagnostics for UI display
+ * Formats diagnostics for UI display with proper WARNING/INFO classification
  */
 export function formatDiagnosticsForUI(diagnostics: MPNDiagnosticsResult): {
   counters: Record<string, number>;
@@ -359,33 +471,61 @@ export function formatDiagnosticsForUI(diagnostics: MPNDiagnosticsResult): {
   info: string[];
 } {
   const counters: Record<string, number> = {
-    'Raw: Righe totali': diagnostics.raw.totalRows,
-    'Raw: MPN formato scientifico': diagnostics.raw.rawSciInMpn,
-    'Raw: MPN con E+ (SKU validi)': diagnostics.raw.rawEPlusInMpn,
-    'Post: Righe totali': diagnostics.post.totalRows,
-    'Post: MPN formato scientifico': diagnostics.post.postSciInMpn,
-    'Post: MPN con E+ (SKU validi)': diagnostics.post.postEPlusInMpn,
-    'Post: Errori tipo (non stringa)': diagnostics.post.typeErrors
+    'RAW scientifico': diagnostics.raw.rawSciInMpn,
+    'RAW con E+ (validi)': diagnostics.raw.rawEPlusInMpn,
+    'POST scientifico': diagnostics.post.postSciInMpn,
+    'POST con E+ (validi)': diagnostics.post.postEPlusInMpn,
+    'Coercizione (RAW=0→POST>0)': diagnostics.coercionSciInMpn,
+    'Divergenza (RAW≠POST)': diagnostics.divergenceSciInMpn
   };
   
-  const warnings: string[] = [];
-  const info: string[] = [];
+  return { 
+    counters, 
+    warnings: diagnostics.warningMessages,
+    info: diagnostics.infoMessages
+  };
+}
+
+/**
+ * Print examples to console for debugging
+ */
+export function printMPNExamplesToConsole(diagnostics: MPNDiagnosticsResult): void {
+  const prefix = `[MPN-Examples:${diagnostics.fileType}]`;
   
-  if (diagnostics.coercionDetected) {
-    warnings.push(diagnostics.coercionMessage || 'Coercizione numerica rilevata');
+  console.group(`%c${prefix} ${diagnostics.filename} - EXAMPLES`, 'color: #9C27B0; font-weight: bold; font-size: 14px;');
+  
+  if (diagnostics.raw.sciExamples.length > 0) {
+    console.log('%cRAW Scientific Notation Examples (20 max):', 'color: #F44336; font-weight: bold;');
+    console.table(diagnostics.raw.sciExamples);
+  } else {
+    console.log('%cRAW Scientific Notation: 0 examples', 'color: #4CAF50;');
   }
   
-  if (diagnostics.post.typeErrors > 0) {
-    warnings.push(`${diagnostics.post.typeErrors} MPN convertiti a numero dal parser`);
+  if (diagnostics.raw.ePlusExamples.length > 0) {
+    console.log('%cRAW E+ Substring Examples (20 max):', 'color: #2196F3; font-weight: bold;');
+    console.table(diagnostics.raw.ePlusExamples);
+  } else {
+    console.log('%cRAW E+ Substring: 0 examples', 'color: #4CAF50;');
   }
   
-  if (!diagnostics.raw.columnDetection.found) {
-    warnings.push(`Colonna MPN non trovata. Headers: ${diagnostics.raw.columnDetection.allHeaders.join(', ')}`);
+  if (diagnostics.post.sciExamples.length > 0) {
+    console.log('%cPOST Scientific Notation Examples (20 max):', 'color: #F44336; font-weight: bold;');
+    console.table(diagnostics.post.sciExamples);
+  } else {
+    console.log('%cPOST Scientific Notation: 0 examples', 'color: #4CAF50;');
   }
   
-  if (diagnostics.raw.rawEPlusInMpn > 0) {
-    info.push(`${diagnostics.raw.rawEPlusInMpn} SKU validi con "E+" nel raw`);
+  if (diagnostics.post.ePlusExamples.length > 0) {
+    console.log('%cPOST E+ Substring Examples (20 max):', 'color: #2196F3; font-weight: bold;');
+    console.table(diagnostics.post.ePlusExamples);
+  } else {
+    console.log('%cPOST E+ Substring: 0 examples', 'color: #4CAF50;');
   }
   
-  return { counters, warnings, info };
+  if (diagnostics.post.typeErrorExamples.length > 0) {
+    console.log('%cType Error Examples (MPN coerced to number):', 'color: #FF5722; font-weight: bold;');
+    console.table(diagnostics.post.typeErrorExamples);
+  }
+  
+  console.groupEnd();
 }

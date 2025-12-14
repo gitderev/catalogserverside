@@ -28,6 +28,7 @@ import {
   performMPNDiagnostics,
   logMPNDiagnostics,
   formatDiagnosticsForUI,
+  printMPNExamplesToConsole,
   MPN_DIAGNOSTICS_VERSION,
   type MPNDiagnosticsResult
 } from '@/utils/mpnDiagnostics';
@@ -1394,12 +1395,12 @@ const AltersideCatalogGenerator: React.FC = () => {
         );
         logMPNDiagnostics(mpnDiagnostics);
         
-        // If coercion detected, show warning
-        if (mpnDiagnostics.coercionDetected) {
-          console.error('%c[MATERIAL IMPORT] COERCION DETECTED!', 'color: red; font-weight: bold; font-size: 16px;', mpnDiagnostics.coercionMessage);
+        // If coercion or divergence detected, show warning
+        if (mpnDiagnostics.hasWarning) {
+          console.error('%c[MATERIAL IMPORT] MPN WARNING!', 'color: red; font-weight: bold; font-size: 16px;', mpnDiagnostics.warningMessages);
           toast({
-            title: "⚠️ Coercizione MPN rilevata",
-            description: `Il parser sta convertendo MPN in notazione scientifica. Raw: ${mpnDiagnostics.raw.rawSciInMpn}, Post: ${mpnDiagnostics.post.postSciInMpn}`,
+            title: "⚠️ Problema MPN rilevato",
+            description: mpnDiagnostics.warningMessages[0] || `Coercizione: ${mpnDiagnostics.coercionSciInMpn}, Divergenza: ${mpnDiagnostics.divergenceSciInMpn}`,
             variant: "destructive"
           });
         }
@@ -5270,36 +5271,84 @@ const AltersideCatalogGenerator: React.FC = () => {
           setPipelineProgress(50);
           setPipelineStepLabel('EAN Prefill completato. Elaborazione pipeline EAN…');
           
-          // Check for warnings in prefill (scientific notation or ambiguous)
-          const hasScientificWarning = prefillCounters && hasScientificNotationWarnings(prefillCounters);
-          const hasConflicts = prefillCounters && (prefillCounters.ambiguousMapping > 0 || prefillCounters.materialWinsDifferentEan > 0);
-          const hasWarnings = hasScientificWarning || hasConflicts;
+          // Get MPN diagnostics from both files
+          const materialDiag = currentFilesForPrefill.material.file?.mpnDiagnostics;
           
-          // Only show warning icon for TRUE scientific notation, not for E+ substrings
+          // Check for warnings:
+          // 1. Coercion (rawSci=0 but postSci>0) or Divergence (rawSci>0 and postSci!=rawSci)
+          // 2. TRUE scientific notation detected in parsed data
+          // 3. Ambiguous mappings
+          const hasScientificWarning = prefillCounters && hasScientificNotationWarnings(prefillCounters);
+          const hasMaterialDiagWarning = materialDiag?.hasWarning || false;
+          const hasAmbiguous = prefillCounters && (prefillCounters.ambiguousMapping ?? 0) > 0;
+          const hasWarnings = hasScientificWarning || hasMaterialDiagWarning || hasAmbiguous;
+          
+          // INFO messages (not warnings)
           const ePlusInfo = generateEPlusSubstringInfo(prefillCounters);
+          
+          // Build counters for display with RAW vs POST split
+          const displayCounters: Record<string, number> = {
+            'EAN riempiti': prefillCounters?.filled_now ?? 0,
+            'Già popolati': prefillCounters?.already_populated ?? 0,
+            'Vince Material (diverso)': prefillCounters?.materialWinsDifferentEan ?? 0,
+            'Match normalizzati': prefillCounters?.materialNormalizedMatchesMapping ?? 0,
+            'Ambigui (non prefillati)': prefillCounters?.ambiguousMapping ?? 0,
+          };
+          
+          // Add RAW vs POST diagnostics if available
+          if (materialDiag) {
+            displayCounters['RAW scientifico Material'] = materialDiag.raw.rawSciInMpn;
+            displayCounters['RAW E+ validi Material'] = materialDiag.raw.rawEPlusInMpn;
+            displayCounters['POST scientifico Material'] = materialDiag.post.postSciInMpn;
+            displayCounters['POST E+ validi Material'] = materialDiag.post.postEPlusInMpn;
+            displayCounters['Coercizione Material'] = materialDiag.coercionSciInMpn;
+            displayCounters['Divergenza Material'] = materialDiag.divergenceSciInMpn;
+          } else {
+            // Fallback to prefill counters
+            displayCounters['POST scientifico Material'] = prefillCounters?.mpnScientificNotationFoundMaterial ?? 0;
+            displayCounters['POST E+ Material'] = prefillCounters?.mpnWithEPlusSubstringMaterial ?? 0;
+            displayCounters['POST scientifico Mapping'] = prefillCounters?.mpnScientificNotationFoundMapping ?? 0;
+            displayCounters['POST E+ Mapping'] = prefillCounters?.mpnWithEPlusSubstringMapping ?? 0;
+          }
+          
+          // Build warnings list
+          const warningsList: string[] = [];
+          if (materialDiag?.hasWarning) {
+            warningsList.push(...materialDiag.warningMessages);
+          } else if (hasScientificWarning) {
+            const sciWarning = generateScientificNotationWarning(prefillCounters!);
+            if (sciWarning) warningsList.push(sciWarning);
+          }
+          if (hasAmbiguous && prefillCounters) {
+            warningsList.push(`${prefillCounters.ambiguousMapping} mapping ambigui`);
+          }
+          
+          // Build info list
+          const infoList: string[] = [];
+          if (materialDiag?.infoMessages.length) {
+            infoList.push(...materialDiag.infoMessages);
+          }
+          if (ePlusInfo) {
+            infoList.push(ePlusInfo);
+          }
+          
+          // Log full diagnostics to console with "Show Examples" for debugging
+          if (materialDiag) {
+            console.log('%c[EAN Prefill] Clicca per vedere esempi MPN:', 'color: #9C27B0; font-weight: bold;');
+            console.log('→ printMPNExamplesToConsole(materialDiag) per vedere 20 esempi per categoria');
+            // Auto-print if there are warnings
+            if (materialDiag.hasWarning) {
+              printMPNExamplesToConsole(materialDiag);
+            }
+          }
           
           updatePipelineStep('ean_prefill', { 
             status: hasWarnings ? 'warning' : 'done', 
-            summary: prefillSummary + (hasScientificWarning ? ' ⚠️ Parser coercion' : ''),
-            details: (hasWarnings || ePlusInfo) && prefillCounters ? {
-              counters: {
-                'EAN riempiti': prefillCounters.filled_now ?? 0,
-                'Già popolati': prefillCounters.already_populated ?? 0,
-                'Vince Material (diverso)': prefillCounters.materialWinsDifferentEan ?? 0,
-                'Match normalizzati': prefillCounters.materialNormalizedMatchesMapping ?? 0,
-                'Ambigui (non prefillati)': prefillCounters.ambiguousMapping ?? 0,
-                // Split E+ counts by file
-                'MPN con E+ Material': prefillCounters.mpnWithEPlusSubstringMaterial ?? 0,
-                'MPN con E+ Mapping': prefillCounters.mpnWithEPlusSubstringMapping ?? 0,
-                // Split scientific notation by file
-                'MPN scientifico Material': prefillCounters.mpnScientificNotationFoundMaterial ?? 0,
-                'MPN scientifico Mapping': prefillCounters.mpnScientificNotationFoundMapping ?? 0
-              },
-              warnings: [
-                ...(hasScientificWarning ? [generateScientificNotationWarning(prefillCounters) || ''] : []),
-                ...(prefillCounters.ambiguousMapping > 0 ? [`${prefillCounters.ambiguousMapping} mapping ambigui`] : [])
-              ].filter(Boolean),
-              info: ePlusInfo ? [ePlusInfo] : undefined
+            summary: prefillSummary + (hasWarnings ? ' ⚠️' : ''),
+            details: prefillCounters ? {
+              counters: displayCounters,
+              warnings: warningsList.length > 0 ? warningsList : undefined,
+              info: infoList.length > 0 ? infoList : undefined
             } : undefined
           });
         } catch (prefillError) {
