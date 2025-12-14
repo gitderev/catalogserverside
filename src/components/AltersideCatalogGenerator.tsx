@@ -11,6 +11,19 @@ import { useAuth } from '@/hooks/useAuth';
 import { filterAndNormalizeForEAN, type EANStats, type DiscardedRow } from '@/utils/ean';
 import { forceEANText, exportDiscardedRowsCSV } from '@/utils/excelFormatter';
 import { 
+  processEANPrefillWithNormalization,
+  generatePrefillSummary,
+  generateScientificNotationWarning,
+  hasScientificNotationWarnings,
+  sanitizeMPN,
+  detectScientificNotation,
+  normalizeEANForComparison,
+  type EANPrefillExtendedCounters,
+  type EANPrefillExtendedReports,
+  createEmptyExtendedCounters,
+  createEmptyExtendedReports
+} from '@/utils/eanPrefill';
+import { 
   parseOverrideFile, 
   applyOverrideToCatalog, 
   validateEnding99Guard,
@@ -123,27 +136,9 @@ interface FileData {
   isValid?: boolean;
 }
 
-interface EANPrefillCounters {
-  already_populated: number;
-  filled_now: number;
-  skipped_due_to_conflict: number;
-  duplicate_mpn_rows: number;
-  mpn_not_in_material: number;
-  empty_ean_rows: number;
-  missing_mapping_in_new_file: number;
-  errori_formali: number;
-}
-
-interface EANPrefillReports {
-  updated: Array<{ ManufPartNr: string; EAN_old: string; EAN_new: string }>;
-  already_populated: Array<{ ManufPartNr: string; EAN_existing: string }>;
-  skipped_due_to_conflict: Array<{ ManufPartNr: string; EAN_material: string; EAN_mapping_first: string }>;
-  duplicate_mpn_rows: Array<{ mpn: string; ean_seen_first: string; ean_conflicting: string; row_index: number }>;
-  mpn_not_in_material: Array<{ mpn: string; ean: string; row_index: number }>;
-  empty_ean_rows: Array<{ mpn: string; row_index: number }>;
-  missing_mapping_in_new_file: Array<{ ManufPartNr: string }>;
-  errori_formali: Array<{ raw_line: string; reason: string; row_index: number }>;
-}
+// Use extended types from eanPrefill.ts
+type EANPrefillCounters = EANPrefillExtendedCounters;
+type EANPrefillReports = EANPrefillExtendedReports;
 
 interface PrefillState {
   status: 'idle' | 'running' | 'done' | 'skipped';
@@ -4768,135 +4763,9 @@ const AltersideCatalogGenerator: React.FC = () => {
         });
       }
       
-      // Process without worker (synchronous for small files)
-      const mappingMap = new Map<string, string>();
-      const reports: EANPrefillReports = {
-        duplicate_mpn_rows: [],
-        empty_ean_rows: [],
-        errori_formali: [],
-        updated: [],
-        already_populated: [],
-        skipped_due_to_conflict: [],
-        mpn_not_in_material: [],
-        missing_mapping_in_new_file: []
-      };
-      
-      const counters: EANPrefillCounters = {
-        already_populated: 0,
-        filled_now: 0,
-        skipped_due_to_conflict: 0,
-        duplicate_mpn_rows: 0,
-        mpn_not_in_material: 0,
-        empty_ean_rows: 0,
-        missing_mapping_in_new_file: 0,
-        errori_formali: 0
-      };
-      
-      // Parse mapping file
-      for (let i = 1; i < lines.length; i++) {
-        const line = lines[i]?.trim();
-        if (!line) continue;
-        
-        const parts = line.split(';');
-        if (parts.length < 2) {
-          counters.errori_formali++;
-          reports.errori_formali.push({
-            raw_line: line,
-            reason: 'formato_errato',
-            row_index: i + 1
-          });
-          continue;
-        }
-        
-        const mpn = parts[0]?.trim();
-        const ean = parts[1]?.trim();
-        
-        if (!ean) {
-          counters.empty_ean_rows++;
-          reports.empty_ean_rows.push({
-            mpn: mpn,
-            row_index: i + 1
-          });
-          continue;
-        }
-        
-        if (mappingMap.has(mpn)) {
-          const existing = mappingMap.get(mpn)!;
-          if (existing !== ean) {
-            counters.duplicate_mpn_rows++;
-            reports.duplicate_mpn_rows.push({
-              mpn: mpn,
-              ean_seen_first: existing,
-              ean_conflicting: ean,
-              row_index: i + 1
-            });
-          }
-        } else {
-          mappingMap.set(mpn, ean);
-        }
-      }
-      
-      // Create a set of all MPNs in material
-      const materialMPNs = new Set(
-        materialData.map((row: any) => row.ManufPartNr?.toString().trim()).filter(Boolean)
-      );
-      
-      // Check for MPNs in mapping that don't exist in material
-      for (const [mpn, ean] of mappingMap.entries()) {
-        if (!materialMPNs.has(mpn)) {
-          counters.mpn_not_in_material++;
-          reports.mpn_not_in_material.push({
-            mpn: mpn,
-            ean: ean,
-            row_index: 0
-          });
-        }
-      }
-      
-      // Process material rows - CRITICAL: treat EAN as string, never use Number/parseInt
-      const updatedMaterial = materialData.map((row: any) => {
-        const newRow = { ...row };
-        const mpn = String(row.ManufPartNr ?? '').trim();
-        const currentEAN = String(row.EAN ?? '').trim();
-        
-        if (currentEAN) {
-          // EAN already populated
-          counters.already_populated++;
-          reports.already_populated.push({
-            ManufPartNr: mpn,
-            EAN_existing: currentEAN
-          });
-          
-          // Check if there's also a mapping for this MPN
-          if (mpn && mappingMap.has(mpn)) {
-            const mappingEAN = mappingMap.get(mpn)!;
-            counters.skipped_due_to_conflict++;
-            reports.skipped_due_to_conflict.push({
-              ManufPartNr: mpn,
-              EAN_material: currentEAN,
-              EAN_mapping_first: mappingEAN
-            });
-          }
-        } else if (mpn && mappingMap.has(mpn)) {
-          // EAN empty and mapping exists - fill it (as string)
-          const mappingEAN = mappingMap.get(mpn)!;
-          newRow.EAN = mappingEAN;
-          counters.filled_now++;
-          reports.updated.push({
-            ManufPartNr: mpn,
-            EAN_old: currentEAN || '',
-            EAN_new: mappingEAN
-          });
-        } else {
-          // EAN empty and no mapping found
-          counters.missing_mapping_in_new_file++;
-          reports.missing_mapping_in_new_file.push({
-            ManufPartNr: mpn || ''
-          });
-        }
-        
-        return newRow;
-      });
+      // Process using the new utility function with normalization
+      const result = processEANPrefillWithNormalization(lines, materialData);
+      const { updatedMaterial, counters, reports } = result;
       
       // Diagnostic: Verify material was updated
       const countEANNonVuoti_after = updatedMaterial.filter((row: any) => {
@@ -4904,6 +4773,23 @@ const AltersideCatalogGenerator: React.FC = () => {
         return ean.length > 0;
       }).length;
       console.warn('prefill:diagnostic:after_sync', { total: updatedMaterial.length, nonEmpty: countEANNonVuoti_after });
+      
+      // Log scientific notation warning if detected
+      const scientificWarning = generateScientificNotationWarning(counters);
+      if (scientificWarning) {
+        console.warn('prefill:scientific_notation', scientificWarning);
+      }
+      
+      // Log summary
+      console.log('prefill:summary', {
+        filled_now: counters.filled_now,
+        already_populated: counters.already_populated,
+        materialWinsDifferentEan: counters.materialWinsDifferentEan,
+        materialNormalizedMatchesMapping: counters.materialNormalizedMatchesMapping,
+        ambiguousMapping: counters.ambiguousMapping,
+        mpnScientificNotationMaterial: counters.mpnScientificNotationFoundMaterial,
+        mpnScientificNotationMapping: counters.mpnScientificNotationFoundMapping
+      });
       
       if (countEANNonVuoti_after < countEANNonVuoti_before) {
         throw new Error('Material non aggiornato dopo Pre-fill');
@@ -4931,9 +4817,12 @@ const AltersideCatalogGenerator: React.FC = () => {
       setMaterialRows(updatedMaterial);
       setMaterialVersion(prev => prev + 1);
       
+      // Generate summary message
+      const summaryMessage = generatePrefillSummary(counters);
+      
       toast({
-        title: "Pre-fill completato",
-        description: `${counters.filled_now} EAN aggiunti`
+        title: scientificWarning ? "Pre-fill completato con avvisi" : "Pre-fill completato",
+        description: summaryMessage + (scientificWarning ? ' ⚠️' : '')
       });
       
     } catch (error) {
@@ -5001,53 +4890,90 @@ const AltersideCatalogGenerator: React.FC = () => {
       if (eanPrefillReports.updated.length > 0) {
         const ws1 = XLSX.utils.json_to_sheet(eanPrefillReports.updated);
         XLSX.utils.book_append_sheet(wb, ws1, "updated");
-        forceColumnsAsText(ws1, ['EAN_old', 'EAN_new']);
+        forceColumnsAsText(ws1, ['EAN_old', 'EAN_new', 'EAN_new_normalized']);
       }
       
       // Sheet 2: Already Populated
       if (eanPrefillReports.already_populated.length > 0) {
         const ws2 = XLSX.utils.json_to_sheet(eanPrefillReports.already_populated);
         XLSX.utils.book_append_sheet(wb, ws2, "already_populated");
-        forceColumnsAsText(ws2, ['EAN_existing']);
+        forceColumnsAsText(ws2, ['EAN_existing', 'EAN_existing_normalized']);
       }
       
-      // Sheet 3: Skipped Due to Conflict
-      if (eanPrefillReports.skipped_due_to_conflict.length > 0) {
-        const ws3 = XLSX.utils.json_to_sheet(eanPrefillReports.skipped_due_to_conflict);
-        XLSX.utils.book_append_sheet(wb, ws3, "skipped_due_to_conflict");
-        forceColumnsAsText(ws3, ['EAN_material', 'EAN_mapping_first']);
+      // NEW Sheet 3: Material Wins Different EAN (Case 2A)
+      if (eanPrefillReports.materialWinsDifferentEan && eanPrefillReports.materialWinsDifferentEan.length > 0) {
+        const ws3 = XLSX.utils.json_to_sheet(eanPrefillReports.materialWinsDifferentEan);
+        XLSX.utils.book_append_sheet(wb, ws3, "material_wins");
+        forceColumnsAsText(ws3, ['EAN_material_raw', 'EAN_material_norm', 'EAN_mapping_raw', 'EAN_mapping_norm']);
       }
       
-      // Sheet 4: Duplicate MPN Rows
+      // NEW Sheet 4: Normalized Matches (Case 2B/2C)
+      if (eanPrefillReports.materialNormalizedMatchesMapping && eanPrefillReports.materialNormalizedMatchesMapping.length > 0) {
+        const ws4 = XLSX.utils.json_to_sheet(eanPrefillReports.materialNormalizedMatchesMapping);
+        XLSX.utils.book_append_sheet(wb, ws4, "normalized_matches");
+        forceColumnsAsText(ws4, ['EAN_material_raw', 'EAN_mapping_raw', 'EAN_normalized']);
+      }
+      
+      // NEW Sheet 5: Ambiguous Mapping (Case 3)
+      if (eanPrefillReports.ambiguousMapping && eanPrefillReports.ambiguousMapping.length > 0) {
+        const ws5 = XLSX.utils.json_to_sheet(eanPrefillReports.ambiguousMapping.map(r => ({
+          ManufPartNr: r.ManufPartNr,
+          candidates_raw: r.candidates_raw.join(', '),
+          candidates_normalized: r.candidates_normalized.join(', ')
+        })));
+        XLSX.utils.book_append_sheet(wb, ws5, "ambiguous_mapping");
+      }
+      
+      // NEW Sheet 6: MPN Scientific Notation - Material
+      if (eanPrefillReports.mpnScientificNotationMaterial && eanPrefillReports.mpnScientificNotationMaterial.length > 0) {
+        const ws6 = XLSX.utils.json_to_sheet(eanPrefillReports.mpnScientificNotationMaterial);
+        XLSX.utils.book_append_sheet(wb, ws6, "mpn_scientific_material");
+      }
+      
+      // NEW Sheet 7: MPN Scientific Notation - Mapping
+      if (eanPrefillReports.mpnScientificNotationMapping && eanPrefillReports.mpnScientificNotationMapping.length > 0) {
+        const ws7 = XLSX.utils.json_to_sheet(eanPrefillReports.mpnScientificNotationMapping);
+        XLSX.utils.book_append_sheet(wb, ws7, "mpn_scientific_mapping");
+        forceColumnsAsText(ws7, ['ean']);
+      }
+      
+      // Sheet 8: Duplicate MPN Rows
       if (eanPrefillReports.duplicate_mpn_rows.length > 0) {
-        const ws4 = XLSX.utils.json_to_sheet(eanPrefillReports.duplicate_mpn_rows);
-        XLSX.utils.book_append_sheet(wb, ws4, "duplicate_mpn_rows");
-        forceColumnsAsText(ws4, ['ean_seen_first', 'ean_conflicting']);
+        const ws8 = XLSX.utils.json_to_sheet(eanPrefillReports.duplicate_mpn_rows);
+        XLSX.utils.book_append_sheet(wb, ws8, "duplicate_mpn_rows");
+        forceColumnsAsText(ws8, ['ean_seen_first', 'ean_conflicting']);
       }
       
-      // Sheet 5: MPN Not in Material
+      // Sheet 9: MPN Not in Material
       if (eanPrefillReports.mpn_not_in_material.length > 0) {
-        const ws5 = XLSX.utils.json_to_sheet(eanPrefillReports.mpn_not_in_material);
-        XLSX.utils.book_append_sheet(wb, ws5, "mpn_not_in_material");
-        forceColumnsAsText(ws5, ['ean']);
+        const ws9 = XLSX.utils.json_to_sheet(eanPrefillReports.mpn_not_in_material);
+        XLSX.utils.book_append_sheet(wb, ws9, "mpn_not_in_material");
+        forceColumnsAsText(ws9, ['ean']);
       }
       
-      // Sheet 6: Empty EAN Rows
+      // Sheet 10: Empty EAN Rows
       if (eanPrefillReports.empty_ean_rows.length > 0) {
-        const ws6 = XLSX.utils.json_to_sheet(eanPrefillReports.empty_ean_rows);
-        XLSX.utils.book_append_sheet(wb, ws6, "empty_ean_rows");
+        const ws10 = XLSX.utils.json_to_sheet(eanPrefillReports.empty_ean_rows);
+        XLSX.utils.book_append_sheet(wb, ws10, "empty_ean_rows");
       }
       
-      // Sheet 7: Missing Mapping
+      // Sheet 11: Missing Mapping
       if (eanPrefillReports.missing_mapping_in_new_file.length > 0) {
-        const ws7 = XLSX.utils.json_to_sheet(eanPrefillReports.missing_mapping_in_new_file);
-        XLSX.utils.book_append_sheet(wb, ws7, "missing_mapping_in_new_file");
+        const ws11 = XLSX.utils.json_to_sheet(eanPrefillReports.missing_mapping_in_new_file);
+        XLSX.utils.book_append_sheet(wb, ws11, "missing_mapping");
       }
       
-      // Sheet 8: Errori Formali
+      // Sheet 12: Errori Formali
       if (eanPrefillReports.errori_formali.length > 0) {
-        const ws8 = XLSX.utils.json_to_sheet(eanPrefillReports.errori_formali);
-        XLSX.utils.book_append_sheet(wb, ws8, "errori_formali");
+        const ws12 = XLSX.utils.json_to_sheet(eanPrefillReports.errori_formali);
+        XLSX.utils.book_append_sheet(wb, ws12, "errori_formali");
+      }
+      
+      // Legacy: Skipped Due to Conflict (kept for backward compatibility, may be empty)
+      if (eanPrefillReports.skipped_due_to_conflict && eanPrefillReports.skipped_due_to_conflict.length > 0) {
+        const wsLegacy = XLSX.utils.json_to_sheet(eanPrefillReports.skipped_due_to_conflict);
+        XLSX.utils.book_append_sheet(wb, wsLegacy, "legacy_conflicts");
+        forceColumnsAsText(wsLegacy, ['EAN_material', 'EAN_mapping_first']);
       }
       
       const wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
@@ -5195,29 +5121,38 @@ const AltersideCatalogGenerator: React.FC = () => {
             }, checkInterval);
           });
           
-          // Get prefill counters for summary
+          // Get prefill counters for summary using new format
           const prefillCounters = prefillStateRef.current.counters;
           const prefillSummary = prefillCounters 
-            ? `EAN riempiti: ${prefillCounters.filled_now}, conflitti: ${prefillCounters.skipped_due_to_conflict}`
+            ? generatePrefillSummary(prefillCounters)
             : 'Prefill completato';
           
           console.log('[Pipeline Master] Step 2 completato: prefill eseguito');
           setPipelineProgress(50);
           setPipelineStepLabel('EAN Prefill completato. Elaborazione pipeline EAN…');
           
-          // Check for warnings in prefill
-          const hasWarnings = prefillCounters && (prefillCounters.skipped_due_to_conflict > 0 || prefillCounters.duplicate_mpn_rows > 0);
+          // Check for warnings in prefill (scientific notation or ambiguous)
+          const hasScientificWarning = prefillCounters && hasScientificNotationWarnings(prefillCounters);
+          const hasConflicts = prefillCounters && (prefillCounters.ambiguousMapping > 0 || prefillCounters.materialWinsDifferentEan > 0);
+          const hasWarnings = hasScientificWarning || hasConflicts;
+          
           updatePipelineStep('ean_prefill', { 
             status: hasWarnings ? 'warning' : 'done', 
-            summary: prefillSummary,
+            summary: prefillSummary + (hasScientificWarning ? ' ⚠️ MPN E+' : ''),
             details: hasWarnings && prefillCounters ? {
               counters: {
                 'EAN riempiti': prefillCounters.filled_now,
                 'Già popolati': prefillCounters.already_populated,
-                'Conflitti': prefillCounters.skipped_due_to_conflict,
-                'MPN duplicati': prefillCounters.duplicate_mpn_rows
+                'Vince Material (diverso)': prefillCounters.materialWinsDifferentEan,
+                'Match normalizzati': prefillCounters.materialNormalizedMatchesMapping,
+                'Ambigui (non prefillati)': prefillCounters.ambiguousMapping,
+                'MPN E+ Material': prefillCounters.mpnScientificNotationFoundMaterial,
+                'MPN E+ Mapping': prefillCounters.mpnScientificNotationFoundMapping
               },
-              warnings: prefillCounters.skipped_due_to_conflict > 0 ? [`${prefillCounters.skipped_due_to_conflict} conflitti rilevati`] : []
+              warnings: [
+                ...(hasScientificWarning ? [generateScientificNotationWarning(prefillCounters) || ''] : []),
+                ...(prefillCounters.ambiguousMapping > 0 ? [`${prefillCounters.ambiguousMapping} mapping ambigui`] : [])
+              ].filter(Boolean)
             } : undefined
           });
         } catch (prefillError) {
