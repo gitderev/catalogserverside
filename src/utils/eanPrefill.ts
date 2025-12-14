@@ -23,9 +23,18 @@ export function detectScientificNotation(value: string): boolean {
 /**
  * Sanitizes MPN to ensure it's treated as a string
  * Never converts to number, only trims and removes non-printable characters
+ * 
+ * IMPORTANT: This function should receive already-string values from Papa.parse
+ * with dynamicTyping: false. If it receives a number, it logs a warning.
  */
 export function sanitizeMPN(value: unknown): string {
   if (value === null || value === undefined) return '';
+  
+  // DEBUG: Check if value is unexpectedly a number (should not happen after parsing fix)
+  if (typeof value === 'number') {
+    console.warn('[sanitizeMPN] WARNING: MPN received as number, possible parsing issue:', value);
+  }
+  
   // Convert to string and trim
   let str = String(value).trim();
   // Remove non-printable characters except space
