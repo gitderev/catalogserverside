@@ -1,5 +1,8 @@
 // Web Worker for EAN Pre-fill processing
 // Enhanced with: scientific notation detection, EAN normalization, proper conflict classification
+// BUILD_VERSION for cache busting
+const BUILD_VERSION = '2025-12-14-v2';
+console.log('[ean-prefill-worker] Started, BUILD_VERSION:', BUILD_VERSION);
 
 /**
  * Detects if an MPN value is in TRUE scientific notation format

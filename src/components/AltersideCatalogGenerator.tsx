@@ -24,6 +24,13 @@ import {
   createEmptyExtendedCounters,
   createEmptyExtendedReports
 } from '@/utils/eanPrefill';
+import {
+  performMPNDiagnostics,
+  logMPNDiagnostics,
+  formatDiagnosticsForUI,
+  MPN_DIAGNOSTICS_VERSION,
+  type MPNDiagnosticsResult
+} from '@/utils/mpnDiagnostics';
 import { 
   parseOverrideFile, 
   applyOverrideToCatalog, 
@@ -134,7 +141,9 @@ interface FileData {
   data: any[];
   headers: string[];
   raw: File;
+  rawContent?: string; // Raw file content for MPN diagnostics
   isValid?: boolean;
+  mpnDiagnostics?: MPNDiagnosticsResult; // MPN raw vs post-parse diagnostics
 }
 
 // Use extended types from eanPrefill.ts
@@ -1368,12 +1377,42 @@ const AltersideCatalogGenerator: React.FC = () => {
       const headerLine = parsed.headers.join(', ');
       const firstDataLine = parsed.data.length > 0 ? Object.values(parsed.data[0]).slice(0, 3).join(', ') + '...' : '';
 
-      const fileState = {
+      // Read raw content for MPN diagnostics (only for material file)
+      let rawContent: string | undefined;
+      let mpnDiagnostics: MPNDiagnosticsResult | undefined;
+      
+      if (type === 'material') {
+        rawContent = await file.text();
+        // Perform MPN diagnostics: raw vs post-parse
+        mpnDiagnostics = performMPNDiagnostics(
+          rawContent,
+          parsed.data,
+          'material',
+          file.name,
+          ';',
+          'ManufPartNr'
+        );
+        logMPNDiagnostics(mpnDiagnostics);
+        
+        // If coercion detected, show warning
+        if (mpnDiagnostics.coercionDetected) {
+          console.error('%c[MATERIAL IMPORT] COERCION DETECTED!', 'color: red; font-weight: bold; font-size: 16px;', mpnDiagnostics.coercionMessage);
+          toast({
+            title: "⚠️ Coercizione MPN rilevata",
+            description: `Il parser sta convertendo MPN in notazione scientifica. Raw: ${mpnDiagnostics.raw.rawSciInMpn}, Post: ${mpnDiagnostics.post.postSciInMpn}`,
+            variant: "destructive"
+          });
+        }
+      }
+
+      const fileState: FileData = {
         name: file.name,
         data: parsed.data,
         headers: parsed.headers,
         raw: file,
-        isValid: validation.valid
+        rawContent,
+        isValid: validation.valid,
+        mpnDiagnostics
       };
 
       // Use functional update to preserve other files' state
@@ -4716,6 +4755,43 @@ const AltersideCatalogGenerator: React.FC = () => {
       
       const materialData = currentFiles.material.file!.data;
       
+      // =====================================================================
+      // MPN DIAGNOSTICS: Raw vs Post-Parse Analysis
+      // =====================================================================
+      console.log('%c[MPN Diagnostics] Starting raw vs post-parse analysis...', 'color: #E91E63; font-weight: bold;');
+      console.log('[MPN Diagnostics] Version:', MPN_DIAGNOSTICS_VERSION);
+      
+      // Perform diagnostics on mapping file
+      const mappingDiagnostics = performMPNDiagnostics(
+        mappingText,
+        lines.slice(1).map(line => {
+          const parts = line.split(';');
+          return { mpn: (parts[0] || '').trim(), ean: (parts[1] || '').trim() };
+        }),
+        'mapping',
+        currentFiles.eanMapping.file!.name,
+        ';',
+        'mpn'
+      );
+      logMPNDiagnostics(mappingDiagnostics);
+      
+      // For Material, we need the raw content - if available from the original file
+      // Since we parse material earlier, we log what we have from parsed data
+      const materialPostDiagnostics = performMPNDiagnostics(
+        '', // No raw content available here
+        materialData,
+        'material',
+        currentFiles.material.file?.name || 'material.txt',
+        ';',
+        'ManufPartNr'
+      );
+      // Only log post-parse for material (raw was done at import time)
+      console.log('%c[MPN Diagnostics:material] Post-parse only', 'color: #E91E63;', {
+        postSciInMpn: materialPostDiagnostics.post.postSciInMpn,
+        postEPlusInMpn: materialPostDiagnostics.post.postEPlusInMpn,
+        typeErrors: materialPostDiagnostics.post.typeErrors
+      });
+      
       // Diagnostic: Count EAN before pre-fill
       const countEANNonVuoti_before = materialData.filter((row: any) => {
         const ean = String(row.EAN ?? '').trim();
@@ -4723,11 +4799,13 @@ const AltersideCatalogGenerator: React.FC = () => {
       }).length;
       console.warn('prefill:diagnostic:before', { total: materialData.length, nonEmpty: countEANNonVuoti_before });
       
-      // Use worker for large files
+      // Use worker for large files - with cache busting
       if (lines.length > 100000 || materialData.length > 100000) {
-        // Process with Web Worker
+        // Process with Web Worker - add cache busting version
         return new Promise<void>((resolve, reject) => {
-          const worker = new Worker('/ean-prefill-worker.js');
+          const workerUrl = `/ean-prefill-worker.js?v=${MPN_DIAGNOSTICS_VERSION}`;
+          console.log('[prefill] Creating worker with cache-busted URL:', workerUrl);
+          const worker = new Worker(workerUrl);
           eanPrefillWorkerRef.current = worker;
           
           worker.onmessage = (e) => {
@@ -5210,8 +5288,12 @@ const AltersideCatalogGenerator: React.FC = () => {
                 'Vince Material (diverso)': prefillCounters.materialWinsDifferentEan ?? 0,
                 'Match normalizzati': prefillCounters.materialNormalizedMatchesMapping ?? 0,
                 'Ambigui (non prefillati)': prefillCounters.ambiguousMapping ?? 0,
-                'MPN con E+ (SKU validi)': (prefillCounters.mpnWithEPlusSubstringMaterial ?? 0) + (prefillCounters.mpnWithEPlusSubstringMapping ?? 0),
-                'MPN formato scientifico (coercizione)': (prefillCounters.mpnScientificNotationFoundMaterial ?? 0) + (prefillCounters.mpnScientificNotationFoundMapping ?? 0)
+                // Split E+ counts by file
+                'MPN con E+ Material': prefillCounters.mpnWithEPlusSubstringMaterial ?? 0,
+                'MPN con E+ Mapping': prefillCounters.mpnWithEPlusSubstringMapping ?? 0,
+                // Split scientific notation by file
+                'MPN scientifico Material': prefillCounters.mpnScientificNotationFoundMaterial ?? 0,
+                'MPN scientifico Mapping': prefillCounters.mpnScientificNotationFoundMapping ?? 0
               },
               warnings: [
                 ...(hasScientificWarning ? [generateScientificNotationWarning(prefillCounters) || ''] : []),
