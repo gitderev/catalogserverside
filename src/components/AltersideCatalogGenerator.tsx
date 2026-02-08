@@ -3528,8 +3528,9 @@ const AltersideCatalogGenerator: React.FC = () => {
       });
 
       // =====================================================================
-      // STEP 2: Save all 3 exports to Supabase bucket "exports"
+      // STEP 2: Save all exports to Supabase bucket "exports"
       // =====================================================================
+      console.log('RUN_ALL_EXPORTS_START');
       setSftpUploadStatus({ phase: 'saving', message: 'Salvataggio file nel bucket...' });
       
       try {
@@ -3572,9 +3573,70 @@ const AltersideCatalogGenerator: React.FC = () => {
           throw new Error(`Mediaworld build failed: ${mediaworldResult.error || 'Unknown error'}`);
         }
         
+        // =====================================================================
+        // Build Amazon export (non-blocking: errors don't prevent other uploads)
+        // =====================================================================
+        console.log('AMAZON_EXPORT_START');
+        setIsExportingAmazon(true);
+        setAmazonProgress({ pct: 0, label: 'Avvio export Amazon...' });
+        setLastAmazonResult(null);
+        
+        let amazonExportResult: AmazonExportResult | null = null;
+        try {
+          const pAmazon = getEffectivePricing(extendedFeeConfig, 'amazon');
+          
+          amazonExportResult = await buildAmazonExport({
+            eanDataset: finalDataset,
+            stockLocationIndex: stockLocationIndex,
+            stockLocationWarnings: stockLocationWarnings,
+            includeEu: extendedFeeConfig.amazonIncludeEu,
+            itDays: extendedFeeConfig.amazonItPreparationDays,
+            euDays: extendedFeeConfig.amazonEuPreparationDays,
+            feeDrev: pAmazon.feeDrev,
+            feeMkt: pAmazon.feeMkt,
+            shippingCost: pAmazon.shippingCost,
+            onProgress: (pct, label) => {
+              setAmazonProgress({ pct, label });
+            }
+          });
+          
+          setLastAmazonResult(amazonExportResult);
+          
+          if (amazonExportResult.success) {
+            // Download Amazon files (atomic: both XLSM + TXT)
+            downloadAmazonFiles(amazonExportResult);
+            console.log('AMAZON_EXPORT_SUCCESS', {
+              exportedCount: amazonExportResult.rowCount,
+              discardedCount: amazonExportResult.discardedCount
+            });
+            toast({
+              title: "Export Amazon completato",
+              description: `${amazonExportResult.rowCount} righe esportate (XLSM + TXT), ${amazonExportResult.discardedCount} scartate`
+            });
+          } else {
+            console.error('AMAZON_EXPORT_FAILED', amazonExportResult.error);
+            toast({
+              title: "Errore export Amazon",
+              description: amazonExportResult.error || "Errore sconosciuto",
+              variant: "destructive"
+            });
+          }
+        } catch (amazonErr: any) {
+          console.error('AMAZON_EXPORT_FAILED', amazonErr);
+          toast({
+            title: "Errore export Amazon",
+            description: amazonErr instanceof Error ? amazonErr.message : "Errore sconosciuto durante l'export Amazon",
+            variant: "destructive"
+          });
+        } finally {
+          setIsExportingAmazon(false);
+        }
+        
         console.log('[EAN:sftp] Export builds complete:', {
           epriceRows: epriceResult.rowCount,
-          mediaworldRows: mediaworldResult.rowCount
+          mediaworldRows: mediaworldResult.rowCount,
+          amazonRows: amazonExportResult?.rowCount ?? 0,
+          amazonSuccess: amazonExportResult?.success ?? false
         });
 
         // Upload all 3 files to bucket (using the SAME blobs for download and SFTP)
