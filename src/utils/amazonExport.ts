@@ -426,6 +426,12 @@ export async function buildAmazonExport(params: AmazonExportParams): Promise<Ama
   onProgress?.(50, `Filtrato: ${validRecords.length} validi, ${discardedRows.length} scartati`);
 
   if (validRecords.length === 0) {
+    console.error('[Amazon:export:no_exportable_rows]', {
+      step: 'no_exportable_rows',
+      totalInput: eanDataset.length,
+      discarded: discardedRows.length,
+      topReasons: Array.from(reasonCounts.entries()).sort((a, b) => b[1] - a[1]).slice(0, 5)
+    });
     return {
       success: false,
       rowCount: 0,
@@ -433,7 +439,7 @@ export async function buildAmazonExport(params: AmazonExportParams): Promise<Ama
       discardedRows,
       reasonCounts,
       diagnostics: { totalInput: eanDataset.length, exported: 0, discarded: discardedRows.length, xlsmRows: 0, txtRows: 0 },
-      error: 'Nessun record valido per Amazon dopo il filtraggio'
+      error: 'Nessuna riga esportabile per Amazon'
     };
   }
 
@@ -476,20 +482,12 @@ export async function buildAmazonExport(params: AmazonExportParams): Promise<Ama
     };
   }
 
-  // VBA preservation is MANDATORY - fail if not present
-  const hasVBA = !!(wb as any).vbaraw;
-  if (!hasVBA) {
-    const errMsg = 'Preservazione macro/VBA non supportata dalla libreria corrente o template privo di VBA. Impossibile generare XLSM conforme.';
-    console.error('[Amazon:template:FATAL]', errMsg);
-    return {
-      success: false,
-      rowCount: 0,
-      discardedCount: discardedRows.length,
-      discardedRows,
-      reasonCounts,
-      diagnostics: { totalInput: eanDataset.length, exported: 0, discarded: discardedRows.length, xlsmRows: 0, txtRows: 0 },
-      error: errMsg
-    };
+  // Deterministic VBA flag: preserve macros if present, proceed without if absent
+  const hasVBA = Boolean((wb as any).vbaraw && (wb as any).vbaraw.length > 0);
+  if (hasVBA) {
+    console.log('[Amazon:template] VBA rilevato nel template, macro saranno preservate.');
+  } else {
+    console.log('[Amazon:template] Template privo di VBA, XLSM sarà generato senza macro.');
   }
 
   // "Modello" sheet MUST exist in template
@@ -570,7 +568,7 @@ export async function buildAmazonExport(params: AmazonExportParams): Promise<Ama
   try {
     xlsmOut = XLSX.write(wb, {
       bookType: 'xlsm',
-      bookVBA: true,
+      bookVBA: hasVBA,
       type: 'array'
     });
   } catch (err) {
@@ -585,24 +583,26 @@ export async function buildAmazonExport(params: AmazonExportParams): Promise<Ama
     };
   }
 
-  // Verify VBA is still present after write
-  try {
-    const verifyWb = XLSX.read(xlsmOut, { type: 'array', bookVBA: true });
-    if (!(verifyWb as any).vbaraw) {
-      const errMsg = 'Verifica post-write fallita: VBA perso durante serializzazione XLSM. Impossibile garantire integrità macro.';
-      console.error('[Amazon:xlsm:FATAL]', errMsg);
-      return {
-        success: false,
-        rowCount: 0,
-        discardedCount: discardedRows.length,
-        discardedRows,
-        reasonCounts,
-        diagnostics: { totalInput: eanDataset.length, exported: 0, discarded: discardedRows.length, xlsmRows: 0, txtRows: 0 },
-        error: errMsg
-      };
+  // Verify VBA is still present after write (only if template had VBA)
+  if (hasVBA) {
+    try {
+      const verifyWb = XLSX.read(xlsmOut, { type: 'array', bookVBA: true });
+      if (!(verifyWb as any).vbaraw) {
+        const errMsg = 'Verifica post-write fallita: VBA perso durante serializzazione XLSM. Impossibile garantire integrità macro.';
+        console.error('[Amazon:xlsm:FATAL]', errMsg);
+        return {
+          success: false,
+          rowCount: 0,
+          discardedCount: discardedRows.length,
+          discardedRows,
+          reasonCounts,
+          diagnostics: { totalInput: eanDataset.length, exported: 0, discarded: discardedRows.length, xlsmRows: 0, txtRows: 0 },
+          error: errMsg
+        };
+      }
+    } catch (verifyErr) {
+      console.warn('[Amazon:xlsm:verify] Verifica post-write non riuscita, proseguo con cautela:', verifyErr);
     }
-  } catch (verifyErr) {
-    console.warn('[Amazon:xlsm:verify] Verifica post-write non riuscita, proseguo con cautela:', verifyErr);
   }
 
   const xlsmBlob = new Blob([xlsmOut], {
