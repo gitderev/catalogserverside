@@ -2,12 +2,15 @@
  * Amazon Export Utility
  *
  * Generates two files atomically:
- * A) ListingLoader XLSM (catalog with VBA preserved from template)
+ * A) ListingLoader XLSM (catalog with VBA preserved from template if present)
  * B) Price/Inventory TXT (tab-delimited)
  *
  * Uses eanCatalogDataset as the single source of truth.
  * Calculates Amazon-specific pricing using existing pricing utilities.
- * Uses resolveMarketplaceStock for IT/EU stock logic.
+ * Uses resolveMarketplaceStock for IT/EU stock logic (includeEU always true).
+ *
+ * OVERRIDE: Override rows use price "as is" without fee/IVA/,99 recalculation,
+ * same logic as ePrice and MediaWorld exports.
  *
  * IMPORTANT: This module does NOT modify any existing export logic.
  */
@@ -236,12 +239,18 @@ export async function buildAmazonExport(params: AmazonExportParams): Promise<Ama
     ean: string;
     quantity: number;
     leadDays: number;
-    priceDisplay: string; // "NN,99" format
+    priceDisplay: string; // "NN,99" format for standard, exact format for overrides
     finalCents: number;
+    isOverride: boolean;
   }
   const validRecords: ValidRecord[] = [];
 
-  const effectiveIncludeEu = includeEu === false ? false : true;
+  // Amazon ALWAYS uses EU fallback - hardcoded to prevent the bug where SKUs
+  // with sufficient EU stock are incorrectly discarded when IT < 2
+  const effectiveIncludeEu = true;
+  if (includeEu === false) {
+    console.warn('[Amazon:export] includeEu parameter was false but Amazon always uses EU fallback. Forcing includeEu=true.');
+  }
   const warnings = stockLocationWarnings;
 
   console.log('%c[Amazon:export:start]', 'color: #FF6600; font-weight: bold;', {
@@ -337,6 +346,22 @@ export async function buildAmazonExport(params: AmazonExportParams): Promise<Ama
 
     // Filter 3: shouldExport and quantity >= 2
     if (!stockResult.shouldExport || stockResult.exportQty < 2) {
+      // VALIDATION: Detect stock/includeEU incoherence (safety net)
+      // With includeEU=true, a row with stockIT < 2 and stockEU >= 2 (combined >= 2)
+      // should NEVER be discarded. If it is, there's a bug in resolveMarketplaceStock.
+      if (stockIT < 2 && effectiveStockEU >= 2 && (stockIT + effectiveStockEU) >= 2) {
+        const errMsg = `Incoerenza stock/includeEU rilevata: SKU=${sku} ha stockIT=${stockIT}, stockEU=${effectiveStockEU} (combinato=${stockIT + effectiveStockEU} >= 2) ma è stato scartato con exportQty=${stockResult.exportQty}. Bug nel calcolo stock.`;
+        console.error('[Amazon:validation:FATAL]', { sku, stockIT, stockEU: effectiveStockEU, exportQty: stockResult.exportQty, leadDays: stockResult.leadDays });
+        return {
+          success: false,
+          rowCount: 0,
+          discardedCount: discardedRows.length,
+          discardedRows,
+          reasonCounts,
+          diagnostics: { totalInput: eanDataset.length, exported: 0, discarded: discardedRows.length, xlsmRows: 0, txtRows: 0 },
+          error: errMsg
+        };
+      }
       discardedRows.push({
         SKU: sku,
         EAN: ean13,
@@ -360,56 +385,78 @@ export async function buildAmazonExport(params: AmazonExportParams): Promise<Ama
     }
 
     // =====================================================================
-    // PRICING: Calculate Amazon-specific price in cents
-    // Same formula as existing per-export pricing
+    // PRICING: Override or Amazon-specific calculation
+    // Override rows use price "as is" (same logic as ePrice/MediaWorld)
     // =====================================================================
-    const hasBest = Number.isFinite(record.CustBestPrice) && record.CustBestPrice > 0;
-    const hasListPrice = Number.isFinite(record.ListPrice) && record.ListPrice > 0;
-    const surchargeValue = (Number.isFinite(record.Surcharge) && record.Surcharge >= 0) ? record.Surcharge : 0;
+    let priceDisplay: string;
+    let finalCents: number;
+    const isOverride = record.__override === true;
 
-    let baseCents = 0;
-    if (hasBest) {
-      baseCents = Math.round((record.CustBestPrice + surchargeValue) * 100);
-    } else if (hasListPrice) {
-      baseCents = Math.round(record.ListPrice * 100);
+    if (isOverride) {
+      // Override price: use exactly as provided, no fees/IVA/shipping/rounding/,99
+      const rawPrice = record['Prezzo Finale'];
+      if (rawPrice === null || rawPrice === undefined || rawPrice === '') {
+        discardedRows.push({ SKU: sku, EAN: ean13, reason: 'Override senza Prezzo Finale', quantityResult, leadDaysResult, prezzoAmazon: null });
+        incReason('Override senza Prezzo Finale');
+        continue;
+      }
+      const parsedPrice = parseFloat(String(rawPrice).replace(',', '.'));
+      if (!Number.isFinite(parsedPrice) || parsedPrice <= 0) {
+        discardedRows.push({ SKU: sku, EAN: ean13, reason: `Override Prezzo Finale non valido: ${rawPrice}`, quantityResult, leadDaysResult, prezzoAmazon: null });
+        incReason('Override Prezzo Finale non valido');
+        continue;
+      }
+      finalCents = Math.round(parsedPrice * 100);
+      priceDisplay = formatCents(finalCents);
+    } else {
+      // Standard pricing: Calculate Amazon-specific price in cents
+      const hasBest = Number.isFinite(record.CustBestPrice) && record.CustBestPrice > 0;
+      const hasListPrice = Number.isFinite(record.ListPrice) && record.ListPrice > 0;
+      const surchargeValue = (Number.isFinite(record.Surcharge) && record.Surcharge >= 0) ? record.Surcharge : 0;
+
+      let baseCents = 0;
+      if (hasBest) {
+        baseCents = Math.round((record.CustBestPrice + surchargeValue) * 100);
+      } else if (hasListPrice) {
+        baseCents = Math.round(record.ListPrice * 100);
+      }
+
+      if (baseCents <= 0) {
+        discardedRows.push({ SKU: sku, EAN: ean13, reason: 'Prezzo base non disponibile', quantityResult, leadDaysResult, prezzoAmazon: null });
+        incReason('Prezzo base non disponibile');
+        continue;
+      }
+
+      const shippingCents = Math.round(shippingCost * 100);
+      const afterShippingCents = baseCents + shippingCents;
+      const afterIvaCents = Math.round(afterShippingCents * 1.22);
+      const afterFeeDeRevCents = Math.round(afterIvaCents * feeDrev);
+      const afterFeesCents = Math.round(afterFeeDeRevCents * feeMkt);
+      finalCents = toComma99Cents(afterFeesCents);
+
+      // Assert valid (only for non-override rows)
+      if (!validateEnding99Cents(finalCents) || finalCents <= 0) {
+        const errMsg = `Prezzo Amazon non valido: finalCents=${finalCents}, ending99=${validateEnding99Cents(finalCents)}`;
+        console.error('[Amazon:pricing:FATAL]', { sku, ean13, baseCents, afterFeesCents, finalCents });
+        return {
+          success: false,
+          rowCount: 0,
+          discardedCount: discardedRows.length,
+          discardedRows,
+          reasonCounts,
+          diagnostics: { totalInput: eanDataset.length, exported: 0, discarded: discardedRows.length, xlsmRows: 0, txtRows: 0 },
+          error: errMsg
+        };
+      }
+      priceDisplay = formatCents(finalCents);
     }
-
-    if (baseCents <= 0) {
-      discardedRows.push({ SKU: sku, EAN: ean13, reason: 'Prezzo base non disponibile', quantityResult, leadDaysResult, prezzoAmazon: null });
-      incReason('Prezzo base non disponibile');
-      continue;
-    }
-
-    const shippingCents = Math.round(shippingCost * 100);
-    const afterShippingCents = baseCents + shippingCents;
-    const afterIvaCents = Math.round(afterShippingCents * 1.22);
-    const afterFeeDeRevCents = Math.round(afterIvaCents * feeDrev);
-    const afterFeesCents = Math.round(afterFeeDeRevCents * feeMkt);
-    const finalCents = toComma99Cents(afterFeesCents);
-
-    // Assert valid
-    if (!validateEnding99Cents(finalCents) || finalCents <= 0) {
-      const errMsg = `Prezzo Amazon non valido: finalCents=${finalCents}, ending99=${validateEnding99Cents(finalCents)}`;
-      console.error('[Amazon:pricing:FATAL]', { sku, ean13, baseCents, afterFeesCents, finalCents });
-      return {
-        success: false,
-        rowCount: 0,
-        discardedCount: discardedRows.length,
-        discardedRows,
-        reasonCounts,
-        diagnostics: { totalInput: eanDataset.length, exported: 0, discarded: discardedRows.length, xlsmRows: 0, txtRows: 0 },
-        error: errMsg
-      };
-    }
-
-    const priceDisplay = formatCents(finalCents);
 
     // Log first 10 records
     if (validRecords.length < 10) {
       console.log(`%c[Amazon:row${validRecords.length}]`, 'color: #FF6600;', {
         sku, ean: ean13, stockIT, stockEU: effectiveStockEU,
         qty: quantityResult, lead: leadDaysResult,
-        baseCents, finalCents, priceDisplay
+        finalCents, priceDisplay, isOverride
       });
     }
 
@@ -419,7 +466,8 @@ export async function buildAmazonExport(params: AmazonExportParams): Promise<Ama
       quantity: quantityResult,
       leadDays: leadDaysResult,
       priceDisplay,
-      finalCents
+      finalCents,
+      isOverride
     });
   }
 
