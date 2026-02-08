@@ -507,6 +507,174 @@ const StockLocationConfig: React.FC<StockLocationConfigProps> = ({
         </div>
       </Card>
 
+      {/* Amazon Configuration */}
+      <Card className="alt-config-card alt-config-card--amazon">
+        <h4 className="text-lg font-semibold mb-4" style={{ color: '#FF9900' }}>Amazon - Configurazione Stock IT/EU e Pricing</h4>
+        
+        <div className="space-y-4">
+          {/* Per-export pricing fields */}
+          <div className="grid grid-cols-3 gap-4">
+            <div>
+              <Label htmlFor="amazon-fee-drev" className="text-sm font-medium">
+                Fee DeRev (moltiplicatore)
+              </Label>
+              <Input
+                id="amazon-fee-drev"
+                type="text"
+                inputMode="decimal"
+                value={formatForDisplay(config.amazonFeeDrev, config.feeDrev)}
+                onChange={(e) => {
+                  const parsed = parseFeeInput(e.target.value);
+                  if (parsed !== null && parsed > 0) {
+                    onConfigChange({ amazonFeeDrev: parsed });
+                  }
+                }}
+                onBlur={(e) => {
+                  const parsed = parseFeeInput(e.target.value);
+                  if (parsed === null || parsed <= 0) {
+                    onConfigChange({ amazonFeeDrev: config.feeDrev });
+                  }
+                }}
+                className="w-full mt-1"
+                disabled={disabled}
+                placeholder={`${config.feeDrev}`}
+              />
+              <p className="text-xs text-muted-foreground mt-1">
+                Globale: {config.feeDrev}
+              </p>
+            </div>
+            <div>
+              <Label htmlFor="amazon-fee-mkt" className="text-sm font-medium">
+                Fee Marketplace (moltiplicatore)
+              </Label>
+              <Input
+                id="amazon-fee-mkt"
+                type="text"
+                inputMode="decimal"
+                value={formatForDisplay(config.amazonFeeMkt, config.feeMkt)}
+                onChange={(e) => {
+                  const parsed = parseFeeInput(e.target.value);
+                  if (parsed !== null && parsed > 0) {
+                    onConfigChange({ amazonFeeMkt: parsed });
+                  }
+                }}
+                onBlur={(e) => {
+                  const parsed = parseFeeInput(e.target.value);
+                  if (parsed === null || parsed <= 0) {
+                    onConfigChange({ amazonFeeMkt: config.feeMkt });
+                  }
+                }}
+                className="w-full mt-1"
+                disabled={disabled}
+                placeholder={`${config.feeMkt}`}
+              />
+              <p className="text-xs text-muted-foreground mt-1">
+                Globale: {config.feeMkt}
+              </p>
+            </div>
+            <div>
+              <Label htmlFor="amazon-shipping" className="text-sm font-medium">
+                Costo spedizione (netti IVA)
+              </Label>
+              <Input
+                id="amazon-shipping"
+                type="text"
+                inputMode="decimal"
+                value={formatForDisplay(config.amazonShippingCost, config.shippingCost)}
+                onChange={(e) => {
+                  const parsed = parseShippingInput(e.target.value);
+                  if (parsed !== null && parsed >= 0) {
+                    onConfigChange({ amazonShippingCost: parsed });
+                  }
+                }}
+                onBlur={(e) => {
+                  const parsed = parseShippingInput(e.target.value);
+                  if (parsed === null || parsed < 0) {
+                    onConfigChange({ amazonShippingCost: config.shippingCost });
+                  }
+                }}
+                className="w-full mt-1"
+                disabled={disabled}
+                placeholder={`${config.shippingCost}`}
+              />
+              <p className="text-xs text-muted-foreground mt-1">
+                Globale: {config.shippingCost.toFixed(2)}
+              </p>
+            </div>
+          </div>
+
+          {/* Include EU Toggle */}
+          <div className="alt-toggle-row">
+            <div>
+              <Label htmlFor="amazon-include-eu" className="text-sm font-medium">
+                Includi magazzino EU per Amazon
+              </Label>
+              <p className="text-xs text-muted-foreground mt-1">
+                {config.amazonIncludeEu 
+                  ? 'Stock EU abilitato: se IT < 2 usa IT+EU combinato'
+                  : 'Solo stock IT: prodotti EU-only saranno esclusi'}
+              </p>
+            </div>
+            <Switch
+              id="amazon-include-eu"
+              checked={config.amazonIncludeEu}
+              onCheckedChange={(checked) => onConfigChange({ amazonIncludeEu: checked })}
+              disabled={disabled}
+            />
+          </div>
+          
+          {/* IT/EU Preparation Days */}
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <Label htmlFor="amazon-it-days" className="text-sm font-medium">
+                Giorni preparazione IT
+              </Label>
+              <Input
+                id="amazon-it-days"
+                type="number"
+                min={0}
+                max={30}
+                value={config.amazonItPreparationDays}
+                onChange={(e) => {
+                  const val = parseInt(e.target.value, 10);
+                  if (!isNaN(val) && val >= 0 && val <= 30) {
+                    onConfigChange({ amazonItPreparationDays: val });
+                  }
+                }}
+                className="w-full mt-1"
+                disabled={disabled}
+              />
+              <p className="text-xs text-muted-foreground mt-1">
+                Lead time export: <strong>{config.amazonItPreparationDays}</strong> giorni
+              </p>
+            </div>
+            <div>
+              <Label htmlFor="amazon-eu-days" className="text-sm font-medium">
+                Giorni preparazione EU
+              </Label>
+              <Input
+                id="amazon-eu-days"
+                type="number"
+                min={0}
+                max={30}
+                value={config.amazonEuPreparationDays}
+                onChange={(e) => {
+                  const val = parseInt(e.target.value, 10);
+                  if (!isNaN(val) && val >= 0 && val <= 30) {
+                    onConfigChange({ amazonEuPreparationDays: val });
+                  }
+                }}
+                className="w-full mt-1"
+                disabled={disabled}
+              />
+              <p className="text-xs text-muted-foreground mt-1">
+                Lead time export: <strong>{config.amazonEuPreparationDays}</strong> giorni
+              </p>
+            </div>
+          </div>
+        </div>
+      </Card>
+
       {/* Legend */}
       <div className="text-xs alt-text-muted p-3 alt-info-box rounded-lg">
         <p><strong>Pricing per-export:</strong> Ogni export usa i suoi Fee DeRev, Fee Marketplace e Costo Spedizione per calcolare i prezzi finali</p>

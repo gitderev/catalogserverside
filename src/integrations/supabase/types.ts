@@ -31,6 +31,12 @@ export type Database = {
       }
       fee_config: {
         Row: {
+          amazon_eu_preparation_days: number
+          amazon_fee_drev: number | null
+          amazon_fee_mkt: number | null
+          amazon_include_eu: boolean
+          amazon_it_preparation_days: number
+          amazon_shipping_cost: number | null
           created_at: string | null
           ean_fee_drev: number | null
           ean_fee_mkt: number | null
@@ -56,6 +62,12 @@ export type Database = {
           updated_at: string | null
         }
         Insert: {
+          amazon_eu_preparation_days?: number
+          amazon_fee_drev?: number | null
+          amazon_fee_mkt?: number | null
+          amazon_include_eu?: boolean
+          amazon_it_preparation_days?: number
+          amazon_shipping_cost?: number | null
           created_at?: string | null
           ean_fee_drev?: number | null
           ean_fee_mkt?: number | null
@@ -81,6 +93,12 @@ export type Database = {
           updated_at?: string | null
         }
         Update: {
+          amazon_eu_preparation_days?: number
+          amazon_fee_drev?: number | null
+          amazon_fee_mkt?: number | null
+          amazon_include_eu?: boolean
+          amazon_it_preparation_days?: number
+          amazon_shipping_cost?: number | null
           created_at?: string | null
           ean_fee_drev?: number | null
           ean_fee_mkt?: number | null

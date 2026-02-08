@@ -570,8 +570,11 @@ tbody td {
 }
 
 .alt-export-card-amazon {
-  border-left: 3px solid hsl(240, 10%, 40%);
-  opacity: 0.6;
+  border-left: 3px solid #FF9900;
+}
+
+.alt-config-card--amazon {
+  border-left: 3px solid #FF9900;
 }
 
 /* ========== Validation Summary ========== */

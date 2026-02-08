@@ -42,6 +42,7 @@ import {
 } from '@/utils/override';
 import { exportMediaworldCatalog, buildMediaworldXlsxFromEanDataset, downloadMediaworldBlob } from '@/utils/mediaworldExport';
 import { buildEpriceXlsxFromEanDataset, downloadEpriceBlob } from '@/utils/epriceExport';
+import { buildAmazonExport, downloadAmazonFiles, type AmazonExportResult } from '@/utils/amazonExport';
 import { 
   toComma99Cents, 
   validateEnding99,
@@ -535,7 +536,14 @@ const AltersideCatalogGenerator: React.FC = () => {
             mediaworldShippingCost: row.mediaworld_shipping_cost != null ? Number(row.mediaworld_shipping_cost) : null,
             epriceFeeDrev: row.eprice_fee_drev != null ? Number(row.eprice_fee_drev) : null,
             epriceFeeMkt: row.eprice_fee_mkt != null ? Number(row.eprice_fee_mkt) : null,
-            epriceShippingCost: row.eprice_shipping_cost != null ? Number(row.eprice_shipping_cost) : null
+            epriceShippingCost: row.eprice_shipping_cost != null ? Number(row.eprice_shipping_cost) : null,
+            // Amazon per-export pricing
+            amazonIncludeEu: row.amazon_include_eu == null ? true : !!row.amazon_include_eu,
+            amazonItPreparationDays: Number(row.amazon_it_preparation_days || 3),
+            amazonEuPreparationDays: Number(row.amazon_eu_preparation_days || 5),
+            amazonFeeDrev: row.amazon_fee_drev != null ? Number(row.amazon_fee_drev) : null,
+            amazonFeeMkt: row.amazon_fee_mkt != null ? Number(row.amazon_fee_mkt) : null,
+            amazonShippingCost: row.amazon_shipping_cost != null ? Number(row.amazon_shipping_cost) : null
           };
           
           setExtendedFeeConfig(loadedConfig);
@@ -645,6 +653,10 @@ const AltersideCatalogGenerator: React.FC = () => {
         eprice_fee_drev: extendedFeeConfig.epriceFeeDrev,
         eprice_fee_mkt: extendedFeeConfig.epriceFeeMkt,
         eprice_shipping_cost: extendedFeeConfig.epriceShippingCost,
+        // Amazon per-export pricing
+        amazon_fee_drev: extendedFeeConfig.amazonFeeDrev,
+        amazon_fee_mkt: extendedFeeConfig.amazonFeeMkt,
+        amazon_shipping_cost: extendedFeeConfig.amazonShippingCost,
         updated_at: new Date().toISOString()
       };
 
@@ -735,6 +747,9 @@ const AltersideCatalogGenerator: React.FC = () => {
     if (!validateFee(extendedFeeConfig.epriceFeeDrev, 'ePrice Fee DeRev')) return;
     if (!validateFee(extendedFeeConfig.epriceFeeMkt, 'ePrice Fee Marketplace')) return;
     if (!validateShipping(extendedFeeConfig.epriceShippingCost, 'ePrice Costo spedizione')) return;
+    if (!validateFee(extendedFeeConfig.amazonFeeDrev, 'Amazon Fee DeRev')) return;
+    if (!validateFee(extendedFeeConfig.amazonFeeMkt, 'Amazon Fee Marketplace')) return;
+    if (!validateShipping(extendedFeeConfig.amazonShippingCost, 'Amazon Costo spedizione')) return;
 
     setIsSavingPrepDays(true);
     try {
@@ -758,6 +773,13 @@ const AltersideCatalogGenerator: React.FC = () => {
         eprice_fee_drev: extendedFeeConfig.epriceFeeDrev,
         eprice_fee_mkt: extendedFeeConfig.epriceFeeMkt,
         eprice_shipping_cost: extendedFeeConfig.epriceShippingCost,
+        // Amazon
+        amazon_include_eu: extendedFeeConfig.amazonIncludeEu,
+        amazon_it_preparation_days: extendedFeeConfig.amazonItPreparationDays,
+        amazon_eu_preparation_days: extendedFeeConfig.amazonEuPreparationDays,
+        amazon_fee_drev: extendedFeeConfig.amazonFeeDrev,
+        amazon_fee_mkt: extendedFeeConfig.amazonFeeMkt,
+        amazon_shipping_cost: extendedFeeConfig.amazonShippingCost,
         updated_at: new Date().toISOString()
       };
       
@@ -1081,6 +1103,9 @@ const AltersideCatalogGenerator: React.FC = () => {
   const [isExportingEAN, setIsExportingEAN] = useState(false);
   const [isExportingEprice, setIsExportingEprice] = useState(false);
   const [isExportingMediaworld, setIsExportingMediaworld] = useState(false);
+  const [isExportingAmazon, setIsExportingAmazon] = useState(false);
+  const [lastAmazonResult, setLastAmazonResult] = useState<AmazonExportResult | null>(null);
+  const [amazonProgress, setAmazonProgress] = useState<{ pct: number; label: string }>({ pct: 0, label: '' });
 
   // Validation results state for visual summary
   interface ExportValidationResult {
@@ -4443,6 +4468,97 @@ const AltersideCatalogGenerator: React.FC = () => {
     }
   }, [eanCatalogDataset, isExportingMediaworld, feeConfig, prepDaysMediaworld, toast, extendedFeeConfig, stockLocationIndex, stockLocationWarnings]);
 
+  // Amazon Export Function - reuses EAN dataset with Amazon-specific pricing
+  const onExportAmazon = useCallback(async (event: React.MouseEvent) => {
+    event.preventDefault();
+    
+    if (isExportingAmazon) {
+      toast({
+        title: "Esportazione in corso...",
+        description: "Attendere completamento dell'esportazione Amazon"
+      });
+      return;
+    }
+    
+    if (!eanCatalogDataset || eanCatalogDataset.length === 0) {
+      toast({
+        title: "Catalogo EAN non disponibile",
+        description: "Devi prima generare il Catalogo EAN prima di esportare per Amazon",
+        variant: "destructive"
+      });
+      return;
+    }
+    
+    setIsExportingAmazon(true);
+    setAmazonProgress({ pct: 0, label: 'Avvio export Amazon...' });
+    setLastAmazonResult(null);
+    
+    try {
+      const pAmazon = getEffectivePricing(extendedFeeConfig, 'amazon');
+      
+      console.log('%c[Amazon:export:config]', 'color: #FF6600; font-weight: bold;', {
+        feeDrev: pAmazon.feeDrev,
+        feeMkt: pAmazon.feeMkt,
+        shippingCost: pAmazon.shippingCost,
+        includeEu: extendedFeeConfig.amazonIncludeEu,
+        itDays: extendedFeeConfig.amazonItPreparationDays,
+        euDays: extendedFeeConfig.amazonEuPreparationDays
+      });
+      
+      const result = await buildAmazonExport({
+        eanDataset: eanCatalogDataset,
+        stockLocationIndex: stockLocationIndex,
+        stockLocationWarnings: stockLocationWarnings,
+        includeEu: extendedFeeConfig.amazonIncludeEu,
+        itDays: extendedFeeConfig.amazonItPreparationDays,
+        euDays: extendedFeeConfig.amazonEuPreparationDays,
+        feeDrev: pAmazon.feeDrev,
+        feeMkt: pAmazon.feeMkt,
+        shippingCost: pAmazon.shippingCost,
+        onProgress: (pct, label) => {
+          setAmazonProgress({ pct, label });
+        }
+      });
+      
+      setLastAmazonResult(result);
+      
+      if (result.success) {
+        downloadAmazonFiles(result);
+        
+        const topReasons = Array.from(result.reasonCounts.entries())
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 5)
+          .map(([reason, count]) => `${reason}: ${count}`)
+          .join(', ');
+        
+        toast({
+          title: "Export Amazon completato",
+          description: `${result.rowCount} righe esportate (XLSM + TXT), ${result.discardedCount} scartate`
+        });
+        
+        if (result.discardedCount > 0) {
+          console.log('%c[Amazon:scarti:top_reasons]', 'color: #FF6600;', topReasons);
+        }
+      } else {
+        toast({
+          title: "Errore export Amazon",
+          description: result.error || "Errore sconosciuto",
+          variant: "destructive"
+        });
+        console.error('[Amazon:export:failed]', result.error);
+      }
+    } catch (error) {
+      console.error('Errore export Amazon:', error);
+      toast({
+        title: "Errore export Amazon",
+        description: error instanceof Error ? error.message : "Errore sconosciuto durante l'export",
+        variant: "destructive"
+      });
+    } finally {
+      setIsExportingAmazon(false);
+    }
+  }, [eanCatalogDataset, isExportingAmazon, toast, extendedFeeConfig, stockLocationIndex, stockLocationWarnings]);
+
   // SFTP upload is now integrated into onExportEAN - no separate function needed
 
   const downloadExcel = (type: 'ean' | 'manufpartnr') => {
@@ -6719,16 +6835,53 @@ const AltersideCatalogGenerator: React.FC = () => {
               </div>
             )}
 
-            {/* Amazon Export Section - Coming Soon */}
+            {/* Amazon Export Section */}
             {currentPipeline === 'EAN' && (
               <div className="mt-8 p-6 rounded-lg alt-export-card alt-export-card-amazon">
-                <h4 className="text-lg font-semibold mb-2 flex items-center gap-2">
-                  Esporta Catalogo Amazon
-                  <span className="alt-badge alt-badge-idle text-xs">In arrivo</span>
-                </h4>
-                <p className="text-xs text-muted-foreground">
-                  Export per Amazon Seller Central sara disponibile prossimamente.
+                <h4 className="text-lg font-semibold mb-4" style={{ color: '#FF9900' }}>Esporta Catalogo Amazon</h4>
+                <div className="flex flex-wrap items-center justify-center gap-4">
+                  <button 
+                    type="button"
+                    onClick={onExportAmazon}
+                    disabled={isExportingAmazon || pipelineRunning}
+                    className={`alt-btn-primary text-lg px-8 py-3 ${isExportingAmazon || pipelineRunning ? 'opacity-50 cursor-not-allowed' : ''}`}
+                  >
+                    <Download className="mr-3 h-5 w-5" />
+                    {isExportingAmazon ? `${amazonProgress.label} (${amazonProgress.pct}%)` : 'Esporta Amazon (XLSM + TXT)'}
+                  </button>
+                </div>
+                <p className="text-xs text-muted-foreground mt-3">
+                  Genera ListingLoader.xlsm e PriceInventory.txt per Seller Central. EAN solo 13 cifre, prezzo con terminazione ,99.
                 </p>
+                {lastAmazonResult && (
+                  <div className="mt-4 text-sm space-y-1">
+                    <div className="flex gap-4">
+                      <span>Righe dataset: <strong>{lastAmazonResult.diagnostics.totalInput}</strong></span>
+                      <span className="text-success">Esportate: <strong>{lastAmazonResult.diagnostics.exported}</strong></span>
+                      <span className="text-warning">Scartate: <strong>{lastAmazonResult.diagnostics.discarded}</strong></span>
+                    </div>
+                    <div className="flex gap-4">
+                      <span>XLSM: <strong>{lastAmazonResult.diagnostics.xlsmRows}</strong> righe</span>
+                      <span>TXT: <strong>{lastAmazonResult.diagnostics.txtRows}</strong> righe</span>
+                      {lastAmazonResult.diagnostics.xlsmRows === lastAmazonResult.diagnostics.txtRows && (
+                        <span className="text-success">Coerenza OK</span>
+                      )}
+                    </div>
+                    {lastAmazonResult.reasonCounts.size > 0 && (
+                      <details className="mt-2">
+                        <summary className="cursor-pointer text-xs text-muted-foreground">Top motivi scarto ({lastAmazonResult.reasonCounts.size} tipi)</summary>
+                        <ul className="text-xs mt-1 space-y-0.5">
+                          {Array.from(lastAmazonResult.reasonCounts.entries())
+                            .sort((a, b) => b[1] - a[1])
+                            .slice(0, 20)
+                            .map(([reason, count], i) => (
+                              <li key={i}>{reason}: {count}</li>
+                            ))}
+                        </ul>
+                      </details>
+                    )}
+                  </div>
+                )}
               </div>
             )}
 

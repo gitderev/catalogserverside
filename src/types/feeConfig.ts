@@ -34,6 +34,13 @@ export interface FeeConfigExtendedRow extends FeeConfigRow {
   eprice_fee_drev: number | null;
   eprice_fee_mkt: number | null;
   eprice_shipping_cost: number | null;
+  // Amazon per-export columns
+  amazon_include_eu: boolean;
+  amazon_it_preparation_days: number;
+  amazon_eu_preparation_days: number;
+  amazon_fee_drev: number | null;
+  amazon_fee_mkt: number | null;
+  amazon_shipping_cost: number | null;
 }
 
 /**
@@ -73,6 +80,13 @@ export interface FeeConfigState {
   epriceFeeDrev: number | null;
   epriceFeeMkt: number | null;
   epriceShippingCost: number | null;
+  // Amazon per-export pricing (null = use global)
+  amazonIncludeEu: boolean;
+  amazonItPreparationDays: number;
+  amazonEuPreparationDays: number;
+  amazonFeeDrev: number | null;
+  amazonFeeMkt: number | null;
+  amazonShippingCost: number | null;
 }
 
 /**
@@ -106,7 +120,14 @@ export const DEFAULT_FEE_CONFIG: FeeConfigState = {
   mediaworldShippingCost: null,
   epriceFeeDrev: null,
   epriceFeeMkt: null,
-  epriceShippingCost: null
+  epriceShippingCost: null,
+  // Amazon defaults
+  amazonIncludeEu: true,
+  amazonItPreparationDays: 3,
+  amazonEuPreparationDays: 5,
+  amazonFeeDrev: null,
+  amazonFeeMkt: null,
+  amazonShippingCost: null
 };
 
 /**
@@ -114,7 +135,7 @@ export const DEFAULT_FEE_CONFIG: FeeConfigState = {
  */
 export function getEffectivePricing(
   config: FeeConfigState,
-  exportType: 'ean' | 'mediaworld' | 'eprice'
+  exportType: 'ean' | 'mediaworld' | 'eprice' | 'amazon'
 ): ExportPricingConfig {
   switch (exportType) {
     case 'ean':
@@ -134,6 +155,12 @@ export function getEffectivePricing(
         feeDrev: config.epriceFeeDrev ?? config.feeDrev,
         feeMkt: config.epriceFeeMkt ?? config.feeMkt,
         shippingCost: config.epriceShippingCost ?? config.shippingCost
+      };
+    case 'amazon':
+      return {
+        feeDrev: config.amazonFeeDrev ?? config.feeDrev,
+        feeMkt: config.amazonFeeMkt ?? config.feeMkt,
+        shippingCost: config.amazonShippingCost ?? config.shippingCost
       };
   }
 }
@@ -169,7 +196,14 @@ export function mapFeeConfigRowToState(row: FeeConfigExtendedRow): FeeConfigStat
     mediaworldShippingCost: row.mediaworld_shipping_cost != null ? Number(row.mediaworld_shipping_cost) : null,
     epriceFeeDrev: row.eprice_fee_drev != null ? Number(row.eprice_fee_drev) : null,
     epriceFeeMkt: row.eprice_fee_mkt != null ? Number(row.eprice_fee_mkt) : null,
-    epriceShippingCost: row.eprice_shipping_cost != null ? Number(row.eprice_shipping_cost) : null
+    epriceShippingCost: row.eprice_shipping_cost != null ? Number(row.eprice_shipping_cost) : null,
+    // Amazon
+    amazonIncludeEu: row.amazon_include_eu == null ? true : !!row.amazon_include_eu,
+    amazonItPreparationDays: Number(row.amazon_it_preparation_days || 3),
+    amazonEuPreparationDays: Number(row.amazon_eu_preparation_days || 5),
+    amazonFeeDrev: row.amazon_fee_drev != null ? Number(row.amazon_fee_drev) : null,
+    amazonFeeMkt: row.amazon_fee_mkt != null ? Number(row.amazon_fee_mkt) : null,
+    amazonShippingCost: row.amazon_shipping_cost != null ? Number(row.amazon_shipping_cost) : null
   };
 }
 
