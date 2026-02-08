@@ -117,20 +117,78 @@ function generateTimestamp(): string {
   return `${y}${m}${d}_${h}${min}`;
 }
 
-async function fetchWithRetry(url: string, maxRetries: number = 3): Promise<ArrayBuffer> {
+function resolveTemplateUrl(): string {
+  // Use Vite's BASE_URL to handle deploys under subpaths
+  let base = '/';
+  try {
+    base = import.meta.env.BASE_URL || '/';
+  } catch {
+    // fallback to root
+  }
+  if (!base.endsWith('/')) base += '/';
+  return `${base}amazon/ListingLoader.xlsm`;
+}
+
+async function fetchXlsmTemplate(maxRetries: number = 3): Promise<ArrayBuffer> {
+  const templateUrl = resolveTemplateUrl();
   const delays = [1000, 3000, 9000];
+
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
-      const response = await fetch(url);
+      const response = await fetch(templateUrl);
+
       if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        console.error('[Amazon:fetch:error]', {
+          templateUrl,
+          status: response.status,
+          contentType: response.headers.get('content-type'),
+        });
+        throw new Error(`HTTP ${response.status} per ${templateUrl}`);
       }
-      return await response.arrayBuffer();
+
+      // Check content-type header for HTML
+      const contentType = response.headers.get('content-type') || '';
+      if (contentType.includes('text/html')) {
+        console.error('[Amazon:fetch:html-content-type]', {
+          templateUrl,
+          status: response.status,
+          contentType,
+        });
+        throw new Error(
+          `Template non trovato o path errato: ricevuto HTML invece di XLSM (content-type: ${contentType}, url: ${templateUrl})`
+        );
+      }
+
+      const buffer = await response.arrayBuffer();
+
+      // Sniff first 128 bytes for HTML content (SPA fallback detection)
+      const preview = new TextDecoder('ascii', { fatal: false }).decode(
+        buffer.slice(0, 128)
+      );
+      const previewLower = preview.toLowerCase();
+      if (previewLower.includes('<html') || previewLower.startsWith('<!doctype')) {
+        console.error('[Amazon:fetch:html-sniff]', {
+          templateUrl,
+          status: response.status,
+          contentType,
+          bodyPreview: preview,
+        });
+        throw new Error(
+          `Template non trovato o path errato: ricevuto HTML invece di XLSM (url: ${templateUrl})`
+        );
+      }
+
+      return buffer;
     } catch (err) {
       if (attempt === maxRetries - 1) {
-        throw new Error(`Fetch fallito dopo ${maxRetries} tentativi: ${err instanceof Error ? err.message : String(err)}`);
+        throw new Error(
+          `Fetch template XLSM fallito dopo ${maxRetries} tentativi: ${err instanceof Error ? err.message : String(err)}`
+        );
       }
-      console.warn(`[Amazon:fetch:retry] Tentativo ${attempt + 1} fallito, attesa ${delays[attempt]}ms...`, err);
+      console.warn(
+        `[Amazon:fetch:retry] Tentativo ${attempt + 1}/${maxRetries} fallito, attesa ${delays[attempt]}ms...`,
+        err
+      );
       await new Promise(resolve => setTimeout(resolve, delays[attempt]));
     }
   }
@@ -386,7 +444,7 @@ export async function buildAmazonExport(params: AmazonExportParams): Promise<Ama
 
   let xlsmBuffer: ArrayBuffer;
   try {
-    xlsmBuffer = await fetchWithRetry('/amazon/ListingLoader.xlsm');
+    xlsmBuffer = await fetchXlsmTemplate();
   } catch (err) {
     const errMsg = `Template ListingLoader.xlsm non trovato o non accessibile: ${err instanceof Error ? err.message : String(err)}`;
     console.error('[Amazon:template:FATAL]', errMsg);
