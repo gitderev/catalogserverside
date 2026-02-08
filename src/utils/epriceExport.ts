@@ -377,9 +377,10 @@ export function buildEpriceXlsxFromEanDataset({
     
     // =========================================================
     // OVERRIDE EXCLUSION: both StockIT and StockEU present and sum = 0
+    // Check isPresent on both fields (0 IS a valid value, null/undefined/'' means not set)
+    // No need to check __override flag — non-override records won't have these fields
     // =========================================================
-    if (record.__override === true &&
-        isPresent(record.__overrideStockIT) &&
+    if (isPresent(record.__overrideStockIT) &&
         isPresent(record.__overrideStockEU) &&
         (Number(record.__overrideStockIT) + Number(record.__overrideStockEU)) === 0) {
       errors.push({

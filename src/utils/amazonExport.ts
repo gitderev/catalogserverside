@@ -569,11 +569,14 @@ export async function buildAmazonExport(params: AmazonExportParams): Promise<Ama
     };
   }
 
-  // Clean target columns from row 7 onwards
+  // Clean target columns from row 5 onwards (index 4)
+  // Template structure: rows 1-3 = metadata, row 4 = column headers, row 5+ = data
+  // Example rows at row 5-6 ("contribution_sku#1.value", "ABC123") must be removed
+  const AMAZON_DATA_START_ROW = 4; // 0-indexed, corresponds to Excel row 5
   if (ws['!ref']) {
     const range = XLSX.utils.decode_range(ws['!ref']);
     const targetCols = [COL.A, COL.B, COL.C, COL.H, COL.AF, COL.AG, COL.AH, COL.AK, COL.BJ];
-    for (let R = 6; R <= range.e.r; R++) { // Row 7 = index 6
+    for (let R = AMAZON_DATA_START_ROW; R <= range.e.r; R++) {
       for (const C of targetCols) {
         const addr = XLSX.utils.encode_cell({ r: R, c: C });
         delete ws[addr];
@@ -581,10 +584,10 @@ export async function buildAmazonExport(params: AmazonExportParams): Promise<Ama
     }
   }
 
-  // Write data from row 7 (index 6)
+  // Write data from row 5 (index 4)
   for (let i = 0; i < validRecords.length; i++) {
     const rec = validRecords[i];
-    const R = 6 + i; // Row 7 = index 6
+    const R = AMAZON_DATA_START_ROW + i;
 
     // Yield every 500 rows
     if (i > 0 && i % 500 === 0) {
@@ -613,7 +616,7 @@ export async function buildAmazonExport(params: AmazonExportParams): Promise<Ama
   }
 
   // Update sheet range
-  const lastRow = 6 + validRecords.length - 1;
+  const lastRow = AMAZON_DATA_START_ROW + validRecords.length - 1;
   const maxCol = COL.BJ;
   if (ws['!ref']) {
     const existingRange = XLSX.utils.decode_range(ws['!ref']);
@@ -622,6 +625,26 @@ export async function buildAmazonExport(params: AmazonExportParams): Promise<Ama
     ws['!ref'] = XLSX.utils.encode_range(existingRange);
   } else {
     ws['!ref'] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: lastRow, c: maxCol } });
+  }
+
+  // POST-WRITE VALIDATION: Ensure no example rows remain
+  const FORBIDDEN_SKUS = ['contribution_sku#1.value', 'ABC123'];
+  for (let R = AMAZON_DATA_START_ROW; R <= lastRow; R++) {
+    const skuAddr = XLSX.utils.encode_cell({ r: R, c: COL.A });
+    const cell = ws[skuAddr];
+    if (cell && FORBIDDEN_SKUS.includes(String(cell.v))) {
+      const errMsg = `ASSERT FAIL: Riga di esempio "${cell.v}" ancora presente nel foglio Modello alla riga ${R + 1}`;
+      console.error('[Amazon:xlsm:ASSERT_FAIL]', errMsg);
+      return {
+        success: false,
+        rowCount: 0,
+        discardedCount: discardedRows.length,
+        discardedRows,
+        reasonCounts,
+        diagnostics: { totalInput: eanDataset.length, exported: 0, discarded: discardedRows.length, xlsmRows: 0, txtRows: 0 },
+        error: errMsg
+      };
+    }
   }
 
   onProgress?.(78, 'Serializzazione XLSM...');

@@ -640,8 +640,20 @@ export async function buildMediaworldXlsxFromEanDataset({
       };
     }
     
-    // Write data starting from row 3 (index 2)
-    const DATA_START_ROW = 2;
+    // Write data starting from row 2 (index 1)
+    // Template row 1 (index 0) = headers, row 2 (index 1) = placeholder/example row to be overwritten
+    const DATA_START_ROW = 1;
+    
+    // Clear any existing template data/example rows before writing
+    if (dataSheet['!ref']) {
+      const existingRange = XLSX.utils.decode_range(dataSheet['!ref']);
+      for (let R = DATA_START_ROW; R <= existingRange.e.r; R++) {
+        for (let C = 0; C < MEDIAWORLD_TEMPLATE.columnCount; C++) {
+          const addr = XLSX.utils.encode_cell({ r: R, c: C });
+          delete dataSheet[addr];
+        }
+      }
+    }
     
     dataRows.forEach((row, dataIndex) => {
       const rowIndex = DATA_START_ROW + dataIndex;
@@ -685,6 +697,25 @@ export async function buildMediaworldXlsxFromEanDataset({
           cell.t = 'n';
           cell.z = '0.00';
         }
+      }
+    }
+    
+    // POST-WRITE VALIDATION: Ensure no placeholder/example rows remain
+    for (let R = DATA_START_ROW; R <= lastRow; R++) {
+      const skuAddr = XLSX.utils.encode_cell({ r: R, c: 0 });
+      const skuCell = dataSheet[skuAddr];
+      const skuVal = skuCell ? String(skuCell.v).trim().toLowerCase() : '';
+      if (skuVal === 'sku') {
+        const errMsg = `ASSERT FAIL: Riga placeholder "sku" trovata alla riga ${R + 1} del foglio Data Mediaworld`;
+        console.error('[Mediaworld:ASSERT_FAIL]', errMsg);
+        return {
+          success: false,
+          error: errMsg,
+          rowCount: 0,
+          skippedCount,
+          validationErrors,
+          diagnostics: { euOnlyTotal, euOnlyExported, itOnlyCount, itAndEuCount }
+        };
       }
     }
     
@@ -1116,16 +1147,26 @@ export async function exportMediaworldCatalog({
       };
     }
     
-    // IMPORTANT: Write data starting from row 3 (rowIndex = 2, 0-indexed)
+    // IMPORTANT: Write data starting from row 2 (rowIndex = 1, 0-indexed)
     // Row 1 (index 0) = Italian headers from template - DO NOT TOUCH
-    // Row 2 (index 1) = Technical codes from template (sku, product-id, etc.) - DO NOT TOUCH
-    // Row 3+ (index 2+) = Data rows - WRITE ONLY VALUES HERE
-    const DATA_START_ROW = 2; // 0-indexed, corresponds to Excel row 3
+    // Row 2 (index 1) = Placeholder/example row - OVERWRITE with real data
+    const DATA_START_ROW = 1; // 0-indexed, corresponds to Excel row 2
     
-    // Write each data row starting from row 3
+    // Clear any existing template data/example rows before writing
+    if (dataSheet['!ref']) {
+      const existingRange = XLSX.utils.decode_range(dataSheet['!ref']);
+      for (let R = DATA_START_ROW; R <= existingRange.e.r; R++) {
+        for (let C = 0; C < MEDIAWORLD_HEADERS_ITALIAN.length; C++) {
+          const addr = XLSX.utils.encode_cell({ r: R, c: C });
+          delete dataSheet[addr];
+        }
+      }
+    }
+    
+    // Write each data row starting from row 2
     // Only write the cell values (.v), preserve any existing cell properties where possible
     dataRows.forEach((row, dataIndex) => {
-      const rowIndex = DATA_START_ROW + dataIndex; // Row 2, 3, 4... (0-indexed)
+      const rowIndex = DATA_START_ROW + dataIndex; // Row 1, 2, 3... (0-indexed)
       
       row.forEach((value, colIndex) => {
         const addr = XLSX.utils.encode_cell({ r: rowIndex, c: colIndex });
@@ -1178,18 +1219,35 @@ export async function exportMediaworldCatalog({
       }
     }
     
+    // POST-WRITE VALIDATION: Ensure no placeholder/example rows remain
+    for (let R = DATA_START_ROW; R <= lastRow; R++) {
+      const skuAddr = XLSX.utils.encode_cell({ r: R, c: 0 });
+      const skuCell = dataSheet[skuAddr];
+      const skuVal = skuCell ? String(skuCell.v).trim().toLowerCase() : '';
+      if (skuVal === 'sku') {
+        const errMsg = `ASSERT FAIL: Riga placeholder "sku" trovata alla riga ${R + 1} del foglio Data Mediaworld`;
+        console.error('[Mediaworld:ASSERT_FAIL]', errMsg);
+        return { 
+          success: false, 
+          error: errMsg,
+          validationErrors,
+          skippedCount
+        };
+      }
+    }
+    
     // === LOG DIAGNOSTICO: Verifica struttura prime 3 righe del foglio Data ===
     console.log('%c[Mediaworld:structure-check] Verifica righe 1-3 del foglio Data:', 'color: #FF9800; font-weight: bold;');
     for (let R = 0; R <= Math.min(2, lastRow); R++) {
       const rowData: Record<string, any> = {};
-      const colsToCheck = [0, 1, 2, 5, 9, 13]; // SKU, EAN, Tipo, Prezzo offerta, State, Prezzo scontato
+      const colsToCheck = [0, 1, 2, 5, 9, 13];
       const colNames = ['A (SKU)', 'B (EAN)', 'C (Tipo)', 'F (PrezzoOff)', 'J (State)', 'N (PrezzoSc)'];
       colsToCheck.forEach((C, idx) => {
         const addr = XLSX.utils.encode_cell({ r: R, c: C });
         const cell = dataSheet[addr];
         rowData[colNames[idx]] = cell ? cell.v : '(vuoto)';
       });
-      const rowLabel = R === 0 ? 'Riga 1 (intestazioni IT)' : R === 1 ? 'Riga 2 (codici tecnici)' : 'Riga 3 (primo dato)';
+      const rowLabel = R === 0 ? 'Riga 1 (intestazioni)' : `Riga ${R + 1} (dato ${R})`;
       console.log(`  ${rowLabel}:`, rowData);
     }
     console.log('%c[Mediaworld:structure-check] Fine verifica', 'color: #FF9800;');
