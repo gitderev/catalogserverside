@@ -18,10 +18,10 @@ export interface OverrideItem {
   rawRowIndex: number;
   sku: string;
   ean: string;
-  quantity: number; // Now mandatory
-  listPrice: number; // Now mandatory
+  quantity?: number; // Optional - empty means don't overwrite catalog value
+  listPrice?: number; // Optional - empty means don't overwrite catalog value
   offerPrice?: number; // Optional for existing product overrides, mandatory for new
-  // NEW optional fields for per-product stock/lead days
+  leadDays?: number; // Single lead days (applies to both IT/EU if per-side not set)
   stockIT?: number;
   stockEU?: number;
   leadDaysIT?: number;
@@ -68,7 +68,7 @@ export interface ApplyOverrideResult {
 // =====================================================================
 
 const REQUIRED_COLUMNS = ['SKU', 'EAN', 'Quantity', 'ListPrice', 'OfferPrice'];
-const OPTIONAL_COLUMNS = ['StockIT', 'StockEU', 'LeadDaysIT', 'LeadDaysEU'];
+const OPTIONAL_COLUMNS = ['StockIT', 'StockEU', 'LeadDaysIT', 'LeadDaysEU', 'LeadDays'];
 
 // =====================================================================
 // HELPER FUNCTIONS
@@ -258,6 +258,7 @@ export function parseOverrideFile(data: ArrayBuffer): ParseOverrideResult {
     const stockEUIdx = optionalIndices.get('StockEU') ?? -1;
     const leadDaysITIdx = optionalIndices.get('LeadDaysIT') ?? -1;
     const leadDaysEUIdx = optionalIndices.get('LeadDaysEU') ?? -1;
+    const leadDaysIdx = optionalIndices.get('LeadDays') ?? -1;
     
     // Parsa le righe dati - collect ALL valid items first
     const allValidItems: OverrideItem[] = [];
@@ -280,6 +281,7 @@ export function parseOverrideFile(data: ArrayBuffer): ParseOverrideResult {
       const stockEURaw = stockEUIdx >= 0 ? row[stockEUIdx] : undefined;
       const leadDaysITRaw = leadDaysITIdx >= 0 ? row[leadDaysITIdx] : undefined;
       const leadDaysEURaw = leadDaysEUIdx >= 0 ? row[leadDaysEUIdx] : undefined;
+      const leadDaysRaw = leadDaysIdx >= 0 ? row[leadDaysIdx] : undefined;
       
       // Valida SKU (mandatory non-empty)
       const sku = normalizeSku(skuRaw);
@@ -298,20 +300,28 @@ export function parseOverrideFile(data: ArrayBuffer): ParseOverrideResult {
       }
       const ean = eanResult.value;
       
-      // Valida Quantity (mandatory integer >= 0)
-      const quantity = parseInteger(quantityRaw);
-      if (quantity === null) {
-        errors.push({ rowIndex, field: 'Quantity', value: String(quantityRaw ?? ''), reason: 'Quantity mancante o non è un intero >= 0' });
-        invalidCount++;
-        continue;
+      // Quantity: optional per row, validate if present
+      let quantity: number | undefined = undefined;
+      if (quantityRaw !== null && quantityRaw !== undefined && quantityRaw !== '') {
+        const parsedQty = parseInteger(quantityRaw);
+        if (parsedQty === null) {
+          errors.push({ rowIndex, field: 'Quantity', value: String(quantityRaw), reason: 'Quantity non è un intero >= 0' });
+          invalidCount++;
+          continue;
+        }
+        quantity = parsedQty;
       }
       
-      // Valida ListPrice (mandatory number with max 2 decimals)
-      const listPrice = parseNumericWithDecimals(listPriceRaw);
-      if (listPrice === null) {
-        errors.push({ rowIndex, field: 'ListPrice', value: String(listPriceRaw ?? ''), reason: 'ListPrice mancante o non valido (max 2 decimali)' });
-        invalidCount++;
-        continue;
+      // ListPrice: optional per row, validate if present
+      let listPrice: number | undefined = undefined;
+      if (listPriceRaw !== null && listPriceRaw !== undefined && listPriceRaw !== '') {
+        const parsedLP = parseNumericWithDecimals(listPriceRaw);
+        if (parsedLP === null) {
+          errors.push({ rowIndex, field: 'ListPrice', value: String(listPriceRaw), reason: 'ListPrice non valido (max 2 decimali)' });
+          invalidCount++;
+          continue;
+        }
+        listPrice = parsedLP;
       }
       
       // Parsa OfferPrice (optional per row - empty allowed)
@@ -374,6 +384,18 @@ export function parseOverrideFile(data: ArrayBuffer): ParseOverrideResult {
         leadDaysEU = parsed;
       }
       
+      // Parse optional LeadDays (single value, applies to both IT/EU if per-side not set)
+      let leadDays: number | undefined = undefined;
+      if (leadDaysRaw !== null && leadDaysRaw !== undefined && leadDaysRaw !== '') {
+        const parsed = parseInteger(leadDaysRaw);
+        if (parsed === null) {
+          errors.push({ rowIndex, field: 'LeadDays', value: String(leadDaysRaw), reason: 'LeadDays non è un intero >= 0' });
+          invalidCount++;
+          continue;
+        }
+        leadDays = parsed;
+      }
+      
       allValidItems.push({
         rawRowIndex: rowIndex,
         sku,
@@ -381,6 +403,7 @@ export function parseOverrideFile(data: ArrayBuffer): ParseOverrideResult {
         quantity,
         listPrice,
         offerPrice,
+        leadDays,
         stockIT,
         stockEU,
         leadDaysIT,
@@ -564,30 +587,38 @@ export function applyOverrideToCatalog(
       });
     }
     
-    // Applica overrides nell'ordine specificato
+    // Applica overrides - only overwrite fields that have values
     
-    // STOCK PRIORITY: If StockIT or StockEU is present, Quantity is ignored
-    // Quantity is only used as fallback (interpreted as StockIT=Quantity, StockEU=0)
+    // STOCK: If explicit StockIT/StockEU present, use them for ExistingStock
     const hasExplicitStock = overrideItem.stockIT !== undefined || overrideItem.stockEU !== undefined;
     if (hasExplicitStock) {
-      // Use explicit stock values - ExistingStock = StockIT + StockEU
-      const stockIT = overrideItem.stockIT ?? 0;
-      const stockEU = overrideItem.stockEU ?? 0;
-      updatedRecord.ExistingStock = stockIT + stockEU;
-    } else {
-      // Fallback: Quantity → ExistingStock (interpreted as IT-only)
+      const sIT = overrideItem.stockIT !== undefined ? overrideItem.stockIT : 0;
+      const sEU = overrideItem.stockEU !== undefined ? overrideItem.stockEU : 0;
+      updatedRecord.ExistingStock = sIT + sEU;
+    } else if (overrideItem.quantity !== undefined) {
+      // Fallback: Quantity → ExistingStock
       updatedRecord.ExistingStock = overrideItem.quantity;
     }
+    // If neither stock nor quantity provided, keep catalog ExistingStock
     
-    // 2. ListPrice -> ListPrice e "ListPrice con Fee" (always provided, mandatory)
-    updatedRecord.ListPrice = overrideItem.listPrice;
-    updatedRecord['ListPrice con Fee'] = overrideItem.listPrice;
+    // ListPrice: only overwrite if provided
+    if (overrideItem.listPrice !== undefined) {
+      updatedRecord.ListPrice = overrideItem.listPrice;
+      updatedRecord['ListPrice con Fee'] = overrideItem.listPrice;
+      // Update per-export ListPrice fields so marketplace exports use override value
+      updatedRecord.listprice_with_fee_mediaworld = overrideItem.listPrice;
+      updatedRecord.listprice_with_fee_eprice = overrideItem.listPrice;
+    }
     
-    // 3. OfferPrice -> "Prezzo Finale" WITHOUT forceEnding99
+    // OfferPrice -> "Prezzo Finale" WITHOUT forceEnding99
     if (overrideItem.offerPrice !== undefined) {
-      // Use exact OfferPrice - NO forceEnding99
-      // Format as string with 2 decimals and comma as decimal separator
       updatedRecord['Prezzo Finale'] = overrideItem.offerPrice.toFixed(2).replace('.', ',');
+      // Update per-export price fields so marketplace exports use override price "as is"
+      updatedRecord.final_price_ean = overrideItem.offerPrice.toFixed(2).replace('.', ',');
+      updatedRecord.final_price_eprice = overrideItem.offerPrice;
+      updatedRecord.final_price_mediaworld = overrideItem.offerPrice;
+      updatedRecord.mediaworldPricingError = false;
+      updatedRecord.epricePricingError = false;
     }
     
     // Add override metadata
@@ -595,8 +626,9 @@ export function applyOverrideToCatalog(
     updatedRecord.__overrideSource = 'existing';
     updatedRecord.__overrideStockIT = overrideItem.stockIT ?? null;
     updatedRecord.__overrideStockEU = overrideItem.stockEU ?? null;
-    updatedRecord.__overrideLeadDaysIT = overrideItem.leadDaysIT ?? null;
-    updatedRecord.__overrideLeadDaysEU = overrideItem.leadDaysEU ?? null;
+    // LeadDays: per-side takes priority, then single LeadDays
+    updatedRecord.__overrideLeadDaysIT = overrideItem.leadDaysIT ?? overrideItem.leadDays ?? null;
+    updatedRecord.__overrideLeadDaysEU = overrideItem.leadDaysEU ?? overrideItem.leadDays ?? null;
     
     catalogWithOverride.push(updatedRecord);
     stats.updatedExisting++;
@@ -618,8 +650,6 @@ export function applyOverrideToCatalog(
       continue;
     }
     
-    // Quantity and ListPrice are now mandatory in parsing, so always present
-    
     // OfferPrice mandatory for NEW products
     if (item.offerPrice === undefined) {
       errors.push({
@@ -632,11 +662,32 @@ export function applyOverrideToCatalog(
       continue;
     }
     
-    // STOCK PRIORITY for new products: If StockIT or StockEU is present, Quantity is ignored
+    // STOCK for new products
     const hasExplicitStock = item.stockIT !== undefined || item.stockEU !== undefined;
-    const stockITValue = item.stockIT ?? 0;
-    const stockEUValue = item.stockEU ?? 0;
-    const existingStockValue = hasExplicitStock ? (stockITValue + stockEUValue) : item.quantity;
+    let stockITValue: number;
+    let stockEUValue: number;
+    let existingStockValue: number;
+    
+    if (hasExplicitStock) {
+      stockITValue = item.stockIT !== undefined ? item.stockIT : 0;
+      stockEUValue = item.stockEU !== undefined ? item.stockEU : 0;
+      existingStockValue = stockITValue + stockEUValue;
+    } else if (item.quantity !== undefined) {
+      // Fallback: Quantity as IT-only
+      stockITValue = item.quantity;
+      stockEUValue = 0;
+      existingStockValue = item.quantity;
+    } else {
+      // No stock info at all - skip with warning
+      errors.push({
+        rowIndex: item.rawRowIndex,
+        field: 'nuovo_prodotto',
+        value: item.sku,
+        reason: 'Riga non idonea per nuovo prodotto: StockIT/StockEU e Quantity tutti mancanti'
+      });
+      stats.skippedRows++;
+      continue;
+    }
     
     // Create new record WITHOUT forceEnding99 - use exact OfferPrice
     const newRecord: any = {
@@ -645,7 +696,7 @@ export function applyOverrideToCatalog(
       EAN: item.ean,
       ShortDescription: `Override item ${item.sku}`,
       ExistingStock: existingStockValue,
-      ListPrice: item.listPrice,
+      ListPrice: item.listPrice ?? 0,
       CustBestPrice: 0,
       Surcharge: 0,
       'Costo di Spedizione': '0,00',
@@ -656,14 +707,22 @@ export function applyOverrideToCatalog(
       'Subtotale post-fee': '0,00',
       // Use EXACT OfferPrice - NO forceEnding99
       'Prezzo Finale': item.offerPrice.toFixed(2).replace('.', ','),
-      'ListPrice con Fee': item.listPrice,
+      'ListPrice con Fee': item.listPrice ?? 0,
+      // Per-export pricing: override price "as is"
+      final_price_ean: item.offerPrice.toFixed(2).replace('.', ','),
+      final_price_eprice: item.offerPrice,
+      final_price_mediaworld: item.offerPrice,
+      listprice_with_fee_mediaworld: item.listPrice ?? 0,
+      listprice_with_fee_eprice: item.listPrice ?? 0,
+      mediaworldPricingError: false,
+      epricePricingError: false,
       // Override metadata
       __override: true,
       __overrideSource: 'new',
       __overrideStockIT: item.stockIT ?? null,
       __overrideStockEU: item.stockEU ?? null,
-      __overrideLeadDaysIT: item.leadDaysIT ?? null,
-      __overrideLeadDaysEU: item.leadDaysEU ?? null
+      __overrideLeadDaysIT: item.leadDaysIT ?? item.leadDays ?? null,
+      __overrideLeadDaysEU: item.leadDaysEU ?? item.leadDays ?? null
     };
     
     catalogWithOverride.push(newRecord);

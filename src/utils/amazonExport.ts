@@ -288,28 +288,25 @@ export async function buildAmazonExport(params: AmazonExportParams): Promise<Ama
       continue;
     }
 
-    // Filter 2: EAN must be exactly 13 digits after normalization
+    // Filter 2: EAN must be 13 or 14 digits after normalization
     const eanResult = normalizeEAN(rawEAN);
     if (!eanResult.ok || !eanResult.value) {
       discardedRows.push({ SKU: sku, EAN: rawEAN, reason: eanResult.reason || 'EAN non valido', quantityResult: null, leadDaysResult: null, prezzoAmazon: null });
       incReason(eanResult.reason || 'EAN non valido');
       continue;
     }
-    if (eanResult.value.length !== 13) {
-      discardedRows.push({ SKU: sku, EAN: rawEAN, reason: `EAN non 13 cifre per Amazon (lunghezza ${eanResult.value.length})`, quantityResult: null, leadDaysResult: null, prezzoAmazon: null });
-      incReason('EAN non 13 cifre per Amazon');
+    if (eanResult.value.length !== 13 && eanResult.value.length !== 14) {
+      discardedRows.push({ SKU: sku, EAN: rawEAN, reason: `EAN non valido per Amazon: lunghezza ${eanResult.value.length} (atteso 13 o 14)`, quantityResult: null, leadDaysResult: null, prezzoAmazon: null });
+      incReason('EAN lunghezza non valida');
       continue;
     }
-    const ean13 = eanResult.value;
+    const eanNorm = eanResult.value;
 
-    // Stock resolution
+    // Stock resolution: compute catalog stock first, then overlay per-field overrides
     let stockIT: number;
     let stockEU: number;
 
-    if (record.__overrideStockIT != null || record.__overrideStockEU != null) {
-      stockIT = record.__overrideStockIT != null ? Number(record.__overrideStockIT) : 0;
-      stockEU = record.__overrideStockEU != null ? Number(record.__overrideStockEU) : 0;
-    } else if (record.__overrideSource === 'new') {
+    if (record.__overrideSource === 'new') {
       stockIT = existingStock;
       stockEU = 0;
     } else {
@@ -322,6 +319,24 @@ export async function buildAmazonExport(params: AmazonExportParams): Promise<Ama
       );
       stockIT = stockData.stockIT;
       stockEU = stockData.stockEU;
+    }
+    // Selectively overlay per-field overrides (missing side keeps catalog value)
+    if (record.__overrideStockIT != null) stockIT = Number(record.__overrideStockIT);
+    if (record.__overrideStockEU != null) stockEU = Number(record.__overrideStockEU);
+
+    // Override exclusion: both StockIT and StockEU present in override and sum = 0
+    if (record.__override && record.__overrideStockIT != null && record.__overrideStockEU != null &&
+        (Number(record.__overrideStockIT) + Number(record.__overrideStockEU)) === 0) {
+      discardedRows.push({
+        SKU: sku,
+        EAN: eanNorm,
+        reason: `Escluso da override: StockIT=${record.__overrideStockIT} + StockEU=${record.__overrideStockEU} = 0`,
+        quantityResult: 0,
+        leadDaysResult: 0,
+        prezzoAmazon: null
+      });
+      incReason('Escluso da override (stock 0)');
+      continue;
     }
 
     const effectiveStockEU = effectiveIncludeEu ? stockEU : 0;
@@ -347,8 +362,6 @@ export async function buildAmazonExport(params: AmazonExportParams): Promise<Ama
     // Filter 3: shouldExport and quantity >= 2
     if (!stockResult.shouldExport || stockResult.exportQty < 2) {
       // VALIDATION: Detect stock/includeEU incoherence (safety net)
-      // With includeEU=true, a row with stockIT < 2 and stockEU >= 2 (combined >= 2)
-      // should NEVER be discarded. If it is, there's a bug in resolveMarketplaceStock.
       if (stockIT < 2 && effectiveStockEU >= 2 && (stockIT + effectiveStockEU) >= 2) {
         const errMsg = `Incoerenza stock/includeEU rilevata: SKU=${sku} ha stockIT=${stockIT}, stockEU=${effectiveStockEU} (combinato=${stockIT + effectiveStockEU} >= 2) ma è stato scartato con exportQty=${stockResult.exportQty}. Bug nel calcolo stock.`;
         console.error('[Amazon:validation:FATAL]', { sku, stockIT, stockEU: effectiveStockEU, exportQty: stockResult.exportQty, leadDays: stockResult.leadDays });
@@ -364,7 +377,7 @@ export async function buildAmazonExport(params: AmazonExportParams): Promise<Ama
       }
       discardedRows.push({
         SKU: sku,
-        EAN: ean13,
+        EAN: eanNorm,
         reason: `Stock insufficiente: IT=${stockIT}, EU=${effectiveStockEU}, qty=${stockResult.exportQty}`,
         quantityResult: stockResult.exportQty,
         leadDaysResult: stockResult.leadDays,
@@ -379,7 +392,7 @@ export async function buildAmazonExport(params: AmazonExportParams): Promise<Ama
 
     // Filter 4: leadDays >= 0
     if (!Number.isInteger(leadDaysResult) || leadDaysResult < 0) {
-      discardedRows.push({ SKU: sku, EAN: ean13, reason: `Lead days non valido: ${leadDaysResult}`, quantityResult, leadDaysResult, prezzoAmazon: null });
+      discardedRows.push({ SKU: sku, EAN: eanNorm, reason: `Lead days non valido: ${leadDaysResult}`, quantityResult, leadDaysResult, prezzoAmazon: null });
       incReason('Lead days non valido');
       continue;
     }
@@ -396,18 +409,19 @@ export async function buildAmazonExport(params: AmazonExportParams): Promise<Ama
       // Override price: use exactly as provided, no fees/IVA/shipping/rounding/,99
       const rawPrice = record['Prezzo Finale'];
       if (rawPrice === null || rawPrice === undefined || rawPrice === '') {
-        discardedRows.push({ SKU: sku, EAN: ean13, reason: 'Override senza Prezzo Finale', quantityResult, leadDaysResult, prezzoAmazon: null });
+        discardedRows.push({ SKU: sku, EAN: eanNorm, reason: 'Override senza Prezzo Finale', quantityResult, leadDaysResult, prezzoAmazon: null });
         incReason('Override senza Prezzo Finale');
         continue;
       }
       const parsedPrice = parseFloat(String(rawPrice).replace(',', '.'));
       if (!Number.isFinite(parsedPrice) || parsedPrice <= 0) {
-        discardedRows.push({ SKU: sku, EAN: ean13, reason: `Override Prezzo Finale non valido: ${rawPrice}`, quantityResult, leadDaysResult, prezzoAmazon: null });
+        discardedRows.push({ SKU: sku, EAN: eanNorm, reason: `Override Prezzo Finale non valido: ${rawPrice}`, quantityResult, leadDaysResult, prezzoAmazon: null });
         incReason('Override Prezzo Finale non valido');
         continue;
       }
       finalCents = Math.round(parsedPrice * 100);
-      priceDisplay = formatCents(finalCents);
+      // Amazon prices use dot separator with 2 decimals
+      priceDisplay = (finalCents / 100).toFixed(2);
     } else {
       // Standard pricing: Calculate Amazon-specific price in cents
       const hasBest = Number.isFinite(record.CustBestPrice) && record.CustBestPrice > 0;
@@ -422,7 +436,7 @@ export async function buildAmazonExport(params: AmazonExportParams): Promise<Ama
       }
 
       if (baseCents <= 0) {
-        discardedRows.push({ SKU: sku, EAN: ean13, reason: 'Prezzo base non disponibile', quantityResult, leadDaysResult, prezzoAmazon: null });
+        discardedRows.push({ SKU: sku, EAN: eanNorm, reason: 'Prezzo base non disponibile', quantityResult, leadDaysResult, prezzoAmazon: null });
         incReason('Prezzo base non disponibile');
         continue;
       }
@@ -437,7 +451,7 @@ export async function buildAmazonExport(params: AmazonExportParams): Promise<Ama
       // Assert valid (only for non-override rows)
       if (!validateEnding99Cents(finalCents) || finalCents <= 0) {
         const errMsg = `Prezzo Amazon non valido: finalCents=${finalCents}, ending99=${validateEnding99Cents(finalCents)}`;
-        console.error('[Amazon:pricing:FATAL]', { sku, ean13, baseCents, afterFeesCents, finalCents });
+        console.error('[Amazon:pricing:FATAL]', { sku, ean: eanNorm, baseCents, afterFeesCents, finalCents });
         return {
           success: false,
           rowCount: 0,
@@ -448,13 +462,14 @@ export async function buildAmazonExport(params: AmazonExportParams): Promise<Ama
           error: errMsg
         };
       }
-      priceDisplay = formatCents(finalCents);
+      // Amazon prices use dot separator with 2 decimals
+      priceDisplay = (finalCents / 100).toFixed(2);
     }
 
     // Log first 10 records
     if (validRecords.length < 10) {
       console.log(`%c[Amazon:row${validRecords.length}]`, 'color: #FF6600;', {
-        sku, ean: ean13, stockIT, stockEU: effectiveStockEU,
+        sku, ean: eanNorm, stockIT, stockEU: effectiveStockEU,
         qty: quantityResult, lead: leadDaysResult,
         finalCents, priceDisplay, isOverride
       });
@@ -462,7 +477,7 @@ export async function buildAmazonExport(params: AmazonExportParams): Promise<Ama
 
     validRecords.push({
       sku,
-      ean: ean13,
+      ean: eanNorm,
       quantity: quantityResult,
       leadDays: leadDaysResult,
       priceDisplay,

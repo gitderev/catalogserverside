@@ -400,17 +400,11 @@ export async function buildMediaworldXlsxFromEanDataset({
         return;
       }
       
-      // OVERRIDE STOCK PRIORITY:
-      // 1. If __overrideStockIT or __overrideStockEU is non-null, use those (missing side = 0)
-      // 2. Else if __overrideSource === 'new', use ExistingStock as IT, EU = 0
-      // 3. Else use getStockForMatnr
+      // Stock resolution: compute catalog stock first, then overlay per-field overrides
       let stockIT: number;
       let stockEU: number;
       
-      if (record.__overrideStockIT != null || record.__overrideStockEU != null) {
-        stockIT = record.__overrideStockIT != null ? Number(record.__overrideStockIT) : 0;
-        stockEU = record.__overrideStockEU != null ? Number(record.__overrideStockEU) : 0;
-      } else if (record.__overrideSource === 'new') {
+      if (record.__overrideSource === 'new') {
         stockIT = existingStock;
         stockEU = 0;
       } else {
@@ -423,6 +417,17 @@ export async function buildMediaworldXlsxFromEanDataset({
         );
         stockIT = stockData.stockIT;
         stockEU = stockData.stockEU;
+      }
+      // Selectively overlay per-field overrides (missing side keeps catalog value)
+      if (record.__overrideStockIT != null) stockIT = Number(record.__overrideStockIT);
+      if (record.__overrideStockEU != null) stockEU = Number(record.__overrideStockEU);
+      
+      // Override exclusion: both StockIT and StockEU present in override and sum = 0
+      if (record.__override && record.__overrideStockIT != null && record.__overrideStockEU != null &&
+          (Number(record.__overrideStockIT) + Number(record.__overrideStockEU)) === 0) {
+        validationErrors.push({ row: index + 1, sku, field: 'Quantità', reason: `Escluso da override: StockIT=${record.__overrideStockIT} + StockEU=${record.__overrideStockEU} = 0` });
+        skippedCount++;
+        return;
       }
       
       // Apply includeEU rule: if false, treat EU as 0
@@ -808,23 +813,44 @@ export async function exportMediaworldCatalog({
       }
       
       // === IT/EU STOCK LOGIC ===
-      // Get IT/EU stock from location index (with fallback to existingStock)
       const warnings = stockLocationWarnings || { 
         missing_location_file: 0, invalid_location_parse: 0, missing_location_data: 0,
         split_mismatch: 0, multi_mpn_per_matnr: 0, orphan_4255: 0, 
         decode_fallback_used: 0, invalid_stock_value: 0 
       };
       
-      const { stockIT, stockEU } = getStockForMatnr(
-        stockLocationIndex || null,
-        matnr,
-        existingStock,
-        warnings,
-        true // useFallback
-      );
+      // Stock resolution: compute catalog stock first, then overlay per-field overrides
+      let stockIT: number;
+      let stockEU: number;
+      
+      if (record.__overrideSource === 'new') {
+        stockIT = existingStock;
+        stockEU = 0;
+      } else {
+        const stockData = getStockForMatnr(
+          stockLocationIndex || null,
+          matnr,
+          existingStock,
+          warnings,
+          true // useFallback
+        );
+        stockIT = stockData.stockIT;
+        stockEU = stockData.stockEU;
+      }
+      // Selectively overlay per-field overrides (missing side keeps catalog value)
+      if (record.__overrideStockIT != null) stockIT = Number(record.__overrideStockIT);
+      if (record.__overrideStockEU != null) stockEU = Number(record.__overrideStockEU);
+      
+      // Override exclusion: both StockIT and StockEU present in override and sum = 0
+      if (record.__override && record.__overrideStockIT != null && record.__overrideStockEU != null &&
+          (Number(record.__overrideStockIT) + Number(record.__overrideStockEU)) === 0) {
+        validationErrors.push({ row: index + 1, sku, field: 'Quantità', reason: `Escluso da override: StockIT=${record.__overrideStockIT} + StockEU=${record.__overrideStockEU} = 0` });
+        skippedCount++;
+        return;
+      }
       
       // Check split mismatch if location file is loaded
-      if (stockLocationIndex) {
+      if (stockLocationIndex && !record.__override) {
         checkSplitMismatch(stockIT, stockEU, existingStock, warnings);
       }
       

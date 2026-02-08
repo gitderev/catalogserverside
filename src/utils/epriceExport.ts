@@ -132,23 +132,14 @@ export function buildEpriceXlsxFromEanDataset({
       return;
     }
     
-    // OVERRIDE STOCK PRIORITY:
-    // 1. If __overrideStockIT or __overrideStockEU is non-null, use those (missing side = 0)
-    // 2. Else if __overrideSource === 'new', use ExistingStock as IT, EU = 0
-    // 3. Else use getStockForMatnr
+    // Stock resolution: compute catalog stock first, then overlay per-field overrides
     let stockIT: number;
     let stockEU: number;
     
-    if (record.__overrideStockIT != null || record.__overrideStockEU != null) {
-      // Override provides explicit stock values
-      stockIT = record.__overrideStockIT != null ? Number(record.__overrideStockIT) : 0;
-      stockEU = record.__overrideStockEU != null ? Number(record.__overrideStockEU) : 0;
-    } else if (record.__overrideSource === 'new') {
-      // New override product without explicit stock: use ExistingStock as IT-only
+    if (record.__overrideSource === 'new') {
       stockIT = existingStock;
       stockEU = 0;
     } else {
-      // Standard catalog product: use getStockForMatnr
       const stockData = getStockForMatnr(
         stockLocationIndex,
         matnr,
@@ -158,6 +149,17 @@ export function buildEpriceXlsxFromEanDataset({
       );
       stockIT = stockData.stockIT;
       stockEU = stockData.stockEU;
+    }
+    // Selectively overlay per-field overrides (missing side keeps catalog value)
+    if (record.__overrideStockIT != null) stockIT = Number(record.__overrideStockIT);
+    if (record.__overrideStockEU != null) stockEU = Number(record.__overrideStockEU);
+    
+    // Override exclusion: both StockIT and StockEU present in override and sum = 0
+    if (record.__override && record.__overrideStockIT != null && record.__overrideStockEU != null &&
+        (Number(record.__overrideStockIT) + Number(record.__overrideStockEU)) === 0) {
+      errors.push({ row: index + 1, sku, field: 'quantity', reason: `Escluso da override: StockIT=${record.__overrideStockIT} + StockEU=${record.__overrideStockEU} = 0` });
+      skippedCount++;
+      return;
     }
     
     // Apply includeEU rule: if false, treat EU as 0
