@@ -408,16 +408,12 @@ export function buildEpriceXlsxFromEanDataset({
     // =========================================================
     // RESOLVE STOCK: inline IT-first logic for ePrice
     // =========================================================
-    // Override lead days: per-record override takes priority, then UI euDays
-    const euDaysEff = (effectiveIncludeEu && isPresent(record.__overrideLeadDaysEU))
-      ? Number(record.__overrideLeadDaysEU)
-      : euDays;
-
+    // ePrice lead time: always from UI parameters, never from per-record override
     const stockResult = resolveEpriceStock(
       stockIT,
       effectiveIncludeEu ? stockEU : 0,
       effectiveIncludeEu,
-      euDaysEff
+      euDays
     );
     
     // Filter 3: Stock threshold (min 2)

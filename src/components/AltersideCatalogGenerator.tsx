@@ -3909,7 +3909,7 @@ const AltersideCatalogGenerator: React.FC = () => {
     };
   }, []);
 
-  // ePrice Export Function - reuses EAN dataset
+  // ePrice Export Function - reuses EAN dataset via buildEpriceXlsxFromEanDataset
   const onExportEprice = useCallback((event: React.MouseEvent) => {
     event.preventDefault();
     
@@ -3927,22 +3927,19 @@ const AltersideCatalogGenerator: React.FC = () => {
     setStockLocationWarnings(EMPTY_WARNINGS);
     
     // === DIAGNOSTIC LOG: IT/EU Config for ePrice ===
+    const epriceIncludeEu = extendedFeeConfig.epriceIncludeEu === false ? false : true;
+    const epriceEuDays = extendedFeeConfig.epriceEuPreparationDays;
+    const epriceItDays = extendedFeeConfig.epriceItPreparationDays;
+    
     console.log('%c[ePrice:IT_EU_Config]', 'color: #9C27B0; font-weight: bold;', {
-      epriceIncludeEu: extendedFeeConfig.epriceIncludeEu,
-      epriceItDays: extendedFeeConfig.epriceItPreparationDays,
-      epriceEuDays: extendedFeeConfig.epriceEuPreparationDays,
+      epriceIncludeEu,
+      epriceItDays,
+      epriceEuDays,
       stockLocationIndex_loaded: !!stockLocationIndex,
       stockLocationIndex_count: stockLocationIndex ? Object.keys(stockLocationIndex).length : 0
     });
     
     try {
-      // =====================================================================
-      // FONTE UNICA: USARE IL DATASET DEL CATALOGO EAN
-      // Il dataset eanCatalogDataset contiene i prezzi formattati "NN,99"
-      // esattamente come vengono scritti nel file Excel del Catalogo EAN.
-      // Se il dataset è vuoto, l'utente deve prima generare il Catalogo EAN.
-      // =====================================================================
-      
       if (!eanCatalogDataset || eanCatalogDataset.length === 0) {
         toast({
           title: "Catalogo EAN non disponibile",
@@ -3954,368 +3951,67 @@ const AltersideCatalogGenerator: React.FC = () => {
       }
       
       // =====================================================================
-      // USA DIRETTAMENTE eanCatalogDataset SENZA ULTERIORI FILTRI
-      // Questo dataset è già filtrato durante la generazione del Catalogo EAN.
-      // NON usare currentProcessedData o altre fonti dati.
+      // DELEGA A buildEpriceXlsxFromEanDataset (logica override, stock IT-first,
+      // fulfillment-latency, esclusione 0+0, assertions hard-fail)
       // =====================================================================
-      
-      // =====================================================================
-      // LOG ESTESO: EXPORT ePRICE - CONTEGGI E CONFRONTI
-      // =====================================================================
-      console.log('%c[ePrice:counts] === INIZIO EXPORT ePRICE ===', 'color: #9C27B0; font-weight: bold; font-size: 14px;');
-      console.log(`%c[ePrice:counts]`, 'color: #9C27B0;', { 
-        'prodotti in eanCatalogDataset': eanCatalogDataset.length,
-        'prodotti da esportare': eanCatalogDataset.length,
-        'differenza (dovrebbe essere 0)': 0,
-        timestamp: new Date().toISOString()
+      const epriceResult = buildEpriceXlsxFromEanDataset({
+        eanDataset: eanCatalogDataset,
+        stockLocationIndex: stockLocationIndex,
+        stockLocationWarnings: stockLocationWarnings,
+        includeEu: epriceIncludeEu,
+        itDays: epriceItDays,
+        euDays: epriceEuDays
       });
       
-      // Log primi 5 record dalla sorgente
-      eanCatalogDataset.slice(0, 5).forEach((record: any, idx: number) => {
-        console.log(`%c[ePrice:source:row${idx}]`, 'color: #9C27B0;', {
-          EAN: record.EAN,
-          SKU: record.ManufPartNr,
-          'Prezzo Finale RAW (da Catalogo EAN)': record['Prezzo Finale'],
-          'Prezzo Finale RAW type': typeof record['Prezzo Finale'],
-          'ExistingStock RAW': record.ExistingStock
-        });
-      });
-      
-      // USA DIRETTAMENTE IL DATASET - già filtrato in onExportEAN
-      const eanFilteredData = eanCatalogDataset;
-      
-      // Log di inizio export standardizzato con IT/EU config
-      console.log('%c[ePrice:export:start]', 'color: #9C27B0; font-weight: bold;', {
-        rows_da_exportare: eanFilteredData.length,
-        timestamp: new Date().toISOString(),
-        // Diagnostic: IT/EU config being used
-        config_IT_EU: {
-          includeEu: extendedFeeConfig.epriceIncludeEu,
-          itDays: extendedFeeConfig.epriceItPreparationDays,
-          euDays: extendedFeeConfig.epriceEuPreparationDays,
-          stockLocationIndex_present: !!stockLocationIndex
-        }
-      });
-      
-      if (eanFilteredData.length === 0) {
-        toast({
-          title: "Nessuna riga valida per ePrice",
-          description: "Non ci sono record con EAN validi da esportare. Genera prima il Catalogo EAN.",
-          variant: "destructive"
-        });
-        setIsExportingEprice(false);
-        return;
-      }
-      
-      // Validate prepDays
-      if (!Number.isInteger(prepDays) || prepDays < 0 || prepDays > 30) {
-        toast({
-          title: "Errore validazione",
-          description: "I giorni di preparazione devono essere un numero intero tra 0 e 30",
-          variant: "destructive"
-        });
-        setIsExportingEprice(false);
-        return;
-      }
-      
-      // Validation arrays for tracking issues
-      const validationErrors: string[] = [];
-      const validationWarnings: string[] = [];
-      let skippedCount = 0;
-      
-      // Diagnostic counters for EU-only records
-      let euOnlyCount = 0;
-      let euOnlyExported = 0;
-      
-      // Use template headers
-      const headers = [...EPRICE_TEMPLATE.headers];
-      
-      // Build AOA (Array of Arrays) with exact headers
-      const aoa: (string | number)[][] = [headers];
-      
-      // Add data rows with validation and IT/EU stock logic
-      eanFilteredData.forEach((record, index) => {
-        const rowErrors: string[] = [];
-        
-        // Validate SKU
-        const sku = record.ManufPartNr || '';
-        if (!sku || sku.trim() === '') {
-          rowErrors.push(`Riga ${index + 1}: SKU mancante`);
-        }
-        
-        // Validate EAN (already filtered but double-check format)
-        const ean = record.EAN || '';
-        if (!/^\d{12,14}$/.test(ean)) {
-          rowErrors.push(`Riga ${index + 1}: EAN non valido (${ean})`);
-        }
-        
-        // Get Matnr for stock location lookup
-        const matnr = record.Matnr || '';
-        const existingStock = Number(record.ExistingStock) || 0;
-        
-        // Get IT/EU stock from location index (with fallback)
-        const { stockIT, stockEU } = getStockForMatnr(
-          stockLocationIndex,
-          matnr,
-          existingStock,
-          stockLocationWarnings,
-          true // useFallback
-        );
-        
-        // Check split mismatch if location file is loaded
-        if (stockLocationIndex) {
-          checkSplitMismatch(stockIT, stockEU, existingStock, stockLocationWarnings);
-        }
-        
-        // Use resolveMarketplaceStock for quantity and lead time
-        const stockResult = resolveMarketplaceStock(
-          stockIT,
-          stockEU,
-          extendedFeeConfig.epriceIncludeEu,
-          extendedFeeConfig.epriceItPreparationDays,
-          extendedFeeConfig.epriceEuPreparationDays
-        );
-        
-        // Track EU-only records (IT < 2 and EU >= 2)
-        const isEuOnly = stockIT < 2 && stockEU >= 2;
-        if (isEuOnly) {
-          euOnlyCount++;
-        }
-        
-        // Skip if shouldn't export (min 2 threshold)
-        if (!stockResult.shouldExport) {
-          skippedCount++;
-          return; // Skip this row
-        }
-        
-        // Track EU-only records that get exported when includeEU=true
-        if (isEuOnly && stockResult.shouldExport) {
-          euOnlyExported++;
-        }
-        
-        // =====================================================================
-        // PREZZO FINALE DA CATALOGO EAN - SOLA LETTURA, NESSUN RICALCOLO
-        // =====================================================================
-        const prezzoFinaleRaw = record['Prezzo Finale'];
-        let prezzoFinaleNumber: number | null = null;
-        
-        if (prezzoFinaleRaw != null) {
-          if (typeof prezzoFinaleRaw === 'number' && Number.isFinite(prezzoFinaleRaw)) {
-            prezzoFinaleNumber = prezzoFinaleRaw;
-          } else {
-            const s = String(prezzoFinaleRaw).trim().replace(',', '.');
-            if (s) {
-              const n = parseFloat(s);
-              if (Number.isFinite(n)) {
-                prezzoFinaleNumber = n;
-              }
-            }
-          }
-        }
-        
-        // LOG ESTESO for first 10 records
-        if (index < 10) {
-          console.log(`%c[ePrice:export:row${index}]`, 'color: #9C27B0;', {
-            EAN: ean,
-            SKU: sku,
-            stockIT, stockEU,
-            includeEU: extendedFeeConfig.epriceIncludeEu,
-            exportQty: stockResult.exportQty,
-            leadDays: stockResult.leadDays,
-            source: stockResult.source,
-            prezzoFinale: prezzoFinaleNumber
-          });
-        }
-        
-        // Validate price
-        if (prezzoFinaleNumber === null || prezzoFinaleNumber <= 0) {
-          rowErrors.push(`Riga ${index + 1}: Prezzo Finale mancante o non valido (SKU: ${sku})`);
-        }
-        
-        if (rowErrors.length > 0) {
-          validationErrors.push(...rowErrors);
-          skippedCount++;
-          return;
-        }
-        
-        // Build row with IT/EU stock logic applied
-        aoa.push([
-          sku,                                        // sku
-          ean,                                        // product-id
-          EPRICE_TEMPLATE.fixedValues["product-id-type"], // product-id-type = "EAN"
-          prezzoFinaleNumber ?? 0,                    // price
-          stockResult.exportQty,                      // quantity - from IT/EU logic
-          EPRICE_TEMPLATE.fixedValues["state"],       // state = 11
-          stockResult.leadDays,                       // fulfillment-latency - from IT/EU logic
-          EPRICE_TEMPLATE.fixedValues["logistic-class"] // logistic-class = "K"
-        ]);
-      });
-      
-      // Check if we have valid rows after validation
-      if (aoa.length <= 1) {
-        toast({
-          title: "Errore validazione",
-          description: `Nessuna riga valida dopo la validazione. ${validationErrors.length} errori trovati.`,
-          variant: "destructive"
-        });
-        console.error("Errori validazione ePrice:", validationErrors);
-        setIsExportingEprice(false);
-        return;
-      }
-      
-      // Show warnings if any (but continue export)
-      if (validationWarnings.length > 0) {
-        console.warn("Warning validazione ePrice:", validationWarnings);
-      }
-      
-      // Log EU-only diagnostic summary
-      console.log('%c[ePrice:export:EU-only-summary]', 'color: #9C27B0; font-weight: bold;', {
-        euOnly_total: euOnlyCount,
-        euOnly_exported: euOnlyExported,
-        euOnly_skipped: euOnlyCount - euOnlyExported,
-        includeEu: extendedFeeConfig.epriceIncludeEu,
-        itDays: extendedFeeConfig.epriceItPreparationDays,
-        euDays: extendedFeeConfig.epriceEuPreparationDays
-      });
-      
-      // Show summary if rows were skipped
-      if (skippedCount > 0) {
-        toast({
-          title: "Attenzione",
-          description: `${skippedCount} righe saltate per errori di validazione. Esportate ${aoa.length - 1} righe valide.`,
-        });
-        console.warn("Righe saltate:", validationErrors);
-      }
-      
-      // Create worksheet from AOA
-      const ws = XLSX.utils.aoa_to_sheet(aoa);
-      
-      // Force product-id (column B) to text format to preserve leading zeros
-      if (ws['!ref']) {
-        const range = XLSX.utils.decode_range(ws['!ref']);
-        const eanCol = 1; // Column B (product-id)
-        
-        for (let R = 1; R <= range.e.r; R++) {
-          const addr = XLSX.utils.encode_cell({ r: R, c: eanCol });
-          const cell = ws[addr];
-          if (cell) {
-            cell.v = (cell.v ?? '').toString();
-            cell.t = 's';
-            cell.z = '@';
-            ws[addr] = cell;
-          }
-        }
-        
-        // Format price (column D) as NUMBER with 2 decimal places (0.00)
-        // NON forzare a testo - deve essere un numero con punto decimale
-        const priceCol = 3; // Column D (price)
-        for (let R = 1; R <= range.e.r; R++) {
-          const addr = XLSX.utils.encode_cell({ r: R, c: priceCol });
-          const cell = ws[addr];
-          if (cell && typeof cell.v === 'number') {
-            cell.t = 'n'; // number type
-            cell.z = '0.00'; // format with 2 decimal places
-            ws[addr] = cell;
-          }
-        }
-      }
-      
-      // Create workbook with official sheet name
-      const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, ws, EPRICE_TEMPLATE.sheetName);
-      
-      // =====================================================================
-      // VALIDAZIONE STRUTTURA: Verifica che il file generato sia conforme
-      // al template ufficiale prima del download
-      // =====================================================================
-      const validationResult = validateEpriceStructure(ws, EPRICE_TEMPLATE.sheetName);
-      
-      // Build validation report for UI - USA eanCatalogDataset NON currentProcessedData
+      // Build validation report for UI
       const validationReport: ExportValidationResult = {
         exportType: 'ePrice',
         timestamp: new Date(),
-        success: validationResult.isValid,
-        totalRows: eanCatalogDataset.length, // CORRETTO: usa eanCatalogDataset
-        validRows: aoa.length - 1,
-        skippedRows: skippedCount,
-        errors: validationErrors.map(e => ({ row: 0, field: '', reason: e })),
-        warnings: [...validationWarnings, ...validationResult.warnings],
-        structureErrors: validationResult.errors
+        success: epriceResult.success,
+        totalRows: eanCatalogDataset.length,
+        validRows: epriceResult.rowCount,
+        skippedRows: epriceResult.skippedCount,
+        errors: epriceResult.errors.map(e => ({ row: e.row, field: e.field, reason: e.reason })),
+        warnings: [],
+        structureErrors: []
       };
       
-      // LOG STANDARDIZZATO: riepilogo export ePRICE
-      const exportedRows = aoa.length - 1;
-      const inputRows = eanCatalogDataset.length;
-      
-      console.log('%c[ePrice:export:summary]', 'color: #9C27B0; font-weight: bold;', {
-        prodotti_input_CatalogoEAN: inputRows,
-        prodotti_ePrice_export: exportedRows,
-        prodotti_scartati: skippedCount,
-        allineamento_set: inputRows === (exportedRows + skippedCount) ? 'OK' : 'MISMATCH'
-      });
-      
-      // === LOG VERIFICA FINALE ePRICE ===
-      console.log('%c[check:export-final-ePrice]', 'color: #E91E63; font-weight: bold;', {
-        catalogoEAN_rows: inputRows,
-        ePrice_export_rows: exportedRows,
-        difference: inputRows - exportedRows - skippedCount,
-        status: inputRows === (exportedRows + skippedCount) ? 'OK' : 'MISMATCH'
-      });
-      
-      if (!validationResult.isValid) {
-        console.error("Errori struttura template ePrice:", validationResult.errors);
-        validationReport.success = false;
+      if (!epriceResult.success || !epriceResult.blob) {
+        const assertErrors = epriceResult.errors.filter(e => e.field === 'assertion');
+        const errorSummary = assertErrors.length > 0
+          ? `Assert fallite: ${assertErrors.map(e => `${e.sku}: ${e.reason}`).join('; ')}`
+          : `Nessuna riga esportabile (${epriceResult.errors.length} errori)`;
+        
         setLastEpriceValidation(validationReport);
         toast({
-          title: "Errore struttura file",
-          description: `Il file generato non è conforme al template: ${validationResult.errors.slice(0, 3).join('; ')}`,
+          title: "Errore export ePrice",
+          description: errorSummary.slice(0, 200),
           variant: "destructive"
+        });
+        console.error('[ePrice:manual:FAIL]', {
+          errors: epriceResult.errors,
+          diagnostics: epriceResult.diagnostics
         });
         setIsExportingEprice(false);
         return;
       }
       
-      if (validationResult.warnings.length > 0) {
-        console.warn("Warning struttura template ePrice:", validationResult.warnings);
-      }
-      
-      // Serialize to ArrayBuffer
-      const wbout = XLSX.write(wb, { bookType: "xlsx", type: "array" });
-      
-      if (!wbout || wbout.length === 0) {
-        toast({
-          title: "Errore generazione file",
-          description: "Buffer vuoto durante la generazione del file ePrice",
-          variant: "destructive"
-        });
-        return;
-      }
-      
-      // Create blob and download
-      const blob = new Blob([wbout], { 
-        type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" 
+      // Log summary
+      console.log('%c[ePrice:manual:success]', 'color: #9C27B0; font-weight: bold;', {
+        exportedRows: epriceResult.rowCount,
+        skippedRows: epriceResult.skippedCount,
+        diagnostics: epriceResult.diagnostics
       });
       
-      const url = URL.createObjectURL(blob);
-      const fileName = "Tracciato_Pubblicazione_Offerte_new.xlsx";
-      
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = fileName;
-      a.rel = "noopener";
-      a.style.display = "none";
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      
-      setTimeout(() => URL.revokeObjectURL(url), 3000);
+      // Download
+      downloadEpriceBlob(epriceResult.blob, "Tracciato_Pubblicazione_Offerte_new.xlsx");
       
       // Save validation report for UI
       setLastEpriceValidation(validationReport);
       
       toast({
         title: "Export ePrice completato",
-        description: `File generato con ${aoa.length - 1} righe, conforme al template ufficiale`
+        description: `File generato con ${epriceResult.rowCount} righe. Scartate: ${epriceResult.skippedCount}.`
       });
       
     } catch (error) {
@@ -4328,7 +4024,7 @@ const AltersideCatalogGenerator: React.FC = () => {
     } finally {
       setIsExportingEprice(false);
     }
-  }, [eanCatalogDataset, isExportingEprice, prepDays, toast, validateEpriceStructure, extendedFeeConfig, stockLocationIndex, stockLocationWarnings]);
+  }, [eanCatalogDataset, isExportingEprice, toast, extendedFeeConfig, stockLocationIndex, stockLocationWarnings]);
 
   // Mediaworld Export Function - reuses EAN dataset
   const onExportMediaworld = useCallback(async (event: React.MouseEvent) => {
