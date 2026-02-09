@@ -84,7 +84,7 @@ import Papa from 'papaparse';
 import { PipelineStepsDisplay, type PipelineStep, type StepStatus } from '@/components/PipelineStepsDisplay';
 
 // Helper functions for MPN calculations
-function asNum(v: any): number {
+function asNum(v: unknown): number {
   if (v == null || v === '') return 0;
   if (typeof v === 'number') return v;
   const s = String(v).replace(/\./g, '').replace(',', '.');
@@ -93,7 +93,7 @@ function asNum(v: any): number {
 }
 
 // Dedicated parsing function for distributor price file (ListPrice, CustBestPrice, Surcharge)
-function parseDistributorPrice(raw: any): number {
+function parseDistributorPrice(raw: unknown): number {
   if (raw === null || raw === undefined) return 0;
   
   let value = String(raw).trim();
@@ -113,15 +113,15 @@ function parseDistributorPrice(raw: any): number {
   return num;
 }
 
-function ceil2(v: any): number {
+function ceil2(v: unknown): number {
   return Math.ceil(asNum(v) * 100) / 100;
 }
 
-function ceilInt(v: any): number {
+function ceilInt(v: unknown): number {
   return Math.ceil(asNum(v));
 }
 
-function toEnding99(v: any): number {
+function toEnding99(v: unknown): number {
   const n = asNum(v);
   const c = Math.round(n * 100) % 100;
   if (c === 99) return Math.floor(n) + 0.99;
@@ -129,11 +129,11 @@ function toEnding99(v: any): number {
   return n <= f + 0.99 ? f + 0.99 : f + 1.99;
 }
 
-function toComma(n: any): string {
+function toComma(n: unknown): string {
   return asNum(n).toFixed(2).replace('.', ',');
 }
 
-function toExcelText(s: any): string {
+function toExcelText(s: unknown): string {
   const str = String(s ?? '');
   return /^[=+\-@]/.test(str) ? `'${str}` : str;
 }
@@ -292,7 +292,7 @@ function computeFinalPrice({
   const prezzoFinaleMPN = Math.ceil(postFee);
   
   // Helper function for robust numeric normalization
-  const normalizeNumeric = (value: any): number | null => {
+  const normalizeNumeric = (value: unknown): number | null => {
     if (value === null || value === undefined || value === '') return null;
     
     let str = String(value).trim();
@@ -1194,14 +1194,14 @@ const AltersideCatalogGenerator: React.FC = () => {
   const canProcess = processingState === 'ready';
   
   // Audit function for critical debugging
-  const audit = useCallback((msg: string, data?: any) => {
+  const audit = useCallback((msg: string, data?: unknown) => {
     const logEntry = `AUDIT: ${msg}${data ? ' | ' + JSON.stringify(data) : ''}`;
     console.warn(logEntry);
     dbg(logEntry);
   }, []);
 
   // Global debug function
-  const dbg = useCallback((event: string, data?: any) => {
+  const dbg = useCallback((event: string, data?: unknown) => {
     const timestamp = new Date().toLocaleTimeString('it-IT', { hour12: false });
     const message = `[${timestamp}] ${event}${data ? ' | ' + JSON.stringify(data) : ''}`;
     setDebugEvents(prev => [...prev, message]);
@@ -3621,7 +3621,7 @@ const AltersideCatalogGenerator: React.FC = () => {
               variant: "destructive"
             });
           }
-        } catch (amazonErr: any) {
+        } catch (amazonErr: unknown) {
           console.error('AMAZON_EXPORT_FAILED', amazonErr);
           toast({
             title: "Errore export Amazon",
@@ -3706,16 +3706,17 @@ const AltersideCatalogGenerator: React.FC = () => {
           });
         }
 
-      } catch (sftpErr: any) {
+      } catch (sftpErr: unknown) {
+        const sftpErrMsg = sftpErr instanceof Error ? sftpErr.message : 'Errore durante salvataggio/upload';
         console.error('[EAN:sftp] Error:', sftpErr);
         setSftpUploadStatus({ 
           phase: 'error', 
-          message: sftpErr.message || 'Errore durante salvataggio/upload'
+          message: sftpErrMsg
         });
         // Don't show destructive toast - local download succeeded
         toast({
           title: "Download locale completato",
-          description: `Errore bucket/SFTP: ${sftpErr.message}`
+          description: `Errore bucket/SFTP: ${sftpErrMsg}`
         });
       }
       
@@ -5772,7 +5773,7 @@ const AltersideCatalogGenerator: React.FC = () => {
               Configurazione Stock IT/EU
             </h3>
             <p className="text-sm text-muted-foreground mb-4">
-              Configura il fallback EU e i giorni di preparazione per Mediaworld ed ePrice.
+              Configura il fallback EU e i giorni di preparazione per Mediaworld, ePrice e Amazon.
               {!stockLocationFileLoaded && (
                 <span className="block mt-2 text-warning">
                   Nessun file Stock Location caricato. Fallback: StockIT=ExistingStock, StockEU=0
@@ -6120,109 +6121,7 @@ const AltersideCatalogGenerator: React.FC = () => {
             </div>
           </div>
         </div>
-        <div className="flex justify-end mb-4">
-          <Button
-            variant="outline"
-            onClick={handleFtpImport}
-            disabled={ftpImportLoading || isProcessing || pipelineRunning}
-          >
-            {ftpImportLoading ? (
-              <>
-                <Activity className="mr-2 h-4 w-4 animate-spin" />
-                Import da FTP in corso…
-              </>
-            ) : (
-              <>
-                <Download className="mr-2 h-4 w-4" />
-                Importa automaticamente da FTP
-              </>
-            )}
-          </Button>
-        </div>
-
-        {/* File Upload Cards */}
-        <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
-          <FileUploadCard
-            title="Material File"
-            description="File principale con informazioni prodotto"
-            type="material"
-            requiredHeaders={REQUIRED_HEADERS.material}
-            optionalHeaders={OPTIONAL_HEADERS.material}
-          />
-          <FileUploadCard
-            title="Stock File Data"
-            description="Dati scorte e disponibilità"
-            type="stock"
-            requiredHeaders={REQUIRED_HEADERS.stock}
-            optionalHeaders={OPTIONAL_HEADERS.stock}
-          />
-          <FileUploadCard
-            title="Price File Data"
-            description="Listini prezzi e scontistiche"
-            type="price"
-            requiredHeaders={REQUIRED_HEADERS.price}
-            optionalHeaders={OPTIONAL_HEADERS.price}
-          />
-          <StockLocationUpload
-            disabled={pipelineRunning || isProcessing}
-            onFileLoaded={handleStockLocationLoaded}
-            externallyLoaded={stockLocationFileLoaded}
-            externalMeta={stockLocationMeta || undefined}
-            onClear={() => {
-              setStockLocationIndex(null);
-              setStockLocationWarnings(EMPTY_WARNINGS);
-              setStockLocationFileLoaded(false);
-              setStockLocationMeta(null);
-            }}
-          />
-        </div>
-        
-        {/* Stock Location Warnings */}
-        {stockLocationFileLoaded && (
-          <StockLocationWarningsDisplay warnings={stockLocationWarnings} />
-        )}
-        
-        {/* IT/EU Stock Configuration - Always visible in manual path */}
-        <div className="mt-6">
-          <div className="alt-card">
-            <div className="card-body">
-              <h3 className="alt-section-title flex items-center gap-2">
-                <Info className="h-5 w-5 text-success" />
-                Configurazione Stock IT/EU
-              </h3>
-              <p className="text-sm alt-text-muted mb-4">
-                Configura il fallback EU e i giorni di preparazione per Mediaworld ed ePrice.
-                {!stockLocationFileLoaded && (
-                  <span className="block mt-1 text-amber-600">
-                    ⚠️ Nessun file Stock Location caricato. Fallback: StockIT=ExistingStock, StockEU=0
-                  </span>
-                )}
-              </p>
-              <StockLocationConfig
-                config={extendedFeeConfig}
-                onConfigChange={handleExtendedConfigChange}
-                disabled={pipelineRunning}
-              />
-              <div className="mt-4 flex justify-end">
-                <button
-                  type="button"
-                  onClick={handleSaveExportConfig}
-                  disabled={isSavingPrepDays}
-                  className={`btn btn-primary text-sm px-6 py-2 ${isSavingPrepDays ? 'opacity-50 cursor-not-allowed' : ''}`}
-                >
-                  {isSavingPrepDays ? (
-                    <>
-                      <Loader2 className="mr-2 h-4 w-4 animate-spin inline" />
-                      Salvataggio...
-                    </>
-                  ) : (
-                    'Salva configurazione export'
-                  )}
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
+        {/* Note: FTP button, upload cards, stock location warnings, and IT/EU config are in the "Sorgenti e File" section above */}
 
         {/* Fee Configuration */}
         {allFilesValid && (
@@ -6609,7 +6508,7 @@ const AltersideCatalogGenerator: React.FC = () => {
                   </button>
                 </div>
                 <p className="text-xs text-muted-foreground mt-3">
-                  Genera ListingLoader.xlsm e PriceInventory.txt per Seller Central. EAN solo 13 cifre, prezzo con terminazione ,99.
+                  Genera ListingLoader.xlsm e PriceInventory.txt per Seller Central. EAN 13 o 14 cifre, prezzo con terminazione ,99.
                 </p>
                 {lastAmazonResult && (
                   <div className="mt-4 text-sm space-y-1">
