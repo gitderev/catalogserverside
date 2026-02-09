@@ -103,9 +103,10 @@ class FTPClient {
       if (code !== 220) {
         throw new Error(`Unexpected welcome code: ${code} - ${welcome}`);
       }
-    } catch (e: any) {
-      console.error(`[FTPClient] Connection failed: ${e.message}`);
-      throw new Error(`FTP connection failed: ${e.message}`);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(`[FTPClient] Connection failed: ${msg}`);
+      throw new Error(`FTP connection failed: ${msg}`);
     }
   }
 

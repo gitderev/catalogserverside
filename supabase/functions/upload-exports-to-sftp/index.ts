@@ -254,14 +254,14 @@ serve(async (req) => {
     // =========================================================================
     // 5. SFTP UPLOAD with retry
     // =========================================================================
-    let Client: any = null;
+    let Client: { new(): unknown } | null = null;
     
     try {
       const ssh2Module = await import("npm:ssh2@1.15.0");
       Client = ssh2Module.Client;
       console.log('[upload-exports-to-sftp] SSH2 library loaded');
-    } catch (importError: any) {
-      console.error('[upload-exports-to-sftp] Failed to load SSH2:', importError.message);
+    } catch (importError: unknown) {
+      console.error('[upload-exports-to-sftp] Failed to load SSH2:', importError instanceof Error ? importError.message : String(importError));
       return new Response(
         JSON.stringify({ 
           status: 'error', 
@@ -277,13 +277,15 @@ serve(async (req) => {
       );
     }
 
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- ssh2 Client/SFTP APIs are untyped in Deno; narrowing not feasible without @types/ssh2
     let conn: any = null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- ssh2 SFTP session is untyped in Deno
     let sftp: any = null;
     
     try {
       console.log('[upload-exports-to-sftp] Connecting to SFTP...');
       
-      conn = new Client();
+      conn = new Client!();
       
       await new Promise<void>((resolve, reject) => {
         const timeout = setTimeout(() => {
@@ -322,7 +324,9 @@ serve(async (req) => {
         });
       });
       
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- ssh2 sftp callback signature is untyped in Deno
       sftp = await new Promise<any>((resolve, reject) => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- ssh2 sftp callback param is untyped
         conn.sftp((err: Error | null, sftpSession: any) => {
           if (err) {
             console.error('[upload-exports-to-sftp] SFTP session error:', err.message);
@@ -336,7 +340,7 @@ serve(async (req) => {
       
       // Verify directory exists
       await new Promise<void>((resolve, reject) => {
-        sftp.stat(sftpBaseDir, (err: Error | null, stats: any) => {
+        sftp.stat(sftpBaseDir, (err: Error | null, stats: { isDirectory(): boolean }) => {
           if (err) {
             console.error('[upload-exports-to-sftp] SFTP directory check failed:', err.message);
             reject(new Error(`Cartella SFTP "${sftpBaseDir}" non accessibile.`));
@@ -378,8 +382,8 @@ serve(async (req) => {
             });
             
             uploaded = true;
-          } catch (err: any) {
-            lastError = err.message || 'Unknown error';
+          } catch (err: unknown) {
+            lastError = err instanceof Error ? err.message : String(err);
             console.warn(`[upload-exports-to-sftp] Attempt ${attempt} failed for ${file.filename}: ${lastError}`);
             
             if (attempt < MAX_SFTP_RETRIES) {
@@ -404,8 +408,8 @@ serve(async (req) => {
         });
       }
       
-    } catch (sftpConnectionError: any) {
-      console.error('[upload-exports-to-sftp] SFTP connection error:', sftpConnectionError.message);
+    } catch (sftpConnectionError: unknown) {
+      console.error('[upload-exports-to-sftp] SFTP connection error:', sftpConnectionError instanceof Error ? sftpConnectionError.message : String(sftpConnectionError));
       
       // Mark all pending files as failed
       for (const file of fileContents) {
@@ -416,9 +420,9 @@ serve(async (req) => {
             uploaded: false,
             attemptsUsed: 0,
             errorDetails: {
-              message: sftpConnectionError.message,
+              message: sftpConnectionError instanceof Error ? sftpConnectionError.message : String(sftpConnectionError),
               phase: 'upload_sftp',
-              stack: sftpConnectionError.stack
+              stack: sftpConnectionError instanceof Error ? sftpConnectionError.stack : undefined
             }
           });
         }
@@ -458,14 +462,16 @@ serve(async (req) => {
       );
     }
 
-  } catch (error: any) {
-    console.error('[upload-exports-to-sftp] Unexpected error:', error.message);
-    console.error('[upload-exports-to-sftp] Stack:', error.stack);
+  } catch (error: unknown) {
+    const msg = error instanceof Error ? error.message : String(error);
+    const stack = error instanceof Error ? error.stack : undefined;
+    console.error('[upload-exports-to-sftp] Unexpected error:', msg);
+    console.error('[upload-exports-to-sftp] Stack:', stack);
     
     return new Response(
       JSON.stringify({ 
         status: 'error', 
-        message: `Errore interno: ${error.message}` 
+        message: `Errore interno: ${msg}` 
       }),
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );

@@ -176,11 +176,11 @@ serve(async (req) => {
       );
     }
 
-  } catch (error: any) {
+  } catch (error: unknown) {
     console.error('[stop-sync] Unexpected error:', error);
     
     return new Response(
-      JSON.stringify({ status: 'error', message: error.message }),
+      JSON.stringify({ status: 'error', message: error instanceof Error ? error.message : String(error) }),
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   }

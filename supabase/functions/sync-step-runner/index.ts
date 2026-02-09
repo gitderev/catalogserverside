@@ -1,6 +1,47 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
 
+type SupabaseClient = ReturnType<typeof createClient>;
+
+interface Product {
+  Matnr: string;
+  MPN: string;
+  EAN: string;
+  Desc: string;
+  Stock: number;
+  LP: number;
+  CBP: number;
+  Sur: number;
+  PF: string;
+  PFNum: number;
+  LPF: string;
+}
+
+interface FeeConfig {
+  feeDrev?: number;
+  feeMkt?: number;
+  shippingCost?: number;
+  mediaworldIncludeEu?: boolean;
+  mediaworldItPrepDays?: number;
+  mediaworldEuPrepDays?: number;
+  epriceIncludeEu?: boolean;
+  epriceItPrepDays?: number;
+  epriceEuPrepDays?: number;
+  epricePrepDays?: number;
+}
+
+interface StepResultData {
+  status: string;
+  error?: string;
+  duration_ms?: number;
+  metrics: Record<string, number>;
+  [key: string]: unknown;
+}
+
+function errMsg(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
@@ -155,7 +196,7 @@ function validateGoldenCases(logPrefix: string, daysIT: number = 2, daysEU: numb
 }
 
 // ========== UPDATE LOCATION WARNINGS IN DB ==========
-async function updateLocationWarnings(supabase: any, runId: string, warnings: StockLocationWarnings): Promise<void> {
+async function updateLocationWarnings(supabase: SupabaseClient, runId: string, warnings: StockLocationWarnings): Promise<void> {
   try {
     await supabase.from('sync_runs').update({ location_warnings: warnings }).eq('id', runId);
     console.log(`[sync-step-runner] Updated location_warnings for run ${runId}:`, warnings);
@@ -236,7 +277,7 @@ function findColumnIndex(headers: string[], columnName: string): { index: number
   return { index: -1, matchedAs: '' };
 }
 
-async function getLatestFile(supabase: any, folder: string): Promise<{ content: string | null; fileName: string | null }> {
+async function getLatestFile(supabase: SupabaseClient, folder: string): Promise<{ content: string | null; fileName: string | null }> {
   console.log(`[storage] Looking for latest file in ftp-import/${folder}`);
   const { data: files, error: listError } = await supabase.storage.from('ftp-import').list(folder, { 
     sortBy: { column: 'created_at', order: 'desc' }, limit: 1 
@@ -267,7 +308,7 @@ async function getLatestFile(supabase: any, folder: string): Promise<{ content: 
   return { content, fileName };
 }
 
-async function uploadToStorage(supabase: any, bucket: string, path: string, content: string, contentType: string): Promise<{ success: boolean; error?: string }> {
+async function uploadToStorage(supabase: SupabaseClient, bucket: string, path: string, content: string, contentType: string): Promise<{ success: boolean; error?: string }> {
   console.log(`[storage] Uploading to ${bucket}/${path}, size: ${content.length} bytes`);
   
   const { data, error } = await supabase.storage.from(bucket).upload(path, 
@@ -282,7 +323,7 @@ async function uploadToStorage(supabase: any, bucket: string, path: string, cont
   const fileName = path.includes('/') ? path.substring(path.lastIndexOf('/') + 1) : path;
   
   const { data: files } = await supabase.storage.from(bucket).list(folder, { search: fileName });
-  const fileExists = files?.some((f: any) => f.name === fileName);
+  const fileExists = files?.some((f: { name: string }) => f.name === fileName);
   
   if (!fileExists) {
     console.error(`[storage] Upload verification failed: file not found after upload`);
@@ -293,7 +334,7 @@ async function uploadToStorage(supabase: any, bucket: string, path: string, cont
   return { success: true };
 }
 
-async function downloadFromStorage(supabase: any, bucket: string, path: string): Promise<{ content: string | null; error?: string }> {
+async function downloadFromStorage(supabase: SupabaseClient, bucket: string, path: string): Promise<{ content: string | null; error?: string }> {
   console.log(`[storage] Downloading from ${bucket}/${path}`);
   
   const folder = path.includes('/') ? path.substring(0, path.lastIndexOf('/')) : '';
@@ -306,9 +347,9 @@ async function downloadFromStorage(supabase: any, bucket: string, path: string):
     return { content: null, error: `Error listing folder: ${listError.message}` };
   }
   
-  console.log(`[storage] Files in ${bucket}/${folder}:`, files?.map((f: any) => f.name).join(', ') || 'none');
+  console.log(`[storage] Files in ${bucket}/${folder}:`, files?.map((f: { name: string }) => f.name).join(', ') || 'none');
   
-  const fileExists = files?.some((f: any) => f.name === fileName);
+  const fileExists = files?.some((f: { name: string }) => f.name === fileName);
   if (!fileExists) {
     console.error(`[storage] File not found: ${bucket}/${path}`);
     return { content: null, error: `File not found: ${path}` };
@@ -326,7 +367,7 @@ async function downloadFromStorage(supabase: any, bucket: string, path: string):
   return { content };
 }
 
-async function deleteFromStorage(supabase: any, bucket: string, path: string): Promise<void> {
+async function deleteFromStorage(supabase: SupabaseClient, bucket: string, path: string): Promise<void> {
   try {
     await supabase.storage.from(bucket).remove([path]);
     console.log(`[storage] Deleted ${bucket}/${path}`);
@@ -355,12 +396,12 @@ interface ParseMergeState {
   error?: string;
 }
 
-async function getParseMergeState(supabase: any, runId: string): Promise<ParseMergeState | null> {
+async function getParseMergeState(supabase: SupabaseClient, runId: string): Promise<ParseMergeState | null> {
   const { data: run } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
   return run?.steps?.parse_merge || null;
 }
 
-async function updateParseMergeState(supabase: any, runId: string, state: Partial<ParseMergeState>): Promise<void> {
+async function updateParseMergeState(supabase: SupabaseClient, runId: string, state: Partial<ParseMergeState>): Promise<void> {
   const { data: run } = await supabase.from('sync_runs').select('steps, metrics').eq('id', runId).single();
   const currentSteps = run?.steps || {};
   const currentMetrics = run?.metrics || {};
@@ -371,7 +412,7 @@ async function updateParseMergeState(supabase: any, runId: string, state: Partia
   // Update metrics if completed
   const updatedMetrics = state.status === 'completed' ? {
     ...currentMetrics,
-    products_total: (state.productCount || 0) + Object.values(state.skipped || {}).reduce((a: number, b: any) => a + (b || 0), 0),
+    products_total: (state.productCount || 0) + Object.values(state.skipped || {}).reduce((a: number, b: unknown) => a + (Number(b) || 0), 0),
     products_processed: state.productCount || 0
   } : currentMetrics;
   
@@ -395,59 +436,59 @@ interface MaterialMeta {
   totalBytes: number;
 }
 
-async function saveStockIndex(supabase: any, stockIndex: Record<string, number>): Promise<{ success: boolean; error?: string }> {
+async function saveStockIndex(supabase: SupabaseClient, stockIndex: Record<string, number>): Promise<{ success: boolean; error?: string }> {
   const json = JSON.stringify(stockIndex);
   console.log(`[parse_merge:indices] Saving stock index: ${Object.keys(stockIndex).length} entries, ${json.length} bytes`);
   return await uploadToStorage(supabase, 'exports', STOCK_INDEX_FILE, json, 'application/json');
 }
 
-async function loadStockIndex(supabase: any): Promise<{ index: Record<string, number> | null; error?: string }> {
+async function loadStockIndex(supabase: SupabaseClient): Promise<{ index: Record<string, number> | null; error?: string }> {
   const { content, error } = await downloadFromStorage(supabase, 'exports', STOCK_INDEX_FILE);
   if (error || !content) return { index: null, error: error || 'Empty content' };
   try {
     const index = JSON.parse(content);
     console.log(`[parse_merge:indices] Loaded stock index: ${Object.keys(index).length} entries`);
     return { index };
-  } catch (e: any) {
-    return { index: null, error: `JSON parse error: ${e.message}` };
+  } catch (e: unknown) {
+    return { index: null, error: `JSON parse error: ${errMsg(e)}` };
   }
 }
 
-async function savePriceIndex(supabase: any, priceIndex: Record<string, [number, number, number]>): Promise<{ success: boolean; error?: string }> {
+async function savePriceIndex(supabase: SupabaseClient, priceIndex: Record<string, [number, number, number]>): Promise<{ success: boolean; error?: string }> {
   const json = JSON.stringify(priceIndex);
   console.log(`[parse_merge:indices] Saving price index: ${Object.keys(priceIndex).length} entries, ${json.length} bytes`);
   return await uploadToStorage(supabase, 'exports', PRICE_INDEX_FILE, json, 'application/json');
 }
 
-async function loadPriceIndex(supabase: any): Promise<{ index: Record<string, [number, number, number]> | null; error?: string }> {
+async function loadPriceIndex(supabase: SupabaseClient): Promise<{ index: Record<string, [number, number, number]> | null; error?: string }> {
   const { content, error } = await downloadFromStorage(supabase, 'exports', PRICE_INDEX_FILE);
   if (error || !content) return { index: null, error: error || 'Empty content' };
   try {
     const index = JSON.parse(content);
     console.log(`[parse_merge:indices] Loaded price index: ${Object.keys(index).length} entries`);
     return { index };
-  } catch (e: any) {
-    return { index: null, error: `JSON parse error: ${e.message}` };
+  } catch (e: unknown) {
+    return { index: null, error: `JSON parse error: ${errMsg(e)}` };
   }
 }
 
-async function saveMaterialMeta(supabase: any, meta: MaterialMeta): Promise<{ success: boolean; error?: string }> {
+async function saveMaterialMeta(supabase: SupabaseClient, meta: MaterialMeta): Promise<{ success: boolean; error?: string }> {
   const json = JSON.stringify(meta);
   console.log(`[parse_merge:indices] Saving material meta: headerEndPos=${meta.headerEndPos}, totalBytes=${meta.totalBytes}`);
   return await uploadToStorage(supabase, 'exports', MATERIAL_META_FILE, json, 'application/json');
 }
 
-async function loadMaterialMeta(supabase: any): Promise<{ meta: MaterialMeta | null; error?: string }> {
+async function loadMaterialMeta(supabase: SupabaseClient): Promise<{ meta: MaterialMeta | null; error?: string }> {
   const { content, error } = await downloadFromStorage(supabase, 'exports', MATERIAL_META_FILE);
   if (error || !content) return { meta: null, error: error || 'Empty content' };
   try {
     return { meta: JSON.parse(content) };
-  } catch (e: any) {
-    return { meta: null, error: `JSON parse error: ${e.message}` };
+  } catch (e: unknown) {
+    return { meta: null, error: `JSON parse error: ${errMsg(e)}` };
   }
 }
 
-async function cleanupIndexFiles(supabase: any): Promise<void> {
+async function cleanupIndexFiles(supabase: SupabaseClient): Promise<void> {
   await deleteFromStorage(supabase, 'exports', STOCK_INDEX_FILE);
   await deleteFromStorage(supabase, 'exports', PRICE_INDEX_FILE);
   await deleteFromStorage(supabase, 'exports', MATERIAL_META_FILE);
@@ -461,7 +502,7 @@ async function cleanupIndexFiles(supabase: any): Promise<void> {
 // Phase 1c: preparing_material - read material file metadata, save it
 // Phase 2: in_progress - chunked material processing
 
-async function stepParseMerge(supabase: any, runId: string): Promise<{ success: boolean; error?: string; status?: string }> {
+async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<{ success: boolean; error?: string; status?: string }> {
   console.log(`[parse_merge] Starting for run ${runId}, CHUNK_SIZE=${CHUNK_SIZE}`);
   const invocationStart = Date.now();
   
@@ -610,7 +651,7 @@ async function stepParseMerge(supabase: any, runId: string): Promise<{ success: 
         return { success: false, error, status: 'failed' };
       }
       
-      const parseNum = (v: any) => parseFloat(String(v || '0').replace(',', '.')) || 0;
+      const parseNum = (v: unknown) => parseFloat(String(v || '0').replace(',', '.')) || 0;
       
       // Build price index
       const priceIndex: Record<string, [number, number, number]> = Object.create(null);
@@ -876,15 +917,15 @@ async function stepParseMerge(supabase: any, runId: string): Promise<{ success: 
     await updateParseMergeState(supabase, runId, { status: 'failed', error });
     return { success: false, error, status: 'failed' };
     
-  } catch (e: any) {
+  } catch (e: unknown) {
     console.error(`[parse_merge] Error:`, e);
-    await updateParseMergeState(supabase, runId, { status: 'failed', error: e.message });
-    return { success: false, error: e.message, status: 'failed' };
+    await updateParseMergeState(supabase, runId, { status: 'failed', error: errMsg(e) });
+    return { success: false, error: errMsg(e), status: 'failed' };
   }
 }
 
 // ========== HELPER: Load/Save Products ==========
-async function loadProductsTSV(supabase: any, runId: string): Promise<{ products: any[] | null; error?: string }> {
+async function loadProductsTSV(supabase: SupabaseClient, runId: string): Promise<{ products: Product[] | null; error?: string }> {
   console.log(`[sync:products] Loading products for run ${runId} from exports/${PRODUCTS_FILE_PATH}`);
   
   const { content, error } = await downloadFromStorage(supabase, 'exports', PRODUCTS_FILE_PATH);
@@ -895,7 +936,7 @@ async function loadProductsTSV(supabase: any, runId: string): Promise<{ products
   }
   
   const lines = content.split('\n');
-  const products: any[] = [];
+  const products: Product[] = [];
   
   console.log(`[sync:products] Parsing ${lines.length} lines...`);
   
@@ -914,7 +955,7 @@ async function loadProductsTSV(supabase: any, runId: string): Promise<{ products
   return { products };
 }
 
-async function saveProductsTSV(supabase: any, products: any[]): Promise<{ success: boolean; error?: string }> {
+async function saveProductsTSV(supabase: SupabaseClient, products: Product[]): Promise<{ success: boolean; error?: string }> {
   const lines = ['Matnr\tMPN\tEAN\tDesc\tStock\tLP\tCBP\tSur\tPF\tPFNum\tLPF'];
   for (const p of products) {
     lines.push(`${p.Matnr}\t${p.MPN}\t${p.EAN}\t${p.Desc}\t${p.Stock}\t${p.LP}\t${p.CBP}\t${p.Sur}\t${p.PF || ''}\t${p.PFNum || ''}\t${p.LPF || ''}`);
@@ -923,7 +964,7 @@ async function saveProductsTSV(supabase: any, products: any[]): Promise<{ succes
 }
 
 // ========== STEP: EAN_MAPPING ==========
-async function stepEanMapping(supabase: any, runId: string): Promise<{ success: boolean; error?: string }> {
+async function stepEanMapping(supabase: SupabaseClient, runId: string): Promise<{ success: boolean; error?: string }> {
   console.log(`[sync:step:ean_mapping] Starting for run ${runId}`);
   const startTime = Date.now();
   
@@ -950,7 +991,7 @@ async function stepEanMapping(supabase: any, runId: string): Promise<{ success: 
       console.error(`[sync:step:ean_mapping] Error listing mapping files:`, listError);
     }
     
-    console.log(`[sync:step:ean_mapping] Mapping files found: ${files?.map((f: any) => f.name).join(', ') || 'none'}`);
+    console.log(`[sync:step:ean_mapping] Mapping files found: ${files?.map((f: { name: string }) => f.name).join(', ') || 'none'}`);
     
     if (files?.length) {
       const mappingFileName = files[0].name;
@@ -997,14 +1038,14 @@ async function stepEanMapping(supabase: any, runId: string): Promise<{ success: 
     console.log(`[sync:step:ean_mapping] Completed: mapped=${eanMapped}, missing=${eanMissing}`);
     return { success: true };
     
-  } catch (e: any) {
+  } catch (e: unknown) {
     console.error(`[sync:step:ean_mapping] Error:`, e);
-    await updateStepResult(supabase, runId, 'ean_mapping', { status: 'failed', error: e.message, metrics: {} });
-    return { success: false, error: e.message };
+    await updateStepResult(supabase, runId, 'ean_mapping', { status: 'failed', error: errMsg(e), metrics: {} });
+    return { success: false, error: errMsg(e) };
   }
 }
 
-async function updateStepResult(supabase: any, runId: string, stepName: string, result: any): Promise<void> {
+async function updateStepResult(supabase: SupabaseClient, runId: string, stepName: string, result: StepResultData): Promise<void> {
   const { data: run } = await supabase.from('sync_runs').select('steps, metrics').eq('id', runId).single();
   const steps = { ...(run?.steps || {}), [stepName]: result, current_step: stepName };
   const metrics = { ...(run?.metrics || {}), ...result.metrics };
@@ -1012,7 +1053,7 @@ async function updateStepResult(supabase: any, runId: string, stepName: string, 
 }
 
 // ========== STEP: PRICING ==========
-async function stepPricing(supabase: any, runId: string, feeConfig: any): Promise<{ success: boolean; error?: string }> {
+async function stepPricing(supabase: SupabaseClient, runId: string, feeConfig: FeeConfig): Promise<{ success: boolean; error?: string }> {
   console.log(`[sync:step:pricing] Starting for run ${runId}`);
   const startTime = Date.now();
   
@@ -1076,15 +1117,15 @@ async function stepPricing(supabase: any, runId: string, feeConfig: any): Promis
     console.log(`[sync:step:pricing] Completed: ${products.length} products priced`);
     return { success: true };
     
-  } catch (e: any) {
+  } catch (e: unknown) {
     console.error(`[sync:step:pricing] Error:`, e);
-    await updateStepResult(supabase, runId, 'pricing', { status: 'failed', error: e.message, metrics: {} });
-    return { success: false, error: e.message };
+    await updateStepResult(supabase, runId, 'pricing', { status: 'failed', error: errMsg(e), metrics: {} });
+    return { success: false, error: errMsg(e) };
   }
 }
 
 // ========== STEP: EXPORT_EAN ==========
-async function stepExportEan(supabase: any, runId: string): Promise<{ success: boolean; error?: string }> {
+async function stepExportEan(supabase: SupabaseClient, runId: string): Promise<{ success: boolean; error?: string }> {
   console.log(`[sync:step:export_ean] Starting for run ${runId}`);
   const startTime = Date.now();
   
@@ -1140,15 +1181,15 @@ async function stepExportEan(supabase: any, runId: string): Promise<{ success: b
     console.log(`[sync:step:export_ean] Completed: ${eanRows.length} rows, ${eanSkipped} skipped`);
     return { success: true };
     
-  } catch (e: any) {
+  } catch (e: unknown) {
     console.error(`[sync:step:export_ean] Error:`, e);
-    await updateStepResult(supabase, runId, 'export_ean', { status: 'failed', error: e.message, metrics: {} });
-    return { success: false, error: e.message };
+    await updateStepResult(supabase, runId, 'export_ean', { status: 'failed', error: errMsg(e), metrics: {} });
+    return { success: false, error: errMsg(e) };
   }
 }
 
 // ========== STEP: EXPORT_MEDIAWORLD (with IT/EU stock support) ==========
-async function stepExportMediaworld(supabase: any, runId: string, feeConfig: any): Promise<{ success: boolean; error?: string }> {
+async function stepExportMediaworld(supabase: SupabaseClient, runId: string, feeConfig: FeeConfig): Promise<{ success: boolean; error?: string }> {
   const includeEu = feeConfig?.mediaworldIncludeEu || false;
   const itDays = feeConfig?.mediaworldItPrepDays || 3;
   const euDays = feeConfig?.mediaworldEuPrepDays || 5;
@@ -1290,15 +1331,15 @@ async function stepExportMediaworld(supabase: any, runId: string, feeConfig: any
     console.log(`[sync:step:export_mediaworld] Completed: ${mwRows.length} rows, ${mwSkipped} skipped, warnings:`, warnings);
     return { success: true };
     
-  } catch (e: any) {
+  } catch (e: unknown) {
     console.error(`[sync:step:export_mediaworld] Error:`, e);
-    await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error: e.message, metrics: {} });
-    return { success: false, error: e.message };
+    await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error: errMsg(e), metrics: {} });
+    return { success: false, error: errMsg(e) };
   }
 }
 
 // ========== STEP: EXPORT_EPRICE (with IT/EU stock support) ==========
-async function stepExportEprice(supabase: any, runId: string, feeConfig: any): Promise<{ success: boolean; error?: string }> {
+async function stepExportEprice(supabase: SupabaseClient, runId: string, feeConfig: FeeConfig): Promise<{ success: boolean; error?: string }> {
   const includeEu = feeConfig?.epriceIncludeEu || false;
   const itDays = feeConfig?.epriceItPrepDays || feeConfig?.epricePrepDays || 1;
   const euDays = feeConfig?.epriceEuPrepDays || 3;
@@ -1390,10 +1431,10 @@ async function stepExportEprice(supabase: any, runId: string, feeConfig: any): P
     console.log(`[sync:step:export_eprice] Completed: ${epRows.length} rows, ${epSkipped} skipped`);
     return { success: true };
     
-  } catch (e: any) {
+  } catch (e: unknown) {
     console.error(`[sync:step:export_eprice] Error:`, e);
-    await updateStepResult(supabase, runId, 'export_eprice', { status: 'failed', error: e.message, metrics: {} });
-    return { success: false, error: e.message };
+    await updateStepResult(supabase, runId, 'export_eprice', { status: 'failed', error: errMsg(e), metrics: {} });
+    return { success: false, error: errMsg(e) };
   }
 }
 
@@ -1464,9 +1505,9 @@ serve(async (req) => {
       ...result 
     }), { status: result.success ? 200 : 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     
-  } catch (e: any) {
+  } catch (e: unknown) {
     console.error('[sync-step-runner] Fatal error:', e);
-    return new Response(JSON.stringify({ status: 'error', message: e.message }), 
+    return new Response(JSON.stringify({ status: 'error', message: errMsg(e) }), 
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   }
 });

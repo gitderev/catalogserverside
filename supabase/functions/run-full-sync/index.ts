@@ -1,6 +1,12 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
 
+type SupabaseClient = ReturnType<typeof createClient>;
+
+function errMsg(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
@@ -28,7 +34,7 @@ const corsHeaders = {
 
 const MAX_PARSE_MERGE_CHUNKS = 100; // Safety limit: max chunks per parse_merge
 
-async function callStep(supabaseUrl: string, serviceKey: string, functionName: string, body: any): Promise<{ success: boolean; error?: string; data?: any }> {
+async function callStep(supabaseUrl: string, serviceKey: string, functionName: string, body: Record<string, unknown>): Promise<{ success: boolean; error?: string; data?: Record<string, unknown> }> {
   try {
     console.log(`[orchestrator] Calling ${functionName}...`);
     const resp = await fetch(`${supabaseUrl}/functions/v1/${functionName}`, {
@@ -50,13 +56,13 @@ async function callStep(supabaseUrl: string, serviceKey: string, functionName: s
     }
     console.log(`[orchestrator] ${functionName} completed, step_status=${data.step_status || 'N/A'}`);
     return { success: true, data };
-  } catch (e: any) {
+  } catch (e: unknown) {
     console.error(`[orchestrator] Error calling ${functionName}:`, e);
-    return { success: false, error: e.message };
+    return { success: false, error: errMsg(e) };
   }
 }
 
-async function verifyStepCompleted(supabase: any, runId: string, stepName: string): Promise<{ success: boolean; status?: string; error?: string }> {
+async function verifyStepCompleted(supabase: SupabaseClient, runId: string, stepName: string): Promise<{ success: boolean; status?: string; error?: string }> {
   const { data: run } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
   const stepResult = run?.steps?.[stepName];
   
@@ -92,16 +98,16 @@ async function verifyStepCompleted(supabase: any, runId: string, stepName: strin
   return { success: false, error: `Step ${stepName} stato imprevisto: ${stepResult.status}` };
 }
 
-async function isCancelRequested(supabase: any, runId: string): Promise<boolean> {
+async function isCancelRequested(supabase: SupabaseClient, runId: string): Promise<boolean> {
   const { data } = await supabase.from('sync_runs').select('cancel_requested').eq('id', runId).single();
   return data?.cancel_requested === true;
 }
 
-async function updateRun(supabase: any, runId: string, updates: any): Promise<void> {
+async function updateRun(supabase: SupabaseClient, runId: string, updates: Record<string, unknown>): Promise<void> {
   await supabase.from('sync_runs').update(updates).eq('id', runId);
 }
 
-async function finalizeRun(supabase: any, runId: string, status: string, startTime: number, errorMessage?: string): Promise<void> {
+async function finalizeRun(supabase: SupabaseClient, runId: string, status: string, startTime: number, errorMessage?: string): Promise<void> {
   await supabase.from('sync_runs').update({
     status, 
     finished_at: new Date().toISOString(), 
@@ -124,7 +130,7 @@ serve(async (req) => {
   
   let runId: string | null = null;
   let startTime = Date.now();
-  let supabase: any = null;
+  let supabase: SupabaseClient | null = null;
 
   try {
     const body = await req.json().catch(() => ({}));
@@ -354,18 +360,18 @@ serve(async (req) => {
     return new Response(JSON.stringify({ status: 'success', run_id: runId }), 
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 
-  } catch (err: any) {
+  } catch (err: unknown) {
     console.error('[orchestrator] Fatal error:', err);
     
     if (runId && supabase) {
       try {
-        await finalizeRun(supabase, runId, 'failed', startTime, err.message);
+        await finalizeRun(supabase, runId, 'failed', startTime, errMsg(err));
       } catch (e) {
         console.error('[orchestrator] Failed to finalize:', e);
       }
     }
     
-    return new Response(JSON.stringify({ status: 'error', message: err.message }), 
+    return new Response(JSON.stringify({ status: 'error', message: errMsg(err) }), 
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   }
 });
