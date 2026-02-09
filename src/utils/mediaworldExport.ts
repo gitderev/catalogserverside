@@ -102,7 +102,7 @@ export const MEDIAWORLD_TEMPLATE = {
 const MEDIAWORLD_HEADERS_ITALIAN = MEDIAWORLD_TEMPLATE.headers;
 
 export interface MediaworldExportParams {
-  processedData: any[];
+  processedData: Record<string, unknown>[];
   feeConfig: {
     feeDrev: number;
     feeMkt: number;
@@ -404,9 +404,9 @@ export async function buildMediaworldXlsxFromEanDataset({
     };
     
     processedData.forEach((record, index) => {
-      const sku = record.ManufPartNr || '';
-      const ean = record.EAN || '';
-      const matnr = record.Matnr || '';
+      const sku = String(record.ManufPartNr ?? '');
+      const ean = String(record.EAN ?? '');
+      const matnr = String(record.Matnr ?? '');
       const existingStock = Number(record.ExistingStock) || 0;
       
       // Filter 1: Valid EAN required
@@ -600,7 +600,7 @@ export async function buildMediaworldXlsxFromEanDataset({
         sku,
         ean,
         'EAN',
-        record.ShortDescription || '',
+        String(record.ShortDescription ?? ''),
         '',
         listPriceConFee,
         '',
@@ -886,9 +886,9 @@ export async function exportMediaworldCatalog({
     
     // Process each record from EAN catalog data
     processedData.forEach((record, index) => {
-      const sku = record.ManufPartNr || '';
-      const ean = record.EAN || '';
-      const matnr = record.Matnr || '';
+      const sku = String(record.ManufPartNr ?? '');
+      const ean = String(record.EAN ?? '');
+      const matnr = String(record.Matnr ?? '');
       const existingStock = Number(record.ExistingStock) || 0;
       
       // === FILTER 1: Skip products without valid EAN ===
@@ -1118,7 +1118,7 @@ export async function exportMediaworldCatalog({
         sku,                                         // Col 1: SKU offerta → ManufPartNr
         ean,                                         // Col 2: ID Prodotto → EAN normalizzato
         'EAN',                                       // Col 3: Tipo ID prodotto → "EAN" (fixed)
-        record.ShortDescription || '',               // Col 4: Descrizione offerta → ShortDescription
+        String(record.ShortDescription ?? ''),        // Col 4: Descrizione offerta → ShortDescription
         '',                                          // Col 5: Descrizione interna offerta → vuoto
         listPriceConFee,                             // Col 6: Prezzo dell'offerta → ListPrice con Fee (NUMBER)
         '',                                          // Col 7: Info aggiuntive prezzo offerta → vuoto
@@ -1328,7 +1328,7 @@ export async function exportMediaworldCatalog({
     // === LOG DIAGNOSTICO: Verifica struttura prime 4 righe del foglio Data ===
     console.log('%c[Mediaworld:structure-check] Verifica righe 1-4 del foglio Data:', 'color: #FF9800; font-weight: bold;');
     for (let R = 0; R <= Math.min(3, lastRow); R++) {
-      const rowData: Record<string, any> = {};
+      const rowData: Record<string, unknown> = {};
       const colsToCheck = [0, 1, 2, 5, 9, 13];
       const colNames = ['A (SKU)', 'B (EAN)', 'C (Tipo)', 'F (PrezzoOff)', 'J (State)', 'N (PrezzoSc)'];
       colsToCheck.forEach((C, idx) => {

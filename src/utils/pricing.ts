@@ -2,10 +2,17 @@
  * Pricing utilities for catalog generation - Pure integer cents arithmetic with robust IT locale parsing
  */
 
+// Typed globalThis extension for one-time logging flags
+interface PricingGlobals {
+  eanEndingInitLogged?: boolean;
+  eanSampleCount?: number;
+}
+const _pricingGlobals = globalThis as unknown as PricingGlobals;
+
 // One-time log to confirm integer-cents implementation
-if (typeof (globalThis as any).eanEndingInitLogged === 'undefined') {
+if (typeof _pricingGlobals.eanEndingInitLogged === 'undefined') {
   console.warn('ean:ending:function=int-cents');
-  (globalThis as any).eanEndingInitLogged = true;
+  _pricingGlobals.eanEndingInitLogged = true;
 }
 
 /**
@@ -14,14 +21,11 @@ if (typeof (globalThis as any).eanEndingInitLogged === 'undefined') {
 export function parseEuroLike(input: unknown): number {
   if (typeof input === 'number' && isFinite(input)) return input;
   let s = String(input ?? '').trim();
-  // Remove common non-numeric symbols (except . , space, - and %)
   s = s.replace(/[^\d.,\s%\-]/g, '').trim();
-  // Take first token (e.g. "1,07 0,00" -> "1,07")
   s = s.split(/\s+/)[0] ?? '';
   s = s.replace(/%/g, '').trim();
   if (!s) return NaN;
 
-  // If both . and , present, assume IT format (1.234,56)
   if (s.includes('.') && s.includes(',')) s = s.replace(/\./g, '').replace(',', '.');
   else s = s.replace(',', '.');
 
@@ -169,7 +173,7 @@ export function computeFinalEan(
   finalCents: number; 
   finalDisplay: string; 
   route: string; 
-  debug: any 
+  debug: Record<string, unknown> 
 } {
   
   // Ensure surcharge is valid and non-negative
@@ -208,7 +212,7 @@ export function computeFinalEan(
   const finalDisplay = formatCents(finalCents);
   
   // Debug info
-  const debug = {
+  const debug: Record<string, unknown> = {
     route,
     custBestPrice: input.custBestPrice,
     surcharge: validSurcharge,
@@ -223,10 +227,10 @@ export function computeFinalEan(
   };
   
   // Sample logging for first few calculations
-  if (typeof (globalThis as any).eanSampleCount === 'undefined') {
-    (globalThis as any).eanSampleCount = 0;
+  if (typeof _pricingGlobals.eanSampleCount === 'undefined') {
+    _pricingGlobals.eanSampleCount = 0;
   }
-  if ((globalThis as any).eanSampleCount < 6) {
+  if (_pricingGlobals.eanSampleCount! < 6) {
     const sampleType = route === 'cbp' ? 'ean:sample:cbp:pricing' : 'ean:sample:listprice:pricing';
     console.warn(sampleType, {
       base: basePrice,
@@ -242,7 +246,7 @@ export function computeFinalEan(
       subtotalDisplay,
       finalDisplay
     });
-    (globalThis as any).eanSampleCount++;
+    _pricingGlobals.eanSampleCount!++;
   }
   
   return { subtotalCents, subtotalDisplay, finalCents, finalDisplay, route, debug };

@@ -58,7 +58,7 @@ export interface OverrideStats {
 }
 
 export interface ApplyOverrideResult {
-  catalog: any[];
+  catalog: Record<string, unknown>[];
   stats: OverrideStats;
   errors: OverrideError[];
 }
@@ -505,7 +505,7 @@ export function parseOverrideFile(data: ArrayBuffer): ParseOverrideResult {
  * - __overrideLeadDaysEU: number | null
  */
 export function applyOverrideToCatalog(
-  baseCatalog: any[],
+  baseCatalog: Record<string, unknown>[],
   overrideIndex: OverrideIndex
 ): ApplyOverrideResult {
   const errors: OverrideError[] = [];
@@ -528,7 +528,7 @@ export function applyOverrideToCatalog(
     }
   }
   
-  const catalogWithOverride: any[] = [];
+  const catalogWithOverride: Record<string, unknown>[] = [];
   const matchedOverrideEans = new Set<string>();
   
   // Processa i record esistenti
@@ -690,7 +690,7 @@ export function applyOverrideToCatalog(
     }
     
     // Create new record WITHOUT forceEnding99 - use exact OfferPrice
-    const newRecord: any = {
+    const newRecord: Record<string, unknown> = {
       Matnr: `OVR-${item.sku}`,
       ManufPartNr: item.sku,
       EAN: item.ean,
@@ -741,7 +741,7 @@ export function applyOverrideToCatalog(
  * 
  * IMPORTANT: Records with __override === true are SKIPPED (override products keep exact price)
  */
-export function validateEnding99Guard(catalog: any[]): { 
+export function validateEnding99Guard(catalog: Record<string, unknown>[]): { 
   valid: boolean; 
   failures: Array<{ index: number; ean: string; price: string }> 
 } {

@@ -35,6 +35,7 @@ export default tseslint.config(
       "src/utils/excelFormatter.ts",
       "src/utils/ean.ts",
       "src/components/DataPreview.tsx",
+      "src/components/AltersideCatalogGenerator.tsx",
     ],
     rules: {
       "@typescript-eslint/no-explicit-any": "warn",

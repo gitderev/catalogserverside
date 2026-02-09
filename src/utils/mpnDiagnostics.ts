@@ -158,7 +158,7 @@ export interface PostParseMPNScanResult {
   sciExamples: MPNDiagnosticExample[];
   ePlusExamples: MPNDiagnosticExample[];
   typeErrors: number; // MPN values that are not strings
-  typeErrorExamples: Array<{ rowIndex: number; value: any; type: string }>;
+  typeErrorExamples: Array<{ rowIndex: number; value: unknown; type: string }>;
 }
 
 /**
@@ -270,7 +270,7 @@ export function performRawMPNScan(
  * @returns Post-parse scan results
  */
 export function performPostParseMPNScan(
-  parsedData: any[],
+  parsedData: Record<string, unknown>[],
   mpnFieldName: string
 ): PostParseMPNScanResult {
   let postSciInMpn = 0;
@@ -278,7 +278,7 @@ export function performPostParseMPNScan(
   let typeErrors = 0;
   const sciExamples: MPNDiagnosticExample[] = [];
   const ePlusExamples: MPNDiagnosticExample[] = [];
-  const typeErrorExamples: Array<{ rowIndex: number; value: any; type: string }> = [];
+  const typeErrorExamples: Array<{ rowIndex: number; value: unknown; type: string }> = [];
   
   parsedData.forEach((row, index) => {
     const rawValue = row[mpnFieldName];
@@ -339,7 +339,7 @@ export function performPostParseMPNScan(
  */
 export function performMPNDiagnostics(
   rawContent: string,
-  parsedData: any[],
+  parsedData: Record<string, unknown>[],
   fileType: 'material' | 'mapping',
   filename: string,
   explicitDelimiter?: string,

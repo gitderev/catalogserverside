@@ -45,7 +45,7 @@ export const EPRICE_TEMPLATE = {
 const EPRICE_IT_FULFILLMENT_LATENCY = 1;
 
 export interface EpriceExportParams {
-  eanDataset: any[];
+  eanDataset: Record<string, unknown>[];
   stockLocationIndex: StockLocationIndex | null;
   stockLocationWarnings: StockLocationWarnings;
   includeEu: boolean;
@@ -314,9 +314,9 @@ export function buildEpriceXlsxFromEanDataset({
   const aoa: (string | number)[][] = [[...EPRICE_TEMPLATE.headers]];
   
   eanDataset.forEach((record, index) => {
-    const sku = record.ManufPartNr || '';
-    const ean = record.EAN || '';
-    const matnr = record.Matnr || '';
+    const sku = String(record.ManufPartNr ?? '');
+    const ean = String(record.EAN ?? '');
+    const matnr = String(record.Matnr ?? '');
     const existingStock = Number(record.ExistingStock) || 0;
     
     // Filter 1: Valid EAN required

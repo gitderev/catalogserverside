@@ -58,7 +58,7 @@ interface SyncRun {
   attempt: number;
   runtime_ms: number | null;
   error_message: string | null;
-  error_details: any;
+  error_details: unknown;
   steps: Record<string, StepResult>;
   metrics: PipelineMetrics;
   cancel_requested: boolean;
@@ -71,7 +71,7 @@ const STALE_RUN_THRESHOLD_MS = 15 * 60 * 1000;
 interface StepResult {
   status: 'success' | 'failed' | 'skipped';
   duration_ms: number;
-  [key: string]: any;
+  [key: string]: unknown;
 }
 
 interface PipelineMetrics {
@@ -120,7 +120,7 @@ const STEP_LABELS: Record<string, string> = {
 };
 
 // Helper function to get user-friendly error messages in Italian
-const getFriendlyErrorMessage = (errorMessage: string | null, errorDetails: any): string => {
+const getFriendlyErrorMessage = (errorMessage: string | null, errorDetails: unknown): string => {
   if (!errorMessage) return 'Errore sconosciuto';
   
   const msg = errorMessage.toLowerCase();
@@ -629,7 +629,7 @@ export const SyncScheduler: React.FC = () => {
               <div>
                 <p className="font-semibold text-info">Sincronizzazione in corso</p>
                 <p className="text-sm alt-text-muted">
-                  Step corrente: {STEP_LABELS[(currentRun.steps as any)?.current_step] || (currentRun.steps as any)?.current_step || 'Avvio...'}
+                  Step corrente: {STEP_LABELS[String((currentRun.steps as Record<string, unknown>)?.current_step ?? '')] || String((currentRun.steps as Record<string, unknown>)?.current_step ?? '') || 'Avvio...'}
                 </p>
               </div>
             </div>

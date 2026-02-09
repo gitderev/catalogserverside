@@ -37,7 +37,7 @@ import {
 // =====================================================================
 
 export interface AmazonExportParams {
-  eanDataset: any[];
+  eanDataset: Record<string, unknown>[];
   stockLocationIndex: StockLocationIndex | null;
   stockLocationWarnings: StockLocationWarnings;
   includeEu: boolean;
@@ -425,15 +425,18 @@ export async function buildAmazonExport(params: AmazonExportParams): Promise<Ama
       priceDisplay = (finalCents / 100).toFixed(2);
     } else {
       // Standard pricing: Calculate Amazon-specific price in cents
-      const hasBest = Number.isFinite(record.CustBestPrice) && record.CustBestPrice > 0;
-      const hasListPrice = Number.isFinite(record.ListPrice) && record.ListPrice > 0;
-      const surchargeValue = (Number.isFinite(record.Surcharge) && record.Surcharge >= 0) ? record.Surcharge : 0;
+      const custBestPriceNum = Number(record.CustBestPrice);
+      const listPriceNum = Number(record.ListPrice);
+      const surchargeNum = Number(record.Surcharge);
+      const hasBest = Number.isFinite(custBestPriceNum) && custBestPriceNum > 0;
+      const hasListPrice = Number.isFinite(listPriceNum) && listPriceNum > 0;
+      const surchargeValue = (Number.isFinite(surchargeNum) && surchargeNum >= 0) ? surchargeNum : 0;
 
       let baseCents = 0;
       if (hasBest) {
-        baseCents = Math.round((record.CustBestPrice + surchargeValue) * 100);
+        baseCents = Math.round((custBestPriceNum + surchargeValue) * 100);
       } else if (hasListPrice) {
-        baseCents = Math.round(record.ListPrice * 100);
+        baseCents = Math.round(listPriceNum * 100);
       }
 
       if (baseCents <= 0) {
@@ -547,7 +550,8 @@ export async function buildAmazonExport(params: AmazonExportParams): Promise<Ama
   }
 
   // Deterministic VBA flag: preserve macros if present, proceed without if absent
-  const hasVBA = Boolean((wb as any).vbaraw && (wb as any).vbaraw.length > 0);
+  const wbExt = wb as unknown as Record<string, unknown>;
+  const hasVBA = Boolean(wbExt.vbaraw);
   if (hasVBA) {
     console.log('[Amazon:template] VBA rilevato nel template, macro saranno preservate.');
   } else {
@@ -674,7 +678,7 @@ export async function buildAmazonExport(params: AmazonExportParams): Promise<Ama
   if (hasVBA) {
     try {
       const verifyWb = XLSX.read(xlsmOut, { type: 'array', bookVBA: true });
-      if (!(verifyWb as any).vbaraw) {
+      if (!(verifyWb as unknown as Record<string, unknown>).vbaraw) {
         const errMsg = 'Verifica post-write fallita: VBA perso durante serializzazione XLSM. Impossibile garantire integrità macro.';
         console.error('[Amazon:xlsm:FATAL]', errMsg);
         return {

@@ -243,9 +243,9 @@ interface MappingEntry {
  */
 export function processEANPrefillWithNormalization(
   mappingLines: string[],
-  materialData: any[]
+  materialData: Record<string, unknown>[]
 ): {
-  updatedMaterial: any[];
+  updatedMaterial: Record<string, unknown>[];
   counters: EANPrefillExtendedCounters;
   reports: EANPrefillExtendedReports;
 } {
@@ -393,7 +393,7 @@ export function processEANPrefillWithNormalization(
   const updatedMaterial = materialData.map((row, index) => {
     const newRow = { ...row };
     const mpn = sanitizeMPN(row.ManufPartNr);
-    const currentEAN_raw = (row.EAN ?? '').toString().trim();
+    const currentEAN_raw = String(row.EAN ?? '').trim();
     
     // Normalize current EAN from material
     const currentEAN_norm = normalizeEANForComparison(currentEAN_raw);
