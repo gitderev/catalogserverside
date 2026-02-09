@@ -24,6 +24,19 @@ export default tseslint.config(
         { allowConstantExport: true },
       ],
       "@typescript-eslint/no-unused-vars": "off",
+      "@typescript-eslint/no-explicit-any": "error",
+    },
+  },
+  // Override: allow 'any' as warning in generic data-parsing files
+  {
+    files: [
+      "src/utils/csvMerger.ts",
+      "src/utils/txtMerger.ts",
+      "src/utils/excelFormatter.ts",
+      "src/utils/ean.ts",
+      "src/components/DataPreview.tsx",
+    ],
+    rules: {
       "@typescript-eslint/no-explicit-any": "warn",
     },
   }
