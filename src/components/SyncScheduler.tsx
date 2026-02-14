@@ -28,7 +28,8 @@ import {
   ChevronDown,
   ChevronRight,
   Server,
-  Zap
+  Zap,
+  Copy
 } from 'lucide-react';
 
 interface SyncConfig {
@@ -166,11 +167,6 @@ const getFriendlyErrorMessage = (errorMessage: string | null, errorDetails: unkn
     return 'Errore upload SFTP: caricamento file non riuscito';
   }
   
-  // File/parsing errors
-  if (msg.includes('parse') || msg.includes('parsing') || msg.includes('file')) {
-    return 'Errore elaborazione file: formato non valido o file corrotto';
-  }
-  
   // Pricing errors
   if (msg.includes('pricing') || msg.includes('prezzo') || msg.includes('price')) {
     return 'Errore calcolo prezzi: verifica la configurazione delle fee';
@@ -191,8 +187,9 @@ const getFriendlyErrorMessage = (errorMessage: string | null, errorDetails: unkn
     return 'Sincronizzazione interrotta per timeout (superati 30 minuti)';
   }
   
-  // Return original message if no match (but trim it if too long)
-  return errorMessage.length > 100 ? errorMessage.substring(0, 100) + '...' : errorMessage;
+  // IMPORTANT: Do NOT mask file/parse errors with a generic message.
+  // Pass through the original error so the user sees the real cause.
+  return errorMessage.length > 200 ? errorMessage.substring(0, 200) + '...' : errorMessage;
 };
 
 // Status badge with proper colors
@@ -238,6 +235,8 @@ export const SyncScheduler: React.FC = () => {
   const [isResetting, setIsResetting] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
   const [expandedLogDetails, setExpandedLogDetails] = useState<string | null>(null);
+  const [runEvents, setRunEvents] = useState<Array<{ id: string; level: string; message: string; details: unknown; created_at: string; step: string | null }>>([]);
+  const [isLoadingEvents, setIsLoadingEvents] = useState(false);
 
   // Load config and runs
   const loadData = useCallback(async () => {
@@ -303,10 +302,41 @@ export const SyncScheduler: React.FC = () => {
     return () => clearInterval(interval);
   }, [loadData]);
 
+  // Load sync_events when a run is selected
+  useEffect(() => {
+    if (!selectedRun) {
+      setRunEvents([]);
+      return;
+    }
+    const loadEvents = async () => {
+      setIsLoadingEvents(true);
+      try {
+        const { data, error } = await supabase
+          .from('sync_events')
+          .select('id, level, message, details, created_at, step')
+          .eq('run_id', selectedRun.id)
+          .order('created_at', { ascending: false })
+          .limit(50);
+        if (!error && data) {
+          setRunEvents(data as typeof runEvents);
+        }
+      } catch (e) {
+        console.error('Error loading sync events:', e);
+      } finally {
+        setIsLoadingEvents(false);
+      }
+    };
+    loadEvents();
+  }, [selectedRun?.id]);
+
   const saveConfig = async (updates: Partial<SyncConfig>) => {
     if (!config) return;
 
+    // Optimistic update
+    const previousConfig = { ...config };
+    setConfig({ ...config, ...updates });
     setIsSaving(true);
+
     try {
       const { error } = await supabase
         .from('sync_config')
@@ -315,16 +345,20 @@ export const SyncScheduler: React.FC = () => {
 
       if (error) throw error;
 
-      setConfig({ ...config, ...updates });
       toast({
         title: 'Salvato',
         description: 'Configurazione aggiornata'
       });
     } catch (error: unknown) {
+      // Rollback on failure
+      setConfig(previousConfig);
+      const supaError = error as { code?: string; message?: string };
+      const errorCode = supaError?.code || 'UNKNOWN';
+      const errorMessage = supaError?.message || 'Errore sconosciuto';
       console.error('Error saving config:', error);
       toast({
-        title: 'Errore',
-        description: 'Impossibile salvare la configurazione',
+        title: 'Errore salvataggio',
+        description: `Impossibile salvare (${errorCode}): ${errorMessage}`,
         variant: 'destructive'
       });
     } finally {
@@ -1084,6 +1118,71 @@ export const SyncScheduler: React.FC = () => {
                   </CollapsibleContent>
                 </Collapsible>
               )}
+
+              {/* Sync Events (ERROR/WARN) */}
+              <div>
+                <div className="flex items-center justify-between mb-3">
+                  <h4 className="font-semibold text-slate-800">Eventi diagnostici</h4>
+                  {runEvents.length > 0 && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="text-xs"
+                      onClick={() => {
+                        const safeEvents = runEvents.map(e => ({
+                          level: e.level,
+                          step: e.step,
+                          message: e.message,
+                          details: e.details,
+                          time: e.created_at
+                        }));
+                        navigator.clipboard.writeText(JSON.stringify(safeEvents, null, 2));
+                        toast({ title: 'Copiato', description: 'Dettagli eventi copiati negli appunti' });
+                      }}
+                    >
+                      <Copy className="h-3 w-3 mr-1" />
+                      Copia dettagli
+                    </Button>
+                  )}
+                </div>
+                {isLoadingEvents ? (
+                  <div className="flex items-center gap-2 text-sm text-slate-500">
+                    <Loader2 className="h-4 w-4 animate-spin" /> Caricamento eventi...
+                  </div>
+                ) : runEvents.length === 0 ? (
+                  <p className="text-sm text-slate-500">Nessun evento registrato per questa run.</p>
+                ) : (
+                  <ScrollArea className="max-h-[200px]">
+                    <div className="space-y-2">
+                      {runEvents.map(event => (
+                        <div key={event.id} className={`p-3 rounded-lg border text-sm ${
+                          event.level === 'ERROR' ? 'bg-red-50 border-red-200' :
+                          event.level === 'WARN' ? 'bg-amber-50 border-amber-200' :
+                          'bg-slate-50 border-slate-200'
+                        }`}>
+                          <div className="flex items-center gap-2 mb-1">
+                            <span className={`text-xs font-bold ${
+                              event.level === 'ERROR' ? 'text-red-700' :
+                              event.level === 'WARN' ? 'text-amber-700' :
+                              'text-slate-600'
+                            }`}>{event.level}</span>
+                            {event.step && <span className="text-xs text-slate-500">[{STEP_LABELS[event.step] || event.step}]</span>}
+                            <span className="text-xs text-slate-400 ml-auto">
+                              {new Date(event.created_at).toLocaleTimeString('it-IT')}
+                            </span>
+                          </div>
+                          <p className="text-slate-700">{event.message}</p>
+                          {event.details && typeof event.details === 'object' && Object.keys(event.details as object).length > 0 && (
+                            <pre className="mt-1 text-xs text-slate-500 overflow-x-auto">
+                              {JSON.stringify(event.details, null, 2)}
+                            </pre>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </ScrollArea>
+                )}
+              </div>
             </div>
           )}
         </DialogContent>
