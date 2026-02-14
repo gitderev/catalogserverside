@@ -39,17 +39,19 @@ serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
 
   try {
-    // 1. AUTHENTICATE via x-cron-secret OR service role key
+    // 1. AUTHENTICATE via x-cron-secret OR service role key OR anon key (for pg_cron)
     const cronSecret = Deno.env.get('CRON_SECRET');
     const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
+    const supabaseAnonKey = Deno.env.get('SUPABASE_ANON_KEY');
     const providedSecret = req.headers.get('x-cron-secret');
     const authHeader = req.headers.get('Authorization');
     const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.replace('Bearer ', '') : null;
 
     const isValidCronSecret = cronSecret && providedSecret === cronSecret;
     const isServiceRole = bearerToken === supabaseServiceKey;
+    const isAnonKey = bearerToken && supabaseAnonKey && bearerToken === supabaseAnonKey;
 
-    if (!isValidCronSecret && !isServiceRole) {
+    if (!isValidCronSecret && !isServiceRole && !isAnonKey) {
       console.log('[cron-tick] Invalid or missing authentication');
       return new Response(
         JSON.stringify({ status: 'error', message: 'Unauthorized' }),
