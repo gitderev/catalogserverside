@@ -39,6 +39,12 @@ interface SyncConfig {
   max_retries: number;
   retry_delay_minutes: number;
   updated_at: string;
+  schedule_type: 'hours' | 'daily';
+  notification_mode: 'never' | 'always' | 'only_on_problem';
+  notify_on_warning: boolean;
+  run_timeout_minutes: number;
+  max_attempts: number;
+  last_disabled_reason: string | null;
 }
 
 /**
@@ -53,7 +59,7 @@ interface SyncRun {
   id: string;
   started_at: string;
   finished_at: string | null;
-  status: 'running' | 'success' | 'failed' | 'timeout' | 'skipped';
+  status: 'running' | 'success' | 'success_with_warning' | 'failed' | 'timeout' | 'skipped';
   trigger_type: 'cron' | 'manual';
   attempt: number;
   runtime_ms: number | null;
@@ -63,6 +69,8 @@ interface SyncRun {
   metrics: PipelineMetrics;
   cancel_requested: boolean;
   cancelled_by_user: boolean;
+  warning_count: number;
+  location_warnings: Record<string, number>;
 }
 
 // Soglia per considerare una run come "bloccata/zombie" (15 minuti)
@@ -102,9 +110,16 @@ const FREQUENCY_OPTIONS = [
 const STATUS_LABELS: Record<string, string> = {
   running: 'In esecuzione',
   success: 'Successo',
+  success_with_warning: 'Successo con avvisi',
   failed: 'Fallita',
   timeout: 'Timeout',
   skipped: 'Saltata'
+};
+
+const NOTIFICATION_MODE_LABELS: Record<string, string> = {
+  never: 'Mai',
+  always: 'Sempre',
+  only_on_problem: 'Solo in caso di problemi'
 };
 
 const STEP_LABELS: Record<string, string> = {
@@ -114,6 +129,8 @@ const STEP_LABELS: Record<string, string> = {
   pricing: 'Calcolo Prezzi',
   override: 'Override Prodotti',
   export_ean: 'Export Catalogo EAN',
+  export_ean_xlsx: 'Export Catalogo EAN (XLSX)',
+  export_amazon: 'Export Amazon',
   export_mediaworld: 'Export Mediaworld',
   export_eprice: 'Export ePrice',
   upload_sftp: 'Upload SFTP'
@@ -186,6 +203,7 @@ const getStatusBadge = (status: string, size: 'sm' | 'md' = 'sm') => {
   const statusStyles: Record<string, string> = {
     running: 'alt-sync-badge alt-sync-badge--running',
     success: 'alt-sync-badge alt-sync-badge--success',
+    success_with_warning: 'alt-sync-badge alt-sync-badge--timeout',
     failed: 'alt-sync-badge alt-sync-badge--failed',
     timeout: 'alt-sync-badge alt-sync-badge--timeout',
     skipped: 'alt-sync-badge alt-sync-badge--skipped'
@@ -194,6 +212,7 @@ const getStatusBadge = (status: string, size: 'sm' | 'md' = 'sm') => {
   const icons: Record<string, React.ReactNode> = {
     running: <Loader2 className={`${size === 'md' ? 'h-4 w-4' : 'h-3 w-3'} animate-spin`} />,
     success: <CheckCircle className={size === 'md' ? 'h-4 w-4' : 'h-3 w-3'} />,
+    success_with_warning: <AlertTriangle className={size === 'md' ? 'h-4 w-4' : 'h-3 w-3'} />,
     failed: <XCircle className={size === 'md' ? 'h-4 w-4' : 'h-3 w-3'} />,
     timeout: <Clock className={size === 'md' ? 'h-4 w-4' : 'h-3 w-3'} />,
     skipped: <AlertTriangle className={size === 'md' ? 'h-4 w-4' : 'h-3 w-3'} />
@@ -457,29 +476,28 @@ export const SyncScheduler: React.FC = () => {
   const getNextSyncTime = (): string | null => {
     if (!config?.enabled || runs.length === 0) return null;
 
+    if (config.schedule_type === 'daily') {
+      const dailyTime = config.daily_time || '03:00';
+      const [hours, minutes] = dailyTime.split(':').map(Number);
+      const now = new Date();
+      // Display in Europe/Rome timezone
+      const romeNow = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Rome' }));
+      const target = new Date(romeNow);
+      target.setHours(hours, minutes, 0, 0);
+      
+      if (target <= romeNow) {
+        target.setDate(target.getDate() + 1);
+      }
+      
+      return `${target.toLocaleDateString('it-IT')} alle ${dailyTime} (Europe/Rome)`;
+    }
+
+    // Hours mode
     const lastCronRun = runs.find(r => r.trigger_type === 'cron' && r.attempt === 1);
     if (!lastCronRun) return 'Prossima esecuzione programmata';
 
     const lastStarted = new Date(lastCronRun.started_at);
     const nextRun = new Date(lastStarted.getTime() + config.frequency_minutes * 60 * 1000);
-
-    if (config.frequency_minutes === 1440 && config.daily_time) {
-      const [hours, minutes] = config.daily_time.split(':').map(Number);
-      const today = new Date();
-      today.setHours(hours, minutes, 0, 0);
-      
-      if (today <= new Date()) {
-        today.setDate(today.getDate() + 1);
-      }
-      
-      return today.toLocaleString('it-IT', {
-        day: '2-digit',
-        month: '2-digit',
-        year: 'numeric',
-        hour: '2-digit',
-        minute: '2-digit'
-      });
-    }
 
     return nextRun.toLocaleString('it-IT', {
       day: '2-digit',
@@ -583,40 +601,108 @@ export const SyncScheduler: React.FC = () => {
                 <p className="text-xs alt-text-muted leading-relaxed">
                   Quando attiva, la pipeline viene eseguita automaticamente in base alla frequenza scelta.
                 </p>
+                {config?.last_disabled_reason && !config?.enabled && (
+                  <p className="text-xs text-warning">
+                    {config.last_disabled_reason}
+                  </p>
+                )}
               </div>
 
-              {/* Frequency */}
+              {/* Schedule Type */}
               <div className="space-y-2">
-                <Label className="font-semibold">Frequenza</Label>
+                <Label className="font-semibold">Tipo di pianificazione</Label>
                 <Select
-                  value={String(config?.frequency_minutes || 60)}
-                  onValueChange={(value) => saveConfig({ frequency_minutes: parseInt(value) })}
+                  value={config?.schedule_type || 'hours'}
+                  onValueChange={(value) => saveConfig({ schedule_type: value as 'hours' | 'daily' })}
                   disabled={isSaving}
                 >
                   <SelectTrigger className="alt-input">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    {FREQUENCY_OPTIONS.map(opt => (
-                      <SelectItem key={opt.value} value={opt.value}>
-                        {opt.label}
-                      </SelectItem>
+                    <SelectItem value="hours">Ogni N ore</SelectItem>
+                    <SelectItem value="daily">Giornaliero</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+
+              {/* Frequency (only for hours mode) */}
+              {(config?.schedule_type || 'hours') === 'hours' && (
+                <div className="space-y-2">
+                  <Label className="font-semibold">Frequenza</Label>
+                  <Select
+                    value={String(config?.frequency_minutes || 60)}
+                    onValueChange={(value) => saveConfig({ frequency_minutes: parseInt(value) })}
+                    disabled={isSaving}
+                  >
+                    <SelectTrigger className="alt-input">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {FREQUENCY_OPTIONS.map(opt => (
+                        <SelectItem key={opt.value} value={opt.value}>
+                          {opt.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              )}
+
+              {/* Daily time (only for daily mode) */}
+              {(config?.schedule_type || 'hours') === 'daily' && (
+                <div className="space-y-2">
+                  <Label className="font-semibold">Orario giornaliero (Europe/Rome)</Label>
+                  <Input
+                    type="time"
+                    value={config?.daily_time || '03:00'}
+                    onChange={(e) => saveConfig({ daily_time: e.target.value })}
+                    disabled={isSaving}
+                    className="alt-input"
+                  />
+                </div>
+              )}
+            </div>
+
+            {/* Notification Settings */}
+            <Separator className="my-4 bg-slate-200" />
+            <h3 className="text-sm font-semibold alt-text-muted uppercase tracking-wide mb-4">Notifiche Email</h3>
+            <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
+              <div className="space-y-2">
+                <Label className="font-semibold">Modalità notifica</Label>
+                <Select
+                  value={config?.notification_mode || 'never'}
+                  onValueChange={(value) => saveConfig({ notification_mode: value as 'never' | 'always' | 'only_on_problem' })}
+                  disabled={isSaving}
+                >
+                  <SelectTrigger className="alt-input">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {Object.entries(NOTIFICATION_MODE_LABELS).map(([key, label]) => (
+                      <SelectItem key={key} value={key}>{label}</SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
               </div>
 
-              {/* Daily time (only for daily frequency) */}
-              {config?.frequency_minutes === 1440 && (
-                <div className="space-y-2">
-                  <Label className="font-semibold">Orario giornaliero</Label>
-                  <Input
-                    type="time"
-                    value={config?.daily_time || '08:00'}
-                    onChange={(e) => saveConfig({ daily_time: e.target.value })}
-                    disabled={isSaving}
-                    className="alt-input"
-                  />
+              {config?.notification_mode === 'only_on_problem' && (
+                <div className="space-y-3">
+                  <div className="flex items-center gap-3">
+                    <Switch
+                      id="notify-warning"
+                      checked={config?.notify_on_warning ?? true}
+                      onCheckedChange={(checked) => saveConfig({ notify_on_warning: checked })}
+                      disabled={isSaving}
+                      className="data-[state=checked]:bg-primary"
+                    />
+                    <Label htmlFor="notify-warning" className="font-semibold cursor-pointer">
+                      Notifica anche per avvisi
+                    </Label>
+                  </div>
+                  <p className="text-xs alt-text-muted">
+                    Invia email anche quando la sync completa con avvisi (non solo errori).
+                  </p>
                 </div>
               )}
             </div>

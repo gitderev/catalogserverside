@@ -346,12 +346,21 @@ serve(async (req) => {
     await updateRun(supabase, runId, { steps: { current_step: 'upload_sftp' } });
     console.log('[orchestrator] === STEP 8: SFTP Upload ===');
     
+    // Build files list - base 3 + extras for cron trigger
+    const sftpFiles = [
+      { bucket: 'exports', path: 'Catalogo EAN.csv', filename: 'Catalogo EAN.csv' },
+      { bucket: 'exports', path: 'Export ePrice.csv', filename: 'Export ePrice.csv' },
+      { bucket: 'exports', path: 'Export Mediaworld.csv', filename: 'Export Mediaworld.csv' }
+    ];
+    if (trigger === 'cron') {
+      sftpFiles.push(
+        { bucket: 'exports', path: 'amazon_listing_loader.xlsm', filename: 'amazon_listing_loader.xlsm' },
+        { bucket: 'exports', path: 'amazon_price_inventory.txt', filename: 'amazon_price_inventory.txt' }
+      );
+    }
+    
     const sftpResult = await callStep(supabaseUrl, supabaseServiceKey, 'upload-exports-to-sftp', {
-      files: [
-        { bucket: 'exports', path: 'Catalogo EAN.csv', filename: 'Catalogo EAN.csv' },
-        { bucket: 'exports', path: 'Export ePrice.csv', filename: 'Export ePrice.csv' },
-        { bucket: 'exports', path: 'Export Mediaworld.csv', filename: 'Export Mediaworld.csv' }
-      ]
+      files: sftpFiles
     });
     
     if (!sftpResult.success) {
@@ -359,11 +368,67 @@ serve(async (req) => {
       return new Response(JSON.stringify({ status: 'failed', error: sftpResult.error }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
-    // ========== SUCCESS ==========
-    await finalizeRun(supabase, runId, 'success', startTime);
-    console.log(`[orchestrator] Pipeline completed: ${runId}`);
+    // ========== STORAGE VERSIONING ==========
+    console.log('[orchestrator] === Storage versioning ===');
+    const versionTimestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const exportFiles = [
+      'Catalogo EAN.csv', 'Export ePrice.csv', 'Export Mediaworld.csv',
+      ...(trigger === 'cron' ? ['catalogo_ean.xlsx', 'amazon_listing_loader.xlsm', 'amazon_price_inventory.txt'] : [])
+    ];
     
-    return new Response(JSON.stringify({ status: 'success', run_id: runId }), 
+    for (const fileName of exportFiles) {
+      try {
+        const { data: fileBlob } = await supabase.storage.from('exports').download(fileName);
+        if (fileBlob) {
+          // Copy to latest/
+          await supabase.storage.from('exports').upload(`latest/${fileName}`, fileBlob, { upsert: true });
+          // Copy to versions/
+          await supabase.storage.from('exports').upload(`versions/${versionTimestamp}/${fileName}`, fileBlob, { upsert: true });
+        }
+      } catch (e: unknown) {
+        console.warn(`[orchestrator] Versioning failed for ${fileName}: ${errMsg(e)}`);
+      }
+    }
+    
+    // Cleanup old versions (keep last 10)
+    try {
+      const { data: versionFolders } = await supabase.storage.from('exports').list('versions', { sortBy: { column: 'name', order: 'desc' }, limit: 100 });
+      if (versionFolders && versionFolders.length > 10) {
+        for (const folder of versionFolders.slice(10)) {
+          const { data: folderFiles } = await supabase.storage.from('exports').list(`versions/${folder.name}`);
+          if (folderFiles?.length) {
+            await supabase.storage.from('exports').remove(folderFiles.map(f => `versions/${folder.name}/${f.name}`));
+          }
+        }
+        console.log(`[orchestrator] Cleaned up ${versionFolders.length - 10} old versions`);
+      }
+    } catch (e: unknown) {
+      console.warn(`[orchestrator] Version cleanup failed: ${errMsg(e)}`);
+    }
+
+    // ========== DETERMINE FINAL STATUS ==========
+    const { data: finalRun } = await supabase.from('sync_runs').select('warning_count, location_warnings').eq('id', runId).single();
+    const totalWarnings = (finalRun?.warning_count || 0);
+    const locationWarnings = finalRun?.location_warnings || {};
+    const hasWarnings = totalWarnings > 0 || Object.values(locationWarnings).some((v: unknown) => (v as number) > 0);
+    const finalStatus = hasWarnings ? 'success_with_warning' : 'success';
+    
+    await finalizeRun(supabase, runId, finalStatus, startTime);
+    console.log(`[orchestrator] Pipeline completed: ${runId}, status: ${finalStatus}`);
+
+    // ========== POST-RUN NOTIFICATION ==========
+    try {
+      await fetch(`${supabaseUrl}/functions/v1/send-sync-notification`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${supabaseServiceKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ run_id: runId, status: finalStatus })
+      });
+      console.log(`[orchestrator] Notification sent for run ${runId}`);
+    } catch (e: unknown) {
+      console.warn(`[orchestrator] Notification failed (non-blocking): ${errMsg(e)}`);
+    }
+    
+    return new Response(JSON.stringify({ status: finalStatus, run_id: runId }), 
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 
   } catch (err: unknown) {
@@ -372,6 +437,12 @@ serve(async (req) => {
     if (runId && supabase) {
       try {
         await finalizeRun(supabase, runId, 'failed', startTime, errMsg(err));
+        // Send notification for failure
+        await fetch(`${supabaseUrl}/functions/v1/send-sync-notification`, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${supabaseServiceKey}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ run_id: runId, status: 'failed' })
+        }).catch(() => {});
       } catch (e: unknown) {
         console.error('[orchestrator] Failed to finalize:', e);
       }
