@@ -330,7 +330,15 @@ export const SyncScheduler: React.FC = () => {
   }, [selectedRun?.id]);
 
   const saveConfig = async (updates: Partial<SyncConfig>) => {
-    if (!config) return;
+    if (!config) {
+      // Config not loaded yet — try to create singleton
+      toast({ title: 'Errore', description: 'Configurazione non ancora caricata', variant: 'destructive' });
+      return;
+    }
+
+    if (import.meta.env.DEV) {
+      console.log('[SyncScheduler] saveConfig called:', JSON.stringify(updates), new Date().toISOString());
+    }
 
     // Optimistic update
     const previousConfig = { ...config };
@@ -338,7 +346,7 @@ export const SyncScheduler: React.FC = () => {
     setIsSaving(true);
 
     try {
-      const { error } = await supabase
+      const { error, count } = await supabase
         .from('sync_config')
         .update(updates)
         .eq('id', 1);
@@ -355,7 +363,7 @@ export const SyncScheduler: React.FC = () => {
       const supaError = error as { code?: string; message?: string };
       const errorCode = supaError?.code || 'UNKNOWN';
       const errorMessage = supaError?.message || 'Errore sconosciuto';
-      console.error('Error saving config:', error);
+      console.error('Error saving config:', errorCode, errorMessage);
       toast({
         title: 'Errore salvataggio',
         description: `Impossibile salvare (${errorCode}): ${errorMessage}`,
@@ -616,8 +624,13 @@ export const SyncScheduler: React.FC = () => {
                   <Switch
                     id="sync-enabled"
                     checked={config?.enabled || false}
-                    onCheckedChange={(checked) => saveConfig({ enabled: checked })}
-                    disabled={isSaving}
+                    onCheckedChange={(checked: boolean) => {
+                      if (import.meta.env.DEV) {
+                        console.log('[SyncScheduler] toggle_click', { checked, ts: Date.now() });
+                      }
+                      saveConfig({ enabled: checked });
+                    }}
+                    disabled={isSaving || !config}
                     className="data-[state=checked]:bg-primary"
                   />
                   <div>

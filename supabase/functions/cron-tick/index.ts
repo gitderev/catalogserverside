@@ -108,12 +108,16 @@ serve(async (req) => {
           error_message: `Timeout: superati ${timeoutMinutes} minuti`
         }).eq('id', run.id);
 
-        await supabase.rpc('log_sync_event', {
-          p_run_id: run.id,
-          p_level: 'ERROR',
-          p_message: `Run interrotta per timeout dopo ${Math.round(elapsed / 60000)} minuti`,
-          p_details: { step: 'timeout', elapsed_minutes: Math.round(elapsed / 60000), timeout_minutes: timeoutMinutes }
-        });
+        try {
+          await supabase.rpc('log_sync_event', {
+            p_run_id: run.id,
+            p_level: 'ERROR',
+            p_message: `Run interrotta per timeout dopo ${Math.round(elapsed / 60000)} minuti`,
+            p_details: { step: 'timeout', elapsed_minutes: Math.round(elapsed / 60000), timeout_minutes: timeoutMinutes }
+          });
+        } catch (logErr) {
+          console.warn('[cron-tick] log_sync_event failed:', logErr);
+        }
 
         // P1-B: Release lock via RPC
         const { data: lockReleased } = await supabase.rpc('release_sync_lock', {

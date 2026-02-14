@@ -1016,12 +1016,16 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
         if (errorMsg.includes('WORKER_LIMIT') || errorMsg.includes('546')) {
           const error = `Finalization exceeded worker limits with ${totalChunks} chunks. Consider staging to DB.`;
           console.error(`[parse_merge] ${error}`);
-          await supabase.rpc('log_sync_event', {
-            p_run_id: runId,
-            p_level: 'ERROR',
-            p_message: error,
-            p_details: { step: 'parse_merge', phase: 'finalization', chunk_count: totalChunks, suggestion: 'ridurre CHUNK_LINES o implementare staging su DB' }
-          });
+          try {
+            await supabase.rpc('log_sync_event', {
+              p_run_id: runId,
+              p_level: 'ERROR',
+              p_message: error,
+              p_details: { step: 'parse_merge', phase: 'finalization', chunk_count: totalChunks, suggestion: 'ridurre CHUNK_LINES o implementare staging su DB' }
+            });
+          } catch (logErr) {
+            console.warn('[parse_merge] log_sync_event failed:', logErr);
+          }
           await updateParseMergeState(supabase, runId, { status: 'failed', error });
           return { success: false, error, status: 'failed' };
         }
