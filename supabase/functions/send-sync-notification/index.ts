@@ -68,12 +68,16 @@ serve(async (req) => {
 
     if (!brevoApiKey) {
       console.warn('[send-sync-notification] BREVO_API_KEY not configured, skipping email');
-      await supabase.rpc('log_sync_event', {
-        p_run_id: runId,
-        p_level: 'WARN',
-        p_message: 'Email non inviata: BREVO_API_KEY non configurata',
-        p_details: { step: 'notification' }
-      });
+      try {
+        await supabase.rpc('log_sync_event', {
+          p_run_id: runId,
+          p_level: 'WARN',
+          p_message: 'Email non inviata: BREVO_API_KEY non configurata',
+          p_details: { step: 'notification' }
+        });
+      } catch (logErr) {
+        console.warn('[send-sync-notification] log_sync_event failed:', logErr);
+      }
       return new Response(
         JSON.stringify({ status: 'skipped', reason: 'no_api_key' }),
         { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -133,22 +137,30 @@ serve(async (req) => {
 
       console.log(`[send-sync-notification] Email sent for run ${runId}`);
       
-      await supabase.rpc('log_sync_event', {
-        p_run_id: runId,
-        p_level: 'INFO',
-        p_message: `Email inviata a ${RECIPIENT_EMAIL}`,
-        p_details: { step: 'notification' }
-      });
+      try {
+        await supabase.rpc('log_sync_event', {
+          p_run_id: runId,
+          p_level: 'INFO',
+          p_message: `Email inviata a ${RECIPIENT_EMAIL}`,
+          p_details: { step: 'notification' }
+        });
+      } catch (logErr) {
+        console.warn('[send-sync-notification] log_sync_event failed:', logErr);
+      }
 
     } catch (emailError: unknown) {
       console.warn(`[send-sync-notification] Email send failed (non-blocking):`, errMsg(emailError));
       
-      await supabase.rpc('log_sync_event', {
-        p_run_id: runId,
-        p_level: 'WARN',
-        p_message: `Invio email fallito: ${errMsg(emailError)}`,
-        p_details: { step: 'notification' }
-      });
+      try {
+        await supabase.rpc('log_sync_event', {
+          p_run_id: runId,
+          p_level: 'WARN',
+          p_message: `Invio email fallito: ${errMsg(emailError)}`,
+          p_details: { step: 'notification' }
+        });
+      } catch (logErr) {
+        console.warn('[send-sync-notification] log_sync_event failed:', logErr);
+      }
     }
 
     return new Response(

@@ -270,12 +270,16 @@ serve(async (req) => {
         await supabase.from('sync_runs').update({ location_warnings: warnings }).eq('id', runId);
         
         // Register WARN via atomic RPC (increments warning_count)
-        await supabase.rpc('log_sync_event', {
-          p_run_id: runId,
-          p_level: 'WARN',
-          p_message: 'File stock location non trovato o non importabile',
-          p_details: { step: 'import_ftp', location_warning: 'missing_location_file' }
-        });
+        try {
+          await supabase.rpc('log_sync_event', {
+            p_run_id: runId,
+            p_level: 'WARN',
+            p_message: 'File stock location non trovato o non importabile',
+            p_details: { step: 'import_ftp', location_warning: 'missing_location_file' }
+          });
+        } catch (logErr) {
+          console.warn('[orchestrator] log_sync_event failed:', logErr);
+        }
       }
     }
 
