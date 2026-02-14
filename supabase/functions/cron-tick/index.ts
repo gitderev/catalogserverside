@@ -39,12 +39,18 @@ serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
 
   try {
-    // 1. AUTHENTICATE via x-cron-secret
+    // 1. AUTHENTICATE via x-cron-secret OR service role key
     const cronSecret = Deno.env.get('CRON_SECRET');
+    const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
     const providedSecret = req.headers.get('x-cron-secret');
+    const authHeader = req.headers.get('Authorization');
+    const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.replace('Bearer ', '') : null;
 
-    if (!cronSecret || providedSecret !== cronSecret) {
-      console.log('[cron-tick] Invalid or missing x-cron-secret');
+    const isValidCronSecret = cronSecret && providedSecret === cronSecret;
+    const isServiceRole = bearerToken === supabaseServiceKey;
+
+    if (!isValidCronSecret && !isServiceRole) {
+      console.log('[cron-tick] Invalid or missing authentication');
       return new Response(
         JSON.stringify({ status: 'error', message: 'Unauthorized' }),
         { status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -52,7 +58,6 @@ serve(async (req) => {
     }
 
     const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
-    const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
     console.log('[cron-tick] Tick received');
