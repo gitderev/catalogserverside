@@ -894,12 +894,16 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
       }
       
       // Log INFO event per chunk for diagnostics
-      await supabase.rpc('log_sync_event', {
-        p_run_id: runId,
-        p_level: 'INFO',
-        p_message: `parse_merge chunk #${chunkIndex} completato`,
-        p_details: { step: 'parse_merge', chunk_index: chunkIndex, cursor_pos_start: cursorPos, cursor_pos_end: pos, lines_processed: linesProcessed, new_products: newProducts, output_chunk_path: chunkPath, elapsed_ms: elapsedMs }
-      }).catch(() => {});
+      try {
+        await supabase.rpc('log_sync_event', {
+          p_run_id: runId,
+          p_level: 'INFO',
+          p_message: `parse_merge chunk #${chunkIndex} completato`,
+          p_details: { step: 'parse_merge', chunk_index: chunkIndex, cursor_pos_start: cursorPos, cursor_pos_end: pos, lines_processed: linesProcessed, new_products: newProducts, output_chunk_path: chunkPath, elapsed_ms: elapsedMs }
+        });
+      } catch (logErr) {
+        console.warn(`[parse_merge] Non-blocking log_sync_event error:`, logErr);
+      }
       
       // Check if finished
       const isFinished = pos >= materialSize;
@@ -945,12 +949,16 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
         if (totalChunks > MAX_FINALIZE_CHUNKS) {
           const error = `Finalizing richiede strategia alternativa: ${totalChunks} chunk superano il limite di ${MAX_FINALIZE_CHUNKS}`;
           console.error(`[parse_merge] ${error}`);
-          await supabase.rpc('log_sync_event', {
-            p_run_id: runId,
-            p_level: 'ERROR',
-            p_message: error,
-            p_details: { step: 'parse_merge', phase: 'finalization', chunk_count: totalChunks, max_chunks: MAX_FINALIZE_CHUNKS, suggestion: 'implementare staging su DB o streaming upload' }
-          }).catch(() => {});
+          try {
+            await supabase.rpc('log_sync_event', {
+              p_run_id: runId,
+              p_level: 'ERROR',
+              p_message: error,
+              p_details: { step: 'parse_merge', phase: 'finalization', chunk_count: totalChunks, max_chunks: MAX_FINALIZE_CHUNKS, suggestion: 'implementare staging su DB o streaming upload' }
+            });
+          } catch (logErr) {
+            console.warn(`[parse_merge] Non-blocking log_sync_event error:`, logErr);
+          }
           await updateParseMergeState(supabase, runId, { status: 'failed', error });
           return { success: false, error, status: 'failed' };
         }
@@ -972,12 +980,16 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
           if (finalContent.length > MAX_FINALIZE_SIZE_BYTES) {
             const error = `Finalizing richiede strategia alternativa: dimensione ${(finalContent.length / 1024 / 1024).toFixed(1)}MB supera il limite di ${MAX_FINALIZE_SIZE_BYTES / 1024 / 1024}MB`;
             console.error(`[parse_merge] ${error}`);
-            await supabase.rpc('log_sync_event', {
-              p_run_id: runId,
-              p_level: 'ERROR',
-              p_message: error,
-              p_details: { step: 'parse_merge', phase: 'finalization', current_size_bytes: finalContent.length, max_size_bytes: MAX_FINALIZE_SIZE_BYTES, chunks_loaded: i + 1, total_chunks: totalChunks }
-            }).catch(() => {});
+            try {
+              await supabase.rpc('log_sync_event', {
+                p_run_id: runId,
+                p_level: 'ERROR',
+                p_message: error,
+                p_details: { step: 'parse_merge', phase: 'finalization', current_size_bytes: finalContent.length, max_size_bytes: MAX_FINALIZE_SIZE_BYTES, chunks_loaded: i + 1, total_chunks: totalChunks }
+              });
+            } catch (logErr) {
+              console.warn(`[parse_merge] Non-blocking log_sync_event error:`, logErr);
+            }
             await updateParseMergeState(supabase, runId, { status: 'failed', error });
             return { success: false, error, status: 'failed' };
           }
