@@ -7,6 +7,8 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
  * Called after a sync run completes (or times out).
  * Checks notification_mode in sync_config to decide if email should be sent.
  * If email send fails, logs WARN but does NOT fail the run.
+ * 
+ * Generates signed URLs for real latest/ paths only.
  */
 
 const corsHeaders = {
@@ -54,7 +56,6 @@ serve(async (req) => {
     const notificationMode = config?.notification_mode || 'never';
     const notifyOnWarning = config?.notify_on_warning ?? true;
 
-    // Check if we should send
     const shouldSend = checkShouldSend(notificationMode, status, notifyOnWarning);
     
     if (!shouldSend) {
@@ -101,14 +102,14 @@ serve(async (req) => {
       .order('created_at', { ascending: true })
       .limit(50);
 
-    // Generate signed URLs for latest files (7 days)
+    // Generate signed URLs for real latest/ file paths
     const fileLinks = await generateFileLinks(supabase);
 
     // Build email
     const subject = buildSubject(run.status, run.attempt);
     const htmlContent = buildEmailHtml(run, events || [], fileLinks);
 
-    // Send via Brevo
+    // Send via Brevo (non-blocking: failure = WARN, not fatal)
     try {
       const brevoResp = await fetch(BREVO_API_URL, {
         method: 'POST',
@@ -140,7 +141,6 @@ serve(async (req) => {
       });
 
     } catch (emailError: unknown) {
-      // Email failure is WARN, not fatal
       console.warn(`[send-sync-notification] Email send failed (non-blocking):`, errMsg(emailError));
       
       await supabase.from('sync_events').insert({
@@ -191,7 +191,7 @@ function buildSubject(status: string, attempt: number): string {
 function buildEmailHtml(
   run: Record<string, unknown>,
   events: Array<Record<string, unknown>>,
-  fileLinks: Array<{ name: string; url: string | null }>
+  fileLinks: Array<{ name: string; url: string | null; path: string }>
 ): string {
   const statusColors: Record<string, string> = {
     'success': '#22c55e',
@@ -222,12 +222,32 @@ function buildEmailHtml(
       </table>`;
   }
 
+  // Build files section - include valid links, mention missing ones
   let filesHtml = '';
-  const validLinks = fileLinks.filter(f => f.url);
-  if (validLinks.length > 0) {
+  if (fileLinks.length > 0) {
+    const items = fileLinks.map(f => {
+      if (f.url) {
+        return `<li><a href="${f.url}">${f.name}</a> (link valido 7 giorni)</li>`;
+      } else {
+        return `<li>${f.name} — <em>link non disponibile, file in: ${f.path}</em></li>`;
+      }
+    }).join('');
     filesHtml = `
       <h3>File Export</h3>
-      <ul>${validLinks.map(f => `<li><a href="${f.url}">${f.name}</a> (link valido 7 giorni)</li>`).join('')}</ul>`;
+      <ul>${items}</ul>`;
+  }
+
+  // Recommended actions for failures
+  let actionsHtml = '';
+  if (['failed', 'timeout'].includes(run.status as string)) {
+    actionsHtml = `
+      <h3 style="color:#ef4444;">Azioni consigliate</h3>
+      <ol>
+        <li>Controlla i log degli eventi sopra per identificare lo step fallito</li>
+        <li>Verifica le credenziali FTP/SFTP se l'errore è di connessione</li>
+        <li>Se il problema è un timeout, verifica che i file sorgente non siano troppo grandi</li>
+        <li>Riattiva la sincronizzazione automatica dalla dashboard dopo aver risolto il problema</li>
+      </ol>`;
   }
 
   return `
@@ -244,18 +264,20 @@ function buildEmailHtml(
       ${run.error_message ? `<p style="color:#ef4444;"><strong>Errore:</strong> ${run.error_message}</p>` : ''}
       ${eventsHtml}
       ${filesHtml}
+      ${actionsHtml}
     </div>`;
 }
 
 async function generateFileLinks(
   supabase: ReturnType<typeof createClient>
-): Promise<Array<{ name: string; url: string | null }>> {
+): Promise<Array<{ name: string; url: string | null; path: string }>> {
+  // Exact real paths in latest/
   const files = [
     { name: 'Catalogo EAN (XLSX)', path: 'latest/catalogo_ean.xlsx' },
     { name: 'Amazon Listing Loader', path: 'latest/amazon_listing_loader.xlsm' },
     { name: 'Amazon Price Inventory', path: 'latest/amazon_price_inventory.txt' },
-    { name: 'Export MediaWorld', path: 'latest/mediaworld.csv' },
-    { name: 'Export ePrice', path: 'latest/eprice.csv' }
+    { name: 'Export Mediaworld', path: 'latest/Export Mediaworld.csv' },
+    { name: 'Export ePrice', path: 'latest/Export ePrice.csv' }
   ];
 
   const results = [];
@@ -264,9 +286,16 @@ async function generateFileLinks(
       const { data } = await supabase.storage
         .from('exports')
         .createSignedUrl(file.path, 7 * 24 * 60 * 60); // 7 days
-      results.push({ name: file.name, url: data?.signedUrl || null });
-    } catch {
-      results.push({ name: file.name, url: null });
+      
+      if (data?.signedUrl) {
+        results.push({ name: file.name, url: data.signedUrl, path: file.path });
+      } else {
+        console.warn(`[send-sync-notification] WARN: No signed URL for ${file.path}`);
+        results.push({ name: file.name, url: null, path: file.path });
+      }
+    } catch (e: unknown) {
+      console.warn(`[send-sync-notification] WARN: Failed to generate signed URL for ${file.path}: ${errMsg(e)}`);
+      results.push({ name: file.name, url: null, path: file.path });
     }
   }
   return results;

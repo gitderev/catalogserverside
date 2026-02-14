@@ -2,15 +2,15 @@ import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
 
 /**
- * cron-tick - Called every 5 minutes by pg_cron
+ * cron-tick - Called every 5 minutes by GitHub Actions
  * 
  * Responsibilities:
- * 1. Authenticate via x-cron-secret header
+ * 1. Authenticate ONLY via x-cron-secret header (no anon/service role bypass)
  * 2. Check if a sync is due (based on schedule_type, frequency, daily_time)
  * 3. Detect and handle timed-out runs (>run_timeout_minutes)
- * 4. Manage retry logic (max_attempts with 5-min delay)
+ * 4. Manage retry logic (max_attempts with retry_delay_minutes)
  * 5. Prevent concurrent runs
- * 6. Auto-disable scheduling after max_attempts failures
+ * 6. Auto-disable scheduling after max_attempts consecutive failures (failed OR timeout)
  */
 
 const corsHeaders = {
@@ -25,13 +25,12 @@ function errMsg(e: unknown): string {
 // Convert a Date to Europe/Rome local time components
 function toRomeTime(date: Date): { hours: number; minutes: number; dateStr: string } {
   const rome = date.toLocaleString('en-GB', { timeZone: 'Europe/Rome', hour12: false });
-  // Format: "DD/MM/YYYY, HH:mm:ss"
   const parts = rome.split(', ');
   const timeParts = parts[1].split(':');
   return {
     hours: parseInt(timeParts[0]),
     minutes: parseInt(timeParts[1]),
-    dateStr: parts[0] // DD/MM/YYYY
+    dateStr: parts[0]
   };
 }
 
@@ -39,20 +38,12 @@ serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
 
   try {
-    // 1. AUTHENTICATE via x-cron-secret OR service role key OR anon key (for pg_cron)
+    // 1. AUTHENTICATE: ONLY x-cron-secret header
     const cronSecret = Deno.env.get('CRON_SECRET');
-    const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
-    const supabaseAnonKey = Deno.env.get('SUPABASE_ANON_KEY');
     const providedSecret = req.headers.get('x-cron-secret');
-    const authHeader = req.headers.get('Authorization');
-    const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.replace('Bearer ', '') : null;
 
-    const isValidCronSecret = cronSecret && providedSecret === cronSecret;
-    const isServiceRole = bearerToken === supabaseServiceKey;
-    const isAnonKey = bearerToken && supabaseAnonKey && bearerToken === supabaseAnonKey;
-
-    if (!isValidCronSecret && !isServiceRole && !isAnonKey) {
-      console.log('[cron-tick] Invalid or missing authentication');
+    if (!cronSecret || !providedSecret || providedSecret !== cronSecret) {
+      console.log('[cron-tick] Invalid or missing x-cron-secret');
       return new Response(
         JSON.stringify({ status: 'error', message: 'Unauthorized' }),
         { status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -60,6 +51,7 @@ serve(async (req) => {
     }
 
     const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
+    const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
     console.log('[cron-tick] Tick received');
@@ -106,7 +98,7 @@ serve(async (req) => {
       const timeoutMs = timeoutMinutes * 60 * 1000;
 
       if (elapsed > timeoutMs) {
-        // TIMEOUT: mark as timeout, log event
+        // TIMEOUT: mark as timeout
         console.log(`[cron-tick] Run ${run.id} timed out (${Math.round(elapsed / 60000)}min > ${timeoutMinutes}min)`);
 
         await supabase.from('sync_runs').update({
@@ -126,33 +118,23 @@ serve(async (req) => {
         // Release lock
         await supabase.from('sync_locks').delete().eq('lock_key', 'sync_pipeline');
 
-        // Should we retry? Check attempt count
-        if (run.attempt < maxAttempts) {
-          // Don't retry immediately - wait for next tick (5 min delay)
-          console.log(`[cron-tick] Timeout on attempt ${run.attempt}/${maxAttempts}, will retry on next tick`);
-          
-          // Send notification for timeout
-          await callNotification(supabaseUrl, supabaseServiceKey, run.id, 'timeout');
-          
-          return new Response(
-            JSON.stringify({ status: 'timeout_detected', run_id: run.id, will_retry: true }),
-            { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-          );
-        } else {
-          // Max attempts reached - disable scheduling
-          console.log(`[cron-tick] Max attempts reached after timeout, disabling scheduling`);
-          await supabase.from('sync_config').update({
-            enabled: false,
-            last_disabled_reason: `Auto-disabilitato: timeout dopo ${maxAttempts} tentativi`
-          }).eq('id', 1);
-
-          await callNotification(supabaseUrl, supabaseServiceKey, run.id, 'timeout');
-
+        // Check if max attempts reached (considering this timeout as a terminal failure)
+        const shouldDisable = await checkAndHandleMaxAttempts(supabase, supabaseUrl, supabaseServiceKey, maxAttempts);
+        
+        if (shouldDisable) {
           return new Response(
             JSON.stringify({ status: 'max_attempts_exceeded', disabled: true }),
             { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
           );
         }
+
+        // Send notification for timeout
+        await callNotification(supabaseUrl, supabaseServiceKey, run.id, 'timeout');
+
+        return new Response(
+          JSON.stringify({ status: 'timeout_detected', run_id: run.id, will_retry: true }),
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
       }
 
       // Run is still within timeout window
@@ -192,6 +174,17 @@ serve(async (req) => {
         console.log(`[cron-tick] Retry delay not elapsed, wait ${waitSec}s more`);
         return new Response(
           JSON.stringify({ status: 'skipped', reason: 'retry_delay', wait_seconds: waitSec }),
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+    }
+
+    // 4b. CHECK FOR MAX ATTEMPTS REACHED (last run was final attempt and failed)
+    if (lastCronRun && ['failed', 'timeout'].includes(lastCronRun.status) && lastCronRun.attempt >= maxAttempts) {
+      const shouldDisable = await checkAndHandleMaxAttempts(supabase, supabaseUrl, supabaseServiceKey, maxAttempts);
+      if (shouldDisable) {
+        return new Response(
+          JSON.stringify({ status: 'max_attempts_exceeded', disabled: true }),
           { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
         );
       }
@@ -269,17 +262,14 @@ function checkIfSyncIsDue(
     const [targetHours, targetMinutes] = dailyTime.split(':').map(Number);
     const rome = toRomeTime(now);
 
-    // Current Rome time in minutes since midnight
     const nowMinutes = rome.hours * 60 + rome.minutes;
     const targetMinutesSinceMidnight = targetHours * 60 + targetMinutes;
 
-    // Has the target time passed today?
     if (nowMinutes < targetMinutesSinceMidnight) {
       return { due: false, reason: `daily_time_not_reached (${rome.hours}:${String(rome.minutes).padStart(2, '0')} < ${dailyTime})` };
     }
 
-    // Check if already executed today (Rome date)
-    const todayRomeStr = rome.dateStr; // DD/MM/YYYY
+    const todayRomeStr = rome.dateStr;
     
     if (lastTerminal) {
       const lastStartedDate = new Date(lastTerminal.started_at as string);
@@ -340,4 +330,45 @@ async function callNotification(
   } catch (e: unknown) {
     console.warn('[cron-tick] Notification call failed (non-blocking):', errMsg(e));
   }
+}
+
+/**
+ * Check if max consecutive failures reached. If so, disable scheduling and send notification.
+ * Returns true if scheduling was disabled.
+ */
+async function checkAndHandleMaxAttempts(
+  supabase: ReturnType<typeof createClient>,
+  supabaseUrl: string,
+  serviceKey: string,
+  maxAttempts: number
+): Promise<boolean> {
+  // Get last N cron runs to check for consecutive failures
+  const { data: recentRuns } = await supabase
+    .from('sync_runs')
+    .select('id, status, attempt, trigger_type')
+    .eq('trigger_type', 'cron')
+    .order('started_at', { ascending: false })
+    .limit(maxAttempts);
+
+  if (!recentRuns || recentRuns.length < maxAttempts) return false;
+
+  // Check if all last maxAttempts runs are terminal failures
+  const allFailed = recentRuns.slice(0, maxAttempts).every(
+    r => ['failed', 'timeout'].includes(r.status)
+  );
+
+  if (!allFailed) return false;
+
+  console.log(`[cron-tick] ${maxAttempts} consecutive failures detected, disabling scheduling`);
+  
+  await supabase.from('sync_config').update({
+    enabled: false,
+    last_disabled_reason: `Auto-disabilitato: ${maxAttempts} fallimenti consecutivi (failed/timeout)`
+  }).eq('id', 1);
+
+  // Send notification for the last failed run
+  const lastFailedRun = recentRuns[0];
+  await callNotification(supabaseUrl, serviceKey, lastFailedRun.id, lastFailedRun.status);
+
+  return true;
 }
