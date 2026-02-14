@@ -172,63 +172,8 @@ function runEpriceAssertions(
     });
   }
 
-  // Assert 1: UB9S6E and UQ993E must NOT be present (override exclusion 0+0)
-  for (const excludedSku of ['UB9S6E', 'UQ993E']) {
-    if (skuMap.has(excludedSku)) {
-      failures.push({
-        sku: excludedSku,
-        rule: 'override_exclusion_0_0',
-        expected: 'non presente nel file ePrice',
-        found: `presente con qty=${skuMap.get(excludedSku)!.quantity}`
-      });
-    }
-  }
-
-  // Assert 2: Quest3 SKUs must have quantity=100, fulfillment-latency=1 (IT bucket)
-  for (const questSku of ['SK-1000934-01Quest3', 'SK-1000940-01Quest3S', 'SK-1000945-01Quest3S']) {
-    const entry = skuMap.get(questSku);
-    if (entry) {
-      if (entry.quantity !== 100) {
-        failures.push({
-          sku: questSku,
-          rule: 'IT_first_quantity',
-          expected: 'quantity=100 (StockIT only)',
-          found: `quantity=${entry.quantity}`
-        });
-      }
-      if (entry.fulfillmentLatency !== EPRICE_IT_FULFILLMENT_LATENCY) {
-        failures.push({
-          sku: questSku,
-          rule: 'IT_fulfillment_latency',
-          expected: `fulfillment-latency=${EPRICE_IT_FULFILLMENT_LATENCY}`,
-          found: `fulfillment-latency=${entry.fulfillmentLatency}`
-        });
-      }
-    }
-  }
-
-  // Assert 3: EU-only SKUs must have quantity=100, fulfillment-latency=euDays
-  for (const euSku of ['PVH00010195', 'PVH00010174', 'KAT-Walk-C2-Core', 'KAT-Walk-C2-Plus']) {
-    const entry = skuMap.get(euSku);
-    if (entry) {
-      if (entry.quantity !== 100) {
-        failures.push({
-          sku: euSku,
-          rule: 'EU_fallback_quantity',
-          expected: 'quantity=100 (StockEU with IT=0)',
-          found: `quantity=${entry.quantity}`
-        });
-      }
-      if (entry.fulfillmentLatency !== euDays) {
-        failures.push({
-          sku: euSku,
-          rule: 'EU_fulfillment_latency',
-          expected: `fulfillment-latency=${euDays} (euDays from UI)`,
-          found: `fulfillment-latency=${entry.fulfillmentLatency}`
-        });
-      }
-    }
-  }
+  // Generic assertions only — no hardcoded SKU checks
+  // The override_exclusion logic (StockIT+StockEU=0) is enforced during build at row level
 
   // Assert 4: No row should have quantity < 2
   for (let i = 1; i < aoa.length; i++) {
