@@ -205,25 +205,25 @@ export type Database = {
       }
       sync_locks: {
         Row: {
-          expires_at: string
-          lock_key: string
-          locked_at: string
-          locked_by: string
-          run_id: string | null
+          acquired_at: string
+          lease_until: string
+          lock_name: string
+          run_id: string
+          updated_at: string
         }
         Insert: {
-          expires_at: string
-          lock_key: string
-          locked_at?: string
-          locked_by: string
-          run_id?: string | null
+          acquired_at?: string
+          lease_until: string
+          lock_name: string
+          run_id: string
+          updated_at?: string
         }
         Update: {
-          expires_at?: string
-          lock_key?: string
-          locked_at?: string
-          locked_by?: string
-          run_id?: string | null
+          acquired_at?: string
+          lease_until?: string
+          lock_name?: string
+          run_id?: string
+          updated_at?: string
         }
         Relationships: []
       }
@@ -293,6 +293,26 @@ export type Database = {
     }
     Functions: {
       add_self_as_admin: { Args: never; Returns: boolean }
+      log_sync_event: {
+        Args: {
+          p_details?: Json
+          p_level: string
+          p_message: string
+          p_run_id: string
+        }
+        Returns: {
+          event_id: string
+          new_warning_count: number
+        }[]
+      }
+      release_sync_lock: {
+        Args: { p_lock_name: string; p_run_id: string }
+        Returns: boolean
+      }
+      try_acquire_sync_lock: {
+        Args: { p_lock_name: string; p_run_id: string; p_ttl_seconds: number }
+        Returns: boolean
+      }
     }
     Enums: {
       [_ in never]: never

@@ -195,11 +195,22 @@ function validateGoldenCases(logPrefix: string, daysIT: number = 2, daysEU: numb
   return { passed, failed };
 }
 
-// ========== UPDATE LOCATION WARNINGS IN DB ==========
+// ========== UPDATE LOCATION WARNINGS + LOG WARN EVENTS VIA RPC ==========
 async function updateLocationWarnings(supabase: SupabaseClient, runId: string, warnings: StockLocationWarnings): Promise<void> {
   try {
     await supabase.from('sync_runs').update({ location_warnings: warnings }).eq('id', runId);
     console.log(`[sync-step-runner] Updated location_warnings for run ${runId}:`, warnings);
+    
+    // Register each non-zero warning as a WARN event via atomic RPC
+    const warningEntries = Object.entries(warnings).filter(([_, v]) => v > 0);
+    for (const [key, count] of warningEntries) {
+      await supabase.rpc('log_sync_event', {
+        p_run_id: runId,
+        p_level: 'WARN',
+        p_message: `Location warning: ${key} (count: ${count})`,
+        p_details: { step: 'export', location_warning_type: key, count }
+      });
+    }
   } catch (e: unknown) {
     console.error(`[sync-step-runner] Failed to update location_warnings:`, e);
   }

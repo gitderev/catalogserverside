@@ -108,15 +108,21 @@ serve(async (req) => {
           error_message: `Timeout: superati ${timeoutMinutes} minuti`
         }).eq('id', run.id);
 
-        await supabase.from('sync_events').insert({
-          run_id: run.id,
-          level: 'ERROR',
-          step: 'timeout',
-          message: `Run interrotta per timeout dopo ${Math.round(elapsed / 60000)} minuti`
+        await supabase.rpc('log_sync_event', {
+          p_run_id: run.id,
+          p_level: 'ERROR',
+          p_message: `Run interrotta per timeout dopo ${Math.round(elapsed / 60000)} minuti`,
+          p_details: { step: 'timeout', elapsed_minutes: Math.round(elapsed / 60000), timeout_minutes: timeoutMinutes }
         });
 
-        // Release lock
-        await supabase.from('sync_locks').delete().eq('lock_key', 'sync_pipeline');
+        // P1-B: Release lock via RPC
+        const { data: lockReleased } = await supabase.rpc('release_sync_lock', {
+          p_lock_name: 'global_sync',
+          p_run_id: run.id
+        });
+        if (!lockReleased) {
+          console.warn(`[cron-tick] WARN: Lock release returned false for timed-out run ${run.id}`);
+        }
 
         // Check if max attempts reached (considering this timeout as a terminal failure)
         const shouldDisable = await checkAndHandleMaxAttempts(supabase, supabaseUrl, supabaseServiceKey, maxAttempts);
