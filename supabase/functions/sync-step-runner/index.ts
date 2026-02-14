@@ -1438,6 +1438,199 @@ async function stepExportEprice(supabase: SupabaseClient, runId: string, feeConf
   }
 }
 
+// ========== STEP: EXPORT_EAN_XLSX ==========
+async function stepExportEanXlsx(supabase: SupabaseClient, runId: string): Promise<{ success: boolean; error?: string }> {
+  console.log(`[sync:step:export_ean_xlsx] Starting for run ${runId}`);
+  const startTime = Date.now();
+  try {
+    const XLSX = await import("npm:xlsx@0.18.5");
+    const { content: csvContent, error: dlError } = await downloadFromStorage(supabase, 'exports', 'Catalogo EAN.csv');
+    if (dlError || !csvContent) {
+      const error = `Catalogo EAN.csv non trovato: ${dlError || 'empty'}`;
+      await updateStepResult(supabase, runId, 'export_ean_xlsx', { status: 'failed', error, metrics: {} });
+      return { success: false, error };
+    }
+    const lines = csvContent.split('\n').filter((l: string) => l.trim());
+    const headers = lines[0].split(';');
+    const rows = lines.slice(1).map((line: string) => {
+      const vals = line.split(';');
+      const row: Record<string, string> = {};
+      headers.forEach((h: string, i: number) => { row[h] = vals[i] || ''; });
+      return row;
+    });
+    const ws = XLSX.utils.json_to_sheet(rows);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Catalogo EAN');
+    const eanColIdx = headers.indexOf('EAN');
+    if (eanColIdx >= 0) {
+      for (let r = 1; r <= rows.length; r++) {
+        const addr = XLSX.utils.encode_cell({ r, c: eanColIdx });
+        if (ws[addr]) { ws[addr].t = 's'; ws[addr].z = '@'; }
+      }
+    }
+    const xlsxBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+    const blob = new Blob([xlsxBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    const { error: uploadError } = await supabase.storage.from('exports').upload(
+      'catalogo_ean.xlsx', blob, { upsert: true, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }
+    );
+    if (uploadError) {
+      const error = `Upload catalogo_ean.xlsx fallito: ${uploadError.message}`;
+      await updateStepResult(supabase, runId, 'export_ean_xlsx', { status: 'failed', error, metrics: {} });
+      return { success: false, error };
+    }
+    await updateStepResult(supabase, runId, 'export_ean_xlsx', {
+      status: 'success', duration_ms: Date.now() - startTime, rows: rows.length,
+      metrics: { ean_xlsx_rows: rows.length }
+    });
+    console.log(`[sync:step:export_ean_xlsx] Completed: ${rows.length} rows`);
+    return { success: true };
+  } catch (e: unknown) {
+    console.error(`[sync:step:export_ean_xlsx] Error:`, e);
+    await updateStepResult(supabase, runId, 'export_ean_xlsx', { status: 'failed', error: errMsg(e), metrics: {} });
+    return { success: false, error: errMsg(e) };
+  }
+}
+
+// ========== STEP: EXPORT_AMAZON (SERVER-SIDE) ==========
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function stepExportAmazon(supabase: SupabaseClient, runId: string, feeConfig: any): Promise<{ success: boolean; error?: string }> {
+  console.log(`[sync:step:export_amazon] Starting for run ${runId}`);
+  const startTime = Date.now();
+  try {
+    const XLSX = await import("npm:xlsx@0.18.5");
+    const { products, error: loadError } = await loadProductsTSV(supabase, runId);
+    if (loadError || !products) {
+      const error = loadError || 'Products file not found';
+      await updateStepResult(supabase, runId, 'export_amazon', { status: 'failed', error, metrics: {} });
+      return { success: false, error };
+    }
+    const amazonFeeDrev = feeConfig?.amazonFeeDrev ?? feeConfig?.feeDrev ?? 1.05;
+    const amazonFeeMkt = feeConfig?.amazonFeeMkt ?? feeConfig?.feeMkt ?? 1.08;
+    const amazonShipping = feeConfig?.amazonShippingCost ?? feeConfig?.shippingCost ?? 6.00;
+    const itDays = feeConfig?.amazonItPrepDays ?? 3;
+    const euDays = feeConfig?.amazonEuPrepDays ?? 5;
+
+    // Load stock location
+    let stockLocationIndex: Record<string, { stockIT: number; stockEU: number }> | null = null;
+    const stockLocationPath = `stock-location/runs/${runId}.txt`;
+    const { content: stockLocationContent } = await downloadFromStorage(supabase, 'ftp-import', stockLocationPath);
+    if (stockLocationContent) {
+      stockLocationIndex = {};
+      const slLines = stockLocationContent.replace(/\r\n/g, '\n').split('\n');
+      const slHeaders = slLines[0]?.split(';').map((h: string) => h.trim().toLowerCase()) || [];
+      const mIdx = slHeaders.indexOf('matnr'), sIdx = slHeaders.indexOf('stock'), lIdx = slHeaders.indexOf('locationid');
+      if (mIdx >= 0 && sIdx >= 0 && lIdx >= 0) {
+        for (let i = 1; i < slLines.length; i++) {
+          const vals = slLines[i].split(';');
+          const matnr = vals[mIdx]?.trim();
+          if (!matnr) continue;
+          const stock = parseInt(vals[sIdx]) || 0;
+          const locationId = parseInt(vals[lIdx]) || 0;
+          if (!stockLocationIndex[matnr]) stockLocationIndex[matnr] = { stockIT: 0, stockEU: 0 };
+          if (locationId === 4242) stockLocationIndex[matnr].stockIT += stock;
+          else if (locationId === 4254) stockLocationIndex[matnr].stockEU += stock;
+        }
+      }
+    }
+
+    interface AmazonRec { sku: string; ean: string; quantity: number; leadDays: number; priceDisplay: string; }
+    const validRecords: AmazonRec[] = [];
+    let skipped = 0;
+    for (const p of products) {
+      const norm = normalizeEAN(p.EAN);
+      if (!norm.ok || !norm.value || (norm.value.length !== 13 && norm.value.length !== 14)) { skipped++; continue; }
+      if (!p.MPN || !p.MPN.trim()) { skipped++; continue; }
+      let stockIT = p.Stock || 0, stockEU = 0;
+      if (stockLocationIndex?.[p.Matnr]) { stockIT = stockLocationIndex[p.Matnr].stockIT; stockEU = stockLocationIndex[p.Matnr].stockEU; }
+      const stockResult = resolveMarketplaceStock(stockIT, stockEU, true, itDays, euDays);
+      if (!stockResult.shouldExport || stockResult.exportQty < 2) { skipped++; continue; }
+      let baseCents = 0;
+      if (p.CBP > 0) baseCents = Math.round((p.CBP + (p.Sur || 0)) * 100);
+      else if (p.LP > 0) baseCents = Math.round(p.LP * 100);
+      if (baseCents <= 0) { skipped++; continue; }
+      const afterFees = Math.round(Math.round(Math.round((baseCents + Math.round(amazonShipping * 100)) * 1.22) * amazonFeeDrev) * amazonFeeMkt);
+      const finalCents = toComma99Cents(afterFees);
+      validRecords.push({ sku: p.MPN.replace(/[\x00-\x1f\x7f]/g, ''), ean: norm.value, quantity: stockResult.exportQty, leadDays: stockResult.leadDays, priceDisplay: (finalCents / 100).toFixed(2) });
+    }
+    if (validRecords.length === 0) {
+      const error = 'Nessuna riga esportabile per Amazon';
+      await updateStepResult(supabase, runId, 'export_amazon', { status: 'failed', error, metrics: {} });
+      return { success: false, error };
+    }
+    console.log(`[sync:step:export_amazon] ${validRecords.length} valid, ${skipped} skipped`);
+
+    // Load template
+    let templateBuffer: ArrayBuffer | null = null;
+    const { data: tplData } = await supabase.storage.from('exports').download('templates/amazon/ListingLoader.xlsm');
+    if (tplData) { templateBuffer = await tplData.arrayBuffer(); console.log('[export_amazon] Template from Storage'); }
+    if (!templateBuffer) {
+      try {
+        const resp = await fetch('https://catalogserverside.lovable.app/amazon/ListingLoader.xlsm');
+        if (resp.ok) {
+          const ct = resp.headers.get('content-type') || '';
+          if (!ct.includes('text/html')) {
+            const buf = await resp.arrayBuffer();
+            const preview = new TextDecoder('ascii', { fatal: false }).decode(new Uint8Array(buf.slice(0, 64)));
+            if (!preview.toLowerCase().includes('<html')) { templateBuffer = buf; console.log('[export_amazon] Template from public URL'); }
+          }
+        }
+      } catch { /* ignore */ }
+    }
+    if (!templateBuffer) {
+      const error = 'missing_amazon_template: Caricare ListingLoader.xlsm in exports/templates/amazon/ListingLoader.xlsm';
+      await updateStepResult(supabase, runId, 'export_amazon', { status: 'failed', error, metrics: {} });
+      return { success: false, error };
+    }
+
+    // Build XLSM
+    const wb = XLSX.read(new Uint8Array(templateBuffer), { type: 'array', bookVBA: true });
+    const ws = wb.Sheets['Modello'];
+    if (!ws) { await updateStepResult(supabase, runId, 'export_amazon', { status: 'failed', error: 'Foglio Modello non trovato', metrics: {} }); return { success: false, error: 'Foglio Modello non trovato' }; }
+    const COL_A=0,COL_B=1,COL_C=2,COL_H=7,COL_AF=31,COL_AG=32,COL_AH=33,COL_AK=36,COL_BJ=61;
+    const DS = 4;
+    if (ws['!ref']) {
+      const range = XLSX.utils.decode_range(ws['!ref']);
+      for (let R = DS; R <= range.e.r; R++) for (const C of [COL_A,COL_B,COL_C,COL_H,COL_AF,COL_AG,COL_AH,COL_AK,COL_BJ]) delete ws[XLSX.utils.encode_cell({ r: R, c: C })];
+    }
+    for (let i = 0; i < validRecords.length; i++) {
+      const rec = validRecords[i], R = DS + i;
+      ws[XLSX.utils.encode_cell({r:R,c:COL_A})]={t:'s',v:rec.sku};
+      ws[XLSX.utils.encode_cell({r:R,c:COL_B})]={t:'s',v:'EAN'};
+      ws[XLSX.utils.encode_cell({r:R,c:COL_C})]={t:'s',v:rec.ean,z:'@'};
+      ws[XLSX.utils.encode_cell({r:R,c:COL_H})]={t:'s',v:'Nuovo'};
+      ws[XLSX.utils.encode_cell({r:R,c:COL_AF})]={t:'s',v:'Default'};
+      ws[XLSX.utils.encode_cell({r:R,c:COL_AG})]={t:'n',v:rec.quantity};
+      ws[XLSX.utils.encode_cell({r:R,c:COL_AH})]={t:'n',v:rec.leadDays};
+      ws[XLSX.utils.encode_cell({r:R,c:COL_AK})]={t:'s',v:rec.priceDisplay};
+      ws[XLSX.utils.encode_cell({r:R,c:COL_BJ})]={t:'s',v:'Modello Amazon predefinito'};
+    }
+    const lastRow = DS + validRecords.length - 1;
+    if (ws['!ref']) { const r = XLSX.utils.decode_range(ws['!ref']); r.e.r = Math.max(r.e.r, lastRow); r.e.c = Math.max(r.e.c, COL_BJ); ws['!ref'] = XLSX.utils.encode_range(r); }
+    const hasVBA = Boolean((wb as unknown as Record<string,unknown>).vbaraw);
+    const xlsmOut = XLSX.write(wb, { bookType: 'xlsm', bookVBA: hasVBA, type: 'array' });
+    const xlsmBlob = new Blob([xlsmOut], { type: 'application/vnd.ms-excel.sheet.macroEnabled.12' });
+    const { error: xlsmErr } = await supabase.storage.from('exports').upload('amazon_listing_loader.xlsm', xlsmBlob, { upsert: true, contentType: 'application/vnd.ms-excel.sheet.macroEnabled.12' });
+    if (xlsmErr) { await updateStepResult(supabase, runId, 'export_amazon', { status: 'failed', error: xlsmErr.message, metrics: {} }); return { success: false, error: xlsmErr.message }; }
+
+    // TXT
+    const txtHeader = 'sku\tprice\tminimum-seller-allowed-price\tmaximum-seller-allowed-price\tquantity\tfulfillment-channel\thandling-time\n';
+    const txtContent = txtHeader + validRecords.map(r => `${r.sku}\t${r.priceDisplay}\t\t\t${r.quantity}\t\t${r.leadDays}\n`).join('');
+    const txtSave = await uploadToStorage(supabase, 'exports', 'amazon_price_inventory.txt', txtContent, 'text/plain');
+    if (!txtSave.success) { await updateStepResult(supabase, runId, 'export_amazon', { status: 'failed', error: txtSave.error!, metrics: {} }); return { success: false, error: txtSave.error }; }
+
+    await updateStepResult(supabase, runId, 'export_amazon', {
+      status: 'success', duration_ms: Date.now() - startTime, rows: validRecords.length, skipped,
+      metrics: { amazon_export_rows: validRecords.length, amazon_export_skipped: skipped }
+    });
+    console.log(`[sync:step:export_amazon] Completed: ${validRecords.length} rows`);
+    return { success: true };
+  } catch (e: unknown) {
+    console.error(`[sync:step:export_amazon] Error:`, e);
+    await updateStepResult(supabase, runId, 'export_amazon', { status: 'failed', error: errMsg(e), metrics: {} });
+    return { success: false, error: errMsg(e) };
+  }
+}
+
 // ========== MAIN HANDLER ==========
 serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
@@ -1463,7 +1656,6 @@ serve(async (req) => {
     console.log(`[sync-step-runner] Executing step: ${step} for run: ${run_id}`);
     console.log(`[sync-step-runner] ========================================`);
     
-    // Run golden cases validation on first step (parse_merge) for debugging
     if (step === 'parse_merge') {
       const itDays = fee_config?.mediaworldItPrepDays || 3;
       const euDays = fee_config?.mediaworldEuPrepDays || 5;
@@ -1473,24 +1665,14 @@ serve(async (req) => {
     let result: { success: boolean; error?: string; status?: string };
     
     switch (step) {
-      case 'parse_merge':
-        result = await stepParseMerge(supabase, run_id);
-        break;
-      case 'ean_mapping':
-        result = await stepEanMapping(supabase, run_id);
-        break;
-      case 'pricing':
-        result = await stepPricing(supabase, run_id, fee_config);
-        break;
-      case 'export_ean':
-        result = await stepExportEan(supabase, run_id);
-        break;
-      case 'export_mediaworld':
-        result = await stepExportMediaworld(supabase, run_id, fee_config);
-        break;
-      case 'export_eprice':
-        result = await stepExportEprice(supabase, run_id, fee_config);
-        break;
+      case 'parse_merge': result = await stepParseMerge(supabase, run_id); break;
+      case 'ean_mapping': result = await stepEanMapping(supabase, run_id); break;
+      case 'pricing': result = await stepPricing(supabase, run_id, fee_config); break;
+      case 'export_ean': result = await stepExportEan(supabase, run_id); break;
+      case 'export_ean_xlsx': result = await stepExportEanXlsx(supabase, run_id); break;
+      case 'export_amazon': result = await stepExportAmazon(supabase, run_id, fee_config); break;
+      case 'export_mediaworld': result = await stepExportMediaworld(supabase, run_id, fee_config); break;
+      case 'export_eprice': result = await stepExportEprice(supabase, run_id, fee_config); break;
       default:
         return new Response(JSON.stringify({ status: 'error', message: `Unknown step: ${step}` }), 
           { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
@@ -1498,7 +1680,6 @@ serve(async (req) => {
     
     console.log(`[sync-step-runner] Step ${step} result: success=${result.success}, status=${result.status || 'N/A'}, error=${result.error || 'none'}`);
     
-    // Return status in response for orchestrator to handle in_progress
     return new Response(JSON.stringify({ 
       status: result.success ? 'ok' : 'error', 
       step_status: result.status,

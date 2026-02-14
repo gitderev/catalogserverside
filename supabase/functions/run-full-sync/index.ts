@@ -135,6 +135,7 @@ serve(async (req) => {
   try {
     const body = await req.json().catch(() => ({}));
     const trigger = body.trigger as string;
+    const attemptNumber = (body.attempt as number) || 1;
     
     if (!trigger || !['cron', 'manual'].includes(trigger)) {
       return new Response(JSON.stringify({ status: 'error', message: 'trigger deve essere cron o manual' }), 
@@ -220,8 +221,8 @@ serve(async (req) => {
     startTime = Date.now();
     await supabase.from('sync_runs').insert({ 
       id: runId, started_at: new Date().toISOString(), status: 'running', 
-      trigger_type: trigger, attempt: 1, steps: { current_step: 'import_ftp' }, metrics: {},
-      location_warnings: {}
+      trigger_type: trigger, attempt: attemptNumber, steps: { current_step: 'import_ftp' }, metrics: {},
+      location_warnings: {}, warning_count: 0, file_manifest: {}
     });
     console.log(`[orchestrator] Run created: ${runId}`);
 
@@ -308,6 +309,11 @@ serve(async (req) => {
 
     // ========== STEPS 3-7: Processing via sync-step-runner ==========
     const remainingSteps = ['ean_mapping', 'pricing', 'export_ean', 'export_mediaworld', 'export_eprice'];
+    
+    // For cron triggers, add EAN XLSX and Amazon export steps
+    if (trigger === 'cron') {
+      remainingSteps.push('export_ean_xlsx', 'export_amazon');
+    }
     
     for (const step of remainingSteps) {
       if (await isCancelRequested(supabase, runId)) {
