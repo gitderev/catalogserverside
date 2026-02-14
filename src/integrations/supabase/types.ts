@@ -131,8 +131,14 @@ export type Database = {
           enabled: boolean
           frequency_minutes: number
           id: number
+          last_disabled_reason: string | null
+          max_attempts: number
           max_retries: number
+          notification_mode: string
+          notify_on_warning: boolean
           retry_delay_minutes: number
+          run_timeout_minutes: number
+          schedule_type: string
           updated_at: string
         }
         Insert: {
@@ -140,8 +146,14 @@ export type Database = {
           enabled?: boolean
           frequency_minutes?: number
           id?: number
+          last_disabled_reason?: string | null
+          max_attempts?: number
           max_retries?: number
+          notification_mode?: string
+          notify_on_warning?: boolean
           retry_delay_minutes?: number
+          run_timeout_minutes?: number
+          schedule_type?: string
           updated_at?: string
         }
         Update: {
@@ -149,9 +161,45 @@ export type Database = {
           enabled?: boolean
           frequency_minutes?: number
           id?: number
+          last_disabled_reason?: string | null
+          max_attempts?: number
           max_retries?: number
+          notification_mode?: string
+          notify_on_warning?: boolean
           retry_delay_minutes?: number
+          run_timeout_minutes?: number
+          schedule_type?: string
           updated_at?: string
+        }
+        Relationships: []
+      }
+      sync_events: {
+        Row: {
+          created_at: string
+          details: Json | null
+          id: string
+          level: string
+          message: string
+          run_id: string
+          step: string | null
+        }
+        Insert: {
+          created_at?: string
+          details?: Json | null
+          id?: string
+          level: string
+          message: string
+          run_id: string
+          step?: string | null
+        }
+        Update: {
+          created_at?: string
+          details?: Json | null
+          id?: string
+          level?: string
+          message?: string
+          run_id?: string
+          step?: string | null
         }
         Relationships: []
       }
@@ -187,6 +235,7 @@ export type Database = {
           created_at: string
           error_details: Json | null
           error_message: string | null
+          file_manifest: Json
           finished_at: string | null
           id: string
           location_warnings: Json
@@ -196,6 +245,7 @@ export type Database = {
           status: string
           steps: Json
           trigger_type: string
+          warning_count: number
         }
         Insert: {
           attempt?: number
@@ -204,6 +254,7 @@ export type Database = {
           created_at?: string
           error_details?: Json | null
           error_message?: string | null
+          file_manifest?: Json
           finished_at?: string | null
           id?: string
           location_warnings?: Json
@@ -213,6 +264,7 @@ export type Database = {
           status?: string
           steps?: Json
           trigger_type: string
+          warning_count?: number
         }
         Update: {
           attempt?: number
@@ -221,6 +273,7 @@ export type Database = {
           created_at?: string
           error_details?: Json | null
           error_message?: string | null
+          file_manifest?: Json
           finished_at?: string | null
           id?: string
           location_warnings?: Json
@@ -230,6 +283,7 @@ export type Database = {
           status?: string
           steps?: Json
           trigger_type?: string
+          warning_count?: number
         }
         Relationships: []
       }
