@@ -51,6 +51,21 @@ async function callStep(supabaseUrl: string, serviceKey: string, functionName: s
     if (!resp.ok) {
       const errorText = await resp.text().catch(() => 'Unknown error');
       console.log(`[orchestrator] ${functionName} HTTP error ${resp.status}: ${errorText}`);
+      
+      // Detect WORKER_LIMIT (HTTP 546)
+      if (resp.status === 546 || errorText.includes('WORKER_LIMIT')) {
+        const supabase = createClient(supabaseUrl, serviceKey);
+        const runId = body.run_id as string;
+        if (runId) {
+          await supabase.rpc('log_sync_event', {
+            p_run_id: runId,
+            p_level: 'ERROR',
+            p_message: `WORKER_LIMIT in ${functionName}: HTTP ${resp.status}`,
+            p_details: { step: body.step || functionName, chunk_index: body.chunk_index, http_status: resp.status, suggestion: 'ridurre CHUNK_LINES o ottimizzare chunking' }
+          }).catch(() => {});
+        }
+      }
+      
       return { success: false, error: `HTTP ${resp.status}: ${errorText}` };
     }
     
@@ -81,7 +96,7 @@ async function verifyStepCompleted(supabase: SupabaseClient, runId: string, step
     return { success: false, status: 'failed', error: stepResult.error };
   }
   
-  const intermediatePhases = ['building_stock_index', 'building_price_index', 'preparing_material', 'in_progress'];
+  const intermediatePhases = ['building_stock_index', 'building_price_index', 'preparing_material', 'in_progress', 'finalizing'];
   if (intermediatePhases.includes(stepResult.status)) {
     console.log(`[orchestrator] Step ${stepName} is ${stepResult.status} (needs more invocations)`);
     return { success: true, status: 'in_progress' };
