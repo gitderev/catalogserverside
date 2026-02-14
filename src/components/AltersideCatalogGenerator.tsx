@@ -1584,7 +1584,7 @@ const AltersideCatalogGenerator: React.FC = () => {
     }
     
     const accessToken = session.access_token;
-    const edgeFunctionUrl = "https://hdcniibdblgqkhhgbqtz.supabase.co/functions/v1/import-catalog-ftp";
+    const edgeFunctionUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/import-catalog-ftp`;
     
     // Helper: download file from URL and convert to File object
     const fetchFileFromUrl = async (fileUrl: string, filename: string): Promise<File> => {
