@@ -790,7 +790,7 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
       await updateParseMergeState(supabase, runId, {
         status: 'in_progress',
         offset: 0,
-        cursor_pos: materialMeta.headerEndPos,
+        cursor_pos: meta.headerEndPos,
         chunk_index: 0,
         productCount: 0,
         skipped: { noStock: 0, noPrice: 0, lowStock: 0, noValid: 0 },
@@ -884,13 +884,22 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
       }
       
       const newProducts = productCount - state.productCount;
+      const elapsedMs = Date.now() - invocationStart;
       console.log(`[parse_merge] Chunk #${chunkIndex} processed: ${linesProcessed} lines, ${newProducts} new products, total=${productCount}`);
       
       // Save chunk to its own file (no download+append of growing file)
+      const chunkPath = `${CHUNKS_DIR}/${runId}/${chunkIndex}.tsv`;
       if (chunkTSV.length > 0) {
-        const chunkPath = `${CHUNKS_DIR}/${runId}/${chunkIndex}.tsv`;
         await uploadToStorage(supabase, 'exports', chunkPath, chunkTSV, 'text/tab-separated-values');
       }
+      
+      // Log INFO event per chunk for diagnostics
+      await supabase.rpc('log_sync_event', {
+        p_run_id: runId,
+        p_level: 'INFO',
+        p_message: `parse_merge chunk #${chunkIndex} completato`,
+        p_details: { step: 'parse_merge', chunk_index: chunkIndex, cursor_pos_start: cursorPos, cursor_pos_end: pos, lines_processed: linesProcessed, new_products: newProducts, output_chunk_path: chunkPath, elapsed_ms: elapsedMs }
+      }).catch(() => {});
       
       // Check if finished
       const isFinished = pos >= materialSize;
@@ -930,6 +939,22 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
       console.log(`[parse_merge] Phase 3: Finalizing - concatenating ${totalChunks} chunk files...`);
       
       try {
+        // Guardrail: if too many chunks, fail explicitly rather than risk WORKER_LIMIT
+        const MAX_FINALIZE_CHUNKS = 50;
+        const MAX_FINALIZE_SIZE_BYTES = 40 * 1024 * 1024; // 40MB
+        if (totalChunks > MAX_FINALIZE_CHUNKS) {
+          const error = `Finalizing richiede strategia alternativa: ${totalChunks} chunk superano il limite di ${MAX_FINALIZE_CHUNKS}`;
+          console.error(`[parse_merge] ${error}`);
+          await supabase.rpc('log_sync_event', {
+            p_run_id: runId,
+            p_level: 'ERROR',
+            p_message: error,
+            p_details: { step: 'parse_merge', phase: 'finalization', chunk_count: totalChunks, max_chunks: MAX_FINALIZE_CHUNKS, suggestion: 'implementare staging su DB o streaming upload' }
+          }).catch(() => {});
+          await updateParseMergeState(supabase, runId, { status: 'failed', error });
+          return { success: false, error, status: 'failed' };
+        }
+        
         const headerTSV = 'Matnr\tMPN\tEAN\tDesc\tStock\tLP\tCBP\tSur\n';
         let finalContent = headerTSV;
         
@@ -937,12 +962,24 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
           const chunkPath = `${CHUNKS_DIR}/${runId}/${i}.tsv`;
           const { content: chunkContent, error: chunkError } = await downloadFromStorage(supabase, 'exports', chunkPath);
           if (chunkError) {
-            // Chunk might be empty (no products matched), skip it
             console.log(`[parse_merge] Chunk ${i} not found or empty, skipping: ${chunkError}`);
             continue;
           }
           if (chunkContent) {
             finalContent += chunkContent;
+          }
+          // Size guardrail
+          if (finalContent.length > MAX_FINALIZE_SIZE_BYTES) {
+            const error = `Finalizing richiede strategia alternativa: dimensione ${(finalContent.length / 1024 / 1024).toFixed(1)}MB supera il limite di ${MAX_FINALIZE_SIZE_BYTES / 1024 / 1024}MB`;
+            console.error(`[parse_merge] ${error}`);
+            await supabase.rpc('log_sync_event', {
+              p_run_id: runId,
+              p_level: 'ERROR',
+              p_message: error,
+              p_details: { step: 'parse_merge', phase: 'finalization', current_size_bytes: finalContent.length, max_size_bytes: MAX_FINALIZE_SIZE_BYTES, chunks_loaded: i + 1, total_chunks: totalChunks }
+            }).catch(() => {});
+            await updateParseMergeState(supabase, runId, { status: 'failed', error });
+            return { success: false, error, status: 'failed' };
           }
         }
         
