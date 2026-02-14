@@ -57,12 +57,16 @@ async function callStep(supabaseUrl: string, serviceKey: string, functionName: s
         const supabase = createClient(supabaseUrl, serviceKey);
         const runId = body.run_id as string;
         if (runId) {
-          await supabase.rpc('log_sync_event', {
-            p_run_id: runId,
-            p_level: 'ERROR',
-            p_message: `WORKER_LIMIT in ${functionName}: HTTP ${resp.status}`,
-            p_details: { step: body.step || functionName, chunk_index: body.chunk_index, http_status: resp.status, suggestion: 'ridurre CHUNK_LINES o ottimizzare chunking' }
-          }).catch(() => {});
+          try {
+            await supabase.rpc('log_sync_event', {
+              p_run_id: runId,
+              p_level: 'ERROR',
+              p_message: `WORKER_LIMIT in ${functionName}: HTTP ${resp.status}`,
+              p_details: { step: body.step || functionName, chunk_index: body.chunk_index, http_status: resp.status, suggestion: 'ridurre CHUNK_LINES o ottimizzare chunking' }
+            });
+          } catch (logErr) {
+            console.warn(`[orchestrator] Non-blocking log_sync_event error:`, logErr);
+          }
         }
       }
       
