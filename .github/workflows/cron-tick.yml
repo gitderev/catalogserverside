@@ -1,0 +1,39 @@
+name: Cron Tick (every 5 minutes)
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch: {}
+
+jobs:
+  cron-tick:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate secrets
+        run: |
+          if [ -z "${{ secrets.CRON_TICK_URL }}" ]; then
+            echo "::error::Secret CRON_TICK_URL is not configured. Go to Settings > Secrets and variables > Actions and add CRON_TICK_URL (the full URL of your cron-tick Edge Function, e.g. https://<project-id>.supabase.co/functions/v1/cron-tick)."
+            exit 1
+          fi
+          if [ -z "${{ secrets.CRON_SECRET }}" ]; then
+            echo "::error::Secret CRON_SECRET is not configured. Go to Settings > Secrets and variables > Actions and add CRON_SECRET (must match the CRON_SECRET Supabase secret)."
+            exit 1
+          fi
+
+      - name: Call cron-tick
+        run: |
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "${{ secrets.CRON_TICK_URL }}" \
+            -H "Content-Type: application/json" \
+            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" \
+            -d '{"timestamp":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}')
+          
+          BODY=$(echo "$RESPONSE" | sed '$d')
+          STATUS=$(echo "$RESPONSE" | tail -1)
+          
+          echo "HTTP Status: $STATUS"
+          echo "Response: $BODY"
+          
+          if [ "$STATUS" -ge 400 ]; then
+            echo "::error::cron-tick returned HTTP $STATUS"
+            exit 1
+          fi

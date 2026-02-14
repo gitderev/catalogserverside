@@ -18,21 +18,26 @@ const corsHeaders = {
  * Non esegue logica di business, solo orchestrazione.
  * Chiama step separati tramite sync-step-runner per evitare WORKER_LIMIT.
  * 
- * IMPORTANTE: parse_merge è CHUNKED - può richiedere più invocazioni.
- * L'orchestratore chiama parse_merge in loop finché non è completed.
+ * SFTP upload: SOLO per trigger === 'cron'.
+ * File SFTP: Export Mediaworld.csv, Export ePrice.csv, catalogo_ean.xlsx,
+ *            amazon_listing_loader.xlsm, amazon_price_inventory.txt
  * 
- * Sequenza step:
- * 1. import_ftp - Download file da FTP (import-catalog-ftp)
- * 2. parse_merge - Parse e merge file (CHUNKED - loop finché completed)
- * 3. ean_mapping - Mapping EAN
- * 4. pricing - Calcolo prezzi
- * 5. export_ean - Generazione catalogo EAN
- * 6. export_mediaworld - Export Mediaworld
- * 7. export_eprice - Export ePrice
- * 8. upload_sftp - Upload su SFTP (upload-exports-to-sftp)
+ * Storage versioning: latest/ (overwrite) + versions/<timestamp>/ (storico)
+ * Retention: per ciascuno dei 5 file, max 3 versioni; elimina >3 solo se >7 giorni.
+ * 
+ * success_with_warning: basato SOLO su warning_count > 0.
  */
 
-const MAX_PARSE_MERGE_CHUNKS = 100; // Safety limit: max chunks per parse_merge
+const MAX_PARSE_MERGE_CHUNKS = 100;
+
+// The 5 canonical export files
+const EXPORT_FILES = [
+  'Export Mediaworld.csv',
+  'Export ePrice.csv',
+  'catalogo_ean.xlsx',
+  'amazon_listing_loader.xlsm',
+  'amazon_price_inventory.txt'
+];
 
 async function callStep(supabaseUrl: string, serviceKey: string, functionName: string, body: Record<string, unknown>): Promise<{ success: boolean; error?: string; data?: Record<string, unknown> }> {
   try {
@@ -76,7 +81,6 @@ async function verifyStepCompleted(supabase: SupabaseClient, runId: string, step
     return { success: false, status: 'failed', error: stepResult.error };
   }
   
-  // For parse_merge: handle intermediate phases as "still in progress"
   const intermediatePhases = ['building_stock_index', 'building_price_index', 'preparing_material', 'in_progress'];
   if (intermediatePhases.includes(stepResult.status)) {
     console.log(`[orchestrator] Step ${stepName} is ${stepResult.status} (needs more invocations)`);
@@ -88,7 +92,6 @@ async function verifyStepCompleted(supabase: SupabaseClient, runId: string, step
     return { success: true, status: 'completed' };
   }
   
-  // 'pending' at this point means step didn't start processing yet - should continue
   if (stepResult.status === 'pending') {
     console.log(`[orchestrator] Step ${stepName} is pending (first invocation needed)`);
     return { success: true, status: 'in_progress' };
@@ -168,44 +171,21 @@ serve(async (req) => {
         { status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
-    if (trigger === 'cron') {
-      const { data: config } = await supabase.from('sync_config').select('enabled, frequency_minutes').eq('id', 1).single();
-      if (!config?.enabled) {
-        console.log('[orchestrator] Sync disabled');
-        return new Response(JSON.stringify({ status: 'skipped', message: 'Disabled' }), 
-          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-      }
-      
-      const { data: lastRun } = await supabase.from('sync_runs').select('started_at').eq('trigger_type', 'cron').eq('attempt', 1).order('started_at', { ascending: false }).limit(1);
-      if (lastRun?.length) {
-        const elapsed = Date.now() - new Date(lastRun[0].started_at).getTime();
-        if (elapsed < config.frequency_minutes * 60 * 1000) {
-          console.log('[orchestrator] Frequency not elapsed');
-          return new Response(JSON.stringify({ status: 'skipped', message: 'Frequency not elapsed' }), 
-            { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-        }
-      }
-    }
-
     // Use singleton row for deterministic fee_config read
     const FEE_CONFIG_SINGLETON_ID = '00000000-0000-0000-0000-000000000001';
     const { data: feeData } = await supabase.from('fee_config').select('*').eq('id', FEE_CONFIG_SINGLETON_ID).maybeSingle();
     const feeConfig = {
-      // Global fees
       feeDrev: feeData?.fee_drev ?? 1.05,
       feeMkt: feeData?.fee_mkt ?? 1.08,
       shippingCost: feeData?.shipping_cost ?? 6.00,
-      // Prep days
       mediaworldPrepDays: feeData?.mediaworld_preparation_days ?? 3,
       epricePrepDays: feeData?.eprice_preparation_days ?? 1,
-      // IT/EU stock config
       mediaworldIncludeEu: feeData?.mediaworld_include_eu ?? false,
       mediaworldItPrepDays: feeData?.mediaworld_it_preparation_days ?? 3,
       mediaworldEuPrepDays: feeData?.mediaworld_eu_preparation_days ?? 5,
       epriceIncludeEu: feeData?.eprice_include_eu ?? false,
       epriceItPrepDays: feeData?.eprice_it_preparation_days ?? 1,
       epriceEuPrepDays: feeData?.eprice_eu_preparation_days ?? 3,
-      // Per-export pricing (null = use global)
       eanFeeDrev: feeData?.ean_fee_drev ?? null,
       eanFeeMkt: feeData?.ean_fee_mkt ?? null,
       eanShippingCost: feeData?.ean_shipping_cost ?? null,
@@ -226,7 +206,7 @@ serve(async (req) => {
     });
     console.log(`[orchestrator] Run created: ${runId}`);
 
-    // ========== STEP 1: FTP Import (including stock location) ==========
+    // ========== STEP 1: FTP Import ==========
     await updateRun(supabase, runId, { steps: { current_step: 'import_ftp' } });
     console.log('[orchestrator] === STEP 1: FTP Import ===');
     
@@ -238,10 +218,9 @@ serve(async (req) => {
       
       const result = await callStep(supabaseUrl, supabaseServiceKey, 'import-catalog-ftp', { 
         fileType,
-        run_id: runId // Pass run_id for per-run stock location storage
+        run_id: runId
       });
       
-      // Stock location failure is non-blocking - use fallback compatibility
       if (!result.success && fileType !== 'stockLocation') {
         await finalizeRun(supabase, runId, 'failed', startTime, `FTP ${fileType}: ${result.error}`);
         return new Response(JSON.stringify({ status: 'failed', error: result.error }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
@@ -249,11 +228,21 @@ serve(async (req) => {
       
       if (!result.success && fileType === 'stockLocation') {
         console.log(`[orchestrator] Stock location import failed (non-blocking): ${result.error}`);
-        // Update location_warnings for missing file
-        const { data: run } = await supabase.from('sync_runs').select('location_warnings').eq('id', runId).single();
+        const { data: run } = await supabase.from('sync_runs').select('location_warnings, warning_count').eq('id', runId).single();
         const warnings = run?.location_warnings || {};
         warnings.missing_location_file = 1;
-        await supabase.from('sync_runs').update({ location_warnings: warnings }).eq('id', runId);
+        await supabase.from('sync_runs').update({ 
+          location_warnings: warnings,
+          warning_count: (run?.warning_count || 0) + 1
+        }).eq('id', runId);
+        
+        // Register WARN event
+        await supabase.from('sync_events').insert({
+          run_id: runId,
+          level: 'WARN',
+          step: 'import_ftp',
+          message: 'File stock location non trovato o non importabile'
+        });
       }
     }
 
@@ -282,7 +271,6 @@ serve(async (req) => {
         return new Response(JSON.stringify({ status: 'failed', error: result.error }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       }
       
-      // Verify status in database
       const verification = await verifyStepCompleted(supabase, runId, 'parse_merge');
       
       if (!verification.success) {
@@ -295,7 +283,6 @@ serve(async (req) => {
         console.log(`[orchestrator] parse_merge completed after ${chunkCount} chunks`);
       } else if (verification.status === 'in_progress') {
         console.log(`[orchestrator] parse_merge in_progress, continuing to next chunk...`);
-        // Continue loop for next chunk
       } else {
         await finalizeRun(supabase, runId, 'failed', startTime, `parse_merge unexpected status: ${verification.status}`);
         return new Response(JSON.stringify({ status: 'failed', error: `Unexpected status: ${verification.status}` }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
@@ -337,81 +324,67 @@ serve(async (req) => {
       }
     }
 
-    // ========== STEP 8: SFTP Upload ==========
-    if (await isCancelRequested(supabase, runId)) {
-      await finalizeRun(supabase, runId, 'failed', startTime, 'Interrotta dall\'utente');
-      return new Response(JSON.stringify({ status: 'cancelled' }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-    }
-    
-    await updateRun(supabase, runId, { steps: { current_step: 'upload_sftp' } });
-    console.log('[orchestrator] === STEP 8: SFTP Upload ===');
-    
-    // Build files list - base 3 + extras for cron trigger
-    const sftpFiles = [
-      { bucket: 'exports', path: 'Catalogo EAN.csv', filename: 'Catalogo EAN.csv' },
-      { bucket: 'exports', path: 'Export ePrice.csv', filename: 'Export ePrice.csv' },
-      { bucket: 'exports', path: 'Export Mediaworld.csv', filename: 'Export Mediaworld.csv' }
-    ];
+    // ========== STEP 8: SFTP Upload (ONLY for cron trigger) ==========
     if (trigger === 'cron') {
-      sftpFiles.push(
-        { bucket: 'exports', path: 'amazon_listing_loader.xlsm', filename: 'amazon_listing_loader.xlsm' },
-        { bucket: 'exports', path: 'amazon_price_inventory.txt', filename: 'amazon_price_inventory.txt' }
-      );
-    }
-    
-    const sftpResult = await callStep(supabaseUrl, supabaseServiceKey, 'upload-exports-to-sftp', {
-      files: sftpFiles
-    });
-    
-    if (!sftpResult.success) {
-      await finalizeRun(supabase, runId, 'failed', startTime, `SFTP: ${sftpResult.error}`);
-      return new Response(JSON.stringify({ status: 'failed', error: sftpResult.error }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      if (await isCancelRequested(supabase, runId)) {
+        await finalizeRun(supabase, runId, 'failed', startTime, 'Interrotta dall\'utente');
+        return new Response(JSON.stringify({ status: 'cancelled' }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+      
+      await updateRun(supabase, runId, { steps: { current_step: 'upload_sftp' } });
+      console.log('[orchestrator] === STEP 8: SFTP Upload (cron only) ===');
+      
+      // Exactly the 5 required files, same remote folder, fixed names, overwrite
+      const sftpFiles = EXPORT_FILES.map(f => ({
+        bucket: 'exports',
+        path: f,
+        filename: f
+      }));
+      
+      const sftpResult = await callStep(supabaseUrl, supabaseServiceKey, 'upload-exports-to-sftp', {
+        files: sftpFiles
+      });
+      
+      if (!sftpResult.success) {
+        await finalizeRun(supabase, runId, 'failed', startTime, `SFTP: ${sftpResult.error}`);
+        return new Response(JSON.stringify({ status: 'failed', error: sftpResult.error }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+    } else {
+      console.log('[orchestrator] Skipping SFTP upload (manual trigger)');
     }
 
     // ========== STORAGE VERSIONING ==========
     console.log('[orchestrator] === Storage versioning ===');
     const versionTimestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const exportFiles = [
-      'Catalogo EAN.csv', 'Export ePrice.csv', 'Export Mediaworld.csv',
-      ...(trigger === 'cron' ? ['catalogo_ean.xlsx', 'amazon_listing_loader.xlsm', 'amazon_price_inventory.txt'] : [])
-    ];
     
-    for (const fileName of exportFiles) {
+    // Save file_manifest with version timestamp for retention tracking
+    const fileManifest: Record<string, string> = {};
+    
+    for (const fileName of EXPORT_FILES) {
       try {
         const { data: fileBlob } = await supabase.storage.from('exports').download(fileName);
         if (fileBlob) {
-          // Copy to latest/
+          // Copy to latest/ (overwrite)
           await supabase.storage.from('exports').upload(`latest/${fileName}`, fileBlob, { upsert: true });
           // Copy to versions/
           await supabase.storage.from('exports').upload(`versions/${versionTimestamp}/${fileName}`, fileBlob, { upsert: true });
+          fileManifest[fileName] = versionTimestamp;
         }
       } catch (e: unknown) {
         console.warn(`[orchestrator] Versioning failed for ${fileName}: ${errMsg(e)}`);
       }
     }
     
-    // Cleanup old versions (keep last 10)
-    try {
-      const { data: versionFolders } = await supabase.storage.from('exports').list('versions', { sortBy: { column: 'name', order: 'desc' }, limit: 100 });
-      if (versionFolders && versionFolders.length > 10) {
-        for (const folder of versionFolders.slice(10)) {
-          const { data: folderFiles } = await supabase.storage.from('exports').list(`versions/${folder.name}`);
-          if (folderFiles?.length) {
-            await supabase.storage.from('exports').remove(folderFiles.map(f => `versions/${folder.name}/${f.name}`));
-          }
-        }
-        console.log(`[orchestrator] Cleaned up ${versionFolders.length - 10} old versions`);
-      }
-    } catch (e: unknown) {
-      console.warn(`[orchestrator] Version cleanup failed: ${errMsg(e)}`);
-    }
+    // Save file_manifest for retention tracking
+    await supabase.from('sync_runs').update({ file_manifest: fileManifest }).eq('id', runId);
+
+    // ========== RETENTION CLEANUP (per-file, max 3 versions, >7 days) ==========
+    await cleanupVersions(supabase);
 
     // ========== DETERMINE FINAL STATUS ==========
-    const { data: finalRun } = await supabase.from('sync_runs').select('warning_count, location_warnings').eq('id', runId).single();
-    const totalWarnings = (finalRun?.warning_count || 0);
-    const locationWarnings = finalRun?.location_warnings || {};
-    const hasWarnings = totalWarnings > 0 || Object.values(locationWarnings).some((v: unknown) => (v as number) > 0);
-    const finalStatus = hasWarnings ? 'success_with_warning' : 'success';
+    // success_with_warning based SOLELY on warning_count > 0
+    const { data: finalRun } = await supabase.from('sync_runs').select('warning_count').eq('id', runId).single();
+    const finalStatus = (finalRun?.warning_count || 0) > 0 ? 'success_with_warning' : 'success';
     
     await finalizeRun(supabase, runId, finalStatus, startTime);
     console.log(`[orchestrator] Pipeline completed: ${runId}, status: ${finalStatus}`);
@@ -437,7 +410,6 @@ serve(async (req) => {
     if (runId && supabase) {
       try {
         await finalizeRun(supabase, runId, 'failed', startTime, errMsg(err));
-        // Send notification for failure
         await fetch(`${supabaseUrl}/functions/v1/send-sync-notification`, {
           method: 'POST',
           headers: { 'Authorization': `Bearer ${supabaseServiceKey}`, 'Content-Type': 'application/json' },
@@ -452,3 +424,109 @@ serve(async (req) => {
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   }
 });
+
+/**
+ * Per-file retention cleanup.
+ * For each of the 5 canonical files:
+ * - Find all versions under versions/<timestamp>/<filename>
+ * - Keep the newest 3 versions
+ * - Delete versions beyond 3 only if older than 7 days
+ * - Never delete latest/
+ */
+async function cleanupVersions(supabase: SupabaseClient): Promise<void> {
+  try {
+    const { data: versionFolders } = await supabase.storage.from('exports').list('versions', {
+      sortBy: { column: 'name', order: 'desc' },
+      limit: 200
+    });
+
+    if (!versionFolders || versionFolders.length === 0) {
+      console.log('[orchestrator] No version folders found, skipping cleanup');
+      return;
+    }
+
+    const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+
+    // Build per-file version list
+    const fileVersions: Record<string, Array<{ folder: string; timestamp: number }>> = {};
+    for (const f of EXPORT_FILES) {
+      fileVersions[f] = [];
+    }
+
+    for (const folder of versionFolders) {
+      const folderName = folder.name;
+      // Parse timestamp from folder name (format: YYYY-MM-DDTHH-MM-SS-mmmZ)
+      let folderTs: number;
+      try {
+        const isoStr = folderName.replace(/-(\d{2})-(\d{2})-(\d{3})Z$/, ':$1:$2.$3Z').replace(/T(\d{2})-/, 'T$1:');
+        folderTs = new Date(isoStr).getTime();
+        if (isNaN(folderTs)) {
+          // Fallback: use folder metadata created_at if available
+          folderTs = folder.created_at ? new Date(folder.created_at).getTime() : 0;
+        }
+      } catch {
+        folderTs = folder.created_at ? new Date(folder.created_at).getTime() : 0;
+      }
+
+      if (folderTs === 0) {
+        console.warn(`[orchestrator] WARN: Cannot determine timestamp for version folder: ${folderName}, skipping`);
+        continue;
+      }
+
+      // List files in this version folder
+      const { data: filesInFolder } = await supabase.storage.from('exports').list(`versions/${folderName}`);
+      if (!filesInFolder) continue;
+
+      for (const file of filesInFolder) {
+        if (EXPORT_FILES.includes(file.name)) {
+          fileVersions[file.name].push({ folder: folderName, timestamp: folderTs });
+        }
+      }
+    }
+
+    // For each file, apply retention
+    const toDelete: string[] = [];
+
+    for (const [fileName, versions] of Object.entries(fileVersions)) {
+      // Sort newest first
+      versions.sort((a, b) => b.timestamp - a.timestamp);
+      
+      if (versions.length <= 3) continue;
+
+      // Versions beyond the first 3
+      const excess = versions.slice(3);
+      for (const v of excess) {
+        if (v.timestamp < sevenDaysAgo) {
+          toDelete.push(`versions/${v.folder}/${fileName}`);
+        }
+      }
+    }
+
+    if (toDelete.length > 0) {
+      console.log(`[orchestrator] Deleting ${toDelete.length} old version files`);
+      // Delete in batches of 20
+      for (let i = 0; i < toDelete.length; i += 20) {
+        const batch = toDelete.slice(i, i + 20);
+        await supabase.storage.from('exports').remove(batch);
+      }
+      console.log(`[orchestrator] Retention cleanup completed`);
+    } else {
+      console.log('[orchestrator] No version files to clean up');
+    }
+
+    // Clean up empty version folders
+    try {
+      for (const folder of versionFolders) {
+        const { data: remaining } = await supabase.storage.from('exports').list(`versions/${folder.name}`);
+        if (!remaining || remaining.length === 0) {
+          // Folder is empty, but Supabase storage doesn't have explicit folder deletion
+          // Empty folders are cleaned up automatically
+        }
+      }
+    } catch (e: unknown) {
+      console.warn(`[orchestrator] Folder cleanup warning: ${errMsg(e)}`);
+    }
+  } catch (e: unknown) {
+    console.warn(`[orchestrator] Version cleanup failed (non-blocking): ${errMsg(e)}`);
+  }
+}

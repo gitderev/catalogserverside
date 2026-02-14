@@ -71,3 +71,24 @@ Yes, you can!
 To connect a domain, navigate to Project > Settings > Domains and click Connect Domain.
 
 Read more here: [Setting up a custom domain](https://docs.lovable.dev/tips-tricks/custom-domain#step-by-step-guide)
+
+## Automated Sync Scheduling (GitHub Actions)
+
+The automated synchronization is triggered every 5 minutes by a GitHub Actions workflow (`.github/workflows/cron-tick.yml`). To enable it:
+
+### 1. Configure GitHub Actions Secrets
+
+Go to your GitHub repository → **Settings** → **Secrets and variables** → **Actions** → **New repository secret** and add:
+
+| Secret Name | Value |
+|---|---|
+| `CRON_TICK_URL` | The full URL of the `cron-tick` Edge Function, e.g. `https://<project-id>.supabase.co/functions/v1/cron-tick` |
+| `CRON_SECRET` | A strong random string (e.g. generated with `openssl rand -hex 32`) |
+
+### 2. Configure the backend secret
+
+The `CRON_SECRET` value set in GitHub Actions **must match** the `CRON_SECRET` secret configured in your Lovable Cloud (Supabase) project. Set the same value in both places.
+
+### 3. Verify
+
+After committing the workflow, GitHub Actions will call `cron-tick` every 5 minutes. The function will check the scheduling configuration (enabled, frequency, daily time) and trigger a sync run if due.

@@ -73,8 +73,7 @@ interface SyncRun {
   location_warnings: Record<string, number>;
 }
 
-// Soglia per considerare una run come "bloccata/zombie" (15 minuti)
-const STALE_RUN_THRESHOLD_MS = 15 * 60 * 1000;
+// Stale run threshold is dynamic: uses config.run_timeout_minutes (default 60min)
 
 interface StepResult {
   status: 'success' | 'failed' | 'skipped';
@@ -269,10 +268,11 @@ export const SyncScheduler: React.FC = () => {
       const running = (runsData || []).find((r: Record<string, unknown>) => r.status === 'running');
       
       if (running) {
-        // Controlla se è una run "zombie" (in running da più di 15 minuti)
+        // Use config.run_timeout_minutes for stale detection (default 60)
+        const staleThresholdMs = ((configData as SyncConfig)?.run_timeout_minutes || 60) * 60 * 1000;
         const startedAt = new Date(running.started_at).getTime();
         const elapsed = Date.now() - startedAt;
-        const isStale = elapsed > STALE_RUN_THRESHOLD_MS;
+        const isStale = elapsed > staleThresholdMs;
         
         setCurrentRun(running as unknown as SyncRun);
         setIsStaleRun(isStale);
@@ -509,8 +509,9 @@ export const SyncScheduler: React.FC = () => {
   };
 
   const hasMaxRetriesWarning = (): boolean => {
+    const maxAttempts = config?.max_attempts || 3;
     const lastCronRun = runs.find(r => r.trigger_type === 'cron');
-    return lastCronRun?.attempt === 5 && ['failed', 'timeout'].includes(lastCronRun.status);
+    return lastCronRun?.attempt === maxAttempts && ['failed', 'timeout'].includes(lastCronRun.status);
   };
 
   const formatDuration = (ms: number | null): string => {
@@ -551,7 +552,7 @@ export const SyncScheduler: React.FC = () => {
               <AlertTriangle className="h-5 w-5 text-error flex-shrink-0 mt-0.5" />
               <div>
                 <p className="font-semibold text-error">
-                  Attenzione: la sincronizzazione automatica ha fallito 5 volte consecutive.
+                  Attenzione: la sincronizzazione automatica ha fallito {config?.max_attempts || 3} volte consecutive.
                 </p>
                 <p className="text-sm alt-text-muted mt-1">
                   Controlla i log per verificare il problema e correggerlo.
@@ -560,7 +561,7 @@ export const SyncScheduler: React.FC = () => {
                   variant="link"
                   className="p-0 h-auto text-error hover:text-error/80 font-medium"
                   onClick={() => {
-                    const failedRun = runs.find(r => r.trigger_type === 'cron' && r.attempt === 5);
+                    const failedRun = runs.find(r => r.trigger_type === 'cron' && r.attempt === (config?.max_attempts || 3));
                     if (failedRun) setSelectedRun(failedRun);
                   }}
                 >
@@ -873,8 +874,8 @@ export const SyncScheduler: React.FC = () => {
                   Sincronizzazione bloccata
                 </p>
                 <p className="text-sm alt-text-muted mt-1">
-                  La sincronizzazione e in esecuzione da piu di 15 minuti e potrebbe essere bloccata.
-                  Usa il pulsante "Sblocca sincronizzazione" per resettare lo stato e poter avviare una nuova run.
+                   La sincronizzazione è in esecuzione da più di {config?.run_timeout_minutes || 60} minuti e potrebbe essere bloccata.
+                   Usa il pulsante "Sblocca sincronizzazione" per resettare lo stato e poter avviare una nuova run.
                 </p>
               </div>
             </div>
