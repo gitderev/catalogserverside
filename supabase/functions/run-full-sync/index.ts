@@ -165,11 +165,29 @@ serve(async (req) => {
 
     supabase = createClient(supabaseUrl, supabaseServiceKey);
 
-    const { data: runningJobs } = await supabase.from('sync_runs').select('id').eq('status', 'running').limit(1);
-    if (runningJobs?.length) {
-      return new Response(JSON.stringify({ status: 'error', message: 'Sync già in corso' }), 
-        { status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    // Load sync_config for run_timeout_minutes
+    const { data: syncConfig } = await supabase.from('sync_config').select('run_timeout_minutes').eq('id', 1).single();
+    const runTimeoutMinutes = syncConfig?.run_timeout_minutes || 60;
+
+    // P1-B: Atomic lock acquisition BEFORE creating run
+    runId = crypto.randomUUID();
+    const LOCK_NAME = 'global_sync';
+    const ttlSeconds = runTimeoutMinutes * 60;
+
+    const { data: lockResult } = await supabase.rpc('try_acquire_sync_lock', {
+      p_lock_name: LOCK_NAME,
+      p_run_id: runId,
+      p_ttl_seconds: ttlSeconds
+    });
+
+    if (!lockResult) {
+      console.log('[orchestrator] INFO: Lock not acquired, sync already in progress');
+      runId = null; // Don't release in finally
+      return new Response(JSON.stringify({ status: 'locked', message: 'not_started' }), 
+        { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
+
+    console.log(`[orchestrator] Lock acquired for run ${runId}`);
 
     // Use singleton row for deterministic fee_config read
     const FEE_CONFIG_SINGLETON_ID = '00000000-0000-0000-0000-000000000001';
@@ -197,7 +215,6 @@ serve(async (req) => {
       epriceShippingCost: feeData?.eprice_shipping_cost ?? null
     };
 
-    runId = crypto.randomUUID();
     startTime = Date.now();
     await supabase.from('sync_runs').insert({ 
       id: runId, started_at: new Date().toISOString(), status: 'running', 
@@ -228,20 +245,17 @@ serve(async (req) => {
       
       if (!result.success && fileType === 'stockLocation') {
         console.log(`[orchestrator] Stock location import failed (non-blocking): ${result.error}`);
-        const { data: run } = await supabase.from('sync_runs').select('location_warnings, warning_count').eq('id', runId).single();
+        const { data: run } = await supabase.from('sync_runs').select('location_warnings').eq('id', runId).single();
         const warnings = run?.location_warnings || {};
         warnings.missing_location_file = 1;
-        await supabase.from('sync_runs').update({ 
-          location_warnings: warnings,
-          warning_count: (run?.warning_count || 0) + 1
-        }).eq('id', runId);
+        await supabase.from('sync_runs').update({ location_warnings: warnings }).eq('id', runId);
         
-        // Register WARN event
-        await supabase.from('sync_events').insert({
-          run_id: runId,
-          level: 'WARN',
-          step: 'import_ftp',
-          message: 'File stock location non trovato o non importabile'
+        // Register WARN via atomic RPC (increments warning_count)
+        await supabase.rpc('log_sync_event', {
+          p_run_id: runId,
+          p_level: 'WARN',
+          p_message: 'File stock location non trovato o non importabile',
+          p_details: { step: 'import_ftp', location_warning: 'missing_location_file' }
         });
       }
     }
@@ -422,6 +436,23 @@ serve(async (req) => {
     
     return new Response(JSON.stringify({ status: 'error', message: errMsg(err) }), 
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  } finally {
+    // P1-B: Always release lock in finally
+    if (runId && supabase) {
+      try {
+        const { data: released } = await supabase.rpc('release_sync_lock', {
+          p_lock_name: 'global_sync',
+          p_run_id: runId
+        });
+        if (released) {
+          console.log(`[orchestrator] Lock released for run ${runId}`);
+        } else {
+          console.warn(`[orchestrator] WARN: Lock release returned false for run ${runId} (run_id mismatch or already released)`);
+        }
+      } catch (e: unknown) {
+        console.warn(`[orchestrator] WARN: Failed to release lock: ${errMsg(e)}`);
+      }
+    }
   }
 });
 

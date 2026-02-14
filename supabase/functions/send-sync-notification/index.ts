@@ -68,11 +68,11 @@ serve(async (req) => {
 
     if (!brevoApiKey) {
       console.warn('[send-sync-notification] BREVO_API_KEY not configured, skipping email');
-      await supabase.from('sync_events').insert({
-        run_id: runId,
-        level: 'WARN',
-        step: 'notification',
-        message: 'Email non inviata: BREVO_API_KEY non configurata'
+      await supabase.rpc('log_sync_event', {
+        p_run_id: runId,
+        p_level: 'WARN',
+        p_message: 'Email non inviata: BREVO_API_KEY non configurata',
+        p_details: { step: 'notification' }
       });
       return new Response(
         JSON.stringify({ status: 'skipped', reason: 'no_api_key' }),
@@ -133,21 +133,21 @@ serve(async (req) => {
 
       console.log(`[send-sync-notification] Email sent for run ${runId}`);
       
-      await supabase.from('sync_events').insert({
-        run_id: runId,
-        level: 'INFO',
-        step: 'notification',
-        message: `Email inviata a ${RECIPIENT_EMAIL}`
+      await supabase.rpc('log_sync_event', {
+        p_run_id: runId,
+        p_level: 'INFO',
+        p_message: `Email inviata a ${RECIPIENT_EMAIL}`,
+        p_details: { step: 'notification' }
       });
 
     } catch (emailError: unknown) {
       console.warn(`[send-sync-notification] Email send failed (non-blocking):`, errMsg(emailError));
       
-      await supabase.from('sync_events').insert({
-        run_id: runId,
-        level: 'WARN',
-        step: 'notification',
-        message: `Invio email fallito: ${errMsg(emailError)}`
+      await supabase.rpc('log_sync_event', {
+        p_run_id: runId,
+        p_level: 'WARN',
+        p_message: `Invio email fallito: ${errMsg(emailError)}`,
+        p_details: { step: 'notification' }
       });
     }
 
