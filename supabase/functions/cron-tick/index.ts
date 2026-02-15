@@ -365,13 +365,26 @@ serve(async (req) => {
 
       // RESUME: either yield fast-path or stalled (> 180s)
       const isStalled = lastEventAgeS > STALL_THRESHOLD_SEC;
+      const resumeReason = isYieldEvent ? 'yield_observed' : 'stall_threshold';
 
-      console.log(`[cron-tick] Resuming run ${activeRun.id} (stalled=${isStalled}, yielded=${isYieldEvent}, last_event_age=${Math.round(lastEventAgeS)}s)`);
+      // Structured diagnostic log (Modifica B)
+      console.log(JSON.stringify({
+        diag_tag: 'cron_tick_decision',
+        run_id: activeRun.id,
+        decision: 'force_resume',
+        reason: resumeReason,
+        last_event_age_s: Math.round(lastEventAgeS),
+        progress_source: isYieldEvent ? 'last_progress_event_yield' : 'last_progress_event_stalled',
+        current_step: currentStep,
+        chunk_index: chunkIndex
+      }));
+
       await logDecision(supabase, activeRun.id, 'INFO', 'resume_triggered', {
         ...baseDetails,
         is_stalled: isStalled,
         is_yielded: isYieldEvent,
-        stall_threshold_sec: STALL_THRESHOLD_SEC
+        stall_threshold_sec: STALL_THRESHOLD_SEC,
+        resume_reason: resumeReason
       });
 
       let resumeResult = await triggerSyncResume(supabaseUrl, supabaseServiceKey, activeRun.id);
@@ -383,21 +396,60 @@ serve(async (req) => {
         });
       }
 
-      // DRAIN LOOP: try to drive the run to completion within bounded limits.
+      // DRAIN LOOP: drive the run to completion using response-JSON-based yield detection.
+      // When run-full-sync responds with status "yielded", we re-trigger immediately
+      // (5s debounce) instead of waiting for the next event-based check.
       // Budget is conservative to fit within edge function timeout.
-      // If limits are reached, the next cron-tick invocation continues safely.
       const DRAIN_MAX_ITER = 4;
       const DRAIN_BUDGET_MS = 120_000; // 2 minutes
-      const DRAIN_SLEEP_MS = 25_000;   // 25s (matches orchestrator chunk budget)
-      const RESUME_TIMEOUT_MS = 5_000; // fire-and-forget after 5s
+      const DRAIN_SLEEP_MS = 25_000;   // 25s between poll iterations
+      const FORCE_RESUME_DEBOUNCE_MS = 5_000; // 5s debounce for yield force-resume
       const drainStart = Date.now();
       let drainIter = 0;
+      let lastForceResumeAt = 0; // in-memory debounce timestamp
+
+      // Check if initial resume indicated yield → force immediate re-trigger
+      if (resumeResult.status === 'yielded' && !resumeResult.error) {
+        lastForceResumeAt = Date.now();
+        console.log(JSON.stringify({
+          diag_tag: 'cron_tick_decision',
+          run_id: activeRun.id,
+          decision: 'force_resume',
+          reason: 'yield_observed',
+          progress_source: 'response_json_yield',
+          trigger: 'initial_resume_response'
+        }));
+        // Brief debounce then re-trigger
+        await new Promise(resolve => setTimeout(resolve, FORCE_RESUME_DEBOUNCE_MS));
+        resumeResult = await triggerSyncResume(supabaseUrl, supabaseServiceKey, activeRun.id);
+      }
 
       while (drainIter < DRAIN_MAX_ITER && (Date.now() - drainStart) < DRAIN_BUDGET_MS) {
         drainIter++;
+
+        // If last resume returned "yielded", skip the long sleep and re-trigger quickly
+        if (resumeResult.status === 'yielded' && !resumeResult.error) {
+          const sinceLast = Date.now() - lastForceResumeAt;
+          if (sinceLast >= FORCE_RESUME_DEBOUNCE_MS) {
+            lastForceResumeAt = Date.now();
+            console.log(JSON.stringify({
+              diag_tag: 'cron_tick_decision',
+              run_id: activeRun.id,
+              decision: 'force_resume',
+              reason: 'yield_observed',
+              progress_source: 'response_json_yield',
+              drain_iteration: drainIter
+            }));
+            await new Promise(resolve => setTimeout(resolve, FORCE_RESUME_DEBOUNCE_MS));
+            resumeResult = await triggerSyncResume(supabaseUrl, supabaseServiceKey, activeRun.id);
+            continue; // skip the long sleep, re-check immediately
+          }
+        }
+
+        // Normal drain sleep
         await new Promise(resolve => setTimeout(resolve, DRAIN_SLEEP_MS));
 
-        // Re-read run status with fresh timestamp
+        // Re-read run status
         const { data: runCheck } = await supabase
           .from('sync_runs')
           .select('id, status, steps')
@@ -420,37 +472,13 @@ serve(async (req) => {
           });
         }
 
-        // Re-read last progress event
-        const { data: drainEvents } = await supabase
-          .from('sync_events')
-          .select('created_at, message')
-          .eq('run_id', activeRun.id)
-          .not('message', 'like', 'resume_skipped_%')
-          .not('message', 'like', 'cron_auth_%')
-          .not('message', 'like', 'drain_%')
-          .order('created_at', { ascending: false })
-          .limit(1);
-
-        const drainEvent = drainEvents?.[0];
-        const drainEventAge = drainEvent
-          ? (Date.now() - new Date(drainEvent.created_at).getTime()) / 1000
-          : 999;
-        const drainMsg = (drainEvent?.message || '').toLowerCase();
-        const drainIsYield = drainMsg.includes('yield') || drainMsg.includes('orchestrator_yield');
-
-        if ((drainIsYield && drainEventAge > YIELD_DEBOUNCE_SEC) || drainEventAge > STALL_THRESHOLD_SEC) {
-          console.log(`[cron-tick] Drain iter ${drainIter}: resuming (yield=${drainIsYield}, age=${Math.round(drainEventAge)}s)`);
-          await logDecision(supabase, activeRun.id, 'INFO', 'drain_resume_triggered', {
-            drain_iteration: drainIter,
-            last_event_age_s: Math.round(drainEventAge),
-            is_yield: drainIsYield,
-            last_event_message: drainEvent?.message
-          });
-          // Fire-and-forget resume (don't block waiting for full chunk processing)
-          triggerSyncResumeQuick(supabaseUrl, supabaseServiceKey, activeRun.id, RESUME_TIMEOUT_MS);
-        } else {
-          console.log(`[cron-tick] Drain iter ${drainIter}: waiting (age=${Math.round(drainEventAge)}s, yield=${drainIsYield})`);
-        }
+        // Resume using full triggerSyncResume to read response JSON
+        console.log(`[cron-tick] Drain iter ${drainIter}: triggering resume`);
+        await logDecision(supabase, activeRun.id, 'INFO', 'drain_resume_triggered', {
+          drain_iteration: drainIter,
+          drain_elapsed_ms: Date.now() - drainStart
+        });
+        resumeResult = await triggerSyncResume(supabaseUrl, supabaseServiceKey, activeRun.id);
       }
 
       // Drain ended without run completing — safe stop, no destructive status change

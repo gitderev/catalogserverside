@@ -12,7 +12,10 @@ concurrency:
 jobs:
   cron-tick:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 8
+    env:
+      TICK_MAX_CALLS: "4"
+      TICK_SLEEP_SEC: "20"
     steps:
       - name: Validate secrets
         run: |
@@ -25,26 +28,52 @@ jobs:
             exit 1
           fi
 
-      - name: Call cron-tick
+      - name: Call cron-tick loop
         run: |
-          TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          BODY_FILE=$(mktemp)
-          STATUS=$(curl -sS -o "$BODY_FILE" -w "%{http_code}" \
-            --max-time 300 \
-            -X POST "${{ secrets.CRON_TICK_URL }}" \
-            -H "Content-Type: application/json" \
-            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" \
-            -d '{"timestamp":"'"$TS"'"}')
-          BODY=$(cat "$BODY_FILE")
-          BODY_TRUNCATED=$(printf '%s' "$BODY" | head -c 2000)
-          rm -f "$BODY_FILE"
+          for ATTEMPT in $(seq 1 "$TICK_MAX_CALLS"); do
+            TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            echo "--- attempt $ATTEMPT/$TICK_MAX_CALLS ts=$TS ---"
 
-          echo "timestamp=$TS http_status=$STATUS"
-          echo "body=$BODY_TRUNCATED"
+            BODY_FILE=$(mktemp)
+            HTTP_STATUS=$(curl -sS -o "$BODY_FILE" -w "%{http_code}" \
+              --fail \
+              --max-time 120 \
+              -X POST "${{ secrets.CRON_TICK_URL }}" \
+              -H "Content-Type: application/json" \
+              -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" \
+              -d '{"timestamp":"'"$TS"'"}') || {
+              echo "::error::cron-tick curl failed (attempt $ATTEMPT/$TICK_MAX_CALLS, HTTP $HTTP_STATUS)"
+              cat "$BODY_FILE" | head -c 1000
+              rm -f "$BODY_FILE"
+              exit 1
+            }
+            BODY=$(cat "$BODY_FILE")
+            rm -f "$BODY_FILE"
 
-          if [ "$STATUS" -ge 400 ]; then
-            echo "::error::cron-tick returned HTTP $STATUS"
-            exit 1
-          fi
+            BODY_TRUNCATED=$(printf '%s' "$BODY" | head -c 1000)
+            echo "attempt=$ATTEMPT http_status=$HTTP_STATUS body=$BODY_TRUNCATED"
 
-          echo "cron-tick completed successfully (HTTP $STATUS)"
+            # Parse status from JSON response using python3
+            RESP_STATUS=$(python3 -c "
+          import json, sys
+          try:
+              data = json.loads(sys.argv[1])
+              print(data.get('status', 'unknown'))
+          except Exception:
+              print('unknown')
+          " "$BODY" 2>/dev/null || echo "unknown")
+
+            echo "parsed_status=$RESP_STATUS"
+
+            if [ "$RESP_STATUS" = "noop" ] || [ "$RESP_STATUS" = "skipped" ]; then
+              echo "Stop condition met: status=$RESP_STATUS"
+              break
+            fi
+
+            if [ "$ATTEMPT" -lt "$TICK_MAX_CALLS" ]; then
+              echo "Sleeping ${TICK_SLEEP_SEC}s before next attempt..."
+              sleep "$TICK_SLEEP_SEC"
+            fi
+          done
+
+          echo "cron-tick loop completed"
