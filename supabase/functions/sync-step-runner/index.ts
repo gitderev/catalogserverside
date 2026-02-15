@@ -661,7 +661,8 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
       await updateParseMergeState(supabase, runId, { status: 'building_price_index' });
       
       console.log(`[parse_merge] Phase 1a complete in ${Date.now() - invocationStart}ms, stock index saved`);
-      return { success: true, status: 'building_price_index' };
+      // Fall through to Phase 1b inline (re-read state)
+      state = await getParseMergeState(supabase, runId);
     }
     
     // ========== PHASE 1b: BUILD PRICE INDEX ==========
@@ -749,7 +750,8 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
       await updateParseMergeState(supabase, runId, { status: 'preparing_material' });
       
       console.log(`[parse_merge] Phase 1b complete in ${Date.now() - invocationStart}ms, price index saved`);
-      return { success: true, status: 'preparing_material' };
+      // Fall through to Phase 1c inline (re-read state)
+      state = await getParseMergeState(supabase, runId);
     }
     
     // ========== PHASE 1c: PREPARE MATERIAL METADATA + optional chunk_files split ==========
@@ -921,7 +923,8 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
       }
       
       console.log(`[parse_merge] Phase 1c complete in ${Date.now() - invocationStart}ms, mode=${mode}, totalBytes=${totalBytes}`);
-      return { success: true, status: 'in_progress' };
+      // Fall through to Phase 2 inline (re-read state)
+      state = await getParseMergeState(supabase, runId);
     }
     
     // ========== PHASE 2: CHUNKED MATERIAL PROCESSING ==========
@@ -929,20 +932,35 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
     //   range: fetch MAX_FETCH_BYTES via Range header from material_source.tsv
     //   chunk_files: download one pre-split chunk file per invocation
     if (state.status === 'in_progress') {
-      // PREFLIGHT: verify Phase 2 prerequisites — resume markers OR readable artifacts
-      if (!state.materialBytes && !state.cursor_pos && !state.chunk_index) {
-        // No resume markers — this should have been caught by isFirstExecution above.
-        // If we're here, something unexpected happened. Fail explicitly.
-        const error = 'pipeline_artifact_missing: Phase 2 entered without resume markers or prior Phase 1 execution';
-        console.error(`[parse_merge] ${error}`);
-        try {
-          await supabase.rpc('log_sync_event', {
-            p_run_id: runId, p_level: 'ERROR', p_message: 'pipeline_artifact_missing',
-            p_details: { step: 'parse_merge', expected: 'materialBytes or cursor_pos from Phase 1c', reason: 'Phase 1 never completed' }
-          });
-        } catch (_e) { /* non-blocking */ }
-        await updateParseMergeState(supabase, runId, { status: 'failed', error });
-        return { success: false, error, status: 'failed' };
+      // PREFLIGHT: verify Phase 2 prerequisites
+      // (A) resume markers exist OR (B) artifacts are readable
+      const hasResumeMarkers = !!(state.materialBytes || state.cursor_pos || state.chunk_index);
+      if (!hasResumeMarkers) {
+        // No resume markers — verify artifacts are at least readable
+        console.log(`[parse_merge] Phase 2 preflight: no resume markers, checking artifacts...`);
+        const [stockCheck, priceCheck, metaCheck] = await Promise.all([
+          loadStockIndex(supabase),
+          loadPriceIndex(supabase),
+          loadMaterialMeta(supabase),
+        ]);
+        const missingArtifacts: string[] = [];
+        if (!stockCheck.index) missingArtifacts.push(STOCK_INDEX_FILE);
+        if (!priceCheck.index) missingArtifacts.push(PRICE_INDEX_FILE);
+        if (!metaCheck.meta) missingArtifacts.push(MATERIAL_META_FILE);
+
+        if (missingArtifacts.length > 0) {
+          const error = `pipeline_artifact_missing: Phase 2 cannot start, missing: ${missingArtifacts.join(', ')}`;
+          console.error(`[parse_merge] ${error}`);
+          try {
+            await supabase.rpc('log_sync_event', {
+              p_run_id: runId, p_level: 'ERROR', p_message: 'pipeline_artifact_missing',
+              p_details: { step: 'parse_merge', missing_artifacts: missingArtifacts }
+            });
+          } catch (_e) { /* non-blocking */ }
+          await updateParseMergeState(supabase, runId, { status: 'failed', error });
+          return { success: false, error, status: 'failed' };
+        }
+        console.log(`[parse_merge] Phase 2 preflight passed: all artifacts readable (no resume markers, first Phase 2 entry)`);
       }
       const mode = state.mode || 'range';
       const cursorPos = state.cursor_pos ?? 0;
