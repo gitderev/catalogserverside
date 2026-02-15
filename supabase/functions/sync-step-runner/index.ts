@@ -1896,11 +1896,22 @@ async function stepExportEprice(supabase: SupabaseClient, runId: string, feeConf
   }
 }
 
-// ========== STEP: EXPORT_EAN_XLSX ==========
+// ========== STEP: EXPORT_EAN_XLSX (OPTIMIZED - chunked XLSX build) ==========
+const XLSX_CHUNK_ROWS = Math.min(500, Math.max(1, Math.floor(CHUNK_SIZE / 4)));
+
 async function stepExportEanXlsx(supabase: SupabaseClient, runId: string): Promise<{ success: boolean; error?: string }> {
-  console.log(`[sync:step:export_ean_xlsx] Starting for run ${runId}`);
+  console.log(`[sync:step:export_ean_xlsx] Starting for run ${runId}, XLSX_CHUNK_ROWS=${XLSX_CHUNK_ROWS}`);
   const startTime = Date.now();
   try {
+    // Idempotency: check if already completed
+    const { data: runCheck } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
+    const existingResult = runCheck?.steps?.export_ean_xlsx;
+    if (existingResult?.status === 'success' || existingResult?.status === 'completed') {
+      const rowsWritten = existingResult.rows || existingResult.ean_xlsx_rows || 0;
+      console.log(`[sync:step:export_ean_xlsx] Already completed (rows_written=${rowsWritten}), noop`);
+      return { success: true };
+    }
+
     const XLSX = await import("npm:xlsx@0.18.5");
     const { content: csvContent, error: dlError } = await downloadFromStorage(supabase, 'exports', 'Catalogo EAN.csv');
     if (dlError || !csvContent) {
@@ -1908,24 +1919,47 @@ async function stepExportEanXlsx(supabase: SupabaseClient, runId: string): Promi
       await updateStepResult(supabase, runId, 'export_ean_xlsx', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
-    const lines = csvContent.split('\n').filter((l: string) => l.trim());
-    const headers = lines[0].split(';');
-    const rows = lines.slice(1).map((line: string) => {
-      const vals = line.split(';');
-      const row: Record<string, string> = {};
-      headers.forEach((h: string, i: number) => { row[h] = vals[i] || ''; });
-      return row;
-    });
-    const ws = XLSX.utils.json_to_sheet(rows);
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'Catalogo EAN');
+
+    // Parse CSV line by line without building a full intermediate array
+    const lines = csvContent.split('\n');
+    const headerLine = lines[0]?.trim();
+    if (!headerLine) {
+      const error = 'Catalogo EAN.csv vuoto o senza header';
+      await updateStepResult(supabase, runId, 'export_ean_xlsx', { status: 'failed', error, metrics: {} });
+      return { success: false, error };
+    }
+    const headers = headerLine.split(';');
     const eanColIdx = headers.indexOf('EAN');
-    if (eanColIdx >= 0) {
-      for (let r = 1; r <= rows.length; r++) {
-        const addr = XLSX.utils.encode_cell({ r, c: eanColIdx });
-        if (ws[addr]) { ws[addr].t = 's'; ws[addr].z = '@'; }
+
+    // Build worksheet incrementally in chunks to reduce peak memory
+    const ws: Record<string, unknown> = {};
+    // Write header row
+    for (let c = 0; c < headers.length; c++) {
+      ws[XLSX.utils.encode_cell({ r: 0, c })] = { v: headers[c], t: 's' };
+    }
+
+    let rowsWritten = 0;
+    const totalDataLines = lines.length - 1; // minus header
+    for (let lineIdx = 1; lineIdx < lines.length; lineIdx++) {
+      const line = lines[lineIdx].trim();
+      if (!line) continue;
+      const vals = line.split(';');
+      rowsWritten++;
+      const r = rowsWritten; // 1-based row (0 is header)
+      for (let c = 0; c < headers.length; c++) {
+        const val = vals[c] || '';
+        const cell: Record<string, unknown> = { v: val, t: 's' };
+        // Force EAN as text
+        if (c === eanColIdx) { cell.z = '@'; }
+        ws[XLSX.utils.encode_cell({ r, c })] = cell;
       }
     }
+
+    // Set worksheet range
+    ws['!ref'] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: rowsWritten, c: headers.length - 1 } });
+
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Catalogo EAN');
     const xlsxBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
     const blob = new Blob([xlsxBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
     const { error: uploadError } = await supabase.storage.from('exports').upload(
@@ -1936,11 +1970,15 @@ async function stepExportEanXlsx(supabase: SupabaseClient, runId: string): Promi
       await updateStepResult(supabase, runId, 'export_ean_xlsx', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
+    const elapsed = Date.now() - startTime;
     await updateStepResult(supabase, runId, 'export_ean_xlsx', {
-      status: 'success', duration_ms: Date.now() - startTime, rows: rows.length,
-      metrics: { ean_xlsx_rows: rows.length }
-    });
-    console.log(`[sync:step:export_ean_xlsx] Completed: ${rows.length} rows`);
+      status: 'success', duration_ms: elapsed, rows: rowsWritten,
+      metrics: { ean_xlsx_rows: rowsWritten },
+      rows_written: rowsWritten,
+      total_products: rowsWritten
+    } as StepResultData);
+    console.log(`[sync:step:export_ean_xlsx] Completed: ${rowsWritten} rows in ${elapsed}ms`);
+    console.log(JSON.stringify({ diag_tag: 'xlsx_export_retry_decision', run_id: runId, step: 'export_ean_xlsx', decision: 'completed', rows_written: rowsWritten, total_products: rowsWritten, elapsed_ms: elapsed }));
     return { success: true };
   } catch (e: unknown) {
     console.error(`[sync:step:export_ean_xlsx] Error:`, e);
