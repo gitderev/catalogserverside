@@ -13,16 +13,18 @@ const corsHeaders = {
 };
 
 /**
- * run-full-sync - ORCHESTRATORE LEGGERO CON RESUME
+ * run-full-sync - ORCHESTRATORE LEGGERO CON RESUME via cron-tick
  * 
  * Non esegue logica di business, solo orchestrazione.
  * Chiama step separati tramite sync-step-runner per evitare WORKER_LIMIT.
  * 
  * RESUME: Se parse_merge (o altri step chunked) richiedono più di
- * ORCHESTRATOR_BUDGET_MS, l'orchestratore YIELD e restituisce
- * { status: 'in_progress', run_id, needs_resume: true }.
- * Il chiamante (UI o cron) deve richiamare con { resume_run_id: runId }
- * per continuare la stessa run.
+ * ORCHESTRATOR_BUDGET_MS, l'orchestratore YIELD, RILASCIA IL LOCK,
+ * e restituisce { status: 'yielded', run_id, needs_resume: true }.
+ * cron-tick (ogni 5 min) rileva la run in stato running e la riprende.
+ * 
+ * LOCK POLICY: acquire a inizio invocazione, release SEMPRE in finally
+ * (anche su yield e error). Nessun lock mantenuto tra invocazioni.
  * 
  * SFTP upload: SOLO per trigger === 'cron'.
  * File SFTP: Export Mediaworld.csv, Export ePrice.csv, catalogo_ean.xlsx,
@@ -149,59 +151,6 @@ async function finalizeRun(supabase: SupabaseClient, runId: string, status: stri
   console.log(`[orchestrator] Run ${runId} finalized: ${status}`);
 }
 
-/**
- * Renew (or acquire) the global_sync lock for a given run_id.
- * - If lock exists for this run_id: renew lease
- * - If no lock: acquire fresh
- * - If lock exists for DIFFERENT run_id: fail
- */
-async function acquireOrRenewLock(
-  supabase: SupabaseClient,
-  runId: string,
-  ttlSeconds: number
-): Promise<{ acquired: boolean; owner_run_id?: string; lease_until?: string }> {
-  const newLease = new Date(Date.now() + ttlSeconds * 1000).toISOString();
-  
-  // Try to renew existing lock for same run_id
-  const { data: renewed, error: renewErr } = await supabase
-    .from('sync_locks')
-    .update({ lease_until: newLease, updated_at: new Date().toISOString() })
-    .eq('lock_name', 'global_sync')
-    .eq('run_id', runId)
-    .select('lock_name')
-    .maybeSingle();
-  
-  if (renewed) {
-    console.log(`[orchestrator] Lock renewed for run ${runId}, lease until ${newLease}`);
-    return { acquired: true };
-  }
-  
-  // No existing lock for this run_id - try to acquire fresh
-  const { data: lockResult } = await supabase.rpc('try_acquire_sync_lock', {
-    p_lock_name: 'global_sync',
-    p_run_id: runId,
-    p_ttl_seconds: ttlSeconds
-  });
-  
-  if (lockResult) {
-    console.log(`[orchestrator] Lock acquired fresh for run ${runId}`);
-    return { acquired: true };
-  }
-  
-  // Lock held by someone else - find who
-  const { data: existingLock } = await supabase
-    .from('sync_locks')
-    .select('run_id, lease_until')
-    .eq('lock_name', 'global_sync')
-    .maybeSingle();
-  
-  return { 
-    acquired: false, 
-    owner_run_id: existingLock?.run_id, 
-    lease_until: existingLock?.lease_until 
-  };
-}
-
 serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
   if (req.method !== 'POST') {
@@ -216,7 +165,6 @@ serve(async (req) => {
   let runId: string | null = null;
   let startTime = Date.now();
   let supabase: SupabaseClient | null = null;
-  let shouldReleaseLock = true; // Set to false on yield
   const orchestratorStart = Date.now();
 
   try {
@@ -235,7 +183,9 @@ serve(async (req) => {
     // Load sync_config for run_timeout_minutes
     const { data: syncConfig } = await supabase.from('sync_config').select('run_timeout_minutes').eq('id', 1).single();
     const runTimeoutMinutes = syncConfig?.run_timeout_minutes || 60;
-    const ttlSeconds = runTimeoutMinutes * 60;
+    // Lock TTL: just enough for this invocation (60s), NOT the full run timeout.
+    // Lock is released in finally and re-acquired at next invocation.
+    const lockTtlSeconds = 120; // 2min safety margin over 60s edge function limit
 
     // ========== RESUME MODE ==========
     if (resumeRunId) {
@@ -260,51 +210,71 @@ serve(async (req) => {
           { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       }
       
-      // Renew lock
-      const lockResult = await acquireOrRenewLock(supabase, runId, ttlSeconds);
-      if (!lockResult.acquired) {
-        console.log(`[orchestrator] Cannot renew lock for resume: held by ${lockResult.owner_run_id}`);
+      // Acquire lock (fresh, not renew - lock was released after last yield)
+      const { data: lockResult } = await supabase.rpc('try_acquire_sync_lock', {
+        p_lock_name: 'global_sync',
+        p_run_id: runId,
+        p_ttl_seconds: lockTtlSeconds
+      });
+      
+      if (!lockResult) {
+        // Lock held by someone else - check who
+        const { data: existingLock } = await supabase
+          .from('sync_locks')
+          .select('run_id, lease_until')
+          .eq('lock_name', 'global_sync')
+          .maybeSingle();
+        
+        console.log(`[orchestrator] Cannot acquire lock for resume: held by ${existingLock?.run_id}`);
         try {
           await supabase.rpc('log_sync_event', {
             p_run_id: runId,
             p_level: 'WARN',
-            p_message: 'Resume bloccato: lock occupato da altra run',
+            p_message: 'resume_locked_skip: lock occupato',
             p_details: { 
               step: 'orchestrator_resume', 
-              owner_run_id: lockResult.owner_run_id, 
-              lease_until: lockResult.lease_until 
+              owner_run_id: existingLock?.run_id, 
+              lease_until: existingLock?.lease_until,
+              origin: trigger
             }
           });
         } catch (_) { /* non-blocking */ }
         return new Response(JSON.stringify({ 
-          status: 'locked', message: 'resume_locked', 
-          owner_run_id: lockResult.owner_run_id, 
-          lease_until: lockResult.lease_until 
+          status: 'locked', message: 'resume_locked_skip', 
+          owner_run_id: existingLock?.run_id, 
+          lease_until: existingLock?.lease_until 
         }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       }
       
       startTime = new Date(existingRun.started_at).getTime();
       const currentStep = existingRun.steps?.current_step || 'parse_merge';
-      console.log(`[orchestrator] Resuming run ${runId} at step: ${currentStep}`);
+      console.log(`[orchestrator] Resuming run ${runId} at step: ${currentStep}, lock acquired`);
       
       // Log resume event
       try {
+        const stepState = existingRun.steps?.[currentStep] || {};
         await supabase.rpc('log_sync_event', {
           p_run_id: runId,
           p_level: 'INFO',
-          p_message: 'Orchestrator resume triggered',
-          p_details: { step: currentStep, origin: trigger, elapsed_since_start_ms: Date.now() - startTime }
+          p_message: 'resume_triggered',
+          p_details: { 
+            step: currentStep, 
+            origin: trigger, 
+            elapsed_since_start_ms: Date.now() - startTime,
+            cursor_pos: stepState.cursor_pos,
+            chunk_index: stepState.chunk_index,
+            file_total_size: stepState.materialBytes
+          }
         });
       } catch (_) { /* non-blocking */ }
       
-      // Determine which step to resume at
       // Load fee_config for steps that need it
       const FEE_CONFIG_SINGLETON_ID = '00000000-0000-0000-0000-000000000001';
       const { data: feeData } = await supabase.from('fee_config').select('*').eq('id', FEE_CONFIG_SINGLETON_ID).maybeSingle();
       const feeConfig = buildFeeConfig(feeData);
       
       // Resume the pipeline from the current step
-      return await runPipeline(supabase, supabaseUrl, supabaseServiceKey, runId, existingRun.trigger_type || trigger, feeConfig, startTime, currentStep, orchestratorStart, (val: boolean) => { shouldReleaseLock = val; });
+      return await runPipeline(supabase, supabaseUrl, supabaseServiceKey, runId, existingRun.trigger_type || trigger, feeConfig, startTime, currentStep, orchestratorStart);
     }
 
     // ========== NEW RUN MODE ==========
@@ -324,12 +294,79 @@ serve(async (req) => {
           { status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       }
       console.log(`[orchestrator] Manual trigger by user: ${userData.user.id}`);
+      
+      // Check if there's already a running run - resume it instead of creating new
+      const { data: existingRunning } = await supabase
+        .from('sync_runs')
+        .select('id, steps, started_at, trigger_type')
+        .eq('status', 'running')
+        .limit(1);
+      
+      if (existingRunning?.length) {
+        const existing = existingRunning[0];
+        console.log(`[orchestrator] Found existing running run ${existing.id}, resuming instead of creating new`);
+        runId = existing.id;
+        
+        // Try to acquire lock
+        const { data: lockOk } = await supabase.rpc('try_acquire_sync_lock', {
+          p_lock_name: 'global_sync',
+          p_run_id: runId,
+          p_ttl_seconds: lockTtlSeconds
+        });
+        
+        if (!lockOk) {
+          // Lock held - check if by same run (renew) or different
+          const { data: lockUpdate } = await supabase
+            .from('sync_locks')
+            .update({ lease_until: new Date(Date.now() + lockTtlSeconds * 1000).toISOString(), updated_at: new Date().toISOString() })
+            .eq('lock_name', 'global_sync')
+            .eq('run_id', runId)
+            .select('lock_name')
+            .maybeSingle();
+          
+          if (!lockUpdate) {
+            try {
+              await supabase.rpc('log_sync_event', {
+                p_run_id: runId,
+                p_level: 'INFO',
+                p_message: 'start_resuming_existing_run: lock occupato, resume delegato a cron-tick',
+                p_details: { origin: 'manual' }
+              });
+            } catch (_) {}
+            return new Response(JSON.stringify({ status: 'locked', message: 'run in corso, resume delegato a cron-tick', run_id: runId }), 
+              { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+          }
+        }
+        
+        try {
+          await supabase.rpc('log_sync_event', {
+            p_run_id: runId,
+            p_level: 'INFO',
+            p_message: 'start_resuming_existing_run',
+            p_details: { origin: 'manual', step: existing.steps?.current_step }
+          });
+        } catch (_) {}
+        
+        startTime = new Date(existing.started_at).getTime();
+        const currentStep = existing.steps?.current_step || 'parse_merge';
+        
+        const FEE_CONFIG_SINGLETON_ID = '00000000-0000-0000-0000-000000000001';
+        const { data: feeData } = await supabase.from('fee_config').select('*').eq('id', FEE_CONFIG_SINGLETON_ID).maybeSingle();
+        const feeConfig = buildFeeConfig(feeData);
+        
+        return await runPipeline(supabase, supabaseUrl, supabaseServiceKey, runId, existing.trigger_type || trigger, feeConfig, startTime, currentStep, orchestratorStart);
+      }
     }
 
     runId = crypto.randomUUID();
     
-    const lockResult = await acquireOrRenewLock(supabase, runId, ttlSeconds);
-    if (!lockResult.acquired) {
+    const { data: lockResult } = await supabase.rpc('try_acquire_sync_lock', {
+      p_lock_name: 'global_sync',
+      p_run_id: runId,
+      p_ttl_seconds: lockTtlSeconds
+    });
+    
+    if (!lockResult) {
       console.log('[orchestrator] INFO: Lock not acquired, sync already in progress');
       runId = null;
       return new Response(JSON.stringify({ status: 'locked', message: 'not_started' }), 
@@ -349,8 +386,17 @@ serve(async (req) => {
       location_warnings: {}, warning_count: 0, file_manifest: {}
     });
     console.log(`[orchestrator] Run created: ${runId}`);
+    
+    try {
+      await supabase.rpc('log_sync_event', {
+        p_run_id: runId,
+        p_level: 'INFO',
+        p_message: 'start_created_run',
+        p_details: { origin: trigger, attempt: attemptNumber }
+      });
+    } catch (_) {}
 
-    return await runPipeline(supabase, supabaseUrl, supabaseServiceKey, runId, trigger, feeConfig, startTime, 'import_ftp', orchestratorStart, (val: boolean) => { shouldReleaseLock = val; });
+    return await runPipeline(supabase, supabaseUrl, supabaseServiceKey, runId, trigger, feeConfig, startTime, 'import_ftp', orchestratorStart);
 
   } catch (err: unknown) {
     console.error('[orchestrator] Fatal error:', err);
@@ -371,7 +417,8 @@ serve(async (req) => {
     return new Response(JSON.stringify({ status: 'error', message: errMsg(err) }), 
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   } finally {
-    if (runId && supabase && shouldReleaseLock) {
+    // ALWAYS release lock - even on yield, error, success
+    if (runId && supabase) {
       try {
         const { data: released } = await supabase.rpc('release_sync_lock', {
           p_lock_name: 'global_sync',
@@ -380,13 +427,11 @@ serve(async (req) => {
         if (released) {
           console.log(`[orchestrator] Lock released for run ${runId}`);
         } else {
-          console.warn(`[orchestrator] WARN: Lock release returned false for run ${runId}`);
+          console.log(`[orchestrator] Lock release: no lock found for run ${runId} (already released or expired)`);
         }
       } catch (e: unknown) {
         console.warn(`[orchestrator] WARN: Failed to release lock: ${errMsg(e)}`);
       }
-    } else if (runId && !shouldReleaseLock) {
-      console.log(`[orchestrator] Lock NOT released (yield mode) for run ${runId}`);
     }
   }
 });
@@ -435,32 +480,42 @@ async function runPipeline(
   runStartTime: number,
   resumeFromStep: string,
   orchestratorStart: number,
-  setReleaseLock: (val: boolean) => void
 ): Promise<Response> {
   
   const budgetExceeded = () => (Date.now() - orchestratorStart) > ORCHESTRATOR_BUDGET_MS;
   
-  // Helper to yield
+  // Helper to yield - lock will be released in finally block
   const yieldResponse = async (currentStep: string, reason: string): Promise<Response> => {
-    setReleaseLock(false); // Keep lock
     console.log(`[orchestrator] YIELD at step ${currentStep}: ${reason}`);
+    
+    // Read current step state for logging
+    let stepState: Record<string, unknown> = {};
+    try {
+      const { data: run } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
+      stepState = run?.steps?.[currentStep] || {};
+    } catch (_) {}
     
     try {
       await supabase.rpc('log_sync_event', {
         p_run_id: runId,
         p_level: 'INFO',
-        p_message: `Orchestrator yield: ${reason}`,
+        p_message: 'orchestrator_yield_scheduled',
         p_details: { 
           step: currentStep, 
           orchestrator_elapsed_ms: Date.now() - orchestratorStart,
           budget_ms: ORCHESTRATOR_BUDGET_MS,
-          reason 
+          reason,
+          cursor_pos_end: stepState.cursor_pos,
+          file_total_size: stepState.materialBytes,
+          chunk_index: stepState.chunk_index,
+          resume_via: 'cron-tick (every 5min)'
         }
       });
     } catch (_) { /* non-blocking */ }
     
+    // Lock is released in finally block - cron-tick will re-acquire
     return new Response(JSON.stringify({ 
-      status: 'in_progress', 
+      status: 'yielded', 
       run_id: runId, 
       current_step: currentStep,
       needs_resume: true 
