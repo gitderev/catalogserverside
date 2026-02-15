@@ -2114,11 +2114,15 @@ async function stepExportAmazon(supabase: SupabaseClient, runId: string, feeConf
     const txtSave = await uploadToStorage(supabase, 'exports', 'amazon_price_inventory.txt', txtContent, 'text/plain');
     if (!txtSave.success) { await updateStepResult(supabase, runId, 'export_amazon', { status: 'failed', error: txtSave.error!, metrics: {} }); return { success: false, error: txtSave.error }; }
 
+    const elapsed = Date.now() - startTime;
     await updateStepResult(supabase, runId, 'export_amazon', {
-      status: 'success', duration_ms: Date.now() - startTime, rows: validRecords.length, skipped,
-      metrics: { amazon_export_rows: validRecords.length, amazon_export_skipped: skipped }
+      status: 'success', duration_ms: elapsed, rows: validRecords.length, skipped,
+      metrics: { amazon_export_rows: validRecords.length, amazon_export_skipped: skipped },
+      rows_written: validRecords.length,
+      total_products: validRecords.length
     });
-    console.log(`[sync:step:export_amazon] Completed: ${validRecords.length} rows`);
+    console.log(`[sync:step:export_amazon] Completed: ${validRecords.length} rows in ${elapsed}ms`);
+    console.log(JSON.stringify({ diag_tag: 'xlsx_export_retry_decision', run_id: runId, step: 'export_amazon', decision: 'completed', rows_written: validRecords.length, total_products: validRecords.length, elapsed_ms: elapsed }));
     return { success: true };
   } catch (e: unknown) {
     console.error(`[sync:step:export_amazon] Error:`, e);
