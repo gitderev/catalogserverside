@@ -815,6 +815,12 @@ async function runPipeline(
       return new Response(JSON.stringify({ status: 'failed', error: errText }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
+    // ---- Yield on in_progress: step needs more invocations ----
+    if (verification.status === 'in_progress') {
+      console.log(`[orchestrator] ${step} still in_progress after callStep, yielding for resume`);
+      return await yieldResponse(step, `step ${step} still in_progress, needs resume`);
+    }
+
     // ---- export_*: on success, clear retry state and log ----
     if (isExportStep && result.ok) {
       const { data: runData } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
@@ -881,16 +887,29 @@ async function runPipeline(
       
       if (!sftpResult.ok) {
         const sftpErr = typeof sftpResult.body === 'string' ? sftpResult.body : JSON.stringify(sftpResult.body);
+        // Mark upload_sftp as failed in steps
+        const { data: runDataSftp } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
+        const stepsSftp = runDataSftp?.steps || {};
+        await supabase.from('sync_runs').update({ steps: { ...stepsSftp, upload_sftp: { status: 'failed', error: sftpErr.substring(0, 200) } } }).eq('id', runId);
         await finalizeRun(supabase, runId, 'failed', runStartTime, `SFTP: ${sftpErr.substring(0, 200)}`);
         return new Response(JSON.stringify({ status: 'failed', error: sftpErr.substring(0, 200) }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       }
+      // Mark upload_sftp as success in steps
+      {
+        const { data: runDataSftp } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
+        const stepsSftp = runDataSftp?.steps || {};
+        await supabase.from('sync_runs').update({ steps: { ...stepsSftp, upload_sftp: { status: 'completed' } } }).eq('id', runId);
+      }
     } else {
-      console.log('[orchestrator] SFTP not configured, marking upload_sftp as skipped');
-      // Mark upload_sftp as skipped with reason
+      console.log('[orchestrator] SFTP not configured - failing run');
+      await updateCurrentStep(supabase, runId, 'upload_sftp');
+      // Mark upload_sftp as failed
       const { data: runData } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
       const currentSteps = runData?.steps || {};
-      const updatedSteps = { ...currentSteps, upload_sftp: { status: 'skipped', reason: 'sftp_disabled' }, current_step: 'upload_sftp' };
+      const updatedSteps = { ...currentSteps, upload_sftp: { status: 'failed', error: 'SFTP misconfigured' }, current_step: 'upload_sftp' };
       await supabase.from('sync_runs').update({ steps: updatedSteps }).eq('id', runId);
+      await finalizeRun(supabase, runId, 'failed', runStartTime, 'SFTP misconfigured');
+      return new Response(JSON.stringify({ status: 'failed', error: 'SFTP misconfigured' }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
   }
 
@@ -929,23 +948,38 @@ async function runPipeline(
   expectedSteps.push('upload_sftp');
 
   const missingSteps: string[] = [];
+  const incompleteSteps: string[] = [];
   for (const s of expectedSteps) {
     const st = finalSteps[s];
     if (!st || (typeof st === 'object' && !st.status)) {
       missingSteps.push(s);
+    } else if (typeof st === 'object' && st.status !== 'completed' && st.status !== 'success' && st.status !== 'skipped') {
+      // Step exists but not finished (e.g. in_progress, retry_delay, failed)
+      incompleteSteps.push(s);
     }
   }
 
   let finalStatus: string;
-  if (missingSteps.length > 0) {
-    console.warn(`[orchestrator] Missing steps: ${missingSteps.join(', ')}`);
+  if (missingSteps.length > 0 || incompleteSteps.length > 0) {
+    const allProblematic = [...missingSteps, ...incompleteSteps];
+    console.warn(`[orchestrator] Pipeline incomplete: missing=[${missingSteps}] incomplete=[${incompleteSteps}]`);
     try {
       await supabase.rpc('log_sync_event', {
-        p_run_id: runId, p_level: 'WARN', p_message: 'pipeline_incomplete',
-        p_details: { missing_steps: missingSteps, expected: expectedSteps.length, found: expectedSteps.length - missingSteps.length }
+        p_run_id: runId, p_level: 'ERROR', p_message: 'pipeline_incomplete',
+        p_details: { missing_steps: missingSteps, incomplete_steps: incompleteSteps, expected: expectedSteps.length }
       });
     } catch (_) {}
-    finalStatus = 'success_with_warning';
+    finalStatus = 'failed';
+    await finalizeRun(supabase, runId, 'failed', runStartTime, `Pipeline incomplete: missing_steps=[${allProblematic.join(',')}]`);
+    try {
+      await fetch(`${supabaseUrl}/functions/v1/send-sync-notification`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${supabaseServiceKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ run_id: runId, status: 'failed' })
+      });
+    } catch (_) {}
+    return new Response(JSON.stringify({ status: 'failed', run_id: runId, error: `Pipeline incomplete: missing_steps=[${allProblematic.join(',')}]` }),
+      { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   } else {
     finalStatus = (finalRun?.warning_count || 0) > 0 ? 'success_with_warning' : 'success';
   }
