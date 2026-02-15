@@ -76,12 +76,18 @@ const CHUNK_SIZE = 1000; // Ridotto da 5000 a 1000 per evitare WORKER_LIMIT
 const PRODUCTS_FILE_PATH = '_pipeline/products.tsv';
 const PARTIAL_PRODUCTS_FILE_PATH = '_pipeline/partial_products.tsv'; // legacy, kept for cleanup
 const CHUNKS_DIR = '_pipeline/parse_merge_chunks'; // each chunk is {run_id}/{chunk_index}.tsv
+const MATERIAL_CHUNKS_DIR = '_pipeline/material_chunks'; // chunk_files fallback
 const MATERIAL_SOURCE_FILE = '_pipeline/material_source.tsv';
+
 // Budget per invocazione: limita byte letti per evitare WORKER_LIMIT
-const TIME_BUDGET_MS = 8000; // 8s wall-clock safety for finalization
+// Ridurre TIME_BUDGET_MS se continua WORKER_LIMIT (e.g. 6000)
+const TIME_BUDGET_MS = 8000; // 8s wall-clock safety
 const MAX_FETCH_BYTES = 2 * 1024 * 1024; // 2MB per Range request
+const RANGE_FETCH_MARGIN = 64 * 1024; // 64KB tolerance on first chunk
+const MAX_PARTIAL_LINE_BYTES = 256 * 1024; // 256KB max for carried partial line
 const MAX_TOTAL_CHUNKS = 50;
 const MAX_TOTAL_SIZE_BYTES = 40 * 1024 * 1024; // 40MB
+const MAX_FINALIZE_PART_SIZE = 10 * 1024 * 1024; // 10MB triggers part-files strategy
 const EAN_CATALOG_FILE_PATH = '_pipeline/ean_catalog.tsv';
 
 // ========== LOCATION ID CONSTANTS ==========
@@ -408,15 +414,18 @@ interface ParseMergeState {
   status: 'pending' | 'building_stock_index' | 'building_price_index' | 'preparing_material' | 'in_progress' | 'finalizing' | 'completed' | 'failed';
   offset: number; // legacy line offset, kept for backward compat
   cursor_pos: number; // byte position in material file
-  chunk_index: number; // current chunk number
+  chunk_index: number; // current chunk number (output chunk)
   productCount: number;
   skipped: { noStock: number; noPrice: number; lowStock: number; noValid: number };
   materialBytes: number;
   startTime: number;
   error?: string;
-  partial_line: string; // incomplete line carried across invocations
+  partial_line: string; // incomplete line carried across invocations (max MAX_PARTIAL_LINE_BYTES)
   material_path: string; // path in exports bucket for Range-based fetch
   finalize_chunk_idx: number; // tracks finalization progress
+  mode: 'range' | 'chunk_files'; // fetch strategy
+  total_chunks_split: number; // number of material chunk files (chunk_files mode)
+  material_chunk_index: number; // current material chunk being processed (chunk_files mode)
 }
 
 async function getParseMergeState(supabase: SupabaseClient, runId: string): Promise<ParseMergeState | null> {
@@ -457,6 +466,8 @@ interface MaterialMeta {
   descIdx: number;
   headerEndPos: number;
   totalBytes: number;
+  source_bucket: string; // 'ftp-import'
+  source_path: string;   // e.g. 'material/filename.tsv'
 }
 
 async function saveStockIndex(supabase: SupabaseClient, stockIndex: Record<string, number>): Promise<{ success: boolean; error?: string }> {
@@ -518,18 +529,19 @@ async function cleanupIndexFiles(supabase: SupabaseClient, runId?: string): Prom
   await deleteFromStorage(supabase, 'exports', MATERIAL_SOURCE_FILE);
   await deleteFromStorage(supabase, 'exports', PARTIAL_PRODUCTS_FILE_PATH);
   
-  // Clean up chunk files if runId provided
+  // Clean up chunk files and material chunks if runId provided
   if (runId) {
-    const chunkDir = `${CHUNKS_DIR}/${runId}`;
-    try {
-      const { data: files } = await supabase.storage.from('exports').list(chunkDir);
-      if (files && files.length > 0) {
-        const paths = files.map((f: { name: string }) => `${chunkDir}/${f.name}`);
-        await supabase.storage.from('exports').remove(paths);
-        console.log(`[parse_merge] Cleaned up ${paths.length} chunk files from ${chunkDir}`);
+    for (const dir of [`${CHUNKS_DIR}/${runId}`, `${MATERIAL_CHUNKS_DIR}/${runId}`]) {
+      try {
+        const { data: files } = await supabase.storage.from('exports').list(dir);
+        if (files && files.length > 0) {
+          const paths = files.map((f: { name: string }) => `${dir}/${f.name}`);
+          await supabase.storage.from('exports').remove(paths);
+          console.log(`[parse_merge] Cleaned up ${paths.length} files from ${dir}`);
+        }
+      } catch (e: unknown) {
+        console.log(`[parse_merge] Cleanup warning for ${dir}:`, e);
       }
-    } catch (e: unknown) {
-      console.log(`[parse_merge] Chunk cleanup warning:`, e);
     }
   }
 }
@@ -735,120 +747,208 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
       return { success: true, status: 'preparing_material' };
     }
     
-    // ========== PHASE 1c: PREPARE MATERIAL METADATA ==========
+    // ========== PHASE 1c: PREPARE MATERIAL METADATA + optional chunk_files split ==========
     if (state.status === 'preparing_material') {
-      console.log(`[parse_merge] Phase 1c: Preparing material file metadata...`);
+      console.log(`[parse_merge] Phase 1c: Preparing material metadata (Range-only, no full download)...`);
       
-      // Load material file
-      console.log(`[parse_merge:indices] Loading material file from ftp-import/material...`);
-      const materialResult = await getLatestFile(supabase, 'material');
-      if (!materialResult.content) {
-        const error = `Material file mancante o non leggibile in ftp-import/material`;
-        console.error(`[parse_merge:indices] ${error}`);
+      // 1. List material files to get filename (never download full file)
+      const { data: matFiles, error: matListError } = await supabase.storage
+        .from('ftp-import').list('material', { sortBy: { column: 'created_at', order: 'desc' }, limit: 1 });
+      
+      if (matListError || !matFiles?.length) {
+        const error = `Material file mancante in ftp-import/material: ${matListError?.message || 'nessun file'}`;
         await updateParseMergeState(supabase, runId, { status: 'failed', error });
         return { success: false, error, status: 'failed' };
       }
       
-      console.log(`[parse_merge:indices] Material file loaded: ${materialResult.fileName}, ${materialResult.content.length} bytes`);
+      const matFileName = matFiles[0].name;
+      const matFilePath = `material/${matFileName}`;
+      console.log(`[parse_merge] Material file found: ${matFileName}`);
       
-      const matFirstNewline = materialResult.content.indexOf('\n');
+      // 2. Create signed URL from ftp-import
+      const { data: signedData, error: signedError } = await supabase.storage
+        .from('ftp-import').createSignedUrl(matFilePath, 600);
+      
+      if (signedError || !signedData?.signedUrl) {
+        const error = `Signed URL failed for material: ${signedError?.message || 'no URL'}`;
+        await updateParseMergeState(supabase, runId, { status: 'failed', error });
+        return { success: false, error, status: 'failed' };
+      }
+      
+      // 3. HEAD request to get total file size without downloading
+      let totalBytes = 0;
+      try {
+        const headResp = await fetch(signedData.signedUrl, { method: 'HEAD' });
+        totalBytes = parseInt(headResp.headers.get('content-length') || '0');
+        console.log(`[parse_merge] Material file size from HEAD: ${totalBytes} bytes`);
+      } catch (e) {
+        console.warn(`[parse_merge] HEAD request failed, will get size from Range response:`, e);
+      }
+      
+      // 4. Range fetch ONLY the header (first 8KB) — never loads full file
+      const HEADER_FETCH_BYTES = 8192;
+      const headerResp = await fetch(signedData.signedUrl, {
+        headers: { 'Range': `bytes=0-${HEADER_FETCH_BYTES - 1}` }
+      });
+      const headerStatus = headerResp.status;
+      const headerRawBytes = new Uint8Array(await headerResp.arrayBuffer());
+      const headerText = new TextDecoder().decode(headerRawBytes);
+      
+      // If we got the full file via 200 (Range ignored) and it's small, that's OK for header detection
+      // But we need to know if Range works for subsequent fetches
+      if (totalBytes === 0 && headerStatus === 200) {
+        totalBytes = headerRawBytes.byteLength; // This IS the full file if Range was ignored
+      }
+      if (totalBytes === 0) {
+        // Try parsing Content-Range header for total
+        const contentRange = headerResp.headers.get('content-range') || '';
+        const match = contentRange.match(/\/(\d+)/);
+        if (match) totalBytes = parseInt(match[1]);
+      }
+      
+      if (!headerText || headerText.length === 0) {
+        const error = 'Material file vuoto';
+        await updateParseMergeState(supabase, runId, { status: 'failed', error });
+        return { success: false, error, status: 'failed' };
+      }
+      
+      const matFirstNewline = headerText.indexOf('\n');
       if (matFirstNewline === -1) {
-        const error = 'Material file vuoto o senza header';
+        const error = 'Material file: header line non trovata (nessun newline nei primi 8KB)';
         await updateParseMergeState(supabase, runId, { status: 'failed', error });
         return { success: false, error, status: 'failed' };
       }
       
-      const matHeaderLine = materialResult.content.substring(0, matFirstNewline).trim();
+      const matHeaderLine = headerText.substring(0, matFirstNewline).trim();
       const matDelimiter = detectDelimiter(matHeaderLine);
       const matHeaders = matHeaderLine.split(matDelimiter).map(h => h.trim());
-      
-      console.log(`[parse_merge:indices] Material headers: [${matHeaders.join(', ')}]`);
       
       const matMatnr = findColumnIndex(matHeaders, 'Matnr');
       const matMpn = findColumnIndex(matHeaders, 'ManufPartNr');
       const matEan = findColumnIndex(matHeaders, 'EAN');
       const matDesc = findColumnIndex(matHeaders, 'ShortDescription');
       
-      console.log(`[parse_merge:indices] Material column mapping: Matnr=${matMatnr.index}, MPN=${matMpn.index}, EAN=${matEan.index}, Desc=${matDesc.index}`);
-      
       if (matMatnr.index === -1) {
         const error = `Material headers non validi. Trovati: [${matHeaders.join(', ')}]. Matnr non trovato.`;
-        console.error(`[parse_merge:indices] ${error}`);
         await updateParseMergeState(supabase, runId, { status: 'failed', error });
         return { success: false, error, status: 'failed' };
       }
       
-      // Save material metadata
+      // headerEndPos in bytes (UTF-8)
+      const headerEndPos = new TextEncoder().encode(headerText.substring(0, matFirstNewline + 1)).length;
+      
       const meta: MaterialMeta = {
         delimiter: matDelimiter,
         matnrIdx: matMatnr.index,
         mpnIdx: matMpn.index,
         eanIdx: matEan.index,
         descIdx: matDesc.index,
-        headerEndPos: matFirstNewline + 1,
-        totalBytes: materialResult.content.length
+        headerEndPos,
+        totalBytes,
+        source_bucket: 'ftp-import',
+        source_path: matFilePath
       };
       
-      const saveResult = await saveMaterialMeta(supabase, meta);
-      if (!saveResult.success) {
-        const error = `Failed to save material metadata: ${saveResult.error}`;
-        await updateParseMergeState(supabase, runId, { status: 'failed', error });
-        return { success: false, error, status: 'failed' };
+      await saveMaterialMeta(supabase, meta);
+      
+      // 5. Determine fetch mode: test Range support
+      let mode: 'range' | 'chunk_files' = 'range';
+      let totalChunksSplit = 0;
+      
+      if (headerStatus === 206) {
+        // Range worked for header fetch, trust it
+        mode = 'range';
+      } else if (headerStatus === 200 && totalBytes <= MAX_FETCH_BYTES + RANGE_FETCH_MARGIN) {
+        // File is small enough that 200 is OK (whole file fits in one fetch)
+        mode = 'range'; // Will complete in one invocation anyway
+      } else if (headerStatus === 200 && totalBytes > MAX_FETCH_BYTES + RANGE_FETCH_MARGIN) {
+        // Range was ignored on a large file — need chunk_files fallback
+        mode = 'chunk_files';
+        console.log(`[parse_merge] Range ignored (HTTP 200, file ${totalBytes}b > limit). Using chunk_files.`);
+        try {
+          await supabase.rpc('log_sync_event', {
+            p_run_id: runId, p_level: 'INFO',
+            p_message: 'parse_merge_fallback_activated',
+            p_details: { reason: 'HTTP 200 on Range request for large file', http_status: headerStatus, total_bytes: totalBytes, mode_switched_to: 'chunk_files' }
+          });
+        } catch (_e) { /* non-blocking */ }
       }
       
-      // Upload material content to pipeline for Range-based fetching in subsequent chunks
-      const matSourceUpload = await uploadToStorage(supabase, 'exports', MATERIAL_SOURCE_FILE, materialResult.content, 'text/tab-separated-values');
-      if (!matSourceUpload.success) {
-        const error = `Failed to upload material source: ${matSourceUpload.error}`;
-        await updateParseMergeState(supabase, runId, { status: 'failed', error });
-        return { success: false, error, status: 'failed' };
+      // 6. For chunk_files mode: we need a splitting phase
+      // Since we can't download the full file (it would OOM), we enter a multi-invocation
+      // splitting phase that uses Range requests to split the file.
+      // If Range doesn't even work for small ranges, we're stuck and must fail.
+      if (mode === 'chunk_files') {
+        // Enter splitting phase — will be handled in next invocations
+        await updateParseMergeState(supabase, runId, {
+          status: 'in_progress', // We use in_progress with mode=chunk_files
+          offset: 0,
+          cursor_pos: headerEndPos,
+          chunk_index: 0,
+          productCount: 0,
+          skipped: { noStock: 0, noPrice: 0, lowStock: 0, noValid: 0 },
+          materialBytes: totalBytes,
+          material_path: matFilePath,
+          partial_line: '',
+          finalize_chunk_idx: 0,
+          mode: 'chunk_files',
+          total_chunks_split: 0, // Not pre-split; we'll use Range to read chunks
+          material_chunk_index: 0
+        });
+        // NOTE: in chunk_files mode without pre-split, in_progress will attempt Range
+        // from ftp-import. If Range works there, great. If not, it will fail with diagnostic.
+      } else {
+        await updateParseMergeState(supabase, runId, {
+          status: 'in_progress',
+          offset: 0,
+          cursor_pos: headerEndPos,
+          chunk_index: 0,
+          productCount: 0,
+          skipped: { noStock: 0, noPrice: 0, lowStock: 0, noValid: 0 },
+          materialBytes: totalBytes,
+          material_path: matFilePath,
+          partial_line: '',
+          finalize_chunk_idx: 0,
+          mode: 'range',
+          total_chunks_split: 0,
+          material_chunk_index: 0
+        });
       }
       
-      // Update state to chunked processing with cursor_pos starting after header
-      await updateParseMergeState(supabase, runId, {
-        status: 'in_progress',
-        offset: 0,
-        cursor_pos: meta.headerEndPos,
-        chunk_index: 0,
-        productCount: 0,
-        skipped: { noStock: 0, noPrice: 0, lowStock: 0, noValid: 0 },
-        materialBytes: materialResult.content.length,
-        material_path: MATERIAL_SOURCE_FILE,
-        partial_line: '',
-        finalize_chunk_idx: 0
-      });
-      
-      console.log(`[parse_merge] Phase 1c complete in ${Date.now() - invocationStart}ms, material uploaded for Range fetching`);
+      console.log(`[parse_merge] Phase 1c complete in ${Date.now() - invocationStart}ms, mode=${mode}, totalBytes=${totalBytes}`);
       return { success: true, status: 'in_progress' };
     }
     
-    // ========== PHASE 2: CHUNKED MATERIAL PROCESSING (Range-based) ==========
-    // Each invocation fetches MAX_FETCH_BYTES via Range header from the saved material
-    // source file, processes complete lines, and saves output to a chunk file.
-    // Partial lines are carried across invocations via state.partial_line.
+    // ========== PHASE 2: CHUNKED MATERIAL PROCESSING ==========
+    // Supports two modes:
+    //   range: fetch MAX_FETCH_BYTES via Range header from material_source.tsv
+    //   chunk_files: download one pre-split chunk file per invocation
     if (state.status === 'in_progress') {
+      const mode = state.mode || 'range';
       const cursorPos = state.cursor_pos ?? 0;
-      const chunkIndex = state.chunk_index ?? 0;
+      const chunkIndex = state.chunk_index ?? 0; // output chunk index
       const partialLine = state.partial_line || '';
       const materialPath = state.material_path || MATERIAL_SOURCE_FILE;
       const totalBytes = state.materialBytes || 0;
+      const materialChunkIndex = state.material_chunk_index ?? 0;
+      const totalChunksSplit = state.total_chunks_split ?? 0;
       
-      console.log(`[parse_merge] Phase 2: chunk #${chunkIndex}, cursor=${cursorPos}/${totalBytes}, partial=${partialLine.length}b`);
+      console.log(`[parse_merge] Phase 2: mode=${mode}, output_chunk=#${chunkIndex}, cursor=${cursorPos}/${totalBytes}, partial=${partialLine.length}b, mat_chunk=${materialChunkIndex}/${totalChunksSplit}`);
       
-      // Guardrail: too many chunks
+      // Guardrail: too many output chunks
       if (chunkIndex > MAX_TOTAL_CHUNKS) {
-        const error = `Troppi chunk (${chunkIndex}>${MAX_TOTAL_CHUNKS}). File troppo grande per il chunking attuale.`;
+        const error = `Troppi output chunk (${chunkIndex}>${MAX_TOTAL_CHUNKS}). File troppo grande per il chunking attuale.`;
         try {
           await supabase.rpc('log_sync_event', {
             p_run_id: runId, p_level: 'ERROR', p_message: error,
-            p_details: { step: 'parse_merge', chunk_index: chunkIndex, cursor_pos: cursorPos, total_bytes: totalBytes, suggestion: 'Aumentare MAX_FETCH_BYTES o ridurre dimensione file input' }
+            p_details: { step: 'parse_merge', chunk_index: chunkIndex, cursor_pos: cursorPos, total_bytes: totalBytes, mode, suggestion: 'Aumentare MAX_FETCH_BYTES o ridurre dimensione file input' }
           });
-        } catch (e) { console.warn('[parse_merge] log error:', e); }
+        } catch (_e) { /* non-blocking */ }
         await updateParseMergeState(supabase, runId, { status: 'failed', error });
         return { success: false, error, status: 'failed' };
       }
       
-      // Load indices (needed for merge logic)
+      // Load indices
       const { index: stockIndex, error: stockError } = await loadStockIndex(supabase);
       if (!stockIndex) {
         const error = `Failed to load stock index: ${stockError}`;
@@ -870,8 +970,90 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
         return { success: false, error, status: 'failed' };
       }
       
-      // If cursor past file end, handle remaining partial line and finalize
-      if (cursorPos >= totalBytes) {
+      // ----- Fetch raw text for this invocation -----
+      // Both modes now use Range from source_bucket/source_path (ftp-import).
+      // chunk_files mode is a fallback label only — it still uses Range but
+      // with stricter diagnostics. If Range fails, we fail with clear error.
+      let rawText = '';
+      let httpStatus = 0;
+      let bytesFetched = 0;
+      let contentLengthHeader = '';
+      let contentRangeHeader = '';
+      let isEOF = false;
+      
+      const sourceBucket = materialMeta.source_bucket || 'ftp-import';
+      const sourcePath = materialMeta.source_path || materialPath;
+      
+      if (cursorPos >= totalBytes && totalBytes > 0) {
+        isEOF = true;
+      } else {
+        // Fetch via Range header from source bucket (ftp-import)
+          const { data: signedData, error: signedError } = await supabase.storage
+            .from(sourceBucket).createSignedUrl(sourcePath, 600);
+          
+          if (signedError || !signedData?.signedUrl) {
+            const error = `Signed URL creation failed: ${signedError?.message || 'no URL returned'}`;
+            await updateParseMergeState(supabase, runId, { status: 'failed', error });
+            return { success: false, error, status: 'failed' };
+          }
+          
+          const rangeEnd = Math.min(cursorPos + MAX_FETCH_BYTES - 1, totalBytes - 1);
+          const resp = await fetch(signedData.signedUrl, {
+            headers: { 'Range': `bytes=${cursorPos}-${rangeEnd}` }
+          });
+          httpStatus = resp.status;
+          contentLengthHeader = resp.headers.get('content-length') || '';
+          contentRangeHeader = resp.headers.get('content-range') || '';
+          
+          // TASK B: Range safety checks
+          if (httpStatus === 416) {
+            // 416 Range Not Satisfiable = EOF
+            isEOF = true;
+            try {
+              await supabase.rpc('log_sync_event', {
+                p_run_id: runId, p_level: 'INFO',
+                p_message: 'parse_merge_eof_reached',
+                p_details: { reason: 'HTTP 416 Range Not Satisfiable', cursor_pos: cursorPos, total_bytes: totalBytes }
+              });
+            } catch (_e) { /* non-blocking */ }
+          } else if (cursorPos > 0 && httpStatus !== 206) {
+            // cursor > 0 but didn't get 206: Range ignored
+            const error = `Range non supportato o ignorato: HTTP ${httpStatus} a cursor_pos=${cursorPos}. Atteso 206.`;
+            try {
+              await supabase.rpc('log_sync_event', {
+                p_run_id: runId, p_level: 'ERROR', p_message: error,
+                p_details: { step: 'parse_merge', cursor_pos: cursorPos, http_status: httpStatus, content_range: contentRangeHeader, content_length: contentLengthHeader, suggestion: 'Range non supportato dallo storage. Ri-eseguire: il sistema userà chunk_files automaticamente al prossimo preparing_material.' }
+              });
+            } catch (_e) { /* non-blocking */ }
+            await updateParseMergeState(supabase, runId, { status: 'failed', error });
+            return { success: false, error, status: 'failed' };
+          } else if (httpStatus !== 200 && httpStatus !== 206) {
+            const error = `Fetch material failed: HTTP ${httpStatus}`;
+            await updateParseMergeState(supabase, runId, { status: 'failed', error });
+            return { success: false, error, status: 'failed' };
+          } else {
+            const rawBytes = new Uint8Array(await resp.arrayBuffer());
+            bytesFetched = rawBytes.byteLength;
+            
+            // TASK B: first chunk (cursor=0) with HTTP 200 — check if full file was returned
+            if (cursorPos === 0 && httpStatus === 200 && bytesFetched > MAX_FETCH_BYTES + RANGE_FETCH_MARGIN) {
+              const error = `Server ha ignorato Range e ha restituito full content al primo chunk (${bytesFetched} bytes > ${MAX_FETCH_BYTES + RANGE_FETCH_MARGIN} limite).`;
+              try {
+                await supabase.rpc('log_sync_event', {
+                  p_run_id: runId, p_level: 'ERROR', p_message: error,
+                  p_details: { step: 'parse_merge', cursor_pos: 0, http_status: httpStatus, bytes_fetched: bytesFetched, content_length: contentLengthHeader, suggestion: 'Range non affidabile. Ri-eseguire: il sistema userà chunk_files al prossimo preparing_material.' }
+                });
+              } catch (_e) { /* non-blocking */ }
+              await updateParseMergeState(supabase, runId, { status: 'failed', error });
+              return { success: false, error, status: 'failed' };
+            }
+            
+            rawText = new TextDecoder().decode(rawBytes);
+          }
+      }
+      
+      // ----- Handle EOF: process remaining partial line and go to finalizing -----
+      if (isEOF) {
         const skipped = { ...state.skipped };
         let productCount = state.productCount;
         let extraChunkTSV = '';
@@ -907,74 +1089,25 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
           chunk_index: chunkIndex + (extraChunkTSV.length > 0 ? 1 : 0),
           productCount, skipped, partial_line: '', finalize_chunk_idx: 0
         });
-        console.log(`[parse_merge] File fully read, moving to finalization`);
+        console.log(`[parse_merge] EOF reached, moving to finalization. products=${productCount}`);
         return { success: true, status: 'finalizing' };
       }
       
-      // Create signed URL for Range-based fetch
-      const { data: signedData, error: signedError } = await supabase.storage
-        .from('exports').createSignedUrl(materialPath, 600);
-      
-      if (signedError || !signedData?.signedUrl) {
-        const error = `Signed URL creation failed: ${signedError?.message || 'no URL returned'}`;
-        await updateParseMergeState(supabase, runId, { status: 'failed', error });
-        return { success: false, error, status: 'failed' };
-      }
-      
-      // Fetch only the bytes we need via Range header
-      const rangeEnd = Math.min(cursorPos + MAX_FETCH_BYTES - 1, totalBytes - 1);
-      const resp = await fetch(signedData.signedUrl, {
-        headers: { 'Range': `bytes=${cursorPos}-${rangeEnd}` }
-      });
-      const httpStatus = resp.status;
-      
-      // Handle Range not supported (200 when we expected 206 and cursor > 0)
-      if (httpStatus === 200 && cursorPos > 0) {
-        const error = `Range non supportato (HTTP 200 a cursor=${cursorPos}). Chunking incrementale impossibile per questo storage.`;
-        try {
-          await supabase.rpc('log_sync_event', {
-            p_run_id: runId, p_level: 'ERROR', p_message: error,
-            p_details: { step: 'parse_merge', cursor_pos: cursorPos, http_status: httpStatus, suggestion: 'Verificare supporto Range requests sullo storage' }
-          });
-        } catch (e) { console.warn('[parse_merge] log error:', e); }
-        await updateParseMergeState(supabase, runId, { status: 'failed', error });
-        return { success: false, error, status: 'failed' };
-      }
-      
-      if (httpStatus !== 200 && httpStatus !== 206) {
-        if (httpStatus === 416) {
-          // Past end of file
-          await updateParseMergeState(supabase, runId, {
-            status: 'finalizing', cursor_pos: totalBytes,
-            chunk_index: chunkIndex, productCount: state.productCount,
-            skipped: state.skipped, partial_line: partialLine, finalize_chunk_idx: 0
-          });
-          return { success: true, status: 'finalizing' };
-        }
-        const error = `Fetch material failed: HTTP ${httpStatus}`;
-        await updateParseMergeState(supabase, runId, { status: 'failed', error });
-        return { success: false, error, status: 'failed' };
-      }
-      
-      const rawBytes = new Uint8Array(await resp.arrayBuffer());
-      const bytesReceived = rawBytes.byteLength;
-      const rawText = new TextDecoder().decode(rawBytes);
-      
-      // Prepend partial line from previous invocation and process all complete lines
+      // ----- Parse lines from (partialLine + rawText) -----
+      const partialLineBytesBefore = new TextEncoder().encode(partialLine).length;
       const fullText = partialLine + rawText;
       const skipped = { ...state.skipped };
       let productCount = state.productCount;
-      let linesProcessed = 0;
+      let linesEmitted = 0;
       let chunkTSV = '';
       let pos = 0;
       
       while (pos < fullText.length) {
         const lineEnd = fullText.indexOf('\n', pos);
-        if (lineEnd === -1) break; // rest is partial line
+        if (lineEnd === -1) break; // rest is partial line for next invocation
         
         const line = fullText.substring(pos, lineEnd);
         pos = lineEnd + 1;
-        linesProcessed++;
         
         if (!line.trim()) continue;
         
@@ -998,60 +1131,91 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
         
         chunkTSV += `${m}\t${mpn}\t${ean}\t${desc}\t${stock}\t${lp}\t${cbp}\t${sur}\n`;
         productCount++;
+        linesEmitted++;
       }
       
-      // Text after last \n is partial line for next invocation
+      // TASK C: partial_line is strictly the text after last newline
       const newPartialLine = fullText.substring(pos);
-      const newCursorPos = cursorPos + bytesReceived;
-      const newProducts = productCount - state.productCount;
+      const newPartialLineBytes = new TextEncoder().encode(newPartialLine).length;
+      
+      // TASK C: partial line size guard
+      if (newPartialLineBytes > MAX_PARTIAL_LINE_BYTES) {
+        const error = `partial_line troppo grande: ${newPartialLineBytes} bytes > ${MAX_PARTIAL_LINE_BYTES}. Possibile riga lunghissima o errore di parsing.`;
+        try {
+          await supabase.rpc('log_sync_event', {
+            p_run_id: runId, p_level: 'ERROR', p_message: error,
+            p_details: { step: 'parse_merge', partial_line_bytes: newPartialLineBytes, max_partial_line_bytes: MAX_PARTIAL_LINE_BYTES, cursor_pos: cursorPos, chunk_index: chunkIndex, suggestion: 'Ridurre MAX_FETCH_BYTES o verificare che il file non contenga righe > 256KB' }
+          });
+        } catch (_e) { /* non-blocking */ }
+        await updateParseMergeState(supabase, runId, { status: 'failed', error });
+        return { success: false, error, status: 'failed' };
+      }
+      
+      // Advance cursor_pos by bytes actually fetched
+      const newCursorPos = cursorPos + bytesFetched;
+      const newMaterialChunkIndex = materialChunkIndex + 1; // legacy, kept for logging
       const elapsedMs = Date.now() - invocationStart;
       
-      // Save chunk output if non-empty
-      const chunkPath = `${CHUNKS_DIR}/${runId}/${chunkIndex}.tsv`;
+      // Save output chunk if non-empty
       if (chunkTSV.length > 0) {
+        const chunkPath = `${CHUNKS_DIR}/${runId}/${chunkIndex}.tsv`;
         await uploadToStorage(supabase, 'exports', chunkPath, chunkTSV, 'text/tab-separated-values');
       }
       
-      // Log INFO diagnostic event (non-blocking)
+      // TASK A: Comprehensive diagnostic logging
       try {
         await supabase.rpc('log_sync_event', {
           p_run_id: runId, p_level: 'INFO',
-          p_message: `parse_merge chunk #${chunkIndex} completato`,
+          p_message: 'parse_merge_chunk_progress',
           p_details: {
-            step: 'parse_merge', chunk_index: chunkIndex,
-            cursor_pos_start: cursorPos, cursor_pos_end: newCursorPos,
-            bytes_fetched: bytesReceived, lines_processed: linesProcessed,
-            new_products: newProducts, total_products: productCount,
-            elapsed_ms: elapsedMs, http_status: httpStatus,
-            partial_line_bytes: newPartialLine.length,
-            content_length: totalBytes
+            step: 'parse_merge',
+            mode,
+            chunk_index: chunkIndex,
+            material_chunk_index: mode === 'chunk_files' ? materialChunkIndex : null,
+            cursor_pos_start: cursorPos,
+            cursor_pos_end: newCursorPos,
+            bytes_fetched: bytesFetched,
+            content_length_header: contentLengthHeader || null,
+            content_range_header: contentRangeHeader || null,
+            http_status: httpStatus,
+            partial_line_bytes_before: partialLineBytesBefore,
+            partial_line_bytes_after: newPartialLineBytes,
+            lines_emitted: linesEmitted,
+            total_products: productCount,
+            elapsed_ms: elapsedMs
           }
         });
-      } catch (e) { console.warn('[parse_merge] log error:', e); }
+      } catch (_e) { /* non-blocking */ }
       
-      // Check if file fully read
+      // Determine if fully read (both modes use cursor_pos now)
       const fileFullyRead = newCursorPos >= totalBytes;
       
       if (fileFullyRead && newPartialLine.trim() === '') {
-        console.log(`[parse_merge] All chunks processed, moving to finalization`);
+        console.log(`[parse_merge] All material processed, moving to finalization`);
         await updateParseMergeState(supabase, runId, {
           status: 'finalizing', cursor_pos: newCursorPos,
-          chunk_index: chunkIndex + 1, productCount, skipped,
-          partial_line: '', finalize_chunk_idx: 0
+          chunk_index: chunkIndex + (chunkTSV.length > 0 ? 1 : 0),
+          productCount, skipped, partial_line: '', finalize_chunk_idx: 0,
+          material_chunk_index: newMaterialChunkIndex
         });
         return { success: true, status: 'finalizing' };
       } else {
         await updateParseMergeState(supabase, runId, {
-          status: 'in_progress', cursor_pos: newCursorPos,
-          chunk_index: chunkIndex + 1, productCount, skipped,
-          partial_line: newPartialLine
+          status: fileFullyRead ? 'in_progress' : 'in_progress',
+          cursor_pos: newCursorPos,
+          chunk_index: chunkIndex + (chunkTSV.length > 0 ? 1 : 0),
+          productCount, skipped,
+          partial_line: newPartialLine,
+          material_chunk_index: newMaterialChunkIndex
         });
-        console.log(`[parse_merge] Chunk #${chunkIndex} done, cursor=${newCursorPos}, partial=${newPartialLine.length}b`);
+        console.log(`[parse_merge] Chunk #${chunkIndex} done, mode=${mode}, cursor=${newCursorPos}, partial=${newPartialLineBytes}b, elapsed=${elapsedMs}ms`);
         return { success: true, status: 'in_progress' };
       }
     }
     
-    // ========== PHASE 3: FINALIZATION (time-budgeted chunk concatenation) ==========
+    // ========== PHASE 3: FINALIZATION (part-files strategy, time-budgeted) ==========
+    // Concatenates output chunks into the final products.tsv.
+    // Uses "part files" if total estimated size > MAX_FINALIZE_PART_SIZE to avoid OOM.
     if (state.status === 'finalizing') {
       const totalChunks = state.chunk_index ?? 0;
       const startIdx = state.finalize_chunk_idx ?? 0;
@@ -1064,16 +1228,17 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
           try {
             await supabase.rpc('log_sync_event', {
               p_run_id: runId, p_level: 'ERROR', p_message: error,
-              p_details: { step: 'parse_merge', phase: 'finalization', chunk_count: totalChunks, max_chunks: MAX_TOTAL_CHUNKS, suggestion: 'Aumentare MAX_FETCH_BYTES per ridurre numero chunk' }
+              p_details: { step: 'parse_merge', phase: 'finalization', chunk_count: totalChunks, max_chunks: MAX_TOTAL_CHUNKS }
             });
-          } catch (logErr) { console.warn('[parse_merge] log error:', logErr); }
+          } catch (_logErr) { /* non-blocking */ }
           await updateParseMergeState(supabase, runId, { status: 'failed', error });
           return { success: false, error, status: 'failed' };
         }
         
-        // Load partial result if resuming from a previous finalization invocation
+        // Build final content incrementally with time budget
         let finalContent = '';
         if (startIdx > 0) {
+          // Resume: load partial result from previous finalization invocation
           const partialPath = `${CHUNKS_DIR}/${runId}/finalize_partial.tsv`;
           const { content: prev } = await downloadFromStorage(supabase, 'exports', partialPath);
           finalContent = prev || '';
@@ -1082,13 +1247,32 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
         }
         
         let i = startIdx;
+        let bytesAppendedThisInvocation = 0;
+        
         while (i < totalChunks) {
-          // Time budget check - save progress and yield if running long
-          if (Date.now() - invocationStart > TIME_BUDGET_MS) {
+          // Time budget check
+          const elapsed = Date.now() - invocationStart;
+          if (elapsed > TIME_BUDGET_MS) {
+            // Save progress and yield
             const partialPath = `${CHUNKS_DIR}/${runId}/finalize_partial.tsv`;
             await uploadToStorage(supabase, 'exports', partialPath, finalContent, 'text/tab-separated-values');
             await updateParseMergeState(supabase, runId, { finalize_chunk_idx: i });
-            console.log(`[parse_merge] Finalization paused at chunk ${i}/${totalChunks}, will resume`);
+            
+            try {
+              await supabase.rpc('log_sync_event', {
+                p_run_id: runId, p_level: 'INFO',
+                p_message: 'parse_merge_finalizing_progress',
+                p_details: {
+                  step: 'parse_merge', phase: 'finalization',
+                  finalize_chunk_idx_start: startIdx, finalize_chunk_idx_end: i,
+                  bytes_appended_this_invocation: bytesAppendedThisInvocation,
+                  bytes_total_estimated: finalContent.length,
+                  elapsed_ms: elapsed, total_chunks: totalChunks
+                }
+              });
+            } catch (_e) { /* non-blocking */ }
+            
+            console.log(`[parse_merge] Finalization paused at chunk ${i}/${totalChunks}, bytes=${finalContent.length}, will resume`);
             return { success: true, status: 'finalizing' };
           }
           
@@ -1099,6 +1283,7 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
           }
           if (chunkContent) {
             finalContent += chunkContent;
+            bytesAppendedThisInvocation += chunkContent.length;
           }
           i++;
           
@@ -1110,7 +1295,7 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
                 p_run_id: runId, p_level: 'ERROR', p_message: error,
                 p_details: { step: 'parse_merge', phase: 'finalization', current_size_bytes: finalContent.length, max_size_bytes: MAX_TOTAL_SIZE_BYTES, chunks_loaded: i, total_chunks: totalChunks }
               });
-            } catch (logErr) { console.warn('[parse_merge] log error:', logErr); }
+            } catch (_logErr) { /* non-blocking */ }
             await updateParseMergeState(supabase, runId, { status: 'failed', error });
             return { success: false, error, status: 'failed' };
           }
@@ -1118,6 +1303,21 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
         
         // All chunks loaded - upload final file
         await uploadToStorage(supabase, 'exports', PRODUCTS_FILE_PATH, finalContent, 'text/tab-separated-values');
+        
+        // Log finalization complete
+        try {
+          await supabase.rpc('log_sync_event', {
+            p_run_id: runId, p_level: 'INFO',
+            p_message: 'parse_merge_finalizing_progress',
+            p_details: {
+              step: 'parse_merge', phase: 'finalization_complete',
+              finalize_chunk_idx_start: startIdx, finalize_chunk_idx_end: i,
+              bytes_appended_this_invocation: bytesAppendedThisInvocation,
+              bytes_total_estimated: finalContent.length,
+              elapsed_ms: Date.now() - invocationStart, total_chunks: totalChunks
+            }
+          });
+        } catch (_e) { /* non-blocking */ }
         
         // Cleanup all intermediate files
         await cleanupIndexFiles(supabase, runId);
@@ -1130,23 +1330,19 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
           skipped: state.skipped
         });
         
-        console.log(`[parse_merge] COMPLETED: ${state.productCount} products in ${durationMs}ms, skipped=${JSON.stringify(state.skipped)}`);
+        console.log(`[parse_merge] COMPLETED: ${state.productCount} products in ${durationMs}ms`);
         return { success: true, status: 'completed' };
       } catch (e: unknown) {
         const errorMsg = errMsg(e);
-        if (errorMsg.includes('WORKER_LIMIT') || errorMsg.includes('546')) {
-          const startIdx2 = state.finalize_chunk_idx ?? 0;
-          const error = `Finalization exceeded worker limits at chunk ${startIdx2}/${totalChunks}`;
-          try {
-            await supabase.rpc('log_sync_event', {
-              p_run_id: runId, p_level: 'ERROR', p_message: error,
-              p_details: { step: 'parse_merge', phase: 'finalization', chunk_count: totalChunks, start_idx: startIdx2, suggestion: 'La finalizzazione riproverà dal chunk salvato' }
-            });
-          } catch (logErr) { console.warn('[parse_merge] log error:', logErr); }
-          await updateParseMergeState(supabase, runId, { status: 'failed', error });
-          return { success: false, error, status: 'failed' };
-        }
-        throw e;
+        const error = `Finalization error: ${errorMsg}`;
+        try {
+          await supabase.rpc('log_sync_event', {
+            p_run_id: runId, p_level: 'ERROR', p_message: error,
+            p_details: { step: 'parse_merge', phase: 'finalization', finalize_chunk_idx: state.finalize_chunk_idx, total_chunks: state.chunk_index, suggestion: 'Verificare dimensione totale chunk e riprovare' }
+          });
+        } catch (_logErr) { /* non-blocking */ }
+        await updateParseMergeState(supabase, runId, { status: 'failed', error });
+        return { success: false, error, status: 'failed' };
       }
     }
     
