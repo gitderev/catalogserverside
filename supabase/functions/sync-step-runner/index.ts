@@ -76,6 +76,12 @@ const CHUNK_SIZE = 1000; // Ridotto da 5000 a 1000 per evitare WORKER_LIMIT
 const PRODUCTS_FILE_PATH = '_pipeline/products.tsv';
 const PARTIAL_PRODUCTS_FILE_PATH = '_pipeline/partial_products.tsv'; // legacy, kept for cleanup
 const CHUNKS_DIR = '_pipeline/parse_merge_chunks'; // each chunk is {run_id}/{chunk_index}.tsv
+const MATERIAL_SOURCE_FILE = '_pipeline/material_source.tsv';
+// Budget per invocazione: limita byte letti per evitare WORKER_LIMIT
+const TIME_BUDGET_MS = 8000; // 8s wall-clock safety for finalization
+const MAX_FETCH_BYTES = 2 * 1024 * 1024; // 2MB per Range request
+const MAX_TOTAL_CHUNKS = 50;
+const MAX_TOTAL_SIZE_BYTES = 40 * 1024 * 1024; // 40MB
 const EAN_CATALOG_FILE_PATH = '_pipeline/ean_catalog.tsv';
 
 // ========== LOCATION ID CONSTANTS ==========
@@ -408,6 +414,9 @@ interface ParseMergeState {
   materialBytes: number;
   startTime: number;
   error?: string;
+  partial_line: string; // incomplete line carried across invocations
+  material_path: string; // path in exports bucket for Range-based fetch
+  finalize_chunk_idx: number; // tracks finalization progress
 }
 
 async function getParseMergeState(supabase: SupabaseClient, runId: string): Promise<ParseMergeState | null> {
@@ -506,6 +515,7 @@ async function cleanupIndexFiles(supabase: SupabaseClient, runId?: string): Prom
   await deleteFromStorage(supabase, 'exports', STOCK_INDEX_FILE);
   await deleteFromStorage(supabase, 'exports', PRICE_INDEX_FILE);
   await deleteFromStorage(supabase, 'exports', MATERIAL_META_FILE);
+  await deleteFromStorage(supabase, 'exports', MATERIAL_SOURCE_FILE);
   await deleteFromStorage(supabase, 'exports', PARTIAL_PRODUCTS_FILE_PATH);
   
   // Clean up chunk files if runId provided
@@ -786,7 +796,15 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
         return { success: false, error, status: 'failed' };
       }
       
-      // Update state to chunked processing with cursor_pos
+      // Upload material content to pipeline for Range-based fetching in subsequent chunks
+      const matSourceUpload = await uploadToStorage(supabase, 'exports', MATERIAL_SOURCE_FILE, materialResult.content, 'text/tab-separated-values');
+      if (!matSourceUpload.success) {
+        const error = `Failed to upload material source: ${matSourceUpload.error}`;
+        await updateParseMergeState(supabase, runId, { status: 'failed', error });
+        return { success: false, error, status: 'failed' };
+      }
+      
+      // Update state to chunked processing with cursor_pos starting after header
       await updateParseMergeState(supabase, runId, {
         status: 'in_progress',
         offset: 0,
@@ -794,20 +812,43 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
         chunk_index: 0,
         productCount: 0,
         skipped: { noStock: 0, noPrice: 0, lowStock: 0, noValid: 0 },
-        materialBytes: materialResult.content.length
+        materialBytes: materialResult.content.length,
+        material_path: MATERIAL_SOURCE_FILE,
+        partial_line: '',
+        finalize_chunk_idx: 0
       });
       
-      console.log(`[parse_merge] Phase 1c complete in ${Date.now() - invocationStart}ms, ready for chunked processing`);
+      console.log(`[parse_merge] Phase 1c complete in ${Date.now() - invocationStart}ms, material uploaded for Range fetching`);
       return { success: true, status: 'in_progress' };
     }
     
-    // ========== PHASE 2: CHUNKED MATERIAL PROCESSING (cursor-based) ==========
+    // ========== PHASE 2: CHUNKED MATERIAL PROCESSING (Range-based) ==========
+    // Each invocation fetches MAX_FETCH_BYTES via Range header from the saved material
+    // source file, processes complete lines, and saves output to a chunk file.
+    // Partial lines are carried across invocations via state.partial_line.
     if (state.status === 'in_progress') {
       const cursorPos = state.cursor_pos ?? 0;
       const chunkIndex = state.chunk_index ?? 0;
-      console.log(`[parse_merge] Phase 2: Processing chunk #${chunkIndex} from cursor_pos=${cursorPos}...`);
+      const partialLine = state.partial_line || '';
+      const materialPath = state.material_path || MATERIAL_SOURCE_FILE;
+      const totalBytes = state.materialBytes || 0;
       
-      // Load indices and metadata from storage
+      console.log(`[parse_merge] Phase 2: chunk #${chunkIndex}, cursor=${cursorPos}/${totalBytes}, partial=${partialLine.length}b`);
+      
+      // Guardrail: too many chunks
+      if (chunkIndex > MAX_TOTAL_CHUNKS) {
+        const error = `Troppi chunk (${chunkIndex}>${MAX_TOTAL_CHUNKS}). File troppo grande per il chunking attuale.`;
+        try {
+          await supabase.rpc('log_sync_event', {
+            p_run_id: runId, p_level: 'ERROR', p_message: error,
+            p_details: { step: 'parse_merge', chunk_index: chunkIndex, cursor_pos: cursorPos, total_bytes: totalBytes, suggestion: 'Aumentare MAX_FETCH_BYTES o ridurre dimensione file input' }
+          });
+        } catch (e) { console.warn('[parse_merge] log error:', e); }
+        await updateParseMergeState(supabase, runId, { status: 'failed', error });
+        return { success: false, error, status: 'failed' };
+      }
+      
+      // Load indices (needed for merge logic)
       const { index: stockIndex, error: stockError } = await loadStockIndex(supabase);
       if (!stockIndex) {
         const error = `Failed to load stock index: ${stockError}`;
@@ -829,33 +870,109 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
         return { success: false, error, status: 'failed' };
       }
       
-      // Load material file content
-      const materialResult = await getLatestFile(supabase, 'material');
-      if (!materialResult.content) {
-        const error = 'Material file mancante durante chunk processing';
+      // If cursor past file end, handle remaining partial line and finalize
+      if (cursorPos >= totalBytes) {
+        const skipped = { ...state.skipped };
+        let productCount = state.productCount;
+        let extraChunkTSV = '';
+        
+        if (partialLine.trim()) {
+          const vals = partialLine.split(materialMeta.delimiter);
+          const m = vals[materialMeta.matnrIdx]?.trim();
+          if (m) {
+            const stock = stockIndex[m];
+            const price = priceIndex[m];
+            if (stock !== undefined && price && stock >= 2 && (price[0] > 0 || price[1] > 0)) {
+              const mpn = materialMeta.mpnIdx >= 0 ? (vals[materialMeta.mpnIdx]?.trim() || '') : '';
+              const ean = materialMeta.eanIdx >= 0 ? (vals[materialMeta.eanIdx]?.trim() || '') : '';
+              const desc = materialMeta.descIdx >= 0 ? (vals[materialMeta.descIdx]?.trim() || '') : '';
+              extraChunkTSV = `${m}\t${mpn}\t${ean}\t${desc}\t${stock}\t${price[0]}\t${price[1]}\t${price[2]}\n`;
+              productCount++;
+            } else {
+              if (stock === undefined) skipped.noStock++;
+              else if (!price) skipped.noPrice++;
+              else if (stock < 2) skipped.lowStock++;
+              else skipped.noValid++;
+            }
+          }
+        }
+        
+        if (extraChunkTSV.length > 0) {
+          const chunkPath = `${CHUNKS_DIR}/${runId}/${chunkIndex}.tsv`;
+          await uploadToStorage(supabase, 'exports', chunkPath, extraChunkTSV, 'text/tab-separated-values');
+        }
+        
+        await updateParseMergeState(supabase, runId, {
+          status: 'finalizing', cursor_pos: cursorPos,
+          chunk_index: chunkIndex + (extraChunkTSV.length > 0 ? 1 : 0),
+          productCount, skipped, partial_line: '', finalize_chunk_idx: 0
+        });
+        console.log(`[parse_merge] File fully read, moving to finalization`);
+        return { success: true, status: 'finalizing' };
+      }
+      
+      // Create signed URL for Range-based fetch
+      const { data: signedData, error: signedError } = await supabase.storage
+        .from('exports').createSignedUrl(materialPath, 600);
+      
+      if (signedError || !signedData?.signedUrl) {
+        const error = `Signed URL creation failed: ${signedError?.message || 'no URL returned'}`;
         await updateParseMergeState(supabase, runId, { status: 'failed', error });
         return { success: false, error, status: 'failed' };
       }
       
-      const materialContent = materialResult.content;
-      const materialSize = materialContent.length;
+      // Fetch only the bytes we need via Range header
+      const rangeEnd = Math.min(cursorPos + MAX_FETCH_BYTES - 1, totalBytes - 1);
+      const resp = await fetch(signedData.signedUrl, {
+        headers: { 'Range': `bytes=${cursorPos}-${rangeEnd}` }
+      });
+      const httpStatus = resp.status;
       
-      // Start directly from cursor_pos (byte position) - no line scanning
-      let pos = cursorPos;
+      // Handle Range not supported (200 when we expected 206 and cursor > 0)
+      if (httpStatus === 200 && cursorPos > 0) {
+        const error = `Range non supportato (HTTP 200 a cursor=${cursorPos}). Chunking incrementale impossibile per questo storage.`;
+        try {
+          await supabase.rpc('log_sync_event', {
+            p_run_id: runId, p_level: 'ERROR', p_message: error,
+            p_details: { step: 'parse_merge', cursor_pos: cursorPos, http_status: httpStatus, suggestion: 'Verificare supporto Range requests sullo storage' }
+          });
+        } catch (e) { console.warn('[parse_merge] log error:', e); }
+        await updateParseMergeState(supabase, runId, { status: 'failed', error });
+        return { success: false, error, status: 'failed' };
+      }
       
-      console.log(`[parse_merge] Starting at byte position ${pos}/${materialSize}`);
+      if (httpStatus !== 200 && httpStatus !== 206) {
+        if (httpStatus === 416) {
+          // Past end of file
+          await updateParseMergeState(supabase, runId, {
+            status: 'finalizing', cursor_pos: totalBytes,
+            chunk_index: chunkIndex, productCount: state.productCount,
+            skipped: state.skipped, partial_line: partialLine, finalize_chunk_idx: 0
+          });
+          return { success: true, status: 'finalizing' };
+        }
+        const error = `Fetch material failed: HTTP ${httpStatus}`;
+        await updateParseMergeState(supabase, runId, { status: 'failed', error });
+        return { success: false, error, status: 'failed' };
+      }
       
-      // Process CHUNK_SIZE lines
+      const rawBytes = new Uint8Array(await resp.arrayBuffer());
+      const bytesReceived = rawBytes.byteLength;
+      const rawText = new TextDecoder().decode(rawBytes);
+      
+      // Prepend partial line from previous invocation and process all complete lines
+      const fullText = partialLine + rawText;
       const skipped = { ...state.skipped };
       let productCount = state.productCount;
       let linesProcessed = 0;
       let chunkTSV = '';
+      let pos = 0;
       
-      while (pos < materialSize && linesProcessed < CHUNK_SIZE) {
-        let lineEnd = materialContent.indexOf('\n', pos);
-        if (lineEnd === -1) lineEnd = materialSize;
+      while (pos < fullText.length) {
+        const lineEnd = fullText.indexOf('\n', pos);
+        if (lineEnd === -1) break; // rest is partial line
         
-        const line = materialContent.substring(pos, lineEnd);
+        const line = fullText.substring(pos, lineEnd);
         pos = lineEnd + 1;
         linesProcessed++;
         
@@ -883,123 +1000,128 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
         productCount++;
       }
       
+      // Text after last \n is partial line for next invocation
+      const newPartialLine = fullText.substring(pos);
+      const newCursorPos = cursorPos + bytesReceived;
       const newProducts = productCount - state.productCount;
       const elapsedMs = Date.now() - invocationStart;
-      console.log(`[parse_merge] Chunk #${chunkIndex} processed: ${linesProcessed} lines, ${newProducts} new products, total=${productCount}`);
       
-      // Save chunk to its own file (no download+append of growing file)
+      // Save chunk output if non-empty
       const chunkPath = `${CHUNKS_DIR}/${runId}/${chunkIndex}.tsv`;
       if (chunkTSV.length > 0) {
         await uploadToStorage(supabase, 'exports', chunkPath, chunkTSV, 'text/tab-separated-values');
       }
       
-      // Log INFO event per chunk for diagnostics
+      // Log INFO diagnostic event (non-blocking)
       try {
         await supabase.rpc('log_sync_event', {
-          p_run_id: runId,
-          p_level: 'INFO',
+          p_run_id: runId, p_level: 'INFO',
           p_message: `parse_merge chunk #${chunkIndex} completato`,
-          p_details: { step: 'parse_merge', chunk_index: chunkIndex, cursor_pos_start: cursorPos, cursor_pos_end: pos, lines_processed: linesProcessed, new_products: newProducts, output_chunk_path: chunkPath, elapsed_ms: elapsedMs }
+          p_details: {
+            step: 'parse_merge', chunk_index: chunkIndex,
+            cursor_pos_start: cursorPos, cursor_pos_end: newCursorPos,
+            bytes_fetched: bytesReceived, lines_processed: linesProcessed,
+            new_products: newProducts, total_products: productCount,
+            elapsed_ms: elapsedMs, http_status: httpStatus,
+            partial_line_bytes: newPartialLine.length,
+            content_length: totalBytes
+          }
         });
-      } catch (logErr) {
-        console.warn(`[parse_merge] Non-blocking log_sync_event error:`, logErr);
-      }
+      } catch (e) { console.warn('[parse_merge] log error:', e); }
       
-      // Check if finished
-      const isFinished = pos >= materialSize;
+      // Check if file fully read
+      const fileFullyRead = newCursorPos >= totalBytes;
       
-      if (isFinished) {
-        console.log(`[parse_merge] All chunks processed, moving to finalization...`);
-        
+      if (fileFullyRead && newPartialLine.trim() === '') {
+        console.log(`[parse_merge] All chunks processed, moving to finalization`);
         await updateParseMergeState(supabase, runId, {
-          status: 'finalizing',
-          cursor_pos: pos,
-          chunk_index: chunkIndex + 1,
-          productCount,
-          skipped
+          status: 'finalizing', cursor_pos: newCursorPos,
+          chunk_index: chunkIndex + 1, productCount, skipped,
+          partial_line: '', finalize_chunk_idx: 0
         });
-        
-        console.log(`[parse_merge] Invocation took ${Date.now() - invocationStart}ms`);
         return { success: true, status: 'finalizing' };
       } else {
-        // More chunks to process
         await updateParseMergeState(supabase, runId, {
-          status: 'in_progress',
-          cursor_pos: pos,
-          chunk_index: chunkIndex + 1,
-          productCount,
-          skipped
+          status: 'in_progress', cursor_pos: newCursorPos,
+          chunk_index: chunkIndex + 1, productCount, skipped,
+          partial_line: newPartialLine
         });
-        
-        console.log(`[parse_merge] Chunk complete, cursor_pos=${pos}, more to go`);
-        console.log(`[parse_merge] Invocation took ${Date.now() - invocationStart}ms`);
+        console.log(`[parse_merge] Chunk #${chunkIndex} done, cursor=${newCursorPos}, partial=${newPartialLine.length}b`);
         return { success: true, status: 'in_progress' };
       }
     }
     
-    // ========== PHASE 3: FINALIZATION (concatenate chunk files) ==========
+    // ========== PHASE 3: FINALIZATION (time-budgeted chunk concatenation) ==========
     if (state.status === 'finalizing') {
       const totalChunks = state.chunk_index ?? 0;
-      console.log(`[parse_merge] Phase 3: Finalizing - concatenating ${totalChunks} chunk files...`);
+      const startIdx = state.finalize_chunk_idx ?? 0;
+      console.log(`[parse_merge] Phase 3: Finalizing, chunks ${startIdx}..${totalChunks - 1} (total ${totalChunks})`);
       
       try {
-        // Guardrail: if too many chunks, fail explicitly rather than risk WORKER_LIMIT
-        const MAX_FINALIZE_CHUNKS = 50;
-        const MAX_FINALIZE_SIZE_BYTES = 40 * 1024 * 1024; // 40MB
-        if (totalChunks > MAX_FINALIZE_CHUNKS) {
-          const error = `Finalizing richiede strategia alternativa: ${totalChunks} chunk superano il limite di ${MAX_FINALIZE_CHUNKS}`;
-          console.error(`[parse_merge] ${error}`);
+        // Guardrail: chunk count
+        if (totalChunks > MAX_TOTAL_CHUNKS) {
+          const error = `Troppe parti da finalizzare: ${totalChunks} chunk (max ${MAX_TOTAL_CHUNKS})`;
           try {
             await supabase.rpc('log_sync_event', {
-              p_run_id: runId,
-              p_level: 'ERROR',
-              p_message: error,
-              p_details: { step: 'parse_merge', phase: 'finalization', chunk_count: totalChunks, max_chunks: MAX_FINALIZE_CHUNKS, suggestion: 'implementare staging su DB o streaming upload' }
+              p_run_id: runId, p_level: 'ERROR', p_message: error,
+              p_details: { step: 'parse_merge', phase: 'finalization', chunk_count: totalChunks, max_chunks: MAX_TOTAL_CHUNKS, suggestion: 'Aumentare MAX_FETCH_BYTES per ridurre numero chunk' }
             });
-          } catch (logErr) {
-            console.warn(`[parse_merge] Non-blocking log_sync_event error:`, logErr);
-          }
+          } catch (logErr) { console.warn('[parse_merge] log error:', logErr); }
           await updateParseMergeState(supabase, runId, { status: 'failed', error });
           return { success: false, error, status: 'failed' };
         }
         
-        const headerTSV = 'Matnr\tMPN\tEAN\tDesc\tStock\tLP\tCBP\tSur\n';
-        let finalContent = headerTSV;
+        // Load partial result if resuming from a previous finalization invocation
+        let finalContent = '';
+        if (startIdx > 0) {
+          const partialPath = `${CHUNKS_DIR}/${runId}/finalize_partial.tsv`;
+          const { content: prev } = await downloadFromStorage(supabase, 'exports', partialPath);
+          finalContent = prev || '';
+        } else {
+          finalContent = 'Matnr\tMPN\tEAN\tDesc\tStock\tLP\tCBP\tSur\n';
+        }
         
-        for (let i = 0; i < totalChunks; i++) {
+        let i = startIdx;
+        while (i < totalChunks) {
+          // Time budget check - save progress and yield if running long
+          if (Date.now() - invocationStart > TIME_BUDGET_MS) {
+            const partialPath = `${CHUNKS_DIR}/${runId}/finalize_partial.tsv`;
+            await uploadToStorage(supabase, 'exports', partialPath, finalContent, 'text/tab-separated-values');
+            await updateParseMergeState(supabase, runId, { finalize_chunk_idx: i });
+            console.log(`[parse_merge] Finalization paused at chunk ${i}/${totalChunks}, will resume`);
+            return { success: true, status: 'finalizing' };
+          }
+          
           const chunkPath = `${CHUNKS_DIR}/${runId}/${i}.tsv`;
           const { content: chunkContent, error: chunkError } = await downloadFromStorage(supabase, 'exports', chunkPath);
           if (chunkError) {
             console.log(`[parse_merge] Chunk ${i} not found or empty, skipping: ${chunkError}`);
-            continue;
           }
           if (chunkContent) {
             finalContent += chunkContent;
           }
+          i++;
+          
           // Size guardrail
-          if (finalContent.length > MAX_FINALIZE_SIZE_BYTES) {
-            const error = `Finalizing richiede strategia alternativa: dimensione ${(finalContent.length / 1024 / 1024).toFixed(1)}MB supera il limite di ${MAX_FINALIZE_SIZE_BYTES / 1024 / 1024}MB`;
-            console.error(`[parse_merge] ${error}`);
+          if (finalContent.length > MAX_TOTAL_SIZE_BYTES) {
+            const error = `Dimensione finale ${(finalContent.length / 1024 / 1024).toFixed(1)}MB supera il limite di ${MAX_TOTAL_SIZE_BYTES / 1024 / 1024}MB`;
             try {
               await supabase.rpc('log_sync_event', {
-                p_run_id: runId,
-                p_level: 'ERROR',
-                p_message: error,
-                p_details: { step: 'parse_merge', phase: 'finalization', current_size_bytes: finalContent.length, max_size_bytes: MAX_FINALIZE_SIZE_BYTES, chunks_loaded: i + 1, total_chunks: totalChunks }
+                p_run_id: runId, p_level: 'ERROR', p_message: error,
+                p_details: { step: 'parse_merge', phase: 'finalization', current_size_bytes: finalContent.length, max_size_bytes: MAX_TOTAL_SIZE_BYTES, chunks_loaded: i, total_chunks: totalChunks }
               });
-            } catch (logErr) {
-              console.warn(`[parse_merge] Non-blocking log_sync_event error:`, logErr);
-            }
+            } catch (logErr) { console.warn('[parse_merge] log error:', logErr); }
             await updateParseMergeState(supabase, runId, { status: 'failed', error });
             return { success: false, error, status: 'failed' };
           }
         }
         
-        // Upload final concatenated file
+        // All chunks loaded - upload final file
         await uploadToStorage(supabase, 'exports', PRODUCTS_FILE_PATH, finalContent, 'text/tab-separated-values');
         
-        // Cleanup intermediate files
+        // Cleanup all intermediate files
         await cleanupIndexFiles(supabase, runId);
+        await deleteFromStorage(supabase, 'exports', `${CHUNKS_DIR}/${runId}/finalize_partial.tsv`);
         
         const durationMs = Date.now() - state.startTime;
         await updateParseMergeState(supabase, runId, {
@@ -1009,23 +1131,18 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
         });
         
         console.log(`[parse_merge] COMPLETED: ${state.productCount} products in ${durationMs}ms, skipped=${JSON.stringify(state.skipped)}`);
-        console.log(`[parse_merge] Invocation took ${Date.now() - invocationStart}ms`);
         return { success: true, status: 'completed' };
       } catch (e: unknown) {
         const errorMsg = errMsg(e);
         if (errorMsg.includes('WORKER_LIMIT') || errorMsg.includes('546')) {
-          const error = `Finalization exceeded worker limits with ${totalChunks} chunks. Consider staging to DB.`;
-          console.error(`[parse_merge] ${error}`);
+          const startIdx2 = state.finalize_chunk_idx ?? 0;
+          const error = `Finalization exceeded worker limits at chunk ${startIdx2}/${totalChunks}`;
           try {
             await supabase.rpc('log_sync_event', {
-              p_run_id: runId,
-              p_level: 'ERROR',
-              p_message: error,
-              p_details: { step: 'parse_merge', phase: 'finalization', chunk_count: totalChunks, suggestion: 'ridurre CHUNK_LINES o implementare staging su DB' }
+              p_run_id: runId, p_level: 'ERROR', p_message: error,
+              p_details: { step: 'parse_merge', phase: 'finalization', chunk_count: totalChunks, start_idx: startIdx2, suggestion: 'La finalizzazione riproverà dal chunk salvato' }
             });
-          } catch (logErr) {
-            console.warn('[parse_merge] log_sync_event failed:', logErr);
-          }
+          } catch (logErr) { console.warn('[parse_merge] log error:', logErr); }
           await updateParseMergeState(supabase, runId, { status: 'failed', error });
           return { success: false, error, status: 'failed' };
         }

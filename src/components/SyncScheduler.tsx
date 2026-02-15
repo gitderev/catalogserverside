@@ -654,6 +654,11 @@ export const SyncScheduler: React.FC = () => {
                     {config.last_disabled_reason}
                   </p>
                 )}
+                {!config && !isLoading && (
+                  <p className="text-xs text-destructive font-medium mt-1">
+                    ⚠ Configurazione non trovata. La riga sync_config (id=1) potrebbe mancare dal database.
+                  </p>
+                )}
               </div>
 
               {/* Schedule Type */}
