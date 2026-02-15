@@ -31,6 +31,7 @@ import {
   Zap,
   Copy
 } from 'lucide-react';
+import { SyncHealthPanel } from '@/components/SyncHealthPanel';
 
 interface SyncConfig {
   id: number;
@@ -773,14 +774,22 @@ export const SyncScheduler: React.FC = () => {
 
           {/* Current step indicator for running sync */}
           {currentRun && currentRun.status === 'running' && (
-            <div className="alt-alert alt-alert-info">
-              <Loader2 className="h-5 w-5 animate-spin text-info" />
-              <div>
-                <p className="font-semibold text-info">Sincronizzazione in corso</p>
-                <p className="text-sm alt-text-muted">
-                  Step corrente: {STEP_LABELS[String((currentRun.steps as Record<string, unknown>)?.current_step ?? '')] || String((currentRun.steps as Record<string, unknown>)?.current_step ?? '') || 'Avvio...'}
-                </p>
+            <div className="space-y-3">
+              <div className="alt-alert alt-alert-info">
+                <Loader2 className="h-5 w-5 animate-spin text-info" />
+                <div>
+                  <p className="font-semibold text-info">Sincronizzazione in corso</p>
+                  <p className="text-sm alt-text-muted">
+                    Step corrente: {STEP_LABELS[String((currentRun.steps as Record<string, unknown>)?.current_step ?? '')] || String((currentRun.steps as Record<string, unknown>)?.current_step ?? '') || 'Avvio...'}
+                  </p>
+                </div>
               </div>
+              <SyncHealthPanel
+                runId={currentRun.id}
+                runStartedAt={currentRun.started_at}
+                runStatus={currentRun.status}
+                steps={currentRun.steps as Record<string, unknown>}
+              />
             </div>
           )}
 
