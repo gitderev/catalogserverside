@@ -268,7 +268,14 @@ serve(async (req) => {
         // Force-clean lock if not owned
         await supabase.from('sync_locks').delete().eq('lock_name', 'global_sync');
 
-        await checkAndHandleMaxAttempts(supabase, supabaseUrl, supabaseServiceKey, maxAttempts);
+        // Reload cron runs after marking timeout, then check max attempts
+        const { data: refreshedRuns1 } = await supabase
+          .from('sync_runs')
+          .select('id, status, attempt, finished_at, started_at, trigger_type')
+          .eq('trigger_type', 'cron')
+          .order('started_at', { ascending: false })
+          .limit(50);
+        await checkAndHandleMaxAttempts(supabase, supabaseUrl, supabaseServiceKey, maxAttempts, refreshedRuns1 || []);
         await callNotification(supabaseUrl, supabaseServiceKey, activeRun.id, 'timeout');
 
         return jsonResp({ status: 'timeout_marked', run_id: activeRun.id, reason: 'hard_timeout' });
@@ -309,7 +316,14 @@ serve(async (req) => {
           } catch (_) {}
           await supabase.from('sync_locks').delete().eq('lock_name', 'global_sync');
 
-          await checkAndHandleMaxAttempts(supabase, supabaseUrl, supabaseServiceKey, maxAttempts);
+          // Reload cron runs after marking timeout, then check max attempts
+          const { data: refreshedRuns2 } = await supabase
+            .from('sync_runs')
+            .select('id, status, attempt, finished_at, started_at, trigger_type')
+            .eq('trigger_type', 'cron')
+            .order('started_at', { ascending: false })
+            .limit(50);
+          await checkAndHandleMaxAttempts(supabase, supabaseUrl, supabaseServiceKey, maxAttempts, refreshedRuns2 || []);
           await callNotification(supabaseUrl, supabaseServiceKey, activeRun.id, 'timeout');
 
           return jsonResp({ status: 'timeout_marked', run_id: activeRun.id, reason: 'idle_timeout' });
@@ -379,16 +393,17 @@ serve(async (req) => {
       return jsonResp({ status: 'skipped', reason: 'scheduler_disabled' });
     }
 
-    // 5. CHECK FOR FAILED/TIMEOUT RUNS NEEDING RETRY
+    // 5. LOAD RECENT CRON RUNS (shared by retry, max-attempts, and scheduling logic)
     const { data: lastCronRuns } = await supabase
       .from('sync_runs')
       .select('id, status, attempt, finished_at, started_at, trigger_type')
       .eq('trigger_type', 'cron')
       .order('started_at', { ascending: false })
-      .limit(5);
+      .limit(50);
 
     const lastCronRun = lastCronRuns?.[0];
 
+    // 5a. CHECK FOR FAILED/TIMEOUT RUNS NEEDING RETRY
     if (lastCronRun && ['failed', 'timeout'].includes(lastCronRun.status) && lastCronRun.attempt < maxAttempts) {
       const finishedAt = lastCronRun.finished_at ? new Date(lastCronRun.finished_at).getTime() : 0;
       const sinceFinished = now.getTime() - finishedAt;
@@ -404,9 +419,10 @@ serve(async (req) => {
       }
     }
 
-    // 5b. CHECK MAX ATTEMPTS
+    // 5b. CHECK MAX ATTEMPTS (only when last run is terminal failure at max attempt)
+    // Uses consecutive-failure-since-last-success algorithm (see checkAndHandleMaxAttempts).
     if (lastCronRun && ['failed', 'timeout'].includes(lastCronRun.status) && lastCronRun.attempt >= maxAttempts) {
-      const shouldDisable = await checkAndHandleMaxAttempts(supabase, supabaseUrl, supabaseServiceKey, maxAttempts);
+      const shouldDisable = await checkAndHandleMaxAttempts(supabase, supabaseUrl, supabaseServiceKey, maxAttempts, lastCronRuns || []);
       if (shouldDisable) {
         return jsonResp({ status: 'max_attempts_exceeded', disabled: true });
       }
@@ -568,35 +584,95 @@ async function callNotification(
   }
 }
 
+/**
+ * Determines whether the scheduler should be auto-disabled due to consecutive cron failures.
+ *
+ * Algorithm (deterministic):
+ *   1. Filter runs to attempt=1 only (primary runs, not retries) for chain counting.
+ *   2. Walk from most recent to oldest.
+ *   3. Count consecutive failed/timeout runs until a success/success_with_warning is found (reset point).
+ *   4. If consecutive failures >= maxAttempts AND no cron run is currently running → disable.
+ *   5. If a success exists more recent than the failure chain → do NOT disable (chain is reset).
+ *
+ * Example sequences (max_attempts=3):
+ *   [timeout, timeout, timeout]                         → 3 consecutive → DISABLE
+ *   [timeout, timeout, success, timeout, timeout]       → 2 consecutive → NO disable (reset by success)
+ *   [timeout, timeout, timeout, success_with_warning]   → 3 consecutive → DISABLE (success is older)
+ *   [success, timeout, timeout, timeout]                → 0 consecutive → NO disable (success is most recent)
+ *   [running, timeout, timeout, timeout]                → skip (running exists)
+ */
 async function checkAndHandleMaxAttempts(
   supabase: SClient,
   supabaseUrl: string,
   serviceKey: string,
-  maxAttempts: number
+  maxAttempts: number,
+  allCronRuns: Array<Record<string, unknown>>
 ): Promise<boolean> {
-  const { data: recentRuns } = await supabase
-    .from('sync_runs')
-    .select('id, status, attempt, trigger_type')
-    .eq('trigger_type', 'cron')
-    .order('started_at', { ascending: false })
-    .limit(maxAttempts);
+  // Guard: if any cron run is currently running, don't disable
+  const hasRunning = allCronRuns.some((r) => r.status === 'running');
+  if (hasRunning) {
+    console.log('[cron-tick] checkMaxAttempts: skipped, a cron run is still running');
+    return false;
+  }
 
-  if (!recentRuns || recentRuns.length < maxAttempts) return false;
+  // Filter to primary runs only (attempt=1) for chain determination
+  const primaryRuns = allCronRuns.filter((r) => r.attempt === 1);
 
-  const allFailed = recentRuns.slice(0, maxAttempts).every(
-    (r: { status: string }) => ['failed', 'timeout'].includes(r.status)
-  );
-  if (!allFailed) return false;
+  let consecutiveFailures = 0;
+  let resetPoint: { id: string; started_at: string } | null = null;
+  const failedRunIds: string[] = [];
 
-  console.log(`[cron-tick] ${maxAttempts} consecutive failures detected, disabling scheduling`);
+  for (const run of primaryRuns) {
+    const status = run.status as string;
+    if (['success', 'success_with_warning'].includes(status)) {
+      resetPoint = { id: run.id as string, started_at: run.started_at as string };
+      break; // chain is reset
+    }
+    if (['failed', 'timeout'].includes(status)) {
+      consecutiveFailures++;
+      failedRunIds.push(run.id as string);
+    }
+    // skip other statuses (cancelled, etc.) — don't count, don't break
+  }
+
+  if (consecutiveFailures < maxAttempts) {
+    // Not enough failures to disable. Log only if we were close (avoid spam).
+    if (consecutiveFailures >= maxAttempts - 1 && resetPoint) {
+      console.log(`[cron-tick] checkMaxAttempts: ${consecutiveFailures} failures but reset by success ${resetPoint.id}`);
+      await logDecision(supabase, failedRunIds[0] || 'unknown', 'INFO', 'max_attempts_reset_by_success', {
+        max_attempts: maxAttempts,
+        consecutive_failures_count: consecutiveFailures,
+        reset_point: resetPoint,
+        sample_run_ids: failedRunIds.slice(0, 5)
+      });
+    }
+    return false;
+  }
+
+  // Disable scheduler
+  console.log(`[cron-tick] ${consecutiveFailures} consecutive primary cron failures (>= ${maxAttempts}), disabling`);
 
   await supabase.from('sync_config').update({
     enabled: false,
-    last_disabled_reason: `Auto-disabilitato: ${maxAttempts} fallimenti consecutivi (failed/timeout)`
+    last_disabled_reason: `Auto-disabilitato: ${consecutiveFailures} fallimenti consecutivi cron primari (failed/timeout)`
   }).eq('id', 1);
 
-  const lastFailedRun = recentRuns[0];
-  await callNotification(supabaseUrl, serviceKey, lastFailedRun.id, lastFailedRun.status);
+  // Log persistent decision event
+  if (failedRunIds[0]) {
+    await logDecision(supabase, failedRunIds[0], 'ERROR', 'scheduler_auto_disabled_max_attempts', {
+      max_attempts: maxAttempts,
+      consecutive_failures_count: consecutiveFailures,
+      reset_point: resetPoint,
+      sample_run_ids: failedRunIds.slice(0, 5)
+    });
+  }
+
+  // Non-blocking notification
+  const lastFailedId = failedRunIds[0];
+  if (lastFailedId) {
+    const lastRun = allCronRuns.find((r) => r.id === lastFailedId);
+    await callNotification(supabaseUrl, serviceKey, lastFailedId, (lastRun?.status as string) || 'failed');
+  }
 
   return true;
 }
