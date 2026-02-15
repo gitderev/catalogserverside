@@ -1,4 +1,4 @@
-name: Cron Tick (every 5 minutes)
+name: Cron Tick (every 1 minute)
 
 on:
   schedule:

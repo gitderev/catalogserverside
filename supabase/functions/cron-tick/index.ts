@@ -92,11 +92,13 @@ serve(async (req) => {
       const run = runningRuns[0];
       const startedAt = new Date(run.started_at).getTime();
       const elapsed = now.getTime() - startedAt;
+      const elapsedMin = Math.round(elapsed / 60000);
       const timeoutMs = timeoutMinutes * 60 * 1000;
+      const currentStep = (run.steps as Record<string, unknown>)?.current_step as string | undefined;
 
       if (elapsed > timeoutMs) {
-        // TIMEOUT: mark as timeout
-        console.log(`[cron-tick] Run ${run.id} timed out (${Math.round(elapsed / 60000)}min > ${timeoutMinutes}min)`);
+        // TIMEOUT handling (unchanged)
+        console.log(`[cron-tick] Run ${run.id} timed out (${elapsedMin}min > ${timeoutMinutes}min)`);
 
         await supabase.from('sync_runs').update({
           status: 'timeout',
@@ -109,20 +111,18 @@ serve(async (req) => {
           await supabase.rpc('log_sync_event', {
             p_run_id: run.id,
             p_level: 'ERROR',
-            p_message: `Run interrotta per timeout dopo ${Math.round(elapsed / 60000)} minuti`,
-            p_details: { step: 'timeout', elapsed_minutes: Math.round(elapsed / 60000), timeout_minutes: timeoutMinutes }
+            p_message: `Run interrotta per timeout dopo ${elapsedMin} minuti`,
+            p_details: { step: 'timeout', elapsed_minutes: elapsedMin, timeout_minutes: timeoutMinutes }
           });
         } catch (logErr) {
           console.warn('[cron-tick] log_sync_event failed:', logErr);
         }
 
-        // Release lock via RPC
         const { data: lockReleased } = await supabase.rpc('release_sync_lock', {
           p_lock_name: 'global_sync',
           p_run_id: run.id
         });
         if (!lockReleased) {
-          // Also try deleting any expired locks
           await supabase.from('sync_locks').delete().eq('lock_name', 'global_sync');
           console.log(`[cron-tick] Force-cleaned lock after timeout for run ${run.id}`);
         }
@@ -144,39 +144,91 @@ serve(async (req) => {
         );
       }
 
-      // Run is still within timeout window - check for stall and resume
-      // First check: is the last event too old? (stall detection)
-      const { data: lastEvent } = await supabase
+      // Run is within timeout window — determine if it's yielded or actively running
+      const { data: lastEvents } = await supabase
         .from('sync_events')
         .select('created_at, message')
         .eq('run_id', run.id)
         .order('created_at', { ascending: false })
         .limit(1);
       
-      const lastEventAge = lastEvent?.length 
-        ? (now.getTime() - new Date(lastEvent[0].created_at).getTime()) / 1000
+      const lastEvent = lastEvents?.[0];
+      const lastEventAge = lastEvent
+        ? (now.getTime() - new Date(lastEvent.created_at).getTime()) / 1000
         : elapsed / 1000;
+      const lastMsg = (lastEvent?.message || '').toLowerCase();
       
-      if (lastEventAge > STALE_EVENT_THRESHOLD_S) {
-        console.log(`[cron-tick] Run ${run.id} may be stalled: last event ${Math.round(lastEventAge)}s ago`);
+      // Determine if the run is yielded (safe to resume) vs actively processing
+      const isYielded = lastMsg.includes('yield') || lastMsg.includes('orchestrator_yield');
+      const isStalled = lastEventAge > STALE_EVENT_THRESHOLD_S;
+      // If last event is very recent and NOT a yield, the run may still be actively processing
+      const ACTIVE_THRESHOLD_S = 45; // if last event < 45s ago and not a yield, consider active
+      const isActivelyRunning = !isYielded && lastEventAge < ACTIVE_THRESHOLD_S;
+
+      if (isActivelyRunning) {
+        // Run appears to be actively processing right now — don't resume aggressively
+        console.log(`[cron-tick] Run ${run.id} actively running (last event ${Math.round(lastEventAge)}s ago), skipping resume`);
+        try {
+          await supabase.rpc('log_sync_event', {
+            p_run_id: run.id,
+            p_level: 'INFO',
+            p_message: 'resume_skipped_not_yielded',
+            p_details: {
+              origin: 'cron',
+              step: currentStep,
+              trigger_type: run.trigger_type,
+              elapsed_min: elapsedMin,
+              last_event_age_s: Math.round(lastEventAge),
+              last_event_message: lastEvent?.message
+            }
+          });
+        } catch (_) {}
+
+        return new Response(
+          JSON.stringify({ status: 'running_not_yielded_skip', run_id: run.id, last_event_age_s: Math.round(lastEventAge) }),
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+
+      // Stall detection: old event and not a yield
+      if (isStalled && !isYielded) {
+        console.log(`[cron-tick] Run ${run.id} stalled: last event ${Math.round(lastEventAge)}s ago, forcing resume`);
         try {
           await supabase.rpc('log_sync_event', {
             p_run_id: run.id,
             p_level: 'WARN',
-            p_message: 'stalled_no_resume: run ferma senza attività recente, tentativo resume',
+            p_message: 'stalled_no_resume',
             p_details: { 
-              step: run.steps?.current_step,
+              origin: 'cron',
+              step: currentStep,
+              trigger_type: run.trigger_type,
               last_event_age_s: Math.round(lastEventAge),
               threshold_s: STALE_EVENT_THRESHOLD_S,
-              last_event_message: lastEvent?.[0]?.message
+              last_event_message: lastEvent?.message
             }
           });
         } catch (_) {}
       }
       
-      // Resume the running run (both manual and cron)
-      console.log(`[cron-tick] Run ${run.id} (trigger: ${run.trigger_type}) still running (${Math.round(elapsed / 60000)}min), attempting resume at step ${run.steps?.current_step}...`);
-      
+      // Log resume_triggered before invoking
+      console.log(`[cron-tick] Resuming run ${run.id} (trigger: ${run.trigger_type}, step: ${currentStep}, yielded: ${isYielded}, stalled: ${isStalled})`);
+      try {
+        await supabase.rpc('log_sync_event', {
+          p_run_id: run.id,
+          p_level: 'INFO',
+          p_message: 'resume_triggered',
+          p_details: {
+            origin: 'cron',
+            step: currentStep,
+            trigger_type: run.trigger_type,
+            elapsed_min: elapsedMin,
+            is_yielded: isYielded,
+            is_stalled: isStalled,
+            last_event_age_s: Math.round(lastEventAge)
+          }
+        });
+      } catch (_) {}
+
       const resumeResult = await triggerSyncResume(supabaseUrl, supabaseServiceKey, run.id);
       
       return new Response(
@@ -184,7 +236,8 @@ serve(async (req) => {
           status: 'resume_attempted', 
           run_id: run.id, 
           trigger_type: run.trigger_type,
-          current_step: run.steps?.current_step,
+          current_step: currentStep,
+          is_yielded: isYielded,
           ...resumeResult 
         }),
         { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
