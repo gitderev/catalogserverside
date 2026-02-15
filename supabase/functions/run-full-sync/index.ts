@@ -26,7 +26,7 @@ const corsHeaders = {
  *   3. 546 WORKER_LIMIT è retryable per TUTTI gli step (max 8 tentativi, backoff geometrico).
  *   4. La run non può essere completed se anche uno solo dei 13 step non è completed.
  *   5. notification è blocca-run: se fallisce, run = failed.
- *   6. yielded/locked/retry_delay NON sono failure (toggle auto-sync resta attivo).
+ *   6. yielded/retry_delay NON sono failure (toggle auto-sync resta attivo). Lock → yielded con reason="locked".
  *
  * SFTP upload: eseguito per TUTTI i trigger (manual + cron).
  * Se SFTP non configurato: run failed "SFTP misconfigured".
@@ -374,7 +374,7 @@ serve(async (req) => {
           await supabase.rpc('log_sync_event', {
             p_run_id: runId,
             p_level: 'INFO',
-            p_message: 'locked',
+            p_message: 'yielded_locked',
             p_details: { 
               step: 'orchestrator_resume', 
               lock_name: 'global_sync',
