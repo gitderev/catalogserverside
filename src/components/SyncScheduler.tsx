@@ -391,6 +391,7 @@ export const SyncScheduler: React.FC = () => {
         throw new Error('Sessione non valida');
       }
 
+      // Initial call
       const response = await supabase.functions.invoke('run-full-sync', {
         body: { trigger: 'manual' }
       });
@@ -399,7 +400,7 @@ export const SyncScheduler: React.FC = () => {
         throw new Error(response.error.message);
       }
 
-      const data = response.data;
+      let data = response.data;
 
       if (data.status === 'error') {
         throw new Error(data.message);
@@ -410,6 +411,59 @@ export const SyncScheduler: React.FC = () => {
         description: 'La pipeline è in esecuzione'
       });
 
+      await loadData();
+
+      // Resume loop: if orchestrator yields, re-invoke until complete
+      let resumeCount = 0;
+      const MAX_RESUME_CALLS = 200; // safety limit
+      
+      while (data?.needs_resume && data?.run_id && resumeCount < MAX_RESUME_CALLS) {
+        resumeCount++;
+        console.log(`[SyncScheduler] Resume #${resumeCount} for run ${data.run_id}, step: ${data.current_step}`);
+        
+        // Small delay to avoid hammering
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
+        // Refresh data display
+        await loadData();
+        
+        const resumeResp = await supabase.functions.invoke('run-full-sync', {
+          body: { trigger: 'manual', resume_run_id: data.run_id }
+        });
+        
+        if (resumeResp.error) {
+          console.error('[SyncScheduler] Resume error:', resumeResp.error);
+          break;
+        }
+        
+        data = resumeResp.data;
+        
+        if (data?.status === 'error') {
+          console.error('[SyncScheduler] Resume returned error:', data.message);
+          toast({
+            title: 'Errore durante sync',
+            description: data.message || 'Errore imprevisto durante il resume',
+            variant: 'destructive'
+          });
+          break;
+        }
+        
+        if (data?.status === 'already_finished') {
+          console.log('[SyncScheduler] Run already finished:', data.run_status);
+          break;
+        }
+      }
+      
+      if (resumeCount >= MAX_RESUME_CALLS) {
+        console.warn('[SyncScheduler] Max resume calls reached');
+        toast({
+          title: 'Attenzione',
+          description: 'La pipeline ha superato il limite massimo di resume. Controlla lo stato nella UI.',
+          variant: 'destructive'
+        });
+      }
+
+      // Final refresh
       await loadData();
 
     } catch (error: unknown) {

@@ -13,10 +13,16 @@ const corsHeaders = {
 };
 
 /**
- * run-full-sync - ORCHESTRATORE LEGGERO
+ * run-full-sync - ORCHESTRATORE LEGGERO CON RESUME
  * 
  * Non esegue logica di business, solo orchestrazione.
  * Chiama step separati tramite sync-step-runner per evitare WORKER_LIMIT.
+ * 
+ * RESUME: Se parse_merge (o altri step chunked) richiedono più di
+ * ORCHESTRATOR_BUDGET_MS, l'orchestratore YIELD e restituisce
+ * { status: 'in_progress', run_id, needs_resume: true }.
+ * Il chiamante (UI o cron) deve richiamare con { resume_run_id: runId }
+ * per continuare la stessa run.
  * 
  * SFTP upload: SOLO per trigger === 'cron'.
  * File SFTP: Export Mediaworld.csv, Export ePrice.csv, catalogo_ean.xlsx,
@@ -27,6 +33,11 @@ const corsHeaders = {
  * 
  * success_with_warning: basato SOLO su warning_count > 0.
  */
+
+// Time budget for this Edge Function invocation. Must be well under
+// the Supabase Edge Function wall-clock limit (~60s).
+// After this, we yield and return needs_resume: true.
+const ORCHESTRATOR_BUDGET_MS = 25_000; // 25s
 
 const MAX_PARSE_MERGE_CHUNKS = 100;
 
@@ -52,7 +63,6 @@ async function callStep(supabaseUrl: string, serviceKey: string, functionName: s
       const errorText = await resp.text().catch(() => 'Unknown error');
       console.log(`[orchestrator] ${functionName} HTTP error ${resp.status}: ${errorText}`);
       
-      // Detect WORKER_LIMIT (HTTP 546)
       if (resp.status === 546 || errorText.includes('WORKER_LIMIT')) {
         const supabase = createClient(supabaseUrl, serviceKey);
         const runId = body.run_id as string;
@@ -139,6 +149,59 @@ async function finalizeRun(supabase: SupabaseClient, runId: string, status: stri
   console.log(`[orchestrator] Run ${runId} finalized: ${status}`);
 }
 
+/**
+ * Renew (or acquire) the global_sync lock for a given run_id.
+ * - If lock exists for this run_id: renew lease
+ * - If no lock: acquire fresh
+ * - If lock exists for DIFFERENT run_id: fail
+ */
+async function acquireOrRenewLock(
+  supabase: SupabaseClient,
+  runId: string,
+  ttlSeconds: number
+): Promise<{ acquired: boolean; owner_run_id?: string; lease_until?: string }> {
+  const newLease = new Date(Date.now() + ttlSeconds * 1000).toISOString();
+  
+  // Try to renew existing lock for same run_id
+  const { data: renewed, error: renewErr } = await supabase
+    .from('sync_locks')
+    .update({ lease_until: newLease, updated_at: new Date().toISOString() })
+    .eq('lock_name', 'global_sync')
+    .eq('run_id', runId)
+    .select('lock_name')
+    .maybeSingle();
+  
+  if (renewed) {
+    console.log(`[orchestrator] Lock renewed for run ${runId}, lease until ${newLease}`);
+    return { acquired: true };
+  }
+  
+  // No existing lock for this run_id - try to acquire fresh
+  const { data: lockResult } = await supabase.rpc('try_acquire_sync_lock', {
+    p_lock_name: 'global_sync',
+    p_run_id: runId,
+    p_ttl_seconds: ttlSeconds
+  });
+  
+  if (lockResult) {
+    console.log(`[orchestrator] Lock acquired fresh for run ${runId}`);
+    return { acquired: true };
+  }
+  
+  // Lock held by someone else - find who
+  const { data: existingLock } = await supabase
+    .from('sync_locks')
+    .select('run_id, lease_until')
+    .eq('lock_name', 'global_sync')
+    .maybeSingle();
+  
+  return { 
+    acquired: false, 
+    owner_run_id: existingLock?.run_id, 
+    lease_until: existingLock?.lease_until 
+  };
+}
+
 serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
   if (req.method !== 'POST') {
@@ -153,18 +216,99 @@ serve(async (req) => {
   let runId: string | null = null;
   let startTime = Date.now();
   let supabase: SupabaseClient | null = null;
+  let shouldReleaseLock = true; // Set to false on yield
+  const orchestratorStart = Date.now();
 
   try {
     const body = await req.json().catch(() => ({}));
     const trigger = body.trigger as string;
     const attemptNumber = (body.attempt as number) || 1;
+    const resumeRunId = body.resume_run_id as string | undefined;
     
     if (!trigger || !['cron', 'manual'].includes(trigger)) {
       return new Response(JSON.stringify({ status: 'error', message: 'trigger deve essere cron o manual' }), 
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
-    console.log(`[orchestrator] Starting pipeline, trigger: ${trigger}`);
+    supabase = createClient(supabaseUrl, supabaseServiceKey);
+
+    // Load sync_config for run_timeout_minutes
+    const { data: syncConfig } = await supabase.from('sync_config').select('run_timeout_minutes').eq('id', 1).single();
+    const runTimeoutMinutes = syncConfig?.run_timeout_minutes || 60;
+    const ttlSeconds = runTimeoutMinutes * 60;
+
+    // ========== RESUME MODE ==========
+    if (resumeRunId) {
+      console.log(`[orchestrator] RESUME mode for run ${resumeRunId}, trigger: ${trigger}`);
+      runId = resumeRunId;
+      
+      // Verify the run exists and is still running
+      const { data: existingRun, error: runErr } = await supabase
+        .from('sync_runs')
+        .select('status, steps, started_at, trigger_type')
+        .eq('id', runId)
+        .single();
+      
+      if (runErr || !existingRun) {
+        return new Response(JSON.stringify({ status: 'error', message: `Run ${runId} non trovata` }), 
+          { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+      
+      if (existingRun.status !== 'running') {
+        console.log(`[orchestrator] Run ${runId} is ${existingRun.status}, not running. Cannot resume.`);
+        return new Response(JSON.stringify({ status: 'already_finished', run_status: existingRun.status }), 
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+      
+      // Renew lock
+      const lockResult = await acquireOrRenewLock(supabase, runId, ttlSeconds);
+      if (!lockResult.acquired) {
+        console.log(`[orchestrator] Cannot renew lock for resume: held by ${lockResult.owner_run_id}`);
+        try {
+          await supabase.rpc('log_sync_event', {
+            p_run_id: runId,
+            p_level: 'WARN',
+            p_message: 'Resume bloccato: lock occupato da altra run',
+            p_details: { 
+              step: 'orchestrator_resume', 
+              owner_run_id: lockResult.owner_run_id, 
+              lease_until: lockResult.lease_until 
+            }
+          });
+        } catch (_) { /* non-blocking */ }
+        return new Response(JSON.stringify({ 
+          status: 'locked', message: 'resume_locked', 
+          owner_run_id: lockResult.owner_run_id, 
+          lease_until: lockResult.lease_until 
+        }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+      
+      startTime = new Date(existingRun.started_at).getTime();
+      const currentStep = existingRun.steps?.current_step || 'parse_merge';
+      console.log(`[orchestrator] Resuming run ${runId} at step: ${currentStep}`);
+      
+      // Log resume event
+      try {
+        await supabase.rpc('log_sync_event', {
+          p_run_id: runId,
+          p_level: 'INFO',
+          p_message: 'Orchestrator resume triggered',
+          p_details: { step: currentStep, origin: trigger, elapsed_since_start_ms: Date.now() - startTime }
+        });
+      } catch (_) { /* non-blocking */ }
+      
+      // Determine which step to resume at
+      // Load fee_config for steps that need it
+      const FEE_CONFIG_SINGLETON_ID = '00000000-0000-0000-0000-000000000001';
+      const { data: feeData } = await supabase.from('fee_config').select('*').eq('id', FEE_CONFIG_SINGLETON_ID).maybeSingle();
+      const feeConfig = buildFeeConfig(feeData);
+      
+      // Resume the pipeline from the current step
+      return await runPipeline(supabase, supabaseUrl, supabaseServiceKey, runId, existingRun.trigger_type || trigger, feeConfig, startTime, currentStep, orchestratorStart, (val: boolean) => { shouldReleaseLock = val; });
+    }
+
+    // ========== NEW RUN MODE ==========
+    console.log(`[orchestrator] Starting NEW pipeline, trigger: ${trigger}`);
 
     if (trigger === 'manual') {
       const authHeader = req.headers.get('Authorization');
@@ -182,57 +326,21 @@ serve(async (req) => {
       console.log(`[orchestrator] Manual trigger by user: ${userData.user.id}`);
     }
 
-    supabase = createClient(supabaseUrl, supabaseServiceKey);
-
-    // Load sync_config for run_timeout_minutes
-    const { data: syncConfig } = await supabase.from('sync_config').select('run_timeout_minutes').eq('id', 1).single();
-    const runTimeoutMinutes = syncConfig?.run_timeout_minutes || 60;
-
-    // P1-B: Atomic lock acquisition BEFORE creating run
     runId = crypto.randomUUID();
-    const LOCK_NAME = 'global_sync';
-    const ttlSeconds = runTimeoutMinutes * 60;
-
-    const { data: lockResult } = await supabase.rpc('try_acquire_sync_lock', {
-      p_lock_name: LOCK_NAME,
-      p_run_id: runId,
-      p_ttl_seconds: ttlSeconds
-    });
-
-    if (!lockResult) {
+    
+    const lockResult = await acquireOrRenewLock(supabase, runId, ttlSeconds);
+    if (!lockResult.acquired) {
       console.log('[orchestrator] INFO: Lock not acquired, sync already in progress');
-      runId = null; // Don't release in finally
+      runId = null;
       return new Response(JSON.stringify({ status: 'locked', message: 'not_started' }), 
         { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
     console.log(`[orchestrator] Lock acquired for run ${runId}`);
 
-    // Use singleton row for deterministic fee_config read
     const FEE_CONFIG_SINGLETON_ID = '00000000-0000-0000-0000-000000000001';
     const { data: feeData } = await supabase.from('fee_config').select('*').eq('id', FEE_CONFIG_SINGLETON_ID).maybeSingle();
-    const feeConfig = {
-      feeDrev: feeData?.fee_drev ?? 1.05,
-      feeMkt: feeData?.fee_mkt ?? 1.08,
-      shippingCost: feeData?.shipping_cost ?? 6.00,
-      mediaworldPrepDays: feeData?.mediaworld_preparation_days ?? 3,
-      epricePrepDays: feeData?.eprice_preparation_days ?? 1,
-      mediaworldIncludeEu: feeData?.mediaworld_include_eu ?? false,
-      mediaworldItPrepDays: feeData?.mediaworld_it_preparation_days ?? 3,
-      mediaworldEuPrepDays: feeData?.mediaworld_eu_preparation_days ?? 5,
-      epriceIncludeEu: feeData?.eprice_include_eu ?? false,
-      epriceItPrepDays: feeData?.eprice_it_preparation_days ?? 1,
-      epriceEuPrepDays: feeData?.eprice_eu_preparation_days ?? 3,
-      eanFeeDrev: feeData?.ean_fee_drev ?? null,
-      eanFeeMkt: feeData?.ean_fee_mkt ?? null,
-      eanShippingCost: feeData?.ean_shipping_cost ?? null,
-      mediaworldFeeDrev: feeData?.mediaworld_fee_drev ?? null,
-      mediaworldFeeMkt: feeData?.mediaworld_fee_mkt ?? null,
-      mediaworldShippingCost: feeData?.mediaworld_shipping_cost ?? null,
-      epriceFeeDrev: feeData?.eprice_fee_drev ?? null,
-      epriceFeeMkt: feeData?.eprice_fee_mkt ?? null,
-      epriceShippingCost: feeData?.eprice_shipping_cost ?? null
-    };
+    const feeConfig = buildFeeConfig(feeData);
 
     startTime = Date.now();
     await supabase.from('sync_runs').insert({ 
@@ -242,204 +350,7 @@ serve(async (req) => {
     });
     console.log(`[orchestrator] Run created: ${runId}`);
 
-    // ========== STEP 1: FTP Import ==========
-    await updateRun(supabase, runId, { steps: { current_step: 'import_ftp' } });
-    console.log('[orchestrator] === STEP 1: FTP Import ===');
-    
-    for (const fileType of ['material', 'stock', 'price', 'stockLocation']) {
-      if (await isCancelRequested(supabase, runId)) {
-        await finalizeRun(supabase, runId, 'failed', startTime, 'Interrotta dall\'utente');
-        return new Response(JSON.stringify({ status: 'cancelled' }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-      }
-      
-      const result = await callStep(supabaseUrl, supabaseServiceKey, 'import-catalog-ftp', { 
-        fileType,
-        run_id: runId
-      });
-      
-      if (!result.success && fileType !== 'stockLocation') {
-        await finalizeRun(supabase, runId, 'failed', startTime, `FTP ${fileType}: ${result.error}`);
-        return new Response(JSON.stringify({ status: 'failed', error: result.error }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-      }
-      
-      if (!result.success && fileType === 'stockLocation') {
-        console.log(`[orchestrator] Stock location import failed (non-blocking): ${result.error}`);
-        const { data: run } = await supabase.from('sync_runs').select('location_warnings').eq('id', runId).single();
-        const warnings = run?.location_warnings || {};
-        warnings.missing_location_file = 1;
-        await supabase.from('sync_runs').update({ location_warnings: warnings }).eq('id', runId);
-        
-        // Register WARN via atomic RPC (increments warning_count)
-        try {
-          await supabase.rpc('log_sync_event', {
-            p_run_id: runId,
-            p_level: 'WARN',
-            p_message: 'File stock location non trovato o non importabile',
-            p_details: { step: 'import_ftp', location_warning: 'missing_location_file' }
-          });
-        } catch (logErr) {
-          console.warn('[orchestrator] log_sync_event failed:', logErr);
-        }
-      }
-    }
-
-    // ========== STEP 2: PARSE_MERGE (CHUNKED) ==========
-    await updateRun(supabase, runId, { steps: { current_step: 'parse_merge' } });
-    console.log('[orchestrator] === STEP 2: parse_merge (CHUNKED) ===');
-    
-    let parseMergeComplete = false;
-    let chunkCount = 0;
-    
-    while (!parseMergeComplete && chunkCount < MAX_PARSE_MERGE_CHUNKS) {
-      if (await isCancelRequested(supabase, runId)) {
-        await finalizeRun(supabase, runId, 'failed', startTime, 'Interrotta dall\'utente');
-        return new Response(JSON.stringify({ status: 'cancelled' }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-      }
-      
-      chunkCount++;
-      console.log(`[orchestrator] parse_merge chunk ${chunkCount}/${MAX_PARSE_MERGE_CHUNKS}...`);
-      
-      const result = await callStep(supabaseUrl, supabaseServiceKey, 'sync-step-runner', { 
-        run_id: runId, step: 'parse_merge', fee_config: feeConfig 
-      });
-      
-      if (!result.success) {
-        await finalizeRun(supabase, runId, 'failed', startTime, `parse_merge chunk ${chunkCount}: ${result.error}`);
-        return new Response(JSON.stringify({ status: 'failed', error: result.error }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-      }
-      
-      const verification = await verifyStepCompleted(supabase, runId, 'parse_merge');
-      
-      if (!verification.success) {
-        await finalizeRun(supabase, runId, 'failed', startTime, verification.error || 'parse_merge verification failed');
-        return new Response(JSON.stringify({ status: 'failed', error: verification.error }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-      }
-      
-      if (verification.status === 'completed') {
-        parseMergeComplete = true;
-        console.log(`[orchestrator] parse_merge completed after ${chunkCount} chunks`);
-      } else if (verification.status === 'in_progress') {
-        console.log(`[orchestrator] parse_merge in_progress, continuing to next chunk...`);
-      } else {
-        await finalizeRun(supabase, runId, 'failed', startTime, `parse_merge unexpected status: ${verification.status}`);
-        return new Response(JSON.stringify({ status: 'failed', error: `Unexpected status: ${verification.status}` }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-      }
-    }
-    
-    if (!parseMergeComplete) {
-      await finalizeRun(supabase, runId, 'failed', startTime, `parse_merge exceeded ${MAX_PARSE_MERGE_CHUNKS} chunks limit`);
-      return new Response(JSON.stringify({ status: 'failed', error: 'parse_merge chunk limit exceeded' }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-    }
-
-    // ========== STEPS 3-7: Processing via sync-step-runner ==========
-    const remainingSteps = ['ean_mapping', 'pricing', 'export_ean', 'export_mediaworld', 'export_eprice'];
-    
-    // For cron triggers, add EAN XLSX and Amazon export steps
-    if (trigger === 'cron') {
-      remainingSteps.push('export_ean_xlsx', 'export_amazon');
-    }
-    
-    for (const step of remainingSteps) {
-      if (await isCancelRequested(supabase, runId)) {
-        await finalizeRun(supabase, runId, 'failed', startTime, 'Interrotta dall\'utente');
-        return new Response(JSON.stringify({ status: 'cancelled' }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-      }
-      
-      await updateRun(supabase, runId, { steps: { current_step: step } });
-      console.log(`[orchestrator] === STEP: ${step} ===`);
-      
-      const result = await callStep(supabaseUrl, supabaseServiceKey, 'sync-step-runner', { 
-        run_id: runId, step, fee_config: feeConfig 
-      });
-      
-      const verification = await verifyStepCompleted(supabase, runId, step);
-      
-      if (!result.success || !verification.success) {
-        const error = result.error || verification.error || `Step ${step} fallito`;
-        await finalizeRun(supabase, runId, 'failed', startTime, error);
-        return new Response(JSON.stringify({ status: 'failed', error }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-      }
-    }
-
-    // ========== STEP 8: SFTP Upload (ONLY for cron trigger) ==========
-    if (trigger === 'cron') {
-      if (await isCancelRequested(supabase, runId)) {
-        await finalizeRun(supabase, runId, 'failed', startTime, 'Interrotta dall\'utente');
-        return new Response(JSON.stringify({ status: 'cancelled' }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-      }
-      
-      await updateRun(supabase, runId, { steps: { current_step: 'upload_sftp' } });
-      console.log('[orchestrator] === STEP 8: SFTP Upload (cron only) ===');
-      
-      // Exactly the 5 required files, same remote folder, fixed names, overwrite
-      const sftpFiles = EXPORT_FILES.map(f => ({
-        bucket: 'exports',
-        path: f,
-        filename: f
-      }));
-      
-      const sftpResult = await callStep(supabaseUrl, supabaseServiceKey, 'upload-exports-to-sftp', {
-        files: sftpFiles
-      });
-      
-      if (!sftpResult.success) {
-        await finalizeRun(supabase, runId, 'failed', startTime, `SFTP: ${sftpResult.error}`);
-        return new Response(JSON.stringify({ status: 'failed', error: sftpResult.error }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-      }
-    } else {
-      console.log('[orchestrator] Skipping SFTP upload (manual trigger)');
-    }
-
-    // ========== STORAGE VERSIONING ==========
-    console.log('[orchestrator] === Storage versioning ===');
-    const versionTimestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    
-    // Save file_manifest with version timestamp for retention tracking
-    const fileManifest: Record<string, string> = {};
-    
-    for (const fileName of EXPORT_FILES) {
-      try {
-        const { data: fileBlob } = await supabase.storage.from('exports').download(fileName);
-        if (fileBlob) {
-          // Copy to latest/ (overwrite)
-          await supabase.storage.from('exports').upload(`latest/${fileName}`, fileBlob, { upsert: true });
-          // Copy to versions/
-          await supabase.storage.from('exports').upload(`versions/${versionTimestamp}/${fileName}`, fileBlob, { upsert: true });
-          fileManifest[fileName] = versionTimestamp;
-        }
-      } catch (e: unknown) {
-        console.warn(`[orchestrator] Versioning failed for ${fileName}: ${errMsg(e)}`);
-      }
-    }
-    
-    // Save file_manifest for retention tracking
-    await supabase.from('sync_runs').update({ file_manifest: fileManifest }).eq('id', runId);
-
-    // ========== RETENTION CLEANUP (per-file, max 3 versions, >7 days) ==========
-    await cleanupVersions(supabase);
-
-    // ========== DETERMINE FINAL STATUS ==========
-    // success_with_warning based SOLELY on warning_count > 0
-    const { data: finalRun } = await supabase.from('sync_runs').select('warning_count').eq('id', runId).single();
-    const finalStatus = (finalRun?.warning_count || 0) > 0 ? 'success_with_warning' : 'success';
-    
-    await finalizeRun(supabase, runId, finalStatus, startTime);
-    console.log(`[orchestrator] Pipeline completed: ${runId}, status: ${finalStatus}`);
-
-    // ========== POST-RUN NOTIFICATION ==========
-    try {
-      await fetch(`${supabaseUrl}/functions/v1/send-sync-notification`, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${supabaseServiceKey}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ run_id: runId, status: finalStatus })
-      });
-      console.log(`[orchestrator] Notification sent for run ${runId}`);
-    } catch (e: unknown) {
-      console.warn(`[orchestrator] Notification failed (non-blocking): ${errMsg(e)}`);
-    }
-    
-    return new Response(JSON.stringify({ status: finalStatus, run_id: runId }), 
-      { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    return await runPipeline(supabase, supabaseUrl, supabaseServiceKey, runId, trigger, feeConfig, startTime, 'import_ftp', orchestratorStart, (val: boolean) => { shouldReleaseLock = val; });
 
   } catch (err: unknown) {
     console.error('[orchestrator] Fatal error:', err);
@@ -460,8 +371,7 @@ serve(async (req) => {
     return new Response(JSON.stringify({ status: 'error', message: errMsg(err) }), 
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
   } finally {
-    // P1-B: Always release lock in finally
-    if (runId && supabase) {
+    if (runId && supabase && shouldReleaseLock) {
       try {
         const { data: released } = await supabase.rpc('release_sync_lock', {
           p_lock_name: 'global_sync',
@@ -470,23 +380,327 @@ serve(async (req) => {
         if (released) {
           console.log(`[orchestrator] Lock released for run ${runId}`);
         } else {
-          console.warn(`[orchestrator] WARN: Lock release returned false for run ${runId} (run_id mismatch or already released)`);
+          console.warn(`[orchestrator] WARN: Lock release returned false for run ${runId}`);
         }
       } catch (e: unknown) {
         console.warn(`[orchestrator] WARN: Failed to release lock: ${errMsg(e)}`);
       }
+    } else if (runId && !shouldReleaseLock) {
+      console.log(`[orchestrator] Lock NOT released (yield mode) for run ${runId}`);
     }
   }
 });
 
-/**
- * Per-file retention cleanup.
- * For each of the 5 canonical files:
- * - Find all versions under versions/<timestamp>/<filename>
- * - Keep the newest 3 versions
- * - Delete versions beyond 3 only if older than 7 days
- * - Never delete latest/
- */
+// ============================================================
+// PIPELINE EXECUTION (shared between new run and resume)
+// ============================================================
+
+function buildFeeConfig(feeData: Record<string, unknown> | null): Record<string, unknown> {
+  return {
+    feeDrev: feeData?.fee_drev ?? 1.05,
+    feeMkt: feeData?.fee_mkt ?? 1.08,
+    shippingCost: feeData?.shipping_cost ?? 6.00,
+    mediaworldPrepDays: feeData?.mediaworld_preparation_days ?? 3,
+    epricePrepDays: feeData?.eprice_preparation_days ?? 1,
+    mediaworldIncludeEu: feeData?.mediaworld_include_eu ?? false,
+    mediaworldItPrepDays: feeData?.mediaworld_it_preparation_days ?? 3,
+    mediaworldEuPrepDays: feeData?.mediaworld_eu_preparation_days ?? 5,
+    epriceIncludeEu: feeData?.eprice_include_eu ?? false,
+    epriceItPrepDays: feeData?.eprice_it_preparation_days ?? 1,
+    epriceEuPrepDays: feeData?.eprice_eu_preparation_days ?? 3,
+    eanFeeDrev: feeData?.ean_fee_drev ?? null,
+    eanFeeMkt: feeData?.ean_fee_mkt ?? null,
+    eanShippingCost: feeData?.ean_shipping_cost ?? null,
+    mediaworldFeeDrev: feeData?.mediaworld_fee_drev ?? null,
+    mediaworldFeeMkt: feeData?.mediaworld_fee_mkt ?? null,
+    mediaworldShippingCost: feeData?.mediaworld_shipping_cost ?? null,
+    epriceFeeDrev: feeData?.eprice_fee_drev ?? null,
+    epriceFeeMkt: feeData?.eprice_fee_mkt ?? null,
+    epriceShippingCost: feeData?.eprice_shipping_cost ?? null
+  };
+}
+
+// Steps in pipeline order. parse_merge is special (chunked).
+const ALL_STEPS_BEFORE_PARSE = ['import_ftp'];
+const ALL_STEPS_AFTER_PARSE = ['ean_mapping', 'pricing', 'export_ean', 'export_mediaworld', 'export_eprice'];
+const CRON_EXTRA_STEPS = ['export_ean_xlsx', 'export_amazon'];
+
+async function runPipeline(
+  supabase: SupabaseClient,
+  supabaseUrl: string,
+  supabaseServiceKey: string,
+  runId: string,
+  trigger: string,
+  feeConfig: Record<string, unknown>,
+  runStartTime: number,
+  resumeFromStep: string,
+  orchestratorStart: number,
+  setReleaseLock: (val: boolean) => void
+): Promise<Response> {
+  
+  const budgetExceeded = () => (Date.now() - orchestratorStart) > ORCHESTRATOR_BUDGET_MS;
+  
+  // Helper to yield
+  const yieldResponse = async (currentStep: string, reason: string): Promise<Response> => {
+    setReleaseLock(false); // Keep lock
+    console.log(`[orchestrator] YIELD at step ${currentStep}: ${reason}`);
+    
+    try {
+      await supabase.rpc('log_sync_event', {
+        p_run_id: runId,
+        p_level: 'INFO',
+        p_message: `Orchestrator yield: ${reason}`,
+        p_details: { 
+          step: currentStep, 
+          orchestrator_elapsed_ms: Date.now() - orchestratorStart,
+          budget_ms: ORCHESTRATOR_BUDGET_MS,
+          reason 
+        }
+      });
+    } catch (_) { /* non-blocking */ }
+    
+    return new Response(JSON.stringify({ 
+      status: 'in_progress', 
+      run_id: runId, 
+      current_step: currentStep,
+      needs_resume: true 
+    }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  };
+
+  // ========== STEP 1: FTP Import ==========
+  if (resumeFromStep === 'import_ftp') {
+    await updateRun(supabase, runId, { steps: { current_step: 'import_ftp' } });
+    console.log('[orchestrator] === STEP 1: FTP Import ===');
+    
+    for (const fileType of ['material', 'stock', 'price', 'stockLocation']) {
+      if (await isCancelRequested(supabase, runId)) {
+        await finalizeRun(supabase, runId, 'failed', runStartTime, 'Interrotta dall\'utente');
+        return new Response(JSON.stringify({ status: 'cancelled' }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+      
+      if (budgetExceeded()) {
+        return await yieldResponse('import_ftp', `budget exceeded during FTP import (${fileType})`);
+      }
+      
+      const result = await callStep(supabaseUrl, supabaseServiceKey, 'import-catalog-ftp', { 
+        fileType, run_id: runId
+      });
+      
+      if (!result.success && fileType !== 'stockLocation') {
+        await finalizeRun(supabase, runId, 'failed', runStartTime, `FTP ${fileType}: ${result.error}`);
+        return new Response(JSON.stringify({ status: 'failed', error: result.error }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+      
+      if (!result.success && fileType === 'stockLocation') {
+        console.log(`[orchestrator] Stock location import failed (non-blocking): ${result.error}`);
+        const { data: run } = await supabase.from('sync_runs').select('location_warnings').eq('id', runId).single();
+        const warnings = run?.location_warnings || {};
+        warnings.missing_location_file = 1;
+        await supabase.from('sync_runs').update({ location_warnings: warnings }).eq('id', runId);
+        
+        try {
+          await supabase.rpc('log_sync_event', {
+            p_run_id: runId,
+            p_level: 'WARN',
+            p_message: 'File stock location non trovato o non importabile',
+            p_details: { step: 'import_ftp', location_warning: 'missing_location_file' }
+          });
+        } catch (logErr) {
+          console.warn('[orchestrator] log_sync_event failed:', logErr);
+        }
+      }
+    }
+    // FTP done, fall through to parse_merge
+    resumeFromStep = 'parse_merge';
+  }
+
+  // ========== STEP 2: PARSE_MERGE (CHUNKED with time budget) ==========
+  if (resumeFromStep === 'parse_merge') {
+    await updateRun(supabase, runId, { steps: { current_step: 'parse_merge' } });
+    console.log('[orchestrator] === STEP 2: parse_merge (CHUNKED) ===');
+    
+    let parseMergeComplete = false;
+    let chunkCount = 0;
+    
+    while (!parseMergeComplete && chunkCount < MAX_PARSE_MERGE_CHUNKS) {
+      if (await isCancelRequested(supabase, runId)) {
+        await finalizeRun(supabase, runId, 'failed', runStartTime, 'Interrotta dall\'utente');
+        return new Response(JSON.stringify({ status: 'cancelled' }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+      
+      // Check orchestrator time budget BEFORE calling the step
+      if (budgetExceeded()) {
+        return await yieldResponse('parse_merge', `orchestrator budget exceeded after ${chunkCount} chunks this invocation`);
+      }
+      
+      chunkCount++;
+      console.log(`[orchestrator] parse_merge chunk ${chunkCount} (this invocation)...`);
+      
+      const result = await callStep(supabaseUrl, supabaseServiceKey, 'sync-step-runner', { 
+        run_id: runId, step: 'parse_merge', fee_config: feeConfig 
+      });
+      
+      if (!result.success) {
+        await finalizeRun(supabase, runId, 'failed', runStartTime, `parse_merge: ${result.error}`);
+        return new Response(JSON.stringify({ status: 'failed', error: result.error }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+      
+      const verification = await verifyStepCompleted(supabase, runId, 'parse_merge');
+      
+      if (!verification.success) {
+        await finalizeRun(supabase, runId, 'failed', runStartTime, verification.error || 'parse_merge verification failed');
+        return new Response(JSON.stringify({ status: 'failed', error: verification.error }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+      
+      if (verification.status === 'completed') {
+        parseMergeComplete = true;
+        console.log(`[orchestrator] parse_merge completed after ${chunkCount} chunks this invocation`);
+      } else if (verification.status === 'in_progress') {
+        console.log(`[orchestrator] parse_merge in_progress, continuing...`);
+      } else {
+        await finalizeRun(supabase, runId, 'failed', runStartTime, `parse_merge unexpected status: ${verification.status}`);
+        return new Response(JSON.stringify({ status: 'failed', error: `Unexpected status: ${verification.status}` }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+    }
+    
+    if (!parseMergeComplete) {
+      // Either hit MAX_PARSE_MERGE_CHUNKS or time budget. If still in_progress, yield.
+      const verification = await verifyStepCompleted(supabase, runId, 'parse_merge');
+      if (verification.status === 'in_progress') {
+        return await yieldResponse('parse_merge', `chunk limit ${MAX_PARSE_MERGE_CHUNKS} reached this invocation`);
+      }
+      await finalizeRun(supabase, runId, 'failed', runStartTime, `parse_merge exceeded ${MAX_PARSE_MERGE_CHUNKS} chunks limit`);
+      return new Response(JSON.stringify({ status: 'failed', error: 'parse_merge chunk limit exceeded' }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+    // parse_merge done, fall through to remaining steps
+    resumeFromStep = 'ean_mapping';
+  }
+
+  // ========== STEPS 3+: Remaining processing steps ==========
+  const allRemainingSteps = [...ALL_STEPS_AFTER_PARSE];
+  if (trigger === 'cron') {
+    allRemainingSteps.push(...CRON_EXTRA_STEPS);
+  }
+  
+  // Find where to resume from in the remaining steps
+  let startIdx = 0;
+  if (resumeFromStep !== 'ean_mapping') {
+    const idx = allRemainingSteps.indexOf(resumeFromStep);
+    if (idx >= 0) startIdx = idx;
+  }
+  
+  for (let i = startIdx; i < allRemainingSteps.length; i++) {
+    const step = allRemainingSteps[i];
+    
+    if (await isCancelRequested(supabase, runId)) {
+      await finalizeRun(supabase, runId, 'failed', runStartTime, 'Interrotta dall\'utente');
+      return new Response(JSON.stringify({ status: 'cancelled' }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+    
+    if (budgetExceeded()) {
+      return await yieldResponse(step, 'orchestrator budget exceeded before step');
+    }
+    
+    await updateRun(supabase, runId, { steps: { current_step: step } });
+    console.log(`[orchestrator] === STEP: ${step} ===`);
+    
+    const result = await callStep(supabaseUrl, supabaseServiceKey, 'sync-step-runner', { 
+      run_id: runId, step, fee_config: feeConfig 
+    });
+    
+    const verification = await verifyStepCompleted(supabase, runId, step);
+    
+    if (!result.success || !verification.success) {
+      const error = result.error || verification.error || `Step ${step} fallito`;
+      await finalizeRun(supabase, runId, 'failed', runStartTime, error);
+      return new Response(JSON.stringify({ status: 'failed', error }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+  }
+
+  // ========== SFTP Upload (ONLY for cron trigger) ==========
+  if (trigger === 'cron') {
+    if (await isCancelRequested(supabase, runId)) {
+      await finalizeRun(supabase, runId, 'failed', runStartTime, 'Interrotta dall\'utente');
+      return new Response(JSON.stringify({ status: 'cancelled' }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+    
+    if (budgetExceeded()) {
+      return await yieldResponse('upload_sftp', 'orchestrator budget exceeded before SFTP');
+    }
+    
+    await updateRun(supabase, runId, { steps: { current_step: 'upload_sftp' } });
+    console.log('[orchestrator] === SFTP Upload (cron only) ===');
+    
+    const sftpFiles = EXPORT_FILES.map(f => ({
+      bucket: 'exports',
+      path: f,
+      filename: f
+    }));
+    
+    const sftpResult = await callStep(supabaseUrl, supabaseServiceKey, 'upload-exports-to-sftp', {
+      files: sftpFiles
+    });
+    
+    if (!sftpResult.success) {
+      await finalizeRun(supabase, runId, 'failed', runStartTime, `SFTP: ${sftpResult.error}`);
+      return new Response(JSON.stringify({ status: 'failed', error: sftpResult.error }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+  } else {
+    console.log('[orchestrator] Skipping SFTP upload (manual trigger)');
+  }
+
+  // ========== STORAGE VERSIONING ==========
+  if (budgetExceeded()) {
+    return await yieldResponse('versioning', 'orchestrator budget exceeded before versioning');
+  }
+  
+  console.log('[orchestrator] === Storage versioning ===');
+  const versionTimestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const fileManifest: Record<string, string> = {};
+  
+  for (const fileName of EXPORT_FILES) {
+    try {
+      const { data: fileBlob } = await supabase.storage.from('exports').download(fileName);
+      if (fileBlob) {
+        await supabase.storage.from('exports').upload(`latest/${fileName}`, fileBlob, { upsert: true });
+        await supabase.storage.from('exports').upload(`versions/${versionTimestamp}/${fileName}`, fileBlob, { upsert: true });
+        fileManifest[fileName] = versionTimestamp;
+      }
+    } catch (e: unknown) {
+      console.warn(`[orchestrator] Versioning failed for ${fileName}: ${errMsg(e)}`);
+    }
+  }
+  
+  await supabase.from('sync_runs').update({ file_manifest: fileManifest }).eq('id', runId);
+  await cleanupVersions(supabase);
+
+  // ========== DETERMINE FINAL STATUS ==========
+  const { data: finalRun } = await supabase.from('sync_runs').select('warning_count').eq('id', runId).single();
+  const finalStatus = (finalRun?.warning_count || 0) > 0 ? 'success_with_warning' : 'success';
+  
+  await finalizeRun(supabase, runId, finalStatus, runStartTime);
+  console.log(`[orchestrator] Pipeline completed: ${runId}, status: ${finalStatus}`);
+
+  // Post-run notification
+  try {
+    await fetch(`${supabaseUrl}/functions/v1/send-sync-notification`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${supabaseServiceKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ run_id: runId, status: finalStatus })
+    });
+    console.log(`[orchestrator] Notification sent for run ${runId}`);
+  } catch (e: unknown) {
+    console.warn(`[orchestrator] Notification failed (non-blocking): ${errMsg(e)}`);
+  }
+  
+  return new Response(JSON.stringify({ status: finalStatus, run_id: runId }), 
+    { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+}
+
+// ============================================================
+// VERSION CLEANUP
+// ============================================================
+
 async function cleanupVersions(supabase: SupabaseClient): Promise<void> {
   try {
     const { data: versionFolders } = await supabase.storage.from('exports').list('versions', {
@@ -500,8 +714,6 @@ async function cleanupVersions(supabase: SupabaseClient): Promise<void> {
     }
 
     const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
-
-    // Build per-file version list
     const fileVersions: Record<string, Array<{ folder: string; timestamp: number }>> = {};
     for (const f of EXPORT_FILES) {
       fileVersions[f] = [];
@@ -509,13 +721,11 @@ async function cleanupVersions(supabase: SupabaseClient): Promise<void> {
 
     for (const folder of versionFolders) {
       const folderName = folder.name;
-      // Parse timestamp from folder name (format: YYYY-MM-DDTHH-MM-SS-mmmZ)
       let folderTs: number;
       try {
         const isoStr = folderName.replace(/-(\d{2})-(\d{2})-(\d{3})Z$/, ':$1:$2.$3Z').replace(/T(\d{2})-/, 'T$1:');
         folderTs = new Date(isoStr).getTime();
         if (isNaN(folderTs)) {
-          // Fallback: use folder metadata created_at if available
           folderTs = folder.created_at ? new Date(folder.created_at).getTime() : 0;
         }
       } catch {
@@ -527,7 +737,6 @@ async function cleanupVersions(supabase: SupabaseClient): Promise<void> {
         continue;
       }
 
-      // List files in this version folder
       const { data: filesInFolder } = await supabase.storage.from('exports').list(`versions/${folderName}`);
       if (!filesInFolder) continue;
 
@@ -538,16 +747,10 @@ async function cleanupVersions(supabase: SupabaseClient): Promise<void> {
       }
     }
 
-    // For each file, apply retention
     const toDelete: string[] = [];
-
     for (const [fileName, versions] of Object.entries(fileVersions)) {
-      // Sort newest first
       versions.sort((a, b) => b.timestamp - a.timestamp);
-      
       if (versions.length <= 3) continue;
-
-      // Versions beyond the first 3
       const excess = versions.slice(3);
       for (const v of excess) {
         if (v.timestamp < sevenDaysAgo) {
@@ -558,7 +761,6 @@ async function cleanupVersions(supabase: SupabaseClient): Promise<void> {
 
     if (toDelete.length > 0) {
       console.log(`[orchestrator] Deleting ${toDelete.length} old version files`);
-      // Delete in batches of 20
       for (let i = 0; i < toDelete.length; i += 20) {
         const batch = toDelete.slice(i, i + 20);
         await supabase.storage.from('exports').remove(batch);
@@ -568,12 +770,10 @@ async function cleanupVersions(supabase: SupabaseClient): Promise<void> {
       console.log('[orchestrator] No version files to clean up');
     }
 
-    // Clean up empty version folders
     try {
       for (const folder of versionFolders) {
         const { data: remaining } = await supabase.storage.from('exports').list(`versions/${folder.name}`);
         if (!remaining || remaining.length === 0) {
-          // Folder is empty, but Supabase storage doesn't have explicit folder deletion
           // Empty folders are cleaned up automatically
         }
       }
