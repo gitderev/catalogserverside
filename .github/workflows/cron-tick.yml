@@ -8,6 +8,9 @@ on:
 jobs:
   cron-tick:
     runs-on: ubuntu-latest
+    env:
+      TICK_MAX_CALLS: "8"
+      TICK_SLEEP_SEC: "75"
     steps:
       - name: Validate secrets
         run: |
@@ -17,6 +20,25 @@ jobs:
           fi
           if [ -z "${{ secrets.CRON_SECRET }}" ]; then
             echo "::error::Secret CRON_SECRET is not configured. Go to Settings > Secrets and variables > Actions and add CRON_SECRET (must match the CRON_SECRET Supabase secret)."
+            exit 1
+          fi
+
+      - name: Validate tick loop configuration
+        run: |
+          if ! [[ "$TICK_MAX_CALLS" =~ ^[0-9]+$ ]]; then
+            echo "::error::TICK_MAX_CALLS must be an integer between 1 and 12 (got: $TICK_MAX_CALLS)"
+            exit 1
+          fi
+          if ! [[ "$TICK_SLEEP_SEC" =~ ^[0-9]+$ ]]; then
+            echo "::error::TICK_SLEEP_SEC must be an integer between 61 and 300 (got: $TICK_SLEEP_SEC)"
+            exit 1
+          fi
+          if [ "$TICK_MAX_CALLS" -lt 1 ] || [ "$TICK_MAX_CALLS" -gt 12 ]; then
+            echo "::error::TICK_MAX_CALLS out of range: $TICK_MAX_CALLS (expected 1..12)"
+            exit 1
+          fi
+          if [ "$TICK_SLEEP_SEC" -lt 61 ] || [ "$TICK_SLEEP_SEC" -gt 300 ]; then
+            echo "::error::TICK_SLEEP_SEC out of range: $TICK_SLEEP_SEC (expected 61..300)"
             exit 1
           fi
 
@@ -33,20 +55,67 @@ jobs:
           FP12=$(printf "%s" "${SECRET}cron-fp-v1" | sha256sum | awk '{print $1}' | cut -c1-12)
           echo "secret_fp12=$FP12"
 
-      - name: Call cron-tick
+      - name: Call cron-tick (conditional multi-tick)
         run: |
-          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "${{ secrets.CRON_TICK_URL }}" \
-            -H "Content-Type: application/json" \
-            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" \
-            -d '{"timestamp":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}')
+          for ATTEMPT in $(seq 1 "$TICK_MAX_CALLS"); do
+            TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            BODY_FILE=$(mktemp)
+            STATUS=$(curl -sS -o "$BODY_FILE" -w "%{http_code}" -X POST "${{ secrets.CRON_TICK_URL }}" \
+              -H "Content-Type: application/json" \
+              -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" \
+              -d '{"timestamp":"'"$TS"'"}')
+            BODY=$(cat "$BODY_FILE")
+            BODY_TRUNCATED=$(printf '%s' "$BODY" | head -c 1000)
 
-          BODY=$(echo "$RESPONSE" | sed '$d')
-          STATUS=$(echo "$RESPONSE" | tail -1)
+            echo "attempt=$ATTEMPT timestamp=$TS http_status=$STATUS"
+            echo "body=$BODY_TRUNCATED"
 
-          echo "HTTP Status: $STATUS"
-          echo "Response: $BODY"
+            if [ "$STATUS" -ge 400 ]; then
+              rm -f "$BODY_FILE"
+              echo "::error::cron-tick returned HTTP $STATUS on attempt $ATTEMPT"
+              exit 1
+            fi
 
-          if [ "$STATUS" -ge 400 ]; then
-            echo "::error::cron-tick returned HTTP $STATUS"
-            exit 1
-          fi
+            PY_SCRIPT=$(mktemp)
+            printf '%s\n' \
+              'import json' \
+              'import sys' \
+              'path = sys.argv[1]' \
+              'try:' \
+              '    with open(path, "r", encoding="utf-8") as f:' \
+              '        data = json.load(f)' \
+              'except Exception as e:' \
+              '    print("PARSE_OK=false")' \
+              '    print("SHOULD_CONTINUE=false")' \
+              '    print(f"PARSE_ERROR={e}")' \
+              '    sys.exit(0)' \
+              'run_id = data.get("run_id")' \
+              'has_run_id = isinstance(run_id, str) and run_id.strip() != ""' \
+              'should_continue = (' \
+              '    data.get("is_yielded") is True' \
+              '    or data.get("is_stalled") is True' \
+              '    or data.get("status") == "yielded"' \
+              '    or has_run_id' \
+              ')' \
+              'print("PARSE_OK=true")' \
+              'print("SHOULD_CONTINUE=" + ("true" if should_continue else "false"))' \
+              > "$PY_SCRIPT"
+            PARSE_RESULT=$(python3 "$PY_SCRIPT" "$BODY_FILE")
+            rm -f "$PY_SCRIPT"
+            rm -f "$BODY_FILE"
+
+            echo "$PARSE_RESULT"
+            SHOULD_CONTINUE=$(echo "$PARSE_RESULT" | awk -F= '/^SHOULD_CONTINUE=/{print $2}')
+
+            if [ "$SHOULD_CONTINUE" != "true" ]; then
+              echo "No further work detected; stopping after attempt $ATTEMPT"
+              break
+            fi
+
+            if [ "$ATTEMPT" -lt "$TICK_MAX_CALLS" ]; then
+              echo "Work still pending; sleeping ${TICK_SLEEP_SEC}s before next attempt"
+              sleep "$TICK_SLEEP_SEC"
+            else
+              echo "Reached max attempts ($TICK_MAX_CALLS) with work still pending"
+            fi
+          done
