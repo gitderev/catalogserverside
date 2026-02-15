@@ -970,6 +970,30 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
         return { success: false, error, status: 'failed' };
       }
       
+      // ===== GUARDRAIL: detect cursor_pos regression to headerEndPos on resume =====
+      // If persisted cursor_pos > 0 but we're about to start from headerEndPos,
+      // something upstream wiped the state. Fail fast to avoid infinite re-processing.
+      if (cursorPos <= materialMeta.headerEndPos && chunkIndex === 0 && state.productCount > 0) {
+        const error = `parse_merge_resume_cursor_mismatch: cursor_pos=${cursorPos} regressed to headerEndPos=${materialMeta.headerEndPos} but productCount=${state.productCount} indicates prior progress. State may have been wiped.`;
+        try {
+          await supabase.rpc('log_sync_event', {
+            p_run_id: runId, p_level: 'ERROR',
+            p_message: 'parse_merge_resume_cursor_mismatch',
+            p_details: {
+              step: 'parse_merge',
+              expected_cursor_pos: 'should be > headerEndPos after first chunk',
+              actual_cursor_pos: cursorPos,
+              header_end_pos: materialMeta.headerEndPos,
+              chunk_index: chunkIndex,
+              product_count: state.productCount,
+              suggestion: 'Possible steps JSON overwrite during resume. Check orchestrator updateRun calls.'
+            }
+          });
+        } catch (_e) { /* non-blocking */ }
+        await updateParseMergeState(supabase, runId, { status: 'failed', error });
+        return { success: false, error, status: 'failed' };
+      }
+
       // ----- Fetch raw text for this invocation -----
       // Both modes now use Range from source_bucket/source_path (ftp-import).
       // chunk_files mode is a fallback label only — it still uses Range but

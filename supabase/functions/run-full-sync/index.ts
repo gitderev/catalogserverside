@@ -141,6 +141,14 @@ async function updateRun(supabase: SupabaseClient, runId: string, updates: Recor
   await supabase.from('sync_runs').update(updates).eq('id', runId);
 }
 
+/** Update only current_step inside steps JSON without wiping persisted step state */
+async function updateCurrentStep(supabase: SupabaseClient, runId: string, stepName: string): Promise<void> {
+  const { data: run } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
+  const currentSteps = run?.steps || {};
+  const updatedSteps = { ...currentSteps, current_step: stepName };
+  await supabase.from('sync_runs').update({ steps: updatedSteps }).eq('id', runId);
+}
+
 async function finalizeRun(supabase: SupabaseClient, runId: string, status: string, startTime: number, errorMessage?: string): Promise<void> {
   await supabase.from('sync_runs').update({
     status, 
@@ -527,7 +535,7 @@ async function runPipeline(
 
   // ========== STEP 1: FTP Import ==========
   if (resumeFromStep === 'import_ftp') {
-    await updateRun(supabase, runId, { steps: { current_step: 'import_ftp' } });
+    await updateCurrentStep(supabase, runId, 'import_ftp');
     console.log('[orchestrator] === STEP 1: FTP Import ===');
     
     for (const fileType of ['material', 'stock', 'price', 'stockLocation']) {
@@ -574,7 +582,7 @@ async function runPipeline(
 
   // ========== STEP 2: PARSE_MERGE (CHUNKED with time budget) ==========
   if (resumeFromStep === 'parse_merge') {
-    await updateRun(supabase, runId, { steps: { current_step: 'parse_merge' } });
+    await updateCurrentStep(supabase, runId, 'parse_merge');
     console.log('[orchestrator] === STEP 2: parse_merge (CHUNKED) ===');
     
     let parseMergeComplete = false;
@@ -659,7 +667,7 @@ async function runPipeline(
       return await yieldResponse(step, 'orchestrator budget exceeded before step');
     }
     
-    await updateRun(supabase, runId, { steps: { current_step: step } });
+    await updateCurrentStep(supabase, runId, step);
     console.log(`[orchestrator] === STEP: ${step} ===`);
     
     const result = await callStep(supabaseUrl, supabaseServiceKey, 'sync-step-runner', { 
