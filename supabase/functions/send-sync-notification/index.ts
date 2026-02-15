@@ -2,10 +2,19 @@ import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
 
 /**
- * send-sync-notification - Sends email via Brevo Transactional API
+ * send-sync-notification - Sends email via SMTP
  * 
- * Non-blocking: failures produce WARN, never fail the run.
- * Retry: 1 retry with 2s backoff on transient errors.
+ * SMTP configuration via Supabase Edge Functions secrets:
+ *   SMTP_HOST     - SMTP server hostname
+ *   SMTP_PORT     - SMTP server port (e.g. 587, 465, 25)
+ *   SMTP_USER     - SMTP authentication username
+ *   SMTP_PASS     - SMTP authentication password
+ *   SMTP_FROM     - Sender email address
+ *   SMTP_TO       - Recipient email(s), comma-separated
+ *   SMTP_SECURE   - "true" for implicit TLS (port 465), "false" for STARTTLS
+ * 
+ * Non-blocking: failures produce ERROR log but don't change run status.
+ * Returns { status: "completed" } or { status: "failed", error: "..." }.
  */
 
 const corsHeaders = {
@@ -17,17 +26,12 @@ function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-const SENDER_EMAIL = 'contact@alterside.com';
-const RECIPIENT_EMAIL = 'contact@alterside.com';
-const BREVO_API_URL = 'https://api.brevo.com/v3/smtp/email';
-
 serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
 
   try {
     const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
     const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
-    const brevoApiKey = Deno.env.get('BREVO_API_KEY');
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
     const body = await req.json().catch(() => ({}));
@@ -43,6 +47,7 @@ serve(async (req) => {
 
     console.log(`[send-sync-notification] Processing run ${runId}, status: ${status}`);
 
+    // ========== Check notification mode ==========
     const { data: config } = await supabase
       .from('sync_config')
       .select('notification_mode, notify_on_warning')
@@ -57,28 +62,49 @@ serve(async (req) => {
     if (!shouldSend) {
       console.log(`[send-sync-notification] Skipped: mode=${notificationMode}, status=${status}`);
       return new Response(
-        JSON.stringify({ status: 'skipped', reason: `notification_mode=${notificationMode}` }),
+        JSON.stringify({ status: 'completed', reason: `notification_mode=${notificationMode}` }),
         { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
 
-    if (!brevoApiKey) {
-      console.warn('[send-sync-notification] BREVO_API_KEY not configured, skipping email');
+    // ========== Validate SMTP configuration ==========
+    const smtpHost = Deno.env.get('SMTP_HOST');
+    const smtpPort = Deno.env.get('SMTP_PORT');
+    const smtpUser = Deno.env.get('SMTP_USER');
+    const smtpPass = Deno.env.get('SMTP_PASS');
+    const smtpFrom = Deno.env.get('SMTP_FROM');
+    const smtpTo = Deno.env.get('SMTP_TO');
+    const smtpSecure = Deno.env.get('SMTP_SECURE');
+
+    const missingEnv: string[] = [];
+    if (!smtpHost) missingEnv.push('SMTP_HOST');
+    if (!smtpPort) missingEnv.push('SMTP_PORT');
+    if (!smtpUser) missingEnv.push('SMTP_USER');
+    if (!smtpPass) missingEnv.push('SMTP_PASS');
+    if (!smtpFrom) missingEnv.push('SMTP_FROM');
+    if (!smtpTo) missingEnv.push('SMTP_TO');
+
+    if (missingEnv.length > 0) {
+      console.error(`[send-sync-notification] SMTP misconfigured: missing ${missingEnv.join(', ')}`);
       try {
         await supabase.rpc('log_sync_event', {
           p_run_id: runId,
-          p_level: 'WARN',
-          p_message: 'notification_send_failed',
-          p_details: { step: 'notification', provider: 'brevo', reason: 'api_key_not_configured' }
+          p_level: 'ERROR',
+          p_message: 'notification_failed',
+          p_details: { step: 'notification', reason: 'SMTP misconfigured', missing_env: missingEnv }
         });
       } catch (_) {}
       return new Response(
-        JSON.stringify({ status: 'skipped', reason: 'no_api_key' }),
+        JSON.stringify({ status: 'failed', error: 'SMTP misconfigured', missing_env: missingEnv }),
         { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
 
-    // Load run details
+    // Log config (no credentials)
+    const recipients = smtpTo!.split(',').map(s => s.trim()).filter(Boolean);
+    console.log(`[send-sync-notification] SMTP config: host=${smtpHost}, port=${smtpPort}, from=${smtpFrom}, to_count=${recipients.length}`);
+
+    // ========== Load run details ==========
     const { data: run } = await supabase
       .from('sync_runs')
       .select('*')
@@ -92,106 +118,109 @@ serve(async (req) => {
       );
     }
 
-    const { data: events } = await supabase
-      .from('sync_events')
-      .select('level, step, message')
-      .eq('run_id', runId)
-      .order('created_at', { ascending: true })
-      .limit(50);
+    // ========== Build email content ==========
+    const subject = buildSubject(runId, run.status, run.attempt);
+    const textBody = buildTextBody(run);
 
-    const fileLinks = await generateFileLinks(supabase);
-    const subject = buildSubject(run.status, run.attempt);
-    const htmlContent = buildEmailHtml(run, events || [], fileLinks);
+    // ========== Send via SMTP using nodemailer ==========
+    try {
+      const nodemailer = await import("npm:nodemailer@6.9.10");
+      
+      const useSecure = smtpSecure === 'true';
+      const port = parseInt(smtpPort!, 10);
+      
+      const transporter = nodemailer.default.createTransport({
+        host: smtpHost,
+        port,
+        secure: useSecure,
+        auth: {
+          user: smtpUser,
+          pass: smtpPass,
+        },
+        // STARTTLS is used automatically when secure=false and port != 465
+        tls: {
+          rejectUnauthorized: false, // Allow self-signed certs
+        },
+        connectionTimeout: 15000,
+        greetingTimeout: 10000,
+        socketTimeout: 15000,
+      });
 
-    const emailPayload = JSON.stringify({
-      sender: { name: 'Alterside Sync', email: SENDER_EMAIL },
-      to: [{ email: RECIPIENT_EMAIL }],
-      subject,
-      htmlContent
-    });
+      const info = await transporter.sendMail({
+        from: smtpFrom,
+        to: recipients.join(', '),
+        subject,
+        text: textBody,
+      });
 
-    // Send via Brevo with 1 retry
-    const sendResult = await sendWithRetry(brevoApiKey, emailPayload);
-
-    if (sendResult.ok) {
-      console.log(`[send-sync-notification] Email sent for run ${runId}`);
+      console.log(`[send-sync-notification] Email sent: messageId=${info.messageId}`);
       try {
         await supabase.rpc('log_sync_event', {
           p_run_id: runId,
           p_level: 'INFO',
-          p_message: `Email inviata a ${RECIPIENT_EMAIL}`,
-          p_details: { step: 'notification' }
+          p_message: 'notification_completed',
+          p_details: { step: 'notification', provider: 'smtp', message_id: info.messageId, to_count: recipients.length }
         });
       } catch (_) {}
-    } else {
-      console.warn(`[send-sync-notification] Email send failed after retry (non-blocking): ${sendResult.error}`);
-      try {
-        await supabase.rpc('log_sync_event', {
-          p_run_id: runId,
-          p_level: 'WARN',
-          p_message: 'notification_send_failed_final',
-          p_details: { step: 'notification', provider: 'brevo', http_status: sendResult.httpStatus, error: sendResult.error }
-        });
-      } catch (_) {}
-    }
 
-    // Always return success - notification failures are non-blocking
-    return new Response(
-      JSON.stringify({ status: 'ok' }),
-      { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
+      return new Response(
+        JSON.stringify({ status: 'completed' }),
+        { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    } catch (smtpError: unknown) {
+      const smtpErrMsg = errMsg(smtpError);
+      console.error(`[send-sync-notification] SMTP send failed: ${smtpErrMsg}`);
+      
+      // Retry once after 2s
+      try {
+        await new Promise(r => setTimeout(r, 2000));
+        const nodemailer = await import("npm:nodemailer@6.9.10");
+        const useSecure = smtpSecure === 'true';
+        const port = parseInt(smtpPort!, 10);
+        const transporter = nodemailer.default.createTransport({
+          host: smtpHost, port, secure: useSecure,
+          auth: { user: smtpUser, pass: smtpPass },
+          tls: { rejectUnauthorized: false },
+          connectionTimeout: 15000, greetingTimeout: 10000, socketTimeout: 15000,
+        });
+        const info = await transporter.sendMail({
+          from: smtpFrom, to: recipients.join(', '), subject, text: textBody,
+        });
+        console.log(`[send-sync-notification] Email sent on retry: messageId=${info.messageId}`);
+        try {
+          await supabase.rpc('log_sync_event', {
+            p_run_id: runId, p_level: 'INFO', p_message: 'notification_completed',
+            p_details: { step: 'notification', provider: 'smtp', message_id: info.messageId, retry: true }
+          });
+        } catch (_) {}
+        return new Response(
+          JSON.stringify({ status: 'completed' }),
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      } catch (retryError: unknown) {
+        const retryErrMsg = errMsg(retryError);
+        console.error(`[send-sync-notification] SMTP retry also failed: ${retryErrMsg}`);
+        try {
+          await supabase.rpc('log_sync_event', {
+            p_run_id: runId, p_level: 'ERROR', p_message: 'notification_failed',
+            p_details: { step: 'notification', provider: 'smtp', error: retryErrMsg, attempts: 2 }
+          });
+        } catch (_) {}
+        return new Response(
+          JSON.stringify({ status: 'failed', error: retryErrMsg }),
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+    }
 
   } catch (error: unknown) {
     console.error('[send-sync-notification] Error:', errMsg(error));
-    // Even on unexpected errors, return 200 so we don't fail the caller
     return new Response(
-      JSON.stringify({ status: 'ok', warning: errMsg(error) }),
+      JSON.stringify({ status: 'failed', error: errMsg(error) }),
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   }
 });
-
-async function sendWithRetry(
-  apiKey: string,
-  payload: string
-): Promise<{ ok: boolean; httpStatus?: number; error?: string }> {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const resp = await fetch(BREVO_API_URL, {
-        method: 'POST',
-        headers: {
-          'accept': 'application/json',
-          'api-key': apiKey,
-          'content-type': 'application/json'
-        },
-        body: payload
-      });
-
-      if (resp.ok) {
-        return { ok: true };
-      }
-
-      const errText = await resp.text().catch(() => 'Unknown');
-      console.warn(`[send-sync-notification] Brevo attempt ${attempt + 1} failed: HTTP ${resp.status}`);
-
-      if (attempt === 0) {
-        // Wait 2s before retry
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        continue;
-      }
-
-      return { ok: false, httpStatus: resp.status, error: `HTTP ${resp.status}` };
-    } catch (e: unknown) {
-      console.warn(`[send-sync-notification] Brevo attempt ${attempt + 1} network error:`, errMsg(e));
-      if (attempt === 0) {
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        continue;
-      }
-      return { ok: false, error: errMsg(e) };
-    }
-  }
-  return { ok: false, error: 'exhausted retries' };
-}
 
 function checkShouldSend(mode: string, status: string, notifyOnWarning: boolean): boolean {
   if (mode === 'never') return false;
@@ -204,127 +233,78 @@ function checkShouldSend(mode: string, status: string, notifyOnWarning: boolean)
   return false;
 }
 
-function buildSubject(status: string, attempt: number): string {
+function buildSubject(runId: string, status: string, attempt: number): string {
   const statusMap: Record<string, string> = {
-    'success': '✅ Sync completata',
-    'success_with_warning': '⚠️ Sync completata con avvisi',
-    'failed': '❌ Sync fallita',
-    'timeout': '⏱️ Sync timeout'
+    'success': 'SUCCESS',
+    'success_with_warning': 'WARNING',
+    'failed': 'FAILED',
+    'timeout': 'TIMEOUT'
   };
-  const prefix = statusMap[status] || `Sync ${status}`;
-  const attemptStr = attempt > 1 ? ` (tentativo ${attempt})` : '';
-  return `${prefix}${attemptStr} - Alterside Catalog`;
+  const tag = statusMap[status] || status.toUpperCase();
+  return `[CATALOG SYNC] run ${runId.substring(0, 8)} - ${tag}`;
 }
 
-function buildEmailHtml(
-  run: Record<string, unknown>,
-  events: Array<Record<string, unknown>>,
-  fileLinks: Array<{ name: string; url: string | null; path: string }>
-): string {
-  const statusColors: Record<string, string> = {
-    'success': '#22c55e',
-    'success_with_warning': '#f59e0b',
-    'failed': '#ef4444',
-    'timeout': '#f97316'
-  };
-  const color = statusColors[run.status as string] || '#64748b';
-  
-  const startedAt = run.started_at ? new Date(run.started_at as string).toLocaleString('it-IT', { timeZone: 'Europe/Rome' }) : '-';
-  const finishedAt = run.finished_at ? new Date(run.finished_at as string).toLocaleString('it-IT', { timeZone: 'Europe/Rome' }) : '-';
-  const runtimeSec = run.runtime_ms ? Math.round((run.runtime_ms as number) / 1000) : '-';
-
+function buildTextBody(run: Record<string, unknown>): string {
   const metrics = run.metrics as Record<string, unknown> || {};
+  const steps = run.steps as Record<string, unknown> || {};
   const warningCount = (run.warning_count as number) || 0;
+  const runtimeSec = run.runtime_ms ? Math.round((run.runtime_ms as number) / 1000) : 0;
 
-  let eventsHtml = '';
-  if (events.length > 0) {
-    const eventRows = events.map(e => {
-      const levelColor = e.level === 'ERROR' ? '#ef4444' : e.level === 'WARN' ? '#f59e0b' : '#64748b';
-      return `<tr><td style="color:${levelColor};font-weight:600;">${e.level}</td><td>${e.step || '-'}</td><td>${e.message}</td></tr>`;
-    }).join('');
-    eventsHtml = `
-      <h3>Eventi</h3>
-      <table style="width:100%;border-collapse:collapse;font-size:13px;">
-        <tr style="background:#f1f5f9;"><th style="text-align:left;padding:6px;">Livello</th><th style="text-align:left;padding:6px;">Step</th><th style="text-align:left;padding:6px;">Messaggio</th></tr>
-        ${eventRows}
-      </table>`;
-  }
+  // Compute missing steps
+  const expectedSteps = run.trigger_type === 'cron'
+    ? ['import_ftp', 'parse_merge', 'ean_mapping', 'pricing', 'export_ean', 'export_ean_xlsx', 'export_amazon', 'export_mediaworld', 'export_eprice', 'upload_sftp', 'versioning', 'notification']
+    : ['import_ftp', 'parse_merge', 'ean_mapping', 'pricing', 'export_ean', 'export_ean_xlsx', 'export_amazon', 'export_mediaworld', 'export_eprice', 'versioning', 'notification'];
+  
+  const missingSteps = expectedSteps.filter(s => {
+    const st = steps[s] as Record<string, unknown> | undefined;
+    return !st || !st.status;
+  });
 
-  // Build files section - include valid links, mention missing ones
-  let filesHtml = '';
-  if (fileLinks.length > 0) {
-    const items = fileLinks.map(f => {
-      if (f.url) {
-        return `<li><a href="${f.url}">${f.name}</a> (link valido 7 giorni)</li>`;
-      } else {
-        return `<li>${f.name} — <em>link non disponibile, file in: ${f.path}</em></li>`;
-      }
-    }).join('');
-    filesHtml = `
-      <h3>File Export</h3>
-      <ul>${items}</ul>`;
-  }
-
-  // Recommended actions for failures
-  let actionsHtml = '';
-  if (['failed', 'timeout'].includes(run.status as string)) {
-    actionsHtml = `
-      <h3 style="color:#ef4444;">Azioni consigliate</h3>
-      <ol>
-        <li>Controlla i log degli eventi sopra per identificare lo step fallito</li>
-        <li>Verifica le credenziali FTP/SFTP se l'errore è di connessione</li>
-        <li>Se il problema è un timeout, verifica che i file sorgente non siano troppo grandi</li>
-        <li>Riattiva la sincronizzazione automatica dalla dashboard dopo aver risolto il problema</li>
-      </ol>`;
-  }
-
-  return `
-    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;">
-      <h2 style="color:${color};">Sincronizzazione ${run.status}</h2>
-      <table style="width:100%;font-size:14px;">
-        <tr><td><strong>Avviata:</strong></td><td>${startedAt}</td></tr>
-        <tr><td><strong>Completata:</strong></td><td>${finishedAt}</td></tr>
-        <tr><td><strong>Durata:</strong></td><td>${runtimeSec}s</td></tr>
-        <tr><td><strong>Tentativo:</strong></td><td>${run.attempt || 1}</td></tr>
-        <tr><td><strong>Avvisi:</strong></td><td>${warningCount}</td></tr>
-        <tr><td><strong>Prodotti elaborati:</strong></td><td>${metrics.products_processed || 0}</td></tr>
-      </table>
-      ${run.error_message ? `<p style="color:#ef4444;"><strong>Errore:</strong> ${run.error_message}</p>` : ''}
-      ${eventsHtml}
-      ${filesHtml}
-      ${actionsHtml}
-    </div>`;
-}
-
-async function generateFileLinks(
-  supabase: ReturnType<typeof createClient>
-): Promise<Array<{ name: string; url: string | null; path: string }>> {
-  // Exact real paths in latest/
-  const files = [
-    { name: 'Catalogo EAN (XLSX)', path: 'latest/catalogo_ean.xlsx' },
-    { name: 'Amazon Listing Loader', path: 'latest/amazon_listing_loader.xlsm' },
-    { name: 'Amazon Price Inventory', path: 'latest/amazon_price_inventory.txt' },
-    { name: 'Export Mediaworld', path: 'latest/Export Mediaworld.csv' },
-    { name: 'Export ePrice', path: 'latest/Export ePrice.csv' }
+  const lines: string[] = [
+    `CATALOG SYNC REPORT`,
+    `====================`,
+    ``,
+    `Run ID:       ${run.id}`,
+    `Trigger:      ${run.trigger_type}`,
+    `Status:       ${run.status}`,
+    `Attempt:      ${run.attempt || 1}`,
+    `Runtime:      ${runtimeSec}s`,
+    `Warnings:     ${warningCount}`,
+    `Started:      ${run.started_at}`,
+    `Finished:     ${run.finished_at || 'N/A'}`,
   ];
 
-  const results = [];
-  for (const file of files) {
-    try {
-      const { data } = await supabase.storage
-        .from('exports')
-        .createSignedUrl(file.path, 7 * 24 * 60 * 60); // 7 days
-      
-      if (data?.signedUrl) {
-        results.push({ name: file.name, url: data.signedUrl, path: file.path });
-      } else {
-        console.warn(`[send-sync-notification] WARN: No signed URL for ${file.path}`);
-        results.push({ name: file.name, url: null, path: file.path });
-      }
-    } catch (e: unknown) {
-      console.warn(`[send-sync-notification] WARN: Failed to generate signed URL for ${file.path}: ${errMsg(e)}`);
-      results.push({ name: file.name, url: null, path: file.path });
+  if (run.error_message) {
+    lines.push(`Error:        ${run.error_message}`);
+  }
+
+  lines.push('');
+
+  // Metrics
+  const productsTotal = metrics.products_total || metrics.productCount || 0;
+  const productsProcessed = metrics.products_processed || 0;
+  if (productsTotal || productsProcessed) {
+    lines.push(`Products total:     ${productsTotal}`);
+    lines.push(`Products processed: ${productsProcessed}`);
+  }
+
+  // Export counts from step states
+  for (const stepName of ['export_ean', 'export_ean_xlsx', 'export_amazon', 'export_mediaworld', 'export_eprice']) {
+    const st = steps[stepName] as Record<string, unknown> | undefined;
+    if (st?.rows || st?.rows_written) {
+      lines.push(`${stepName}: ${st.rows_written || st.rows} rows`);
     }
   }
-  return results;
+
+  if (missingSteps.length > 0) {
+    lines.push('');
+    lines.push(`Missing steps: ${missingSteps.join(', ')}`);
+  }
+
+  if (warningCount > 0) {
+    lines.push('');
+    lines.push(`⚠️ ${warningCount} warning(s) recorded during this run.`);
+  }
+
+  return lines.join('\n');
 }
