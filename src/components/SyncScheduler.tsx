@@ -399,16 +399,23 @@ export const SyncScheduler: React.FC = () => {
 
       if (data.status === 'locked') {
         toast({
-          title: 'Sync in corso',
+          title: 'Sincronizzazione in corso',
           description: data.run_id 
-            ? 'Run esistente in corso, il resume continuerà automaticamente' 
+            ? `Run ${data.run_id.substring(0, 8)}… già in esecuzione, verrà ripresa automaticamente` 
             : 'Attendi il completamento della sincronizzazione corrente',
+        });
+      } else if (data.status === 'resumed' || data.status === 'yielded') {
+        toast({
+          title: data.status === 'resumed' ? 'Ripresa sincronizzazione' : 'Sincronizzazione in pausa',
+          description: data.status === 'resumed'
+            ? `Ripresa run esistente ${(data.run_id || '').substring(0, 8)}…`
+            : `Run ${(data.run_id || '').substring(0, 8)}… in pausa (yield), verrà ripresa dal cron`,
         });
       } else {
         toast({
           title: 'Sincronizzazione avviata',
           description: data.needs_resume 
-            ? 'La pipeline è in esecuzione. Il resume continuerà automaticamente via cron-tick.' 
+            ? 'La pipeline è in esecuzione. Il resume continuerà automaticamente.' 
             : 'La pipeline è in esecuzione'
         });
       }
