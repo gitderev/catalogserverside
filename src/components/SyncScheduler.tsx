@@ -398,7 +398,7 @@ export const SyncScheduler: React.FC = () => {
         throw new Error(data.message);
       }
 
-      if (data.status === 'locked') {
+      if (data.status === 'yielded' && data.reason === 'locked') {
         toast({
           title: 'Sincronizzazione in corso',
           description: data.run_id 

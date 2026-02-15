@@ -386,10 +386,11 @@ serve(async (req) => {
           });
         } catch (_) {}
         return new Response(JSON.stringify({ 
-          status: 'locked', message: 'resume_locked_skip', 
+          status: 'yielded', reason: 'locked', message: 'resume_locked_skip', 
           run_id: runId,
           owner_run_id: existingLock?.run_id, 
-          lease_until: existingLock?.lease_until 
+          lease_until: existingLock?.lease_until,
+          needs_resume: true
         }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       }
       
@@ -474,7 +475,7 @@ serve(async (req) => {
                 p_details: { origin: 'manual' }
               });
             } catch (_) {}
-            return new Response(JSON.stringify({ status: 'locked', message: 'run in corso, resume delegato a cron-tick', run_id: runId }), 
+            return new Response(JSON.stringify({ status: 'yielded', reason: 'locked', message: 'run in corso, resume delegato a cron-tick', run_id: runId, needs_resume: true }), 
               { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
           }
         }
@@ -510,7 +511,7 @@ serve(async (req) => {
     if (!lockResult) {
       console.log('[orchestrator] INFO: Lock not acquired, sync already in progress');
       runId = null;
-      return new Response(JSON.stringify({ status: 'locked', message: 'not_started', run_id: null }), 
+      return new Response(JSON.stringify({ status: 'yielded', reason: 'locked', message: 'not_started', run_id: null, needs_resume: true }), 
         { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
