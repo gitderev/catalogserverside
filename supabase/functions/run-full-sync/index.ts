@@ -52,49 +52,40 @@ const EXPORT_FILES = [
   'amazon_price_inventory.txt'
 ];
 
-async function callStep(supabaseUrl: string, serviceKey: string, functionName: string, body: Record<string, unknown>): Promise<{ success: boolean; error?: string; data?: Record<string, unknown>; httpStatus?: number }> {
+/**
+ * callStep - NON-THROWING step caller. Always returns { ok, http_status, body }.
+ * Never throws, never marks run as failed. Decisions are made by the step loop.
+ */
+async function callStep(supabaseUrl: string, serviceKey: string, functionName: string, reqBody: Record<string, unknown>): Promise<{ ok: boolean; http_status: number; body: unknown }> {
   try {
     console.log(`[orchestrator] Calling ${functionName}...`);
     const resp = await fetch(`${supabaseUrl}/functions/v1/${functionName}`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${serviceKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
+      body: JSON.stringify(reqBody)
     });
-    
+
+    const rawText = await resp.text().catch(() => '');
+    let parsedBody: unknown;
+    try { parsedBody = JSON.parse(rawText); } catch { parsedBody = rawText; }
+
     if (!resp.ok) {
-      const errorText = await resp.text().catch(() => 'Unknown error');
-      console.log(`[orchestrator] ${functionName} HTTP error ${resp.status}: ${errorText}`);
-      
-      if (resp.status === 546 || errorText.includes('WORKER_LIMIT')) {
-        const supabase = createClient(supabaseUrl, serviceKey);
-        const runId = body.run_id as string;
-        if (runId) {
-          try {
-            await supabase.rpc('log_sync_event', {
-              p_run_id: runId,
-              p_level: 'ERROR',
-              p_message: `WORKER_LIMIT in ${functionName}: HTTP ${resp.status}`,
-              p_details: { step: body.step || functionName, chunk_index: body.chunk_index, http_status: resp.status, suggestion: 'ridurre CHUNK_LINES o ottimizzare chunking' }
-            });
-          } catch (logErr) {
-            console.warn(`[orchestrator] Non-blocking log_sync_event error:`, logErr);
-          }
-        }
-      }
-      
-      return { success: false, error: `HTTP ${resp.status}: ${errorText}`, httpStatus: resp.status };
+      console.log(`[orchestrator] ${functionName} HTTP error ${resp.status}: ${typeof parsedBody === 'string' ? parsedBody.substring(0, 200) : JSON.stringify(parsedBody).substring(0, 200)}`);
+      return { ok: false, http_status: resp.status, body: parsedBody };
     }
-    
-    const data = await resp.json().catch(() => ({ status: 'error', message: 'Invalid JSON response' }));
-    if (data.status === 'error') {
-      console.log(`[orchestrator] ${functionName} failed: ${data.message || data.error}`);
-      return { success: false, error: data.message || data.error, data, httpStatus: resp.status };
+
+    // Check for application-level error in JSON body
+    const bodyObj = parsedBody as Record<string, unknown> | null;
+    if (bodyObj && typeof bodyObj === 'object' && bodyObj.status === 'error') {
+      console.log(`[orchestrator] ${functionName} app-level error: ${bodyObj.message || bodyObj.error}`);
+      return { ok: false, http_status: resp.status, body: parsedBody };
     }
-    console.log(`[orchestrator] ${functionName} completed, step_status=${data.step_status || 'N/A'}`);
-    return { success: true, data, httpStatus: resp.status };
+
+    console.log(`[orchestrator] ${functionName} completed, step_status=${(bodyObj as Record<string,unknown>)?.step_status || 'N/A'}`);
+    return { ok: true, http_status: resp.status, body: parsedBody };
   } catch (e: unknown) {
     console.error(`[orchestrator] Error calling ${functionName}:`, e);
-    return { success: false, error: errMsg(e) };
+    return { ok: false, http_status: 0, body: `fetch_error: ${errMsg(e)}` };
   }
 }
 
@@ -552,13 +543,14 @@ async function runPipeline(
         fileType, run_id: runId
       });
       
-      if (!result.success && fileType !== 'stockLocation') {
-        await finalizeRun(supabase, runId, 'failed', runStartTime, `FTP ${fileType}: ${result.error}`);
-        return new Response(JSON.stringify({ status: 'failed', error: result.error }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      if (!result.ok && fileType !== 'stockLocation') {
+        const errText = typeof result.body === 'string' ? result.body : JSON.stringify(result.body);
+        await finalizeRun(supabase, runId, 'failed', runStartTime, `FTP ${fileType}: HTTP ${result.http_status} ${errText.substring(0, 200)}`);
+        return new Response(JSON.stringify({ status: 'failed', error: errText.substring(0, 200) }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       }
       
-      if (!result.success && fileType === 'stockLocation') {
-        console.log(`[orchestrator] Stock location import failed (non-blocking): ${result.error}`);
+      if (!result.ok && fileType === 'stockLocation') {
+        console.log(`[orchestrator] Stock location import failed (non-blocking): HTTP ${result.http_status}`);
         const { data: run } = await supabase.from('sync_runs').select('location_warnings').eq('id', runId).single();
         const warnings = run?.location_warnings || {};
         warnings.missing_location_file = 1;
@@ -606,9 +598,10 @@ async function runPipeline(
         run_id: runId, step: 'parse_merge', fee_config: feeConfig 
       });
       
-      if (!result.success) {
-        await finalizeRun(supabase, runId, 'failed', runStartTime, `parse_merge: ${result.error}`);
-        return new Response(JSON.stringify({ status: 'failed', error: result.error }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      if (!result.ok) {
+        const errText = typeof result.body === 'string' ? result.body : JSON.stringify(result.body);
+        await finalizeRun(supabase, runId, 'failed', runStartTime, `parse_merge: ${errText.substring(0, 200)}`);
+        return new Response(JSON.stringify({ status: 'failed', error: errText.substring(0, 200) }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       }
       
       const verification = await verifyStepCompleted(supabase, runId, 'parse_merge');
@@ -654,13 +647,48 @@ async function runPipeline(
     const idx = allRemainingSteps.indexOf(resumeFromStep);
     if (idx >= 0) startIdx = idx;
   }
-  
-  // Backoff sequence for export_ean_xlsx 546 retries (seconds)
-  const XLSX_RETRY_BACKOFF = [60, 120, 240, 300, 300, 300, 300, 300];
-  const XLSX_MAX_RETRIES = 8;
+
+  // ---- Retry constants for export_* 546 WORKER_LIMIT ----
+  const EXPORT_MAX_RETRIES = 8;
+  // Geometric backoff: 60, 120, 240, 480, 600, 600, 600, 600
+  function exportBackoffSeconds(attempt: number): number {
+    return Math.min(60 * Math.pow(2, attempt - 1), 600);
+  }
+
+  // Helper: detect WORKER_LIMIT in body
+  function isWorkerLimit(body: unknown): boolean {
+    if (!body || typeof body !== 'object') return false;
+    const b = body as Record<string, unknown>;
+    if (b.code === 'WORKER_LIMIT' || b.error_code === 'WORKER_LIMIT') return true;
+    const err = b.error as Record<string, unknown> | undefined;
+    if (err && typeof err === 'object' && err.code === 'WORKER_LIMIT') return true;
+    // Also check stringified body for WORKER_LIMIT
+    if (typeof b.message === 'string' && b.message.includes('WORKER_LIMIT')) return true;
+    return false;
+  }
+
+  // ---- Legacy cleanup: remove steps.export_ean_xlsx_retry if present ----
+  {
+    const { data: runData } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
+    const currentSteps = runData?.steps || {};
+    if ('export_ean_xlsx_retry' in currentSteps) {
+      delete (currentSteps as Record<string, unknown>).export_ean_xlsx_retry;
+      await supabase.from('sync_runs').update({ steps: currentSteps }).eq('id', runId);
+      console.log(JSON.stringify({ diag_tag: 'legacy_retry_namespace_cleaned', run_id: runId, action: 'deleted' }));
+      try {
+        await supabase.rpc('log_sync_event', {
+          p_run_id: runId, p_level: 'INFO', p_message: 'legacy_retry_namespace_cleaned',
+          p_details: { action: 'deleted', namespace: 'export_ean_xlsx_retry' }
+        });
+      } catch (_) {}
+    } else {
+      console.log(JSON.stringify({ diag_tag: 'legacy_retry_namespace_cleaned', run_id: runId, action: 'absent' }));
+    }
+  }
 
   for (let i = startIdx; i < allRemainingSteps.length; i++) {
     const step = allRemainingSteps[i];
+    const isExportStep = step.startsWith('export_');
     
     if (await isCancelRequested(supabase, runId)) {
       await finalizeRun(supabase, runId, 'failed', runStartTime, 'Interrotta dall\'utente');
@@ -671,38 +699,40 @@ async function runPipeline(
       return await yieldResponse(step, 'orchestrator budget exceeded before step');
     }
 
-    // ---- export_ean_xlsx: idempotency + retry_delay check ----
-    if (step === 'export_ean_xlsx') {
+    // ---- export_*: idempotency (already completed) + retry_delay gate ----
+    if (isExportStep) {
       const { data: runData } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
-      const xlsxStepState = runData?.steps?.export_ean_xlsx || {};
-      const xlsxRetry = xlsxStepState.retry || {};
+      const stepState = runData?.steps?.[step] || {};
+      const stepRetry = stepState.retry || {};
 
-      // Already completed: skip (validate rows_written == total_products)
-      if (xlsxStepState.status === 'completed' || xlsxStepState.status === 'success') {
-        const rw = xlsxStepState.rows_written ?? xlsxStepState.rows ?? 0;
-        const tp = xlsxStepState.total_products ?? rw;
-        const validComplete = !tp || rw === tp;
-        if (validComplete) {
-          console.log(`[orchestrator] export_ean_xlsx already completed (rows_written=${rw}), skipping`);
-          console.log(JSON.stringify({ diag_tag: 'xlsx_export_retry_decision', run_id: runId, step: 'export_ean_xlsx', decision: 'completed', rows_written: rw, total_products: tp, elapsed_ms: Date.now() - runStartTime }));
-          continue;
-        }
+      // Already completed: skip
+      if (stepState.status === 'completed' || stepState.status === 'success') {
+        console.log(`[orchestrator] ${step} already completed, skipping`);
+        console.log(JSON.stringify({ diag_tag: 'xlsx_export_retry_decision', run_id: runId, step, decision: 'completed', elapsed_ms: Date.now() - runStartTime }));
+        continue;
       }
 
-      // In retry_delay: check if wait_seconds elapsed
-      if (xlsxRetry.status === 'retry_delay' && xlsxRetry.next_retry_at) {
-        const nextRetryAt = new Date(xlsxRetry.next_retry_at).getTime();
+      // In retry_delay: check if next_retry_at has passed
+      if (stepRetry.status === 'retry_delay' && stepRetry.next_retry_at) {
+        const nextRetryAt = new Date(stepRetry.next_retry_at).getTime();
         const now = Date.now();
         if (now < nextRetryAt) {
           const waitSeconds = Math.max(1, Math.ceil((nextRetryAt - now) / 1000));
-          console.log(`[orchestrator] export_ean_xlsx in retry_delay, ${waitSeconds}s remaining`);
-          console.log(JSON.stringify({ diag_tag: 'xlsx_export_retry_decision', run_id: runId, step: 'export_ean_xlsx', decision: 'retry_delay', retry_attempt: xlsxRetry.retry_attempt, wait_seconds: waitSeconds, reason: 'waiting_backoff', http_status: xlsxRetry.last_http_status }));
+          console.log(`[orchestrator] ${step} in retry_delay, ${waitSeconds}s remaining`);
+          console.log(JSON.stringify({ diag_tag: 'xlsx_export_retry_decision', run_id: runId, step, decision: 'retry_not_ready', retry_attempt: stepRetry.retry_attempt, wait_seconds: waitSeconds, next_retry_at: stepRetry.next_retry_at }));
+          try {
+            await supabase.rpc('log_sync_event', {
+              p_run_id: runId, p_level: 'INFO', p_message: 'export_retry_not_ready',
+              p_details: { diag_tag: 'xlsx_export_retry_decision', step, decision: 'retry_not_ready', wait_seconds: waitSeconds, next_retry_at: stepRetry.next_retry_at, retry_attempt: stepRetry.retry_attempt }
+            });
+          } catch (_) {}
+          // Lock released in finally block
           return new Response(JSON.stringify({
-            status: 'skipped', reason: 'retry_delay', wait_seconds: waitSeconds,
-            run_id: runId, current_step: 'export_ean_xlsx', needs_resume: true
+            status: 'skipped', reason: 'retry_not_ready', wait_seconds: waitSeconds,
+            run_id: runId, current_step: step, needs_resume: true
           }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
         }
-        console.log(`[orchestrator] export_ean_xlsx retry_delay expired, retrying (attempt ${(xlsxRetry.retry_attempt || 0) + 1})`);
+        console.log(`[orchestrator] ${step} retry_delay expired, retrying (attempt ${stepRetry.retry_attempt || 0})`);
       }
     }
     
@@ -713,82 +743,101 @@ async function runPipeline(
       run_id: runId, step, fee_config: feeConfig 
     });
     
-    // ---- export_ean_xlsx: handle 546 WORKER_LIMIT as retryable ----
-    if (step === 'export_ean_xlsx' && !result.success && (result.httpStatus === 546 || (result.error && result.error.includes('WORKER_LIMIT')))) {
-      const httpStatus = result.httpStatus || 546;
+    // ---- export_*: handle 546 WORKER_LIMIT as retryable ----
+    if (isExportStep && !result.ok && result.http_status === 546 && isWorkerLimit(result.body)) {
       const { data: runData } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
       const currentSteps = runData?.steps || {};
-      const xlsxStepState = currentSteps.export_ean_xlsx || {};
-      const prevRetry = xlsxStepState.retry || {};
-      const retryAttempt = (prevRetry.retry_attempt || 0) + 1;
+      const stepState = currentSteps[step] || {};
+      const prevRetry = stepState.retry || {};
+      const nextAttempt = (prevRetry.retry_attempt || 0) + 1;
 
-      if (retryAttempt > XLSX_MAX_RETRIES) {
-        const failMsg = `export_ean_xlsx: exceeded max retries (${XLSX_MAX_RETRIES}), last HTTP ${httpStatus}`;
-        console.log(JSON.stringify({ diag_tag: 'xlsx_export_retry_decision', run_id: runId, step: 'export_ean_xlsx', decision: 'fail', retry_attempt: retryAttempt, http_status: httpStatus, reason: `exceeded_max_retries_${XLSX_MAX_RETRIES}` }));
+      // Hard fail if beyond max retries
+      if (nextAttempt > EXPORT_MAX_RETRIES) {
+        const failMsg = `Step ${step} failed: WORKER_LIMIT persistent after ${EXPORT_MAX_RETRIES} retries (HTTP 546)`;
+        console.log(JSON.stringify({ diag_tag: 'xlsx_export_retry_decision', run_id: runId, step, decision: 'fail', retry_attempt: EXPORT_MAX_RETRIES, http_status: 546, reason: 'max_retries_exceeded' }));
+        try {
+          await supabase.rpc('log_sync_event', {
+            p_run_id: runId, p_level: 'ERROR', p_message: 'export_retry_max_exceeded',
+            p_details: { diag_tag: 'xlsx_export_retry_decision', step, decision: 'fail', retry_attempt: EXPORT_MAX_RETRIES, http_status: 546, reason: 'max_retries_exceeded' }
+          });
+        } catch (_) {}
         await finalizeRun(supabase, runId, 'failed', runStartTime, failMsg);
         return new Response(JSON.stringify({ status: 'failed', error: failMsg }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       }
 
-      const backoffSeconds = XLSX_RETRY_BACKOFF[Math.min(retryAttempt - 1, XLSX_RETRY_BACKOFF.length - 1)];
-      const nextRetryAt = new Date(Date.now() + backoffSeconds * 1000).toISOString();
+      const backoffSec = exportBackoffSeconds(nextAttempt);
+      const nextRetryAt = new Date(Date.now() + backoffSec * 1000).toISOString();
       
-      // Store retry state INSIDE steps.export_ean_xlsx.retry (single source of truth)
-      const updatedXlsxState = {
-        ...xlsxStepState,
+      // Merge retry state into steps.[step].retry
+      const updatedStepState = {
+        ...stepState,
         retry: {
-          retry_attempt: retryAttempt,
+          retry_attempt: nextAttempt,
           next_retry_at: nextRetryAt,
-          last_http_status: httpStatus,
-          last_error: `WORKER_LIMIT (HTTP ${httpStatus})`,
+          last_http_status: 546,
+          last_error: 'worker_limit_546',
           status: 'retry_delay'
         }
       };
-      const updatedSteps = { ...currentSteps, export_ean_xlsx: updatedXlsxState, current_step: 'export_ean_xlsx' };
+      const updatedSteps = { ...currentSteps, [step]: updatedStepState, current_step: step };
       await supabase.from('sync_runs').update({ steps: updatedSteps }).eq('id', runId);
 
-      console.log(JSON.stringify({ diag_tag: 'xlsx_export_retry_decision', run_id: runId, step: 'export_ean_xlsx', decision: 'retry_delay', retry_attempt: retryAttempt, backoff_seconds: backoffSeconds, wait_seconds: backoffSeconds, http_status: httpStatus, reason: 'worker_limit_546' }));
+      console.log(JSON.stringify({ diag_tag: 'xlsx_export_retry_decision', run_id: runId, step, decision: 'retry_delay', retry_attempt: nextAttempt, backoff_seconds: backoffSec, wait_seconds: backoffSec, http_status: 546, reason: 'worker_limit_546' }));
+      try {
+        await supabase.rpc('log_sync_event', {
+          p_run_id: runId, p_level: 'WARN', p_message: 'export_retry_delay',
+          p_details: { diag_tag: 'xlsx_export_retry_decision', step, decision: 'retry_delay', retry_attempt: nextAttempt, backoff_seconds: backoffSec, wait_seconds: backoffSec, http_status: 546, reason: 'worker_limit_546' }
+        });
+      } catch (_) {}
 
-      // Return skipped/retry_delay — NOT failed, NOT drain_complete
+      // Lock released in finally block
       return new Response(JSON.stringify({
-        status: 'skipped', reason: 'retry_delay', wait_seconds: backoffSeconds,
-        run_id: runId, current_step: 'export_ean_xlsx', needs_resume: true
+        status: 'skipped', reason: 'retry_delay', wait_seconds: backoffSec,
+        run_id: runId, current_step: step, needs_resume: true
       }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
-    // For non-export_ean_xlsx steps, or non-546 errors: standard verification
+    // ---- Standard verification for all steps ----
     const verification = await verifyStepCompleted(supabase, runId, step);
     
-    if (!result.success || !verification.success) {
-      const error = result.error || verification.error || `Step ${step} fallito`;
-      await finalizeRun(supabase, runId, 'failed', runStartTime, error);
-      return new Response(JSON.stringify({ status: 'failed', error }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    if (!result.ok || !verification.success) {
+      const errText = !result.ok 
+        ? (typeof result.body === 'string' ? result.body : JSON.stringify(result.body)).substring(0, 200) 
+        : (verification.error || `Step ${step} fallito`);
+      await finalizeRun(supabase, runId, 'failed', runStartTime, errText);
+      return new Response(JSON.stringify({ status: 'failed', error: errText }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 
-    // ---- export_ean_xlsx: mark completed with rows validation ----
-    if (step === 'export_ean_xlsx' && result.success) {
+    // ---- export_*: on success, clear retry state and log ----
+    if (isExportStep && result.ok) {
       const { data: runData } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
       const currentSteps = runData?.steps || {};
-      const xlsxStepState = currentSteps.export_ean_xlsx || {};
-      const rw = xlsxStepState.rows_written ?? xlsxStepState.rows ?? xlsxStepState.metrics?.ean_xlsx_rows ?? 0;
-      const tp = xlsxStepState.total_products ?? rw;
+      const stepState = currentSteps[step] || {};
+      const hadRetry = stepState.retry?.retry_attempt > 0;
 
-      // Validate rows_written == total_products
-      if (tp > 0 && rw !== tp) {
-        const failMsg = `export_ean_xlsx validation failed: rows_written(${rw}) != total_products(${tp})`;
-        console.error(JSON.stringify({ diag_tag: 'xlsx_export_retry_decision', run_id: runId, step: 'export_ean_xlsx', decision: 'fail', rows_written: rw, total_products: tp, reason: 'rows_mismatch' }));
-        await finalizeRun(supabase, runId, 'failed', runStartTime, failMsg);
-        return new Response(JSON.stringify({ status: 'failed', error: failMsg }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      // Clear retry sub-state completely (delete it)
+      if (stepState.retry) {
+        const cleanedState = { ...stepState };
+        delete cleanedState.retry;
+        const updatedSteps = { ...currentSteps, [step]: cleanedState };
+        await supabase.from('sync_runs').update({ steps: updatedSteps }).eq('id', runId);
       }
 
-      // Clear retry sub-state, keep completed
-      const updatedXlsxState = {
-        ...xlsxStepState,
-        retry: { status: 'completed', retry_attempt: xlsxStepState.retry?.retry_attempt || 0 }
-      };
-      const updatedSteps = { ...currentSteps, export_ean_xlsx: updatedXlsxState };
-      await supabase.from('sync_runs').update({ steps: updatedSteps }).eq('id', runId);
+      // Row count mismatch: WARN only, not fatal (per spec)
+      const rw = stepState.rows_written ?? stepState.rows ?? 0;
+      const tp = stepState.total_products ?? rw;
+      if (tp > 0 && rw > 0 && rw !== tp) {
+        console.warn(JSON.stringify({ diag_tag: 'xlsx_export_retry_decision', run_id: runId, step, decision: 'row_count_mismatch', rows_written: rw, total_products: tp }));
+        try {
+          await supabase.rpc('log_sync_event', {
+            p_run_id: runId, p_level: 'WARN', p_message: `${step}: rows_written(${rw}) != total_products(${tp})`,
+            p_details: { diag_tag: 'xlsx_export_retry_decision', step, decision: 'row_count_mismatch', rows_written: rw, total_products: tp }
+          });
+        } catch (_) {}
+      }
 
-      console.log(JSON.stringify({ diag_tag: 'xlsx_export_retry_decision', run_id: runId, step: 'export_ean_xlsx', decision: 'completed', rows_written: rw, total_products: tp, elapsed_ms: Date.now() - runStartTime }));
+      const decision = hadRetry ? 'completed_after_retry' : 'completed';
+      console.log(JSON.stringify({ diag_tag: 'xlsx_export_retry_decision', run_id: runId, step, decision, rows_written: rw, total_products: tp, elapsed_ms: Date.now() - runStartTime }));
     }
   }
 
@@ -816,9 +865,10 @@ async function runPipeline(
       files: sftpFiles
     });
     
-    if (!sftpResult.success) {
-      await finalizeRun(supabase, runId, 'failed', runStartTime, `SFTP: ${sftpResult.error}`);
-      return new Response(JSON.stringify({ status: 'failed', error: sftpResult.error }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    if (!sftpResult.ok) {
+      const sftpErr = typeof sftpResult.body === 'string' ? sftpResult.body : JSON.stringify(sftpResult.body);
+      await finalizeRun(supabase, runId, 'failed', runStartTime, `SFTP: ${sftpErr.substring(0, 200)}`);
+      return new Response(JSON.stringify({ status: 'failed', error: sftpErr.substring(0, 200) }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
   } else {
     console.log('[orchestrator] Skipping SFTP upload (manual trigger)');
