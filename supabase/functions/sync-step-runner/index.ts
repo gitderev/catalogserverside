@@ -1987,7 +1987,150 @@ async function stepExportEanXlsx(supabase: SupabaseClient, runId: string): Promi
   }
 }
 
-// ========== STEP: EXPORT_AMAZON (SERVER-SIDE) ==========
+// ========== STEP: OVERRIDE_PRODUCTS ==========
+async function stepOverrideProducts(supabase: SupabaseClient, runId: string): Promise<{ success: boolean; error?: string }> {
+  console.log(`[sync:step:override_products] Starting for run ${runId}`);
+  const startTime = Date.now();
+  try {
+    // Idempotency
+    const { data: runCheck } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
+    const existingResult = runCheck?.steps?.override_products;
+    if (existingResult?.status === 'success' || existingResult?.status === 'completed') {
+      console.log(`[sync:step:override_products] Already completed, noop`);
+      return { success: true };
+    }
+
+    // Check for override file in mapping-files bucket
+    const { data: files } = await supabase.storage.from('mapping-files').list('', { search: 'override' });
+    const overrideFile = files?.find((f: { name: string }) =>
+      f.name.toLowerCase().includes('override') && (f.name.toLowerCase().endsWith('.xlsx') || f.name.toLowerCase().endsWith('.xls'))
+    );
+
+    if (!overrideFile) {
+      console.log(`[sync:step:override_products] No override file found in mapping-files, completing with 0 overrides`);
+      const elapsed = Date.now() - startTime;
+      await updateStepResult(supabase, runId, 'override_products', {
+        status: 'success', duration_ms: elapsed,
+        metrics: { override_count: 0, reason: 'no_override_file' },
+        override_count: 0
+      } as StepResultData);
+      return { success: true };
+    }
+
+    // Download override file
+    const { data: overrideData, error: dlError } = await supabase.storage.from('mapping-files').download(overrideFile.name);
+    if (dlError || !overrideData) {
+      const error = `Failed to download override file: ${dlError?.message || 'empty'}`;
+      await updateStepResult(supabase, runId, 'override_products', { status: 'failed', error, metrics: {} });
+      return { success: false, error };
+    }
+
+    // Parse XLSX
+    const XLSX = await import("npm:xlsx@0.18.5");
+    const arrayBuffer = await overrideData.arrayBuffer();
+    const wb = XLSX.read(new Uint8Array(arrayBuffer), { type: 'array' });
+    const wsName = wb.SheetNames[0];
+    if (!wsName) {
+      const elapsed = Date.now() - startTime;
+      await updateStepResult(supabase, runId, 'override_products', {
+        status: 'success', duration_ms: elapsed,
+        metrics: { override_count: 0, reason: 'empty_override_file' }, override_count: 0
+      } as StepResultData);
+      return { success: true };
+    }
+    const ws = wb.Sheets[wsName];
+    const rows: Record<string, unknown>[] = XLSX.utils.sheet_to_json(ws, { defval: '' });
+
+    if (rows.length === 0) {
+      const elapsed = Date.now() - startTime;
+      await updateStepResult(supabase, runId, 'override_products', {
+        status: 'success', duration_ms: elapsed,
+        metrics: { override_count: 0, reason: 'no_rows_in_override' }, override_count: 0
+      } as StepResultData);
+      return { success: true };
+    }
+
+    // Build override index by EAN and SKU
+    const overrideByEan = new Map<string, Record<string, unknown>>();
+    const overrideBySku = new Map<string, Record<string, unknown>>();
+    for (const row of rows) {
+      const ean = normalizeEAN(row.EAN || row.ean);
+      const sku = String(row.SKU || row.sku || row.MPN || row.mpn || '').trim().toLowerCase();
+      if (ean.ok && ean.value) overrideByEan.set(ean.value, row);
+      if (sku) overrideBySku.set(sku, row);
+    }
+
+    // Load products TSV
+    const { content: productsContent, error: prodError } = await downloadFromStorage(supabase, 'exports', PRODUCTS_FILE_PATH);
+    if (prodError || !productsContent) {
+      const error = `Products file not found: ${prodError || 'empty'}`;
+      await updateStepResult(supabase, runId, 'override_products', { status: 'failed', error, metrics: {} });
+      return { success: false, error };
+    }
+
+    const lines = productsContent.split('\n');
+    const headerLine = lines[0];
+    if (!headerLine) {
+      await updateStepResult(supabase, runId, 'override_products', { status: 'failed', error: 'Empty products file', metrics: {} });
+      return { success: false, error: 'Empty products file' };
+    }
+    const headers = headerLine.split('\t');
+    const eanIdx = headers.indexOf('EAN');
+    const mpnIdx = headers.indexOf('MPN');
+    const stockIdx = headers.indexOf('Stock');
+    const lpIdx = headers.indexOf('LP');
+    const cbpIdx = headers.indexOf('CBP');
+
+    let overrideCount = 0;
+    const outputLines = [headerLine];
+
+    for (let i = 1; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line.trim()) continue;
+      const fields = line.split('\t');
+
+      const ean = eanIdx >= 0 ? normalizeEAN(fields[eanIdx]) : { ok: false as const };
+      const sku = mpnIdx >= 0 ? (fields[mpnIdx]?.trim().toLowerCase() || '') : '';
+
+      let overrideRow: Record<string, unknown> | undefined;
+      if (sku) overrideRow = overrideBySku.get(sku);
+      if (!overrideRow && ean.ok && ean.value) overrideRow = overrideByEan.get(ean.value);
+
+      if (overrideRow) {
+        overrideCount++;
+        const qty = overrideRow.Quantity ?? overrideRow.quantity;
+        const lp = overrideRow.ListPrice ?? overrideRow.listPrice ?? overrideRow.list_price;
+        const op = overrideRow.OfferPrice ?? overrideRow.offerPrice ?? overrideRow.offer_price;
+        if (qty !== undefined && qty !== '' && stockIdx >= 0) fields[stockIdx] = String(parseInt(String(qty)) || 0);
+        if (lp !== undefined && lp !== '' && lpIdx >= 0) fields[lpIdx] = String(parseFloat(String(lp)) || 0);
+        if (op !== undefined && op !== '' && cbpIdx >= 0) fields[cbpIdx] = String(parseFloat(String(op)) || 0);
+      }
+      outputLines.push(fields.join('\t'));
+    }
+
+    // Write back products.tsv
+    const newContent = outputLines.join('\n');
+    const uploadResult = await uploadToStorage(supabase, 'exports', PRODUCTS_FILE_PATH, newContent, 'text/tab-separated-values');
+    if (!uploadResult.success) {
+      await updateStepResult(supabase, runId, 'override_products', { status: 'failed', error: uploadResult.error!, metrics: {} });
+      return { success: false, error: uploadResult.error };
+    }
+
+    const elapsed = Date.now() - startTime;
+    await updateStepResult(supabase, runId, 'override_products', {
+      status: 'success', duration_ms: elapsed,
+      metrics: { override_count: overrideCount, total_override_rows: rows.length },
+      override_count: overrideCount, total_override_rows: rows.length
+    } as StepResultData);
+    console.log(`[sync:step:override_products] Completed: ${overrideCount} overrides applied from ${rows.length} rows in ${elapsed}ms`);
+    return { success: true };
+  } catch (e: unknown) {
+    console.error(`[sync:step:override_products] Error:`, e);
+    await updateStepResult(supabase, runId, 'override_products', { status: 'failed', error: errMsg(e), metrics: {} });
+    return { success: false, error: errMsg(e) };
+  }
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function stepExportAmazon(supabase: SupabaseClient, runId: string, feeConfig: any): Promise<{ success: boolean; error?: string }> {
   console.log(`[sync:step:export_amazon] Starting for run ${runId}`);
@@ -2168,6 +2311,7 @@ serve(async (req) => {
       case 'parse_merge': result = await stepParseMerge(supabase, run_id); break;
       case 'ean_mapping': result = await stepEanMapping(supabase, run_id); break;
       case 'pricing': result = await stepPricing(supabase, run_id, fee_config); break;
+      case 'override_products': result = await stepOverrideProducts(supabase, run_id); break;
       case 'export_ean': result = await stepExportEan(supabase, run_id); break;
       case 'export_ean_xlsx': result = await stepExportEanXlsx(supabase, run_id); break;
       case 'export_amazon': result = await stepExportAmazon(supabase, run_id, fee_config); break;
