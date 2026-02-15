@@ -119,7 +119,7 @@ serve(async (req) => {
           console.warn('[cron-tick] log_sync_event failed:', logErr);
         }
 
-        // P1-B: Release lock via RPC
+        // Release lock via RPC
         const { data: lockReleased } = await supabase.rpc('release_sync_lock', {
           p_lock_name: 'global_sync',
           p_run_id: run.id
@@ -128,7 +128,6 @@ serve(async (req) => {
           console.warn(`[cron-tick] WARN: Lock release returned false for timed-out run ${run.id}`);
         }
 
-        // Check if max attempts reached (considering this timeout as a terminal failure)
         const shouldDisable = await checkAndHandleMaxAttempts(supabase, supabaseUrl, supabaseServiceKey, maxAttempts);
         
         if (shouldDisable) {
@@ -138,7 +137,6 @@ serve(async (req) => {
           );
         }
 
-        // Send notification for timeout
         await callNotification(supabaseUrl, supabaseServiceKey, run.id, 'timeout');
 
         return new Response(
@@ -147,10 +145,22 @@ serve(async (req) => {
         );
       }
 
-      // Run is still within timeout window
-      console.log(`[cron-tick] Run ${run.id} still running (${Math.round(elapsed / 60000)}min), skipping`);
+      // Run is still within timeout window - try to resume it (cron-triggered runs)
+      if (run.trigger_type === 'cron') {
+        console.log(`[cron-tick] Run ${run.id} still running (${Math.round(elapsed / 60000)}min), attempting resume...`);
+        
+        const resumeResult = await triggerSyncResume(supabaseUrl, supabaseServiceKey, run.id);
+        
+        return new Response(
+          JSON.stringify({ status: 'resume_attempted', run_id: run.id, ...resumeResult }),
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+
+      // Manual run in progress - don't interfere
+      console.log(`[cron-tick] Manual run ${run.id} still running (${Math.round(elapsed / 60000)}min), skipping`);
       return new Response(
-        JSON.stringify({ status: 'skipped', reason: 'run_in_progress', run_id: run.id }),
+        JSON.stringify({ status: 'skipped', reason: 'manual_run_in_progress', run_id: run.id }),
         { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
@@ -318,6 +328,31 @@ async function triggerSync(
     return { run_id: data.run_id, error: data.status === 'error' ? data.message : undefined };
   } catch (e: unknown) {
     console.error('[cron-tick] Failed to trigger sync:', errMsg(e));
+    return { error: errMsg(e) };
+  }
+}
+
+async function triggerSyncResume(
+  supabaseUrl: string,
+  serviceKey: string,
+  runId: string
+): Promise<{ status?: string; error?: string }> {
+  try {
+    const resp = await fetch(`${supabaseUrl}/functions/v1/run-full-sync`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${serviceKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ trigger: 'cron', resume_run_id: runId })
+    });
+
+    const data = await resp.json().catch(() => ({ status: 'error', message: 'Invalid response' }));
+    console.log(`[cron-tick] resume response for ${runId}:`, data.status);
+    
+    return { status: data.status, error: data.status === 'error' ? data.message : undefined };
+  } catch (e: unknown) {
+    console.error('[cron-tick] Failed to resume sync:', errMsg(e));
     return { error: errMsg(e) };
   }
 }
