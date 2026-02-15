@@ -229,18 +229,21 @@ serve(async (req) => {
         try {
           await supabase.rpc('log_sync_event', {
             p_run_id: runId,
-            p_level: 'WARN',
-            p_message: 'resume_locked_skip: lock occupato',
+            p_level: 'INFO',
+            p_message: 'locked',
             p_details: { 
               step: 'orchestrator_resume', 
+              lock_name: 'global_sync',
               owner_run_id: existingLock?.run_id, 
               lease_until: existingLock?.lease_until,
-              origin: trigger
+              origin: trigger,
+              reason: 'lock_held_by_other'
             }
           });
         } catch (_) { /* non-blocking */ }
         return new Response(JSON.stringify({ 
           status: 'locked', message: 'resume_locked_skip', 
+          run_id: runId,
           owner_run_id: existingLock?.run_id, 
           lease_until: existingLock?.lease_until 
         }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
@@ -369,7 +372,7 @@ serve(async (req) => {
     if (!lockResult) {
       console.log('[orchestrator] INFO: Lock not acquired, sync already in progress');
       runId = null;
-      return new Response(JSON.stringify({ status: 'locked', message: 'not_started' }), 
+      return new Response(JSON.stringify({ status: 'locked', message: 'not_started', run_id: null }), 
         { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
 

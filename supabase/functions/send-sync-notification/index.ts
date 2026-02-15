@@ -4,11 +4,8 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
 /**
  * send-sync-notification - Sends email via Brevo Transactional API
  * 
- * Called after a sync run completes (or times out).
- * Checks notification_mode in sync_config to decide if email should be sent.
- * If email send fails, logs WARN but does NOT fail the run.
- * 
- * Generates signed URLs for real latest/ paths only.
+ * Non-blocking: failures produce WARN, never fail the run.
+ * Retry: 1 retry with 2s backoff on transient errors.
  */
 
 const corsHeaders = {
@@ -46,7 +43,6 @@ serve(async (req) => {
 
     console.log(`[send-sync-notification] Processing run ${runId}, status: ${status}`);
 
-    // Load config for notification_mode
     const { data: config } = await supabase
       .from('sync_config')
       .select('notification_mode, notify_on_warning')
@@ -57,7 +53,7 @@ serve(async (req) => {
     const notifyOnWarning = config?.notify_on_warning ?? true;
 
     const shouldSend = checkShouldSend(notificationMode, status, notifyOnWarning);
-    
+
     if (!shouldSend) {
       console.log(`[send-sync-notification] Skipped: mode=${notificationMode}, status=${status}`);
       return new Response(
@@ -72,12 +68,10 @@ serve(async (req) => {
         await supabase.rpc('log_sync_event', {
           p_run_id: runId,
           p_level: 'WARN',
-          p_message: 'Email non inviata: BREVO_API_KEY non configurata',
-          p_details: { step: 'notification' }
+          p_message: 'notification_send_failed',
+          p_details: { step: 'notification', provider: 'brevo', reason: 'api_key_not_configured' }
         });
-      } catch (logErr) {
-        console.warn('[send-sync-notification] log_sync_event failed:', logErr);
-      }
+      } catch (_) {}
       return new Response(
         JSON.stringify({ status: 'skipped', reason: 'no_api_key' }),
         { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -98,7 +92,6 @@ serve(async (req) => {
       );
     }
 
-    // Load events for this run
     const { data: events } = await supabase
       .from('sync_events')
       .select('level, step, message')
@@ -106,37 +99,22 @@ serve(async (req) => {
       .order('created_at', { ascending: true })
       .limit(50);
 
-    // Generate signed URLs for real latest/ file paths
     const fileLinks = await generateFileLinks(supabase);
-
-    // Build email
     const subject = buildSubject(run.status, run.attempt);
     const htmlContent = buildEmailHtml(run, events || [], fileLinks);
 
-    // Send via Brevo (non-blocking: failure = WARN, not fatal)
-    try {
-      const brevoResp = await fetch(BREVO_API_URL, {
-        method: 'POST',
-        headers: {
-          'accept': 'application/json',
-          'api-key': brevoApiKey,
-          'content-type': 'application/json'
-        },
-        body: JSON.stringify({
-          sender: { name: 'Alterside Sync', email: SENDER_EMAIL },
-          to: [{ email: RECIPIENT_EMAIL }],
-          subject,
-          htmlContent
-        })
-      });
+    const emailPayload = JSON.stringify({
+      sender: { name: 'Alterside Sync', email: SENDER_EMAIL },
+      to: [{ email: RECIPIENT_EMAIL }],
+      subject,
+      htmlContent
+    });
 
-      if (!brevoResp.ok) {
-        const errText = await brevoResp.text();
-        throw new Error(`Brevo API ${brevoResp.status}: ${errText}`);
-      }
+    // Send via Brevo with 1 retry
+    const sendResult = await sendWithRetry(brevoApiKey, emailPayload);
 
+    if (sendResult.ok) {
       console.log(`[send-sync-notification] Email sent for run ${runId}`);
-      
       try {
         await supabase.rpc('log_sync_event', {
           p_run_id: runId,
@@ -144,25 +122,20 @@ serve(async (req) => {
           p_message: `Email inviata a ${RECIPIENT_EMAIL}`,
           p_details: { step: 'notification' }
         });
-      } catch (logErr) {
-        console.warn('[send-sync-notification] log_sync_event failed:', logErr);
-      }
-
-    } catch (emailError: unknown) {
-      console.warn(`[send-sync-notification] Email send failed (non-blocking):`, errMsg(emailError));
-      
+      } catch (_) {}
+    } else {
+      console.warn(`[send-sync-notification] Email send failed after retry (non-blocking): ${sendResult.error}`);
       try {
         await supabase.rpc('log_sync_event', {
           p_run_id: runId,
           p_level: 'WARN',
-          p_message: `Invio email fallito: ${errMsg(emailError)}`,
-          p_details: { step: 'notification' }
+          p_message: 'notification_send_failed_final',
+          p_details: { step: 'notification', provider: 'brevo', http_status: sendResult.httpStatus, error: sendResult.error }
         });
-      } catch (logErr) {
-        console.warn('[send-sync-notification] log_sync_event failed:', logErr);
-      }
+      } catch (_) {}
     }
 
+    // Always return success - notification failures are non-blocking
     return new Response(
       JSON.stringify({ status: 'ok' }),
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -170,12 +143,55 @@ serve(async (req) => {
 
   } catch (error: unknown) {
     console.error('[send-sync-notification] Error:', errMsg(error));
+    // Even on unexpected errors, return 200 so we don't fail the caller
     return new Response(
-      JSON.stringify({ status: 'error', message: errMsg(error) }),
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      JSON.stringify({ status: 'ok', warning: errMsg(error) }),
+      { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
   }
 });
+
+async function sendWithRetry(
+  apiKey: string,
+  payload: string
+): Promise<{ ok: boolean; httpStatus?: number; error?: string }> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const resp = await fetch(BREVO_API_URL, {
+        method: 'POST',
+        headers: {
+          'accept': 'application/json',
+          'api-key': apiKey,
+          'content-type': 'application/json'
+        },
+        body: payload
+      });
+
+      if (resp.ok) {
+        return { ok: true };
+      }
+
+      const errText = await resp.text().catch(() => 'Unknown');
+      console.warn(`[send-sync-notification] Brevo attempt ${attempt + 1} failed: HTTP ${resp.status}`);
+
+      if (attempt === 0) {
+        // Wait 2s before retry
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        continue;
+      }
+
+      return { ok: false, httpStatus: resp.status, error: `HTTP ${resp.status}` };
+    } catch (e: unknown) {
+      console.warn(`[send-sync-notification] Brevo attempt ${attempt + 1} network error:`, errMsg(e));
+      if (attempt === 0) {
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        continue;
+      }
+      return { ok: false, error: errMsg(e) };
+    }
+  }
+  return { ok: false, error: 'exhausted retries' };
+}
 
 function checkShouldSend(mode: string, status: string, notifyOnWarning: boolean): boolean {
   if (mode === 'never') return false;
