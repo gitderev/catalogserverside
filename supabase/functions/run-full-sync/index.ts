@@ -15,33 +15,21 @@ const corsHeaders = {
 /**
  * run-full-sync - ORCHESTRATORE LEGGERO CON RESUME via cron-tick
  * 
- * Non esegue logica di business, solo orchestrazione.
- * Chiama step separati tramite sync-step-runner per evitare WORKER_LIMIT.
- * 
- * RESUME: Se parse_merge (o altri step chunked) richiedono più di
- * ORCHESTRATOR_BUDGET_MS, l'orchestratore YIELD, RILASCIA IL LOCK,
- * e restituisce { status: 'yielded', run_id, needs_resume: true }.
- * cron-tick (ogni 5 min) rileva la run in stato running e la riprende.
- * 
- * LOCK POLICY: acquire a inizio invocazione, release SEMPRE in finally
- * (anche su yield e error). Nessun lock mantenuto tra invocazioni.
- * 
- * SFTP upload: eseguito per TUTTI i trigger (manual + cron).
- * Se SFTP non configurato: run failed "SFTP misconfigured".
- * 
- * Storage versioning: latest/ (overwrite) + versions/<timestamp>/ (storico)
- * Retention: per ciascuno dei 5 file, max 3 versioni; elimina >3 solo se >7 giorni.
- * 
- * Orchestrator-internal steps (versioning, notification, upload_sftp) scrivono
- * stato in steps JSONB tramite merge.
- * 
- * EXPECTED_STEPS (unified, manual + cron):
+ * PIPELINE CANONICA (13 step, identica per manual e cron):
  *   import_ftp, parse_merge, ean_mapping, pricing, override_products,
  *   export_ean, export_ean_xlsx, export_amazon, export_mediaworld, export_eprice,
  *   upload_sftp, versioning, notification
  * 
- * Diagnostics mode: POST { trigger: "manual", mode: "diagnostics", run_id: "..." }
- *   Requires service role auth. Returns read-only run analysis.
+ * INVARIANTI:
+ *   1. Se current_step è valorizzato, steps[current_step] DEVE esistere.
+ *   2. Prima di ogni step: atomic setStepInProgress (current_step + steps[step].status=in_progress in una singola write).
+ *   3. 546 WORKER_LIMIT è retryable per TUTTI gli step (max 8 tentativi, backoff geometrico).
+ *   4. La run non può essere completed se anche uno solo dei 13 step non è completed.
+ *   5. notification è blocca-run: se fallisce, run = failed.
+ *   6. yielded/locked/retry_delay NON sono failure (toggle auto-sync resta attivo).
+ *
+ * SFTP upload: eseguito per TUTTI i trigger (manual + cron).
+ * Se SFTP non configurato: run failed "SFTP misconfigured".
  */
 
 const ORCHESTRATOR_BUDGET_MS = 25_000;
@@ -55,15 +43,14 @@ const EXPORT_FILES = [
   'amazon_price_inventory.txt'
 ];
 
-// Steps handled by sync-step-runner (verified to exist in runner switch)
+// Steps handled by sync-step-runner
 const ALL_STEPS_AFTER_PARSE = [
   'ean_mapping', 'pricing', 'override_products',
   'export_ean', 'export_ean_xlsx', 'export_amazon',
   'export_mediaworld', 'export_eprice'
 ];
 
-// Unified expected steps for ALL triggers (manual + cron).
-// No distinction between cron and manual: all steps must complete.
+// Unified expected steps for ALL triggers (manual + cron). No distinction.
 const EXPECTED_STEPS = [
   'import_ftp', 'parse_merge',
   ...ALL_STEPS_AFTER_PARSE,
@@ -72,6 +59,40 @@ const EXPECTED_STEPS = [
 
 function getExpectedSteps(_trigger: string): string[] {
   return [...EXPECTED_STEPS];
+}
+
+// ============================================================
+// DEEP MERGE (recursive, plain objects only)
+// Rules: object+object = recursive merge; array = overwrite; primitive/null = overwrite
+// ============================================================
+function deepMerge(target: Record<string, unknown>, source: Record<string, unknown>): Record<string, unknown> {
+  const result: Record<string, unknown> = { ...target };
+  for (const key of Object.keys(source)) {
+    const srcVal = source[key];
+    const tgtVal = target[key];
+    if (
+      srcVal !== null && typeof srcVal === 'object' && !Array.isArray(srcVal) &&
+      tgtVal !== null && typeof tgtVal === 'object' && !Array.isArray(tgtVal)
+    ) {
+      result[key] = deepMerge(tgtVal as Record<string, unknown>, srcVal as Record<string, unknown>);
+    } else {
+      result[key] = srcVal;
+    }
+  }
+  return result;
+}
+
+// Self-check for deep merge (logged once at startup, no framework needed)
+{
+  const existing = { status: "retry_delay", retry: { attempt: 2, retry_after: "2026-02-15T10:00:00Z" }, meta: { a: 1 } };
+  const patch = { status: "in_progress", retry: { attempt: 3 } };
+  const result = deepMerge(existing, patch);
+  const ok = result.status === "in_progress" &&
+    (result.retry as Record<string, unknown>).attempt === 3 &&
+    (result.retry as Record<string, unknown>).retry_after === "2026-02-15T10:00:00Z" &&
+    (result.meta as Record<string, unknown>).a === 1;
+  console.log(`[orchestrator] deepMerge self-check: ${ok ? 'PASS' : 'FAIL'}`);
+  if (!ok) console.error(`[orchestrator] deepMerge self-check FAILED! result=${JSON.stringify(result)}`);
 }
 
 /**
@@ -148,23 +169,43 @@ async function isCancelRequested(supabase: SupabaseClient, runId: string): Promi
   return data?.cancel_requested === true;
 }
 
-/** Update only current_step inside steps JSON without wiping persisted step state */
-async function updateCurrentStep(supabase: SupabaseClient, runId: string, stepName: string): Promise<void> {
+/**
+ * ATOMIC setStepInProgress: single DB write that sets current_step AND
+ * creates/merges steps[stepName] with at least {status:'in_progress'}.
+ * Eliminates the bug where current_step is set but steps[step] is absent.
+ * After write, asserts invariant: steps[current_step] exists.
+ */
+async function setStepInProgress(supabase: SupabaseClient, runId: string, stepName: string): Promise<void> {
   const { data: run } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
-  const currentSteps = run?.steps || {};
-  const updatedSteps = { ...currentSteps, current_step: stepName };
+  const currentSteps = (run?.steps || {}) as Record<string, unknown>;
+  const existingStep = currentSteps[stepName];
+  const patch: Record<string, unknown> = { status: 'in_progress' };
+  if (!existingStep || !(existingStep as Record<string, unknown>).started_at) {
+    patch.started_at = new Date().toISOString();
+  }
+  
+  const mergedStep = (existingStep && typeof existingStep === 'object' && !Array.isArray(existingStep))
+    ? deepMerge(existingStep as Record<string, unknown>, patch)
+    : patch;
+  
+  const updatedSteps = { ...currentSteps, [stepName]: mergedStep, current_step: stepName };
   await supabase.from('sync_runs').update({ steps: updatedSteps }).eq('id', runId);
+  
+  // Invariant assert: steps[current_step] must exist
+  const { data: verify } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
+  if (!verify?.steps?.[stepName]) {
+    console.error(`[orchestrator] INVARIANT BROKEN: current_step=${stepName} but steps[${stepName}] is absent after write`);
+    throw new Error(`invariant_broken: steps[${stepName}] absent after setStepInProgress`);
+  }
 }
 
-/** Merge a step state into steps JSONB without overwriting other steps.
- *  Deep merges the step object: preserves existing fields (e.g. retry, cursor_pos)
- *  while overlaying the new patch. */
+/** Deep-merge a step state into steps JSONB without overwriting other steps. */
 async function mergeStepState(supabase: SupabaseClient, runId: string, stepName: string, state: Record<string, unknown>): Promise<void> {
   const { data: run } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
-  const currentSteps = run?.steps || {};
+  const currentSteps = (run?.steps || {}) as Record<string, unknown>;
   const existingStepState = currentSteps[stepName];
-  const mergedStepState = (existingStepState && typeof existingStepState === 'object')
-    ? { ...existingStepState, ...state }
+  const mergedStepState = (existingStepState && typeof existingStepState === 'object' && !Array.isArray(existingStepState))
+    ? deepMerge(existingStepState as Record<string, unknown>, state)
     : state;
   const updatedSteps = { ...currentSteps, [stepName]: mergedStepState };
   await supabase.from('sync_runs').update({ steps: updatedSteps }).eq('id', runId);
@@ -233,6 +274,28 @@ async function handleDiagnostics(supabase: SupabaseClient, runId: string): Promi
   }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 }
 
+// ============================================================
+// 546 WORKER_LIMIT DETECTION AND RETRY
+// ============================================================
+const STEP_MAX_RETRIES = 8;
+const BACKOFF_SECONDS = [60, 120, 240, 480, 600, 600, 600, 600];
+
+function stepBackoffSeconds(attempt: number): number {
+  return BACKOFF_SECONDS[Math.min(attempt - 1, BACKOFF_SECONDS.length - 1)];
+}
+
+function isWorkerLimit(httpStatus: number, body: unknown): boolean {
+  if (httpStatus === 546) return true;
+  if (typeof body === 'string') return body.includes('WORKER_LIMIT');
+  if (!body || typeof body !== 'object') return false;
+  const b = body as Record<string, unknown>;
+  if (b.code === 'WORKER_LIMIT' || b.error_code === 'WORKER_LIMIT') return true;
+  const err = b.error as Record<string, unknown> | undefined;
+  if (err && typeof err === 'object' && err.code === 'WORKER_LIMIT') return true;
+  if (typeof b.message === 'string' && b.message.includes('WORKER_LIMIT')) return true;
+  return false;
+}
+
 serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
   if (req.method !== 'POST') {
@@ -265,7 +328,6 @@ serve(async (req) => {
 
     // ========== DIAGNOSTICS MODE ==========
     if (mode === 'diagnostics' && body.run_id) {
-      // Service role only (already using service key client)
       return await handleDiagnostics(supabase, body.run_id as string);
     }
 
@@ -475,8 +537,6 @@ serve(async (req) => {
       });
     } catch (_) {}
 
-    // override_products is now implemented in sync-step-runner
-
     return await runPipeline(supabase, supabaseUrl, supabaseServiceKey, runId, trigger, feeConfig, startTime, 'import_ftp', orchestratorStart);
 
   } catch (err: unknown) {
@@ -559,12 +619,20 @@ async function runPipeline(
   
   const budgetExceeded = () => (Date.now() - orchestratorStart) > ORCHESTRATOR_BUDGET_MS;
   
+  // Track if a step failed before notification - we still want to run notification
+  let pipelineFailedBeforeNotification = false;
+  let pipelineFailError = '';
+  
+  const makeResponse = (status: string, extra: Record<string, unknown> = {}): Response => {
+    return new Response(JSON.stringify({ status, run_id: runId, ...extra }), 
+      { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  };
+  
   const yieldResponse = async (currentStep: string, reason: string): Promise<Response> => {
     console.log(`[orchestrator] YIELD at step ${currentStep}: ${reason}`);
     
-    // CRITICAL FIX: persist current_step in DB BEFORE returning yielded response
-    // so that resume picks up the correct step instead of the previous one.
-    await updateCurrentStep(supabase, runId, currentStep);
+    // Atomic: persist current_step AND ensure steps[currentStep] exists
+    await setStepInProgress(supabase, runId, currentStep);
     
     let stepState: Record<string, unknown> = {};
     try {
@@ -585,29 +653,29 @@ async function runPipeline(
           cursor_pos_end: stepState.cursor_pos,
           file_total_size: stepState.materialBytes,
           chunk_index: stepState.chunk_index,
-          resume_via: 'cron-tick (every 5min)'
+          resume_via: 'cron-tick'
         }
       });
     } catch (_) {}
     
-    return new Response(JSON.stringify({ 
-      status: 'yielded', 
-      run_id: runId, 
-      current_step: currentStep,
-      needs_resume: true 
-    }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    return makeResponse('yielded', { current_step: currentStep, needs_resume: true });
   };
 
   // ========== STEP 1: FTP Import ==========
   if (resumeFromStep === 'import_ftp') {
-    await updateCurrentStep(supabase, runId, 'import_ftp');
-    await mergeStepState(supabase, runId, 'import_ftp', { status: 'in_progress', started_at: new Date().toISOString() });
+    await setStepInProgress(supabase, runId, 'import_ftp');
     console.log('[orchestrator] === STEP 1: FTP Import ===');
+    try {
+      await supabase.rpc('log_sync_event', {
+        p_run_id: runId, p_level: 'INFO', p_message: 'step_started',
+        p_details: { step: 'import_ftp' }
+      });
+    } catch (_) {}
     
     for (const fileType of ['material', 'stock', 'price', 'stockLocation']) {
       if (await isCancelRequested(supabase, runId)) {
         await finalizeRun(supabase, runId, 'failed', runStartTime, 'Interrotta dall\'utente');
-        return new Response(JSON.stringify({ status: 'cancelled' }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        return makeResponse('failed_definitive', { error: 'Cancelled' });
       }
       
       if (budgetExceeded()) {
@@ -618,11 +686,26 @@ async function runPipeline(
         fileType, run_id: runId
       });
       
+      // 546 WORKER_LIMIT on import_ftp
+      if (!result.ok && isWorkerLimit(result.http_status, result.body)) {
+        const retryResult = await handleWorkerLimitRetry(supabase, runId, 'import_ftp', result, runStartTime);
+        if (retryResult) return retryResult;
+        // If null, retry limit exceeded - handled inside, but fallthrough to error
+      }
+      
       if (!result.ok && fileType !== 'stockLocation') {
         const errText = typeof result.body === 'string' ? result.body : JSON.stringify(result.body);
         await mergeStepState(supabase, runId, 'import_ftp', { status: 'failed', error: `FTP ${fileType}: ${errText.substring(0, 200)}` });
-        await finalizeRun(supabase, runId, 'failed', runStartTime, `FTP ${fileType}: HTTP ${result.http_status} ${errText.substring(0, 200)}`);
-        return new Response(JSON.stringify({ status: 'failed', error: errText.substring(0, 200) }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        try {
+          await supabase.rpc('log_sync_event', {
+            p_run_id: runId, p_level: 'ERROR', p_message: 'step_failed',
+            p_details: { step: 'import_ftp', file_type: fileType, error: errText.substring(0, 200) }
+          });
+        } catch (_) {}
+        pipelineFailedBeforeNotification = true;
+        pipelineFailError = `FTP ${fileType}: HTTP ${result.http_status} ${errText.substring(0, 200)}`;
+        // Jump to notification
+        break;
       }
       
       if (!result.ok && fileType === 'stockLocation') {
@@ -639,25 +722,31 @@ async function runPipeline(
             p_message: 'File stock location non trovato o non importabile',
             p_details: { step: 'import_ftp', location_warning: 'missing_location_file' }
           });
-        } catch (logErr) {
-          console.warn('[orchestrator] log_sync_event failed:', logErr);
-        }
+        } catch (_) {}
       }
     }
-    await mergeStepState(supabase, runId, 'import_ftp', { status: 'completed', finished_at: new Date().toISOString() });
-    try {
-      await supabase.rpc('log_sync_event', {
-        p_run_id: runId, p_level: 'INFO', p_message: 'step_completed',
-        p_details: { step: 'import_ftp' }
-      });
-    } catch (_) {}
-    resumeFromStep = 'parse_merge';
+    if (!pipelineFailedBeforeNotification) {
+      await mergeStepState(supabase, runId, 'import_ftp', { status: 'completed', finished_at: new Date().toISOString() });
+      try {
+        await supabase.rpc('log_sync_event', {
+          p_run_id: runId, p_level: 'INFO', p_message: 'step_completed',
+          p_details: { step: 'import_ftp' }
+        });
+      } catch (_) {}
+      resumeFromStep = 'parse_merge';
+    }
   }
 
   // ========== STEP 2: PARSE_MERGE (CHUNKED) ==========
-  if (resumeFromStep === 'parse_merge') {
-    await updateCurrentStep(supabase, runId, 'parse_merge');
+  if (!pipelineFailedBeforeNotification && resumeFromStep === 'parse_merge') {
+    await setStepInProgress(supabase, runId, 'parse_merge');
     console.log('[orchestrator] === STEP 2: parse_merge (CHUNKED) ===');
+    try {
+      await supabase.rpc('log_sync_event', {
+        p_run_id: runId, p_level: 'INFO', p_message: 'step_started',
+        p_details: { step: 'parse_merge' }
+      });
+    } catch (_) {}
     
     let parseMergeComplete = false;
     let chunkCount = 0;
@@ -665,7 +754,7 @@ async function runPipeline(
     while (!parseMergeComplete && chunkCount < MAX_PARSE_MERGE_CHUNKS) {
       if (await isCancelRequested(supabase, runId)) {
         await finalizeRun(supabase, runId, 'failed', runStartTime, 'Interrotta dall\'utente');
-        return new Response(JSON.stringify({ status: 'cancelled' }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        return makeResponse('failed_definitive', { error: 'Cancelled' });
       }
       
       if (budgetExceeded()) {
@@ -679,17 +768,33 @@ async function runPipeline(
         run_id: runId, step: 'parse_merge', fee_config: feeConfig 
       });
       
+      // 546 on parse_merge
+      if (!result.ok && isWorkerLimit(result.http_status, result.body)) {
+        const retryResult = await handleWorkerLimitRetry(supabase, runId, 'parse_merge', result, runStartTime);
+        if (retryResult) return retryResult;
+      }
+      
       if (!result.ok) {
         const errText = typeof result.body === 'string' ? result.body : JSON.stringify(result.body);
-        await finalizeRun(supabase, runId, 'failed', runStartTime, `parse_merge: ${errText.substring(0, 200)}`);
-        return new Response(JSON.stringify({ status: 'failed', error: errText.substring(0, 200) }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        pipelineFailedBeforeNotification = true;
+        pipelineFailError = `parse_merge: ${errText.substring(0, 200)}`;
+        await mergeStepState(supabase, runId, 'parse_merge', { status: 'failed', error: pipelineFailError });
+        try {
+          await supabase.rpc('log_sync_event', {
+            p_run_id: runId, p_level: 'ERROR', p_message: 'step_failed',
+            p_details: { step: 'parse_merge', error: pipelineFailError }
+          });
+        } catch (_) {}
+        break;
       }
       
       const verification = await verifyStepCompleted(supabase, runId, 'parse_merge');
       
       if (!verification.success) {
-        await finalizeRun(supabase, runId, 'failed', runStartTime, verification.error || 'parse_merge verification failed');
-        return new Response(JSON.stringify({ status: 'failed', error: verification.error }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        pipelineFailedBeforeNotification = true;
+        pipelineFailError = verification.error || 'parse_merge verification failed';
+        await mergeStepState(supabase, runId, 'parse_merge', { status: 'failed', error: pipelineFailError });
+        break;
       }
       
       if (verification.status === 'completed') {
@@ -698,315 +803,265 @@ async function runPipeline(
       } else if (verification.status === 'in_progress') {
         console.log(`[orchestrator] parse_merge in_progress, continuing...`);
       } else {
-        await finalizeRun(supabase, runId, 'failed', runStartTime, `parse_merge unexpected status: ${verification.status}`);
-        return new Response(JSON.stringify({ status: 'failed', error: `Unexpected status: ${verification.status}` }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        pipelineFailedBeforeNotification = true;
+        pipelineFailError = `parse_merge unexpected status: ${verification.status}`;
+        break;
       }
     }
     
-    if (!parseMergeComplete) {
+    if (!pipelineFailedBeforeNotification && !parseMergeComplete) {
       const verification = await verifyStepCompleted(supabase, runId, 'parse_merge');
       if (verification.status === 'in_progress') {
         return await yieldResponse('parse_merge', `chunk limit ${MAX_PARSE_MERGE_CHUNKS} reached this invocation`);
       }
-      await finalizeRun(supabase, runId, 'failed', runStartTime, `parse_merge exceeded ${MAX_PARSE_MERGE_CHUNKS} chunks limit`);
-      return new Response(JSON.stringify({ status: 'failed', error: 'parse_merge chunk limit exceeded' }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      pipelineFailedBeforeNotification = true;
+      pipelineFailError = `parse_merge exceeded ${MAX_PARSE_MERGE_CHUNKS} chunks limit`;
     }
-    resumeFromStep = 'ean_mapping';
+    if (!pipelineFailedBeforeNotification) {
+      resumeFromStep = 'ean_mapping';
+    }
   }
 
   // ========== STEPS 3+: Remaining processing steps ==========
-  const allRemainingSteps = [...ALL_STEPS_AFTER_PARSE];
-  
-  let startIdx = 0;
-  if (resumeFromStep !== 'ean_mapping') {
-    const idx = allRemainingSteps.indexOf(resumeFromStep);
-    if (idx >= 0) startIdx = idx;
-  }
-
-  // ---- Retry constants for export_* 546 WORKER_LIMIT ----
-  const EXPORT_MAX_RETRIES = 8;
-  function exportBackoffSeconds(attempt: number): number {
-    return Math.min(60 * Math.pow(2, attempt - 1), 600);
-  }
-
-  function isWorkerLimit(body: unknown): boolean {
-    if (typeof body === 'string') return body.includes('WORKER_LIMIT');
-    if (!body || typeof body !== 'object') return false;
-    const b = body as Record<string, unknown>;
-    if (b.code === 'WORKER_LIMIT' || b.error_code === 'WORKER_LIMIT') return true;
-    const err = b.error as Record<string, unknown> | undefined;
-    if (err && typeof err === 'object' && err.code === 'WORKER_LIMIT') return true;
-    if (typeof b.message === 'string' && b.message.includes('WORKER_LIMIT')) return true;
-    return false;
-  }
-
-  // ---- Legacy cleanup: remove steps.export_ean_xlsx_retry if present ----
-  {
-    const { data: runData } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
-    const currentSteps = runData?.steps || {};
-    if ('export_ean_xlsx_retry' in currentSteps) {
-      delete (currentSteps as Record<string, unknown>).export_ean_xlsx_retry;
-      await supabase.from('sync_runs').update({ steps: currentSteps }).eq('id', runId);
-      console.log(JSON.stringify({ diag_tag: 'legacy_retry_namespace_cleaned', run_id: runId, action: 'deleted' }));
-      try {
-        await supabase.rpc('log_sync_event', {
-          p_run_id: runId, p_level: 'INFO', p_message: 'legacy_retry_namespace_cleaned',
-          p_details: { action: 'deleted', namespace: 'export_ean_xlsx_retry' }
-        });
-      } catch (_) {}
-    } else {
-      console.log(JSON.stringify({ diag_tag: 'legacy_retry_namespace_cleaned', run_id: runId, action: 'absent' }));
-    }
-  }
-
-  for (let i = startIdx; i < allRemainingSteps.length; i++) {
-    const step = allRemainingSteps[i];
-    const isExportStep = step.startsWith('export_');
+  if (!pipelineFailedBeforeNotification) {
+    const allRemainingSteps = [...ALL_STEPS_AFTER_PARSE];
     
-    if (await isCancelRequested(supabase, runId)) {
-      await finalizeRun(supabase, runId, 'failed', runStartTime, 'Interrotta dall\'utente');
-      return new Response(JSON.stringify({ status: 'cancelled' }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-    }
-    
-    if (budgetExceeded()) {
-      return await yieldResponse(step, 'orchestrator budget exceeded before step');
+    let startIdx = 0;
+    if (resumeFromStep !== 'ean_mapping') {
+      const idx = allRemainingSteps.indexOf(resumeFromStep);
+      if (idx >= 0) startIdx = idx;
     }
 
-    // ---- Idempotency: skip already completed steps ----
+    // ---- Legacy cleanup: remove steps.export_ean_xlsx_retry if present ----
     {
-      const { data: runData } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
-      const stepState = runData?.steps?.[step] || {};
-
-      if (stepState.status === 'completed' || stepState.status === 'success') {
-        console.log(`[orchestrator] ${step} already completed, skipping`);
-        if (isExportStep) {
-          console.log(JSON.stringify({ diag_tag: 'xlsx_export_retry_decision', run_id: runId, step, decision: 'completed', elapsed_ms: Date.now() - runStartTime }));
-        }
-        continue;
-      }
-    }
-
-    // ---- retry_delay gate (all steps, generalized 546 WORKER_LIMIT) ----
-    {
-      const { data: runData } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
-      const stepState = runData?.steps?.[step] || {};
-      const stepRetry = stepState.retry || {};
-
-      if (stepRetry.status === 'retry_delay' && stepRetry.next_retry_at) {
-        const nextRetryAt = new Date(stepRetry.next_retry_at).getTime();
-        const now = Date.now();
-        if (now < nextRetryAt) {
-          const waitSeconds = Math.max(1, Math.ceil((nextRetryAt - now) / 1000));
-          console.log(`[orchestrator] ${step} in retry_delay, ${waitSeconds}s remaining`);
-          try {
-            await supabase.rpc('log_sync_event', {
-              p_run_id: runId, p_level: 'INFO', p_message: 'retry_not_ready',
-              p_details: { step, decision: 'retry_not_ready', wait_seconds: waitSeconds, next_retry_at: stepRetry.next_retry_at, retry_attempt: stepRetry.retry_attempt }
-            });
-          } catch (_) {}
-          return new Response(JSON.stringify({
-            status: 'skipped', reason: 'retry_not_ready', wait_seconds: waitSeconds,
-            run_id: runId, current_step: step, needs_resume: true
-          }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-        }
-        console.log(`[orchestrator] ${step} retry_delay expired, retrying (attempt ${stepRetry.retry_attempt || 0})`);
-      }
-    }
-    
-    await updateCurrentStep(supabase, runId, step);
-    // CRITICAL: Write in_progress BEFORE callStep to guarantee steps[step] always exists
-    // when current_step points to it. This eliminates the "current_step set but step absent" bug.
-    await mergeStepState(supabase, runId, step, { status: 'in_progress', started_at: new Date().toISOString() });
-    console.log(`[orchestrator] === STEP: ${step} ===`);
-    try {
-      await supabase.rpc('log_sync_event', {
-        p_run_id: runId, p_level: 'INFO', p_message: 'step_started',
-        p_details: { step }
-      });
-    } catch (_) {}
-    
-    const result = await callStep(supabaseUrl, supabaseServiceKey, 'sync-step-runner', { 
-      run_id: runId, step, fee_config: feeConfig 
-    });
-    
-    // ---- export_*: handle 546 WORKER_LIMIT as retryable ----
-    if (!result.ok && result.http_status === 546 && isWorkerLimit(result.body)) {
       const { data: runData } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
       const currentSteps = runData?.steps || {};
-      const stepState = currentSteps[step] || {};
-      const prevRetry = stepState.retry || {};
-      const nextAttempt = (prevRetry.retry_attempt || 0) + 1;
+      if ('export_ean_xlsx_retry' in currentSteps) {
+        delete (currentSteps as Record<string, unknown>).export_ean_xlsx_retry;
+        await supabase.from('sync_runs').update({ steps: currentSteps }).eq('id', runId);
+      }
+    }
 
-      if (nextAttempt > EXPORT_MAX_RETRIES) {
-        const failMsg = `Step ${step} failed: WORKER_LIMIT persistent after ${EXPORT_MAX_RETRIES} retries (HTTP 546)`;
-        console.log(JSON.stringify({ diag_tag: 'xlsx_export_retry_decision', run_id: runId, step, decision: 'fail', retry_attempt: EXPORT_MAX_RETRIES, http_status: 546, reason: 'max_retries_exceeded' }));
+    for (let i = startIdx; i < allRemainingSteps.length; i++) {
+      const step = allRemainingSteps[i];
+      
+      if (await isCancelRequested(supabase, runId)) {
+        await finalizeRun(supabase, runId, 'failed', runStartTime, 'Interrotta dall\'utente');
+        return makeResponse('failed_definitive', { error: 'Cancelled' });
+      }
+      
+      if (budgetExceeded()) {
+        return await yieldResponse(step, 'orchestrator budget exceeded before step');
+      }
+
+      // ---- Idempotency: skip already completed steps ----
+      {
+        const { data: runData } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
+        const stepState = runData?.steps?.[step] || {};
+
+        if (stepState.status === 'completed' || stepState.status === 'success') {
+          console.log(`[orchestrator] ${step} already completed, skipping`);
+          continue;
+        }
+      }
+
+      // ---- retry_delay gate: check both stepState.status and stepState.retry.status ----
+      {
+        const { data: runData } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
+        const stepState = runData?.steps?.[step] || {};
+        const stepRetry = stepState.retry || {};
+
+        // Check if step or its retry sub-object indicates retry_delay
+        const isRetryDelay = stepState.status === 'retry_delay' || stepRetry.status === 'retry_delay';
+        const nextRetryAt = stepRetry.next_retry_at || stepState.next_retry_at;
+        
+        if (isRetryDelay && nextRetryAt) {
+          const nextRetryTime = new Date(nextRetryAt).getTime();
+          const now = Date.now();
+          if (now < nextRetryTime) {
+            const waitSeconds = Math.max(1, Math.ceil((nextRetryTime - now) / 1000));
+            console.log(`[orchestrator] ${step} in retry_delay, ${waitSeconds}s remaining`);
+            try {
+              await supabase.rpc('log_sync_event', {
+                p_run_id: runId, p_level: 'INFO', p_message: 'step_yielded_retry_delay',
+                p_details: { step, wait_seconds: waitSeconds, next_retry_at: nextRetryAt, attempt: stepRetry.retry_attempt }
+              });
+            } catch (_) {}
+            return makeResponse('retry_delay', { 
+              current_step: step, wait_seconds: waitSeconds, needs_resume: true 
+            });
+          }
+          console.log(`[orchestrator] ${step} retry_delay expired, retrying (attempt ${stepRetry.retry_attempt || 0})`);
+        }
+      }
+      
+      // ATOMIC: set current_step AND steps[step].status=in_progress in single write
+      await setStepInProgress(supabase, runId, step);
+      console.log(`[orchestrator] === STEP: ${step} ===`);
+      try {
+        await supabase.rpc('log_sync_event', {
+          p_run_id: runId, p_level: 'INFO', p_message: 'step_started',
+          p_details: { step }
+        });
+      } catch (_) {}
+      
+      const result = await callStep(supabaseUrl, supabaseServiceKey, 'sync-step-runner', { 
+        run_id: runId, step, fee_config: feeConfig 
+      });
+      
+      // ---- 546 WORKER_LIMIT: generalized for ALL steps ----
+      if (!result.ok && isWorkerLimit(result.http_status, result.body)) {
+        const retryResult = await handleWorkerLimitRetry(supabase, runId, step, result, runStartTime);
+        if (retryResult) return retryResult;
+        // null means max retries exceeded - fall through to failure handling
+      }
+
+      // ---- Standard verification for all steps ----
+      const verification = await verifyStepCompleted(supabase, runId, step);
+      
+      if (!result.ok || !verification.success) {
+        const errText = !result.ok 
+          ? (typeof result.body === 'string' ? result.body : JSON.stringify(result.body)).substring(0, 200) 
+          : (verification.error || `Step ${step} fallito`);
+        await mergeStepState(supabase, runId, step, { status: 'failed', error: errText });
         try {
           await supabase.rpc('log_sync_event', {
-            p_run_id: runId, p_level: 'ERROR', p_message: 'export_retry_max_exceeded',
-            p_details: { diag_tag: 'xlsx_export_retry_decision', step, decision: 'fail', retry_attempt: EXPORT_MAX_RETRIES, http_status: 546, reason: 'max_retries_exceeded' }
+            p_run_id: runId, p_level: 'ERROR', p_message: 'step_failed',
+            p_details: { step, error: errText }
           });
         } catch (_) {}
-        await finalizeRun(supabase, runId, 'failed', runStartTime, failMsg);
-        return new Response(JSON.stringify({ status: 'failed', error: failMsg }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        pipelineFailedBeforeNotification = true;
+        pipelineFailError = errText;
+        break; // Jump to notification
       }
 
-      const backoffSec = exportBackoffSeconds(nextAttempt);
-      const nextRetryAt = new Date(Date.now() + backoffSec * 1000).toISOString();
-      
-      const updatedStepState = {
-        ...stepState,
-        retry: {
-          retry_attempt: nextAttempt,
-          next_retry_at: nextRetryAt,
-          last_http_status: 546,
-          last_error: 'worker_limit_546',
-          status: 'retry_delay'
+      // ---- Yield on in_progress: step needs more invocations ----
+      if (verification.status === 'in_progress') {
+        console.log(`[orchestrator] ${step} still in_progress after callStep, yielding for resume`);
+        try {
+          await supabase.rpc('log_sync_event', {
+            p_run_id: runId, p_level: 'INFO', p_message: 'step_yielded_in_progress',
+            p_details: { step }
+          });
+        } catch (_) {}
+        return await yieldResponse(step, `step ${step} still in_progress, needs resume`);
+      }
+
+      // ---- On success: clear retry state and log step_completed ----
+      {
+        const { data: runData } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
+        const currentSteps = runData?.steps || {};
+        const stepState = currentSteps[step] || {};
+        const hadRetry = stepState.retry?.retry_attempt > 0;
+
+        if (stepState.retry) {
+          const cleanedState = { ...stepState };
+          delete cleanedState.retry;
+          const updatedSteps = { ...currentSteps, [step]: cleanedState };
+          await supabase.from('sync_runs').update({ steps: updatedSteps }).eq('id', runId);
         }
-      };
-      const updatedSteps = { ...currentSteps, [step]: updatedStepState, current_step: step };
-      await supabase.from('sync_runs').update({ steps: updatedSteps }).eq('id', runId);
 
-      console.log(JSON.stringify({ diag_tag: 'xlsx_export_retry_decision', run_id: runId, step, decision: 'retry_delay', retry_attempt: nextAttempt, backoff_seconds: backoffSec, wait_seconds: backoffSec, http_status: 546, reason: 'worker_limit_546' }));
-      try {
-        await supabase.rpc('log_sync_event', {
-          p_run_id: runId, p_level: 'WARN', p_message: 'export_retry_delay',
-          p_details: { diag_tag: 'xlsx_export_retry_decision', step, decision: 'retry_delay', retry_attempt: nextAttempt, backoff_seconds: backoffSec, wait_seconds: backoffSec, http_status: 546, reason: 'worker_limit_546' }
-        });
-      } catch (_) {}
-
-      return new Response(JSON.stringify({
-        status: 'skipped', reason: 'retry_delay', wait_seconds: backoffSec,
-        run_id: runId, current_step: step, needs_resume: true
-      }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-    }
-
-    // ---- Standard verification for all steps ----
-    const verification = await verifyStepCompleted(supabase, runId, step);
-    
-    if (!result.ok || !verification.success) {
-      const errText = !result.ok 
-        ? (typeof result.body === 'string' ? result.body : JSON.stringify(result.body)).substring(0, 200) 
-        : (verification.error || `Step ${step} fallito`);
-      await mergeStepState(supabase, runId, step, { status: 'failed', error: errText });
-      try {
-        await supabase.rpc('log_sync_event', {
-          p_run_id: runId, p_level: 'ERROR', p_message: 'step_failed',
-          p_details: { step, error: errText }
-        });
-      } catch (_) {}
-      await finalizeRun(supabase, runId, 'failed', runStartTime, errText);
-      return new Response(JSON.stringify({ status: 'failed', error: errText }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-    }
-
-    // ---- Yield on in_progress: step needs more invocations ----
-    if (verification.status === 'in_progress') {
-      console.log(`[orchestrator] ${step} still in_progress after callStep, yielding for resume`);
-      return await yieldResponse(step, `step ${step} still in_progress, needs resume`);
-    }
-
-    // ---- On success: clear retry state and log step_completed ----
-    {
-      const { data: runData } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
-      const currentSteps = runData?.steps || {};
-      const stepState = currentSteps[step] || {};
-      const hadRetry = stepState.retry?.retry_attempt > 0;
-
-      if (stepState.retry) {
-        const cleanedState = { ...stepState };
-        delete cleanedState.retry;
-        const updatedSteps = { ...currentSteps, [step]: cleanedState };
-        await supabase.from('sync_runs').update({ steps: updatedSteps }).eq('id', runId);
+        try {
+          await supabase.rpc('log_sync_event', {
+            p_run_id: runId, p_level: 'INFO', p_message: 'step_completed',
+            p_details: { step, had_retry: hadRetry, elapsed_ms: Date.now() - runStartTime }
+          });
+        } catch (_) {}
       }
-
-      try {
-        await supabase.rpc('log_sync_event', {
-          p_run_id: runId, p_level: 'INFO', p_message: 'step_completed',
-          p_details: { step, had_retry: hadRetry, elapsed_ms: Date.now() - runStartTime }
-        });
-      } catch (_) {}
     }
   }
 
   // ========== SFTP Upload (all triggers) ==========
-  {
-    // Check if already completed
+  if (!pipelineFailedBeforeNotification) {
     const { data: sftpCheck } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
     const sftpState = sftpCheck?.steps?.upload_sftp;
     if (sftpState?.status === 'completed' || sftpState?.status === 'success') {
       console.log('[orchestrator] upload_sftp already completed, skipping');
     } else {
+      // Validate SFTP env BEFORE marking in_progress (missing_env = immediate fail)
       const sftpHost = Deno.env.get('SFTP_HOST');
       const sftpUser = Deno.env.get('SFTP_USER');
       const sftpPassword = Deno.env.get('SFTP_PASSWORD');
       const sftpBaseDir = Deno.env.get('SFTP_BASE_DIR');
-      const sftpConfigured = !!(sftpHost && sftpUser && sftpPassword && sftpBaseDir);
 
-      if (!sftpConfigured) {
+      if (!sftpHost || !sftpUser || !sftpPassword || !sftpBaseDir) {
         const missingEnv: string[] = [];
         if (!sftpHost) missingEnv.push('SFTP_HOST');
         if (!sftpUser) missingEnv.push('SFTP_USER');
         if (!sftpPassword) missingEnv.push('SFTP_PASSWORD');
         if (!sftpBaseDir) missingEnv.push('SFTP_BASE_DIR');
         console.log(`[orchestrator] SFTP not configured - failing run (missing: ${missingEnv.join(', ')})`);
-        await updateCurrentStep(supabase, runId, 'upload_sftp');
-        await mergeStepState(supabase, runId, 'upload_sftp', { status: 'failed', error: 'SFTP misconfigured', missing_env: missingEnv });
+        await setStepInProgress(supabase, runId, 'upload_sftp');
+        await mergeStepState(supabase, runId, 'upload_sftp', { status: 'failed', code: 'missing_env', error: 'SFTP misconfigured', missing_env: missingEnv });
         try {
           await supabase.rpc('log_sync_event', {
-            p_run_id: runId, p_level: 'ERROR', p_message: 'sftp_failed',
-            p_details: { step: 'upload_sftp', reason: 'SFTP misconfigured', missing_env: missingEnv }
+            p_run_id: runId, p_level: 'ERROR', p_message: 'step_failed',
+            p_details: { step: 'upload_sftp', code: 'missing_env', missing_env: missingEnv }
           });
         } catch (_) {}
-        await finalizeRun(supabase, runId, 'failed', runStartTime, 'SFTP misconfigured');
-        return new Response(JSON.stringify({ status: 'failed', error: 'SFTP misconfigured' }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-      }
-
-      if (await isCancelRequested(supabase, runId)) {
-        await finalizeRun(supabase, runId, 'failed', runStartTime, 'Interrotta dall\'utente');
-        return new Response(JSON.stringify({ status: 'cancelled' }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-      }
-      
-      if (budgetExceeded()) {
-        return await yieldResponse('upload_sftp', 'orchestrator budget exceeded before SFTP');
-      }
-      
-      await updateCurrentStep(supabase, runId, 'upload_sftp');
-      console.log('[orchestrator] === SFTP Upload ===');
-      
-      const sftpFiles = EXPORT_FILES.map(f => ({
-        bucket: 'exports',
-        path: f,
-        filename: f
-      }));
-      
-      const sftpResult = await callStep(supabaseUrl, supabaseServiceKey, 'upload-exports-to-sftp', {
-        files: sftpFiles
-      });
-      
-      if (!sftpResult.ok) {
-        const sftpErr = typeof sftpResult.body === 'string' ? sftpResult.body : JSON.stringify(sftpResult.body);
-        await mergeStepState(supabase, runId, 'upload_sftp', { status: 'failed', error: sftpErr.substring(0, 200) });
+        pipelineFailedBeforeNotification = true;
+        pipelineFailError = 'SFTP misconfigured';
+      } else {
+        if (await isCancelRequested(supabase, runId)) {
+          await finalizeRun(supabase, runId, 'failed', runStartTime, 'Interrotta dall\'utente');
+          return makeResponse('failed_definitive', { error: 'Cancelled' });
+        }
+        
+        if (budgetExceeded()) {
+          return await yieldResponse('upload_sftp', 'orchestrator budget exceeded before SFTP');
+        }
+        
+        await setStepInProgress(supabase, runId, 'upload_sftp');
+        console.log('[orchestrator] === SFTP Upload ===');
         try {
           await supabase.rpc('log_sync_event', {
-            p_run_id: runId, p_level: 'ERROR', p_message: 'sftp_failed',
-            p_details: { step: 'upload_sftp', error: sftpErr.substring(0, 200) }
+            p_run_id: runId, p_level: 'INFO', p_message: 'step_started',
+            p_details: { step: 'upload_sftp' }
           });
         } catch (_) {}
-        await finalizeRun(supabase, runId, 'failed', runStartTime, `SFTP: ${sftpErr.substring(0, 200)}`);
-        return new Response(JSON.stringify({ status: 'failed', error: sftpErr.substring(0, 200) }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-      }
-      
-      await mergeStepState(supabase, runId, 'upload_sftp', { status: 'completed' });
-      try {
-        await supabase.rpc('log_sync_event', {
-          p_run_id: runId, p_level: 'INFO', p_message: 'sftp_completed',
-          p_details: { step: 'upload_sftp', files_count: EXPORT_FILES.length }
+        
+        const sftpFiles = EXPORT_FILES.map(f => ({
+          bucket: 'exports',
+          path: f,
+          filename: f
+        }));
+        
+        const sftpResult = await callStep(supabaseUrl, supabaseServiceKey, 'upload-exports-to-sftp', {
+          files: sftpFiles
         });
-      } catch (_) {}
+        
+        // 546 on SFTP
+        if (!sftpResult.ok && isWorkerLimit(sftpResult.http_status, sftpResult.body)) {
+          const retryResult = await handleWorkerLimitRetry(supabase, runId, 'upload_sftp', sftpResult, runStartTime);
+          if (retryResult) return retryResult;
+        }
+        
+        if (!sftpResult.ok) {
+          const sftpErr = typeof sftpResult.body === 'string' ? sftpResult.body : JSON.stringify(sftpResult.body);
+          await mergeStepState(supabase, runId, 'upload_sftp', { status: 'failed', error: sftpErr.substring(0, 200) });
+          try {
+            await supabase.rpc('log_sync_event', {
+              p_run_id: runId, p_level: 'ERROR', p_message: 'step_failed',
+              p_details: { step: 'upload_sftp', error: sftpErr.substring(0, 200) }
+            });
+          } catch (_) {}
+          pipelineFailedBeforeNotification = true;
+          pipelineFailError = `SFTP: ${sftpErr.substring(0, 200)}`;
+        } else {
+          await mergeStepState(supabase, runId, 'upload_sftp', { status: 'completed', finished_at: new Date().toISOString() });
+          try {
+            await supabase.rpc('log_sync_event', {
+              p_run_id: runId, p_level: 'INFO', p_message: 'step_completed',
+              p_details: { step: 'upload_sftp', files_count: EXPORT_FILES.length }
+            });
+          } catch (_) {}
+        }
+      }
     }
   }
 
   // ========== STORAGE VERSIONING ==========
-  {
+  if (!pipelineFailedBeforeNotification) {
     const { data: verCheck } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
     const verState = verCheck?.steps?.versioning;
     if (verState?.status === 'completed' || verState?.status === 'success') {
@@ -1016,9 +1071,14 @@ async function runPipeline(
         return await yieldResponse('versioning', 'orchestrator budget exceeded before versioning');
       }
       
-      await updateCurrentStep(supabase, runId, 'versioning');
-      await mergeStepState(supabase, runId, 'versioning', { status: 'in_progress' });
+      await setStepInProgress(supabase, runId, 'versioning');
       console.log('[orchestrator] === Storage versioning ===');
+      try {
+        await supabase.rpc('log_sync_event', {
+          p_run_id: runId, p_level: 'INFO', p_message: 'step_started',
+          p_details: { step: 'versioning' }
+        });
+      } catch (_) {}
       
       try {
         const versionTimestamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -1040,103 +1100,136 @@ async function runPipeline(
         await supabase.from('sync_runs').update({ file_manifest: fileManifest }).eq('id', runId);
         await cleanupVersions(supabase);
         
-        await mergeStepState(supabase, runId, 'versioning', { status: 'completed', files: Object.keys(fileManifest).length });
+        await mergeStepState(supabase, runId, 'versioning', { status: 'completed', files: Object.keys(fileManifest).length, finished_at: new Date().toISOString() });
+        try {
+          await supabase.rpc('log_sync_event', {
+            p_run_id: runId, p_level: 'INFO', p_message: 'step_completed',
+            p_details: { step: 'versioning' }
+          });
+        } catch (_) {}
       } catch (e: unknown) {
         console.error(`[orchestrator] Versioning error: ${errMsg(e)}`);
         await mergeStepState(supabase, runId, 'versioning', { status: 'failed', error: errMsg(e).substring(0, 200) });
+        try {
+          await supabase.rpc('log_sync_event', {
+            p_run_id: runId, p_level: 'ERROR', p_message: 'step_failed',
+            p_details: { step: 'versioning', error: errMsg(e).substring(0, 200) }
+          });
+        } catch (_) {}
+        pipelineFailedBeforeNotification = true;
+        pipelineFailError = `versioning: ${errMsg(e).substring(0, 200)}`;
       }
     }
   }
 
-  // ========== NOTIFICATION (runs before final completeness check) ==========
-  await updateCurrentStep(supabase, runId, 'notification');
-  await mergeStepState(supabase, runId, 'notification', { status: 'in_progress' });
-  try {
-    // Determine preliminary status for notification content
-    const { data: preNotifRun } = await supabase.from('sync_runs').select('steps, warning_count').eq('id', runId).single();
-    const preNotifSteps = preNotifRun?.steps || {};
-    const preExpected = getExpectedSteps(trigger);
-    let prelimStatus = 'success';
-    for (const s of preExpected) {
-      if (s === 'notification') continue;
-      const st = preNotifSteps[s];
-      if (!st || (typeof st === 'object' && (!st.status || (st.status !== 'completed' && st.status !== 'success')))) {
-        prelimStatus = 'failed';
-        break;
+  // ========== NOTIFICATION (ALWAYS runs, even on failure - blocca-run) ==========
+  {
+    const { data: notifCheck } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
+    const notifState = notifCheck?.steps?.notification;
+    if (notifState?.status === 'completed' || notifState?.status === 'success') {
+      console.log('[orchestrator] notification already completed, skipping');
+    } else {
+      if (budgetExceeded()) {
+        return await yieldResponse('notification', 'orchestrator budget exceeded before notification');
       }
-    }
-    if (prelimStatus === 'success' && (preNotifRun?.warning_count || 0) > 0) {
-      prelimStatus = 'success_with_warning';
-    }
 
-    const notifResult = await callStep(supabaseUrl, supabaseServiceKey, 'send-sync-notification', {
-      run_id: runId, status: prelimStatus
-    });
-    
-    // send-sync-notification returns HTTP 200 with { status: 'completed' | 'failed' }
-    const notifBody = notifResult.body as Record<string, unknown> | null;
-    const notifBodyStatus = notifBody?.status;
-    const isNotifOk = notifResult.ok && notifBodyStatus !== 'failed';
-    
-    if (isNotifOk) {
-      await mergeStepState(supabase, runId, 'notification', { status: 'completed' });
+      await setStepInProgress(supabase, runId, 'notification');
       try {
         await supabase.rpc('log_sync_event', {
-          p_run_id: runId, p_level: 'INFO', p_message: 'notification_completed',
+          p_run_id: runId, p_level: 'INFO', p_message: 'step_started',
           p_details: { step: 'notification' }
         });
       } catch (_) {}
-      console.log(`[orchestrator] Notification sent for run ${runId}`);
-    } else {
-      const notifErr = typeof notifResult.body === 'string' ? notifResult.body : JSON.stringify(notifResult.body);
-      await mergeStepState(supabase, runId, 'notification', { 
-        status: 'failed', error: notifErr.substring(0, 200),
-        missing_env: notifBody?.missing_env || null
-      });
+      
       try {
-        await supabase.rpc('log_sync_event', {
-          p_run_id: runId, p_level: 'ERROR', p_message: 'notification_failed',
-          p_details: { step: 'notification', error: notifErr.substring(0, 200), missing_env: notifBody?.missing_env }
+        // Determine preliminary status for notification content
+        const { data: preNotifRun } = await supabase.from('sync_runs').select('steps, warning_count').eq('id', runId).single();
+        const preNotifSteps = preNotifRun?.steps || {};
+        const preExpected = getExpectedSteps(trigger);
+        let prelimStatus = pipelineFailedBeforeNotification ? 'failed' : 'success';
+        if (!pipelineFailedBeforeNotification) {
+          for (const s of preExpected) {
+            if (s === 'notification') continue;
+            const st = preNotifSteps[s];
+            if (!st || (typeof st === 'object' && (!st.status || (st.status !== 'completed' && st.status !== 'success')))) {
+              prelimStatus = 'failed';
+              break;
+            }
+          }
+          if (prelimStatus === 'success' && (preNotifRun?.warning_count || 0) > 0) {
+            prelimStatus = 'success_with_warning';
+          }
+        }
+
+        const notifResult = await callStep(supabaseUrl, supabaseServiceKey, 'send-sync-notification', {
+          run_id: runId, status: prelimStatus
         });
-      } catch (_) {}
-      console.warn(`[orchestrator] Notification failed: ${notifErr.substring(0, 200)}`);
+        
+        const notifBody = notifResult.body as Record<string, unknown> | null;
+        const notifBodyStatus = notifBody?.status;
+        const isNotifOk = notifResult.ok && notifBodyStatus !== 'failed';
+        
+        if (isNotifOk) {
+          await mergeStepState(supabase, runId, 'notification', { status: 'completed', finished_at: new Date().toISOString() });
+          try {
+            await supabase.rpc('log_sync_event', {
+              p_run_id: runId, p_level: 'INFO', p_message: 'step_completed',
+              p_details: { step: 'notification' }
+            });
+          } catch (_) {}
+          console.log(`[orchestrator] Notification sent for run ${runId}`);
+        } else {
+          const notifErr = typeof notifResult.body === 'string' ? notifResult.body : JSON.stringify(notifResult.body);
+          await mergeStepState(supabase, runId, 'notification', { 
+            status: 'failed', error: notifErr.substring(0, 200),
+            missing_env: notifBody?.missing_env || null
+          });
+          try {
+            await supabase.rpc('log_sync_event', {
+              p_run_id: runId, p_level: 'ERROR', p_message: 'step_failed',
+              p_details: { step: 'notification', error: notifErr.substring(0, 200), missing_env: notifBody?.missing_env }
+            });
+          } catch (_) {}
+          console.warn(`[orchestrator] Notification failed: ${notifErr.substring(0, 200)}`);
+        }
+      } catch (e: unknown) {
+        await mergeStepState(supabase, runId, 'notification', { status: 'failed', error: errMsg(e).substring(0, 200) });
+        try {
+          await supabase.rpc('log_sync_event', {
+            p_run_id: runId, p_level: 'ERROR', p_message: 'step_failed',
+            p_details: { step: 'notification', error: errMsg(e).substring(0, 200) }
+          });
+        } catch (_) {}
+        console.warn(`[orchestrator] Notification failed: ${errMsg(e)}`);
+      }
     }
-  } catch (e: unknown) {
-    await mergeStepState(supabase, runId, 'notification', { status: 'failed', error: errMsg(e).substring(0, 200) });
-    try {
-      await supabase.rpc('log_sync_event', {
-        p_run_id: runId, p_level: 'ERROR', p_message: 'notification_failed',
-        p_details: { step: 'notification', error: errMsg(e).substring(0, 200) }
-      });
-    } catch (_) {}
-    console.warn(`[orchestrator] Notification failed: ${errMsg(e)}`);
   }
 
   // ========== COMPLETENESS CHECK & FINAL STATUS ==========
-  // All steps including notification must be completed/success. No skipped allowed.
+  // All 13 steps including notification must be completed/success. No skipped allowed.
   const { data: finalRun } = await supabase.from('sync_runs').select('steps, warning_count').eq('id', runId).single();
   const finalSteps = finalRun?.steps || {};
   const expectedSteps = getExpectedSteps(trigger);
 
   const missingSteps: string[] = [];
-  const failedSteps: string[] = [];
+  const incompleteSteps: string[] = [];
   for (const s of expectedSteps) {
     const st = finalSteps[s];
     if (!st || (typeof st === 'object' && !st.status)) {
       missingSteps.push(s);
     } else if (typeof st === 'object' && st.status !== 'completed' && st.status !== 'success') {
-      failedSteps.push(s);
+      incompleteSteps.push(s);
     }
   }
 
   let finalStatus: string;
-  if (missingSteps.length > 0 || failedSteps.length > 0) {
-    const errorMsg = `Pipeline incomplete: missing=[${missingSteps.join(',')}] failed=[${failedSteps.join(',')}]`;
+  if (missingSteps.length > 0 || incompleteSteps.length > 0) {
+    const errorMsg = pipelineFailError || `Pipeline incomplete: missing=[${missingSteps.join(',')}] incomplete=[${incompleteSteps.join(',')}]`;
     console.warn(`[orchestrator] ${errorMsg}`);
     try {
       await supabase.rpc('log_sync_event', {
         p_run_id: runId, p_level: 'ERROR', p_message: 'pipeline_incomplete',
-        p_details: { missing_steps: missingSteps, failed_steps: failedSteps, expected: expectedSteps.length }
+        p_details: { missing_steps: missingSteps, incomplete_steps: incompleteSteps, expected: expectedSteps.length }
       });
     } catch (_) {}
     finalStatus = 'failed';
@@ -1148,8 +1241,73 @@ async function runPipeline(
   
   console.log(`[orchestrator] Pipeline completed: ${runId}, status: ${finalStatus}`);
   
-  return new Response(JSON.stringify({ status: finalStatus, run_id: runId }), 
-    { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+  // Use standardized response status
+  const responseStatus = finalStatus === 'failed' ? 'failed_definitive' : 'completed';
+  return makeResponse(responseStatus, { final_status: finalStatus });
+}
+
+// ============================================================
+// 546 WORKER_LIMIT RETRY HANDLER (generalized for all steps)
+// Returns a Response to yield/fail, or null if max retries exceeded (caller handles)
+// ============================================================
+async function handleWorkerLimitRetry(
+  supabase: SupabaseClient,
+  runId: string,
+  step: string,
+  result: { ok: boolean; http_status: number; body: unknown },
+  _runStartTime: number
+): Promise<Response | null> {
+  const { data: runData } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
+  const currentSteps = runData?.steps || {};
+  const stepState = (currentSteps[step] || {}) as Record<string, unknown>;
+  const prevRetry = (stepState.retry || {}) as Record<string, unknown>;
+  const nextAttempt = ((prevRetry.retry_attempt as number) || 0) + 1;
+
+  if (nextAttempt > STEP_MAX_RETRIES) {
+    const failMsg = `Step ${step} failed: WORKER_LIMIT persistent after ${STEP_MAX_RETRIES} retries (HTTP 546)`;
+    console.log(`[orchestrator] ${failMsg}`);
+    await mergeStepState(supabase, runId, step, { 
+      status: 'failed', 
+      code: 'worker_limit_exhausted',
+      error: failMsg,
+      retry: { retry_attempt: nextAttempt - 1, status: 'exhausted' }
+    });
+    try {
+      await supabase.rpc('log_sync_event', {
+        p_run_id: runId, p_level: 'ERROR', p_message: 'step_failed',
+        p_details: { step, code: 'worker_limit_exhausted', retry_attempt: nextAttempt - 1, http_status: 546 }
+      });
+    } catch (_) {}
+    return null; // Caller handles pipeline failure
+  }
+
+  const backoffSec = stepBackoffSeconds(nextAttempt);
+  const nextRetryAt = new Date(Date.now() + backoffSec * 1000).toISOString();
+  
+  // Deep merge retry state into step
+  await mergeStepState(supabase, runId, step, {
+    status: 'retry_delay',
+    retry: {
+      retry_attempt: nextAttempt,
+      next_retry_at: nextRetryAt,
+      last_http_status: 546,
+      last_error: 'worker_limit_546',
+      status: 'retry_delay'
+    }
+  });
+
+  console.log(`[orchestrator] ${step} WORKER_LIMIT retry ${nextAttempt}/${STEP_MAX_RETRIES}, backoff ${backoffSec}s`);
+  try {
+    await supabase.rpc('log_sync_event', {
+      p_run_id: runId, p_level: 'WARN', p_message: 'step_retry_scheduled',
+      p_details: { step, code: 'WORKER_LIMIT', retry_attempt: nextAttempt, backoff_seconds: backoffSec, next_retry_at: nextRetryAt }
+    });
+  } catch (_) {}
+
+  return new Response(JSON.stringify({
+    status: 'retry_delay', run_id: runId, current_step: step,
+    wait_seconds: backoffSec, needs_resume: true
+  }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
 }
 
 // ============================================================
