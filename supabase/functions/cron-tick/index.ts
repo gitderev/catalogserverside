@@ -221,18 +221,23 @@ serve(async (req) => {
       const chunkIndex = parseMergeState?.chunk_index ?? null;
       const parseMergeStatus = parseMergeState?.status as string | undefined;
 
-      // Get last event
-      const { data: lastEvents } = await supabase
+      // Get last PROGRESS event (exclude skip/diagnostic events for accurate age calculation)
+      const { data: lastProgressEvents } = await supabase
         .from('sync_events')
         .select('created_at, message, details, level')
         .eq('run_id', activeRun.id)
+        .not('message', 'like', 'resume_skipped_%')
+        .not('message', 'like', 'cron_auth_%')
+        .not('message', 'like', 'drain_%')
         .order('created_at', { ascending: false })
         .limit(1);
 
-      const lastEvent = lastEvents?.[0];
+      const lastEvent = lastProgressEvents?.[0];
       const lastEventAgeS = lastEvent
         ? (now.getTime() - new Date(lastEvent.created_at).getTime()) / 1000
         : runAgeMs / 1000;
+      const lastMsg = (lastEvent?.message || '').toLowerCase();
+      const isYieldEvent = lastMsg.includes('yield') || lastMsg.includes('orchestrator_yield');
 
       const baseDetails = {
         run_id: activeRun.id,
@@ -330,44 +335,46 @@ serve(async (req) => {
         }
       }
 
-      // ACTIVE WINDOW: last event < 60s ago → skip resume
-      if (lastEventAgeS <= ACTIVE_WINDOW_SEC) {
-        console.log(`[cron-tick] Run ${activeRun.id} active (last event ${Math.round(lastEventAgeS)}s ago), skipping resume`);
-        await logDecision(supabase, activeRun.id, 'INFO', 'resume_skipped_active_window', {
-          ...baseDetails,
-          active_window_sec: ACTIVE_WINDOW_SEC,
-          reason: 'last_event_within_active_window'
-        });
+      // YIELD FAST-PATH: if last progress event is a yield and > 5s old, bypass gating
+      const YIELD_DEBOUNCE_SEC = 5;
+      if (isYieldEvent && lastEventAgeS > YIELD_DEBOUNCE_SEC) {
+        console.log(`[cron-tick] Yield fast-path: bypassing gating (event=${lastEvent?.message}, age=${Math.round(lastEventAgeS)}s)`);
+      } else {
+        // ACTIVE WINDOW: last progress event < 60s ago → skip resume
+        if (lastEventAgeS <= ACTIVE_WINDOW_SEC) {
+          console.log(`[cron-tick] Run ${activeRun.id} active (last progress event ${Math.round(lastEventAgeS)}s ago), skipping resume`);
+          await logDecision(supabase, activeRun.id, 'INFO', 'resume_skipped_active_window', {
+            ...baseDetails,
+            active_window_sec: ACTIVE_WINDOW_SEC,
+            reason: 'last_progress_event_within_active_window'
+          });
+          return jsonResp({ status: 'resume_skipped_active_window', run_id: activeRun.id, last_event_age_s: Math.round(lastEventAgeS) });
+        }
 
-        return jsonResp({ status: 'resume_skipped_active_window', run_id: activeRun.id, last_event_age_s: Math.round(lastEventAgeS) });
+        // STALL WINDOW (60-180s): don't resume yet unless yielded (handled above)
+        if (lastEventAgeS <= STALL_THRESHOLD_SEC) {
+          console.log(`[cron-tick] Run ${activeRun.id} within stall window (${Math.round(lastEventAgeS)}s), skipping resume`);
+          await logDecision(supabase, activeRun.id, 'INFO', 'resume_skipped_within_stall_window', {
+            ...baseDetails,
+            stall_threshold_sec: STALL_THRESHOLD_SEC,
+            reason: 'within_stall_window'
+          });
+          return jsonResp({ status: 'resume_skipped_within_stall_window', run_id: activeRun.id, last_event_age_s: Math.round(lastEventAgeS) });
+        }
       }
 
-      // BETWEEN 60-180s: don't resume yet to reduce unnecessary invocations
-      if (lastEventAgeS <= STALL_THRESHOLD_SEC) {
-        console.log(`[cron-tick] Run ${activeRun.id} within stall window (${Math.round(lastEventAgeS)}s), skipping resume`);
-        await logDecision(supabase, activeRun.id, 'INFO', 'resume_skipped_within_stall_window', {
-          ...baseDetails,
-          stall_threshold_sec: STALL_THRESHOLD_SEC,
-          reason: 'within_stall_window'
-        });
-
-        return jsonResp({ status: 'resume_skipped_within_stall_window', run_id: activeRun.id, last_event_age_s: Math.round(lastEventAgeS) });
-      }
-
-      // STALLED: last event > 180s ago → resume
+      // RESUME: either yield fast-path or stalled (> 180s)
       const isStalled = lastEventAgeS > STALL_THRESHOLD_SEC;
-      const lastMsg = (lastEvent?.message || '').toLowerCase();
-      const isYielded = lastMsg.includes('yield') || lastMsg.includes('orchestrator_yield');
 
-      console.log(`[cron-tick] Resuming run ${activeRun.id} (stalled=${isStalled}, yielded=${isYielded}, last_event_age=${Math.round(lastEventAgeS)}s)`);
+      console.log(`[cron-tick] Resuming run ${activeRun.id} (stalled=${isStalled}, yielded=${isYieldEvent}, last_event_age=${Math.round(lastEventAgeS)}s)`);
       await logDecision(supabase, activeRun.id, 'INFO', 'resume_triggered', {
         ...baseDetails,
         is_stalled: isStalled,
-        is_yielded: isYielded,
+        is_yielded: isYieldEvent,
         stall_threshold_sec: STALL_THRESHOLD_SEC
       });
 
-      const resumeResult = await triggerSyncResume(supabaseUrl, supabaseServiceKey, activeRun.id);
+      let resumeResult = await triggerSyncResume(supabaseUrl, supabaseServiceKey, activeRun.id);
 
       if (resumeResult.error) {
         await logDecision(supabase, activeRun.id, 'WARN', 'resume_failed_http', {
@@ -376,14 +383,88 @@ serve(async (req) => {
         });
       }
 
+      // DRAIN LOOP: try to drive the run to completion within bounded limits.
+      // Budget is conservative to fit within edge function timeout.
+      // If limits are reached, the next cron-tick invocation continues safely.
+      const DRAIN_MAX_ITER = 4;
+      const DRAIN_BUDGET_MS = 120_000; // 2 minutes
+      const DRAIN_SLEEP_MS = 25_000;   // 25s (matches orchestrator chunk budget)
+      const RESUME_TIMEOUT_MS = 5_000; // fire-and-forget after 5s
+      const drainStart = Date.now();
+      let drainIter = 0;
+
+      while (drainIter < DRAIN_MAX_ITER && (Date.now() - drainStart) < DRAIN_BUDGET_MS) {
+        drainIter++;
+        await new Promise(resolve => setTimeout(resolve, DRAIN_SLEEP_MS));
+
+        // Re-read run status with fresh timestamp
+        const { data: runCheck } = await supabase
+          .from('sync_runs')
+          .select('id, status, steps')
+          .eq('id', activeRun.id)
+          .single();
+
+        if (!runCheck || runCheck.status !== 'running') {
+          const finalStatus = runCheck?.status || 'unknown';
+          console.log(`[cron-tick] Drain complete: run ${activeRun.id} status=${finalStatus} after ${drainIter} drain iterations`);
+          await logDecision(supabase, activeRun.id, 'INFO', 'drain_loop_complete', {
+            final_status: finalStatus,
+            drain_iterations: drainIter,
+            drain_elapsed_ms: Date.now() - drainStart
+          });
+          return jsonResp({
+            status: 'drain_complete',
+            run_id: activeRun.id,
+            final_status: finalStatus,
+            drain_iterations: drainIter
+          });
+        }
+
+        // Re-read last progress event
+        const { data: drainEvents } = await supabase
+          .from('sync_events')
+          .select('created_at, message')
+          .eq('run_id', activeRun.id)
+          .not('message', 'like', 'resume_skipped_%')
+          .not('message', 'like', 'cron_auth_%')
+          .not('message', 'like', 'drain_%')
+          .order('created_at', { ascending: false })
+          .limit(1);
+
+        const drainEvent = drainEvents?.[0];
+        const drainEventAge = drainEvent
+          ? (Date.now() - new Date(drainEvent.created_at).getTime()) / 1000
+          : 999;
+        const drainMsg = (drainEvent?.message || '').toLowerCase();
+        const drainIsYield = drainMsg.includes('yield') || drainMsg.includes('orchestrator_yield');
+
+        if ((drainIsYield && drainEventAge > YIELD_DEBOUNCE_SEC) || drainEventAge > STALL_THRESHOLD_SEC) {
+          console.log(`[cron-tick] Drain iter ${drainIter}: resuming (yield=${drainIsYield}, age=${Math.round(drainEventAge)}s)`);
+          await logDecision(supabase, activeRun.id, 'INFO', 'drain_resume_triggered', {
+            drain_iteration: drainIter,
+            last_event_age_s: Math.round(drainEventAge),
+            is_yield: drainIsYield,
+            last_event_message: drainEvent?.message
+          });
+          // Fire-and-forget resume (don't block waiting for full chunk processing)
+          triggerSyncResumeQuick(supabaseUrl, supabaseServiceKey, activeRun.id, RESUME_TIMEOUT_MS);
+        } else {
+          console.log(`[cron-tick] Drain iter ${drainIter}: waiting (age=${Math.round(drainEventAge)}s, yield=${drainIsYield})`);
+        }
+      }
+
+      // Drain ended without run completing — safe stop, no destructive status change
+      console.log(`[cron-tick] Drain incomplete: ${drainIter} iterations, run ${activeRun.id} still running`);
+      await logDecision(supabase, activeRun.id, 'INFO', 'drain_loop_incomplete', {
+        drain_iterations: drainIter,
+        drain_elapsed_ms: Date.now() - drainStart,
+        reason: drainIter >= DRAIN_MAX_ITER ? 'max_iterations' : 'max_time'
+      });
+
       return jsonResp({
-        status: 'resume_triggered',
+        status: 'drain_incomplete',
         run_id: activeRun.id,
-        trigger_type: activeRun.trigger_type,
-        current_step: currentStep,
-        is_yielded: isYielded,
-        is_stalled: isStalled,
-        ...resumeResult
+        drain_iterations: drainIter
       });
     }
 
@@ -565,6 +646,27 @@ async function triggerSyncResume(
     console.error('[cron-tick] Failed to resume sync:', errMsg(e));
     return { error: errMsg(e) };
   }
+}
+
+/** Fire-and-forget resume: triggers run-full-sync but aborts waiting after timeoutMs.
+ *  The edge function continues processing server-side even after abort. */
+async function triggerSyncResumeQuick(
+  supabaseUrl: string,
+  serviceKey: string,
+  runId: string,
+  timeoutMs: number
+): Promise<void> {
+  const controller = new AbortController();
+  const tid = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    await fetch(`${supabaseUrl}/functions/v1/run-full-sync`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${serviceKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ trigger: 'cron', resume_run_id: runId }),
+      signal: controller.signal
+    });
+  } catch { /* timeout or network error — function keeps running server-side */ }
+  clearTimeout(tid);
 }
 
 async function callNotification(

@@ -5,12 +5,14 @@ on:
     - cron: "* * * * *"
   workflow_dispatch: {}
 
+concurrency:
+  group: cron-tick
+  cancel-in-progress: false
+
 jobs:
   cron-tick:
     runs-on: ubuntu-latest
-    env:
-      TICK_MAX_CALLS: "4"
-      TICK_SLEEP_SEC: "75"
+    timeout-minutes: 6
     steps:
       - name: Validate secrets
         run: |
@@ -23,52 +25,26 @@ jobs:
             exit 1
           fi
 
-      - name: Call cron-tick (multi-tick loop)
+      - name: Call cron-tick
         run: |
-          for ATTEMPT in $(seq 1 "$TICK_MAX_CALLS"); do
-            TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-            BODY_FILE=$(mktemp)
-            STATUS=$(curl -sS -o "$BODY_FILE" -w "%{http_code}" -X POST "${{ secrets.CRON_TICK_URL }}" \
-              -H "Content-Type: application/json" \
-              -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" \
-              -d '{"timestamp":"'"$TS"'"}')
-            BODY=$(cat "$BODY_FILE")
-            BODY_TRUNCATED=$(printf '%s' "$BODY" | head -c 1000)
+          TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          BODY_FILE=$(mktemp)
+          STATUS=$(curl -sS -o "$BODY_FILE" -w "%{http_code}" \
+            --max-time 300 \
+            -X POST "${{ secrets.CRON_TICK_URL }}" \
+            -H "Content-Type: application/json" \
+            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" \
+            -d '{"timestamp":"'"$TS"'"}')
+          BODY=$(cat "$BODY_FILE")
+          BODY_TRUNCATED=$(printf '%s' "$BODY" | head -c 2000)
+          rm -f "$BODY_FILE"
 
-            echo "attempt=$ATTEMPT timestamp=$TS http_status=$STATUS"
-            echo "body=$BODY_TRUNCATED"
+          echo "timestamp=$TS http_status=$STATUS"
+          echo "body=$BODY_TRUNCATED"
 
-            if [ "$STATUS" -ge 400 ]; then
-              rm -f "$BODY_FILE"
-              echo "::error::cron-tick returned HTTP $STATUS on attempt $ATTEMPT"
-              exit 1
-            fi
+          if [ "$STATUS" -ge 400 ]; then
+            echo "::error::cron-tick returned HTTP $STATUS"
+            exit 1
+          fi
 
-            PY_SCRIPT=$(mktemp)
-            cat > "$PY_SCRIPT" << 'PYEOF'
-import json, sys
-try:
-    with open(sys.argv[1], "r", encoding="utf-8") as f:
-        data = json.load(f)
-    print("STATUS=" + str(data.get("status", "unknown")))
-except Exception:
-    print("STATUS=unknown")
-PYEOF
-            RESULT=$(python3 "$PY_SCRIPT" "$BODY_FILE")
-            rm -f "$PY_SCRIPT" "$BODY_FILE"
-
-            echo "$RESULT"
-            RESP_STATUS=$(echo "$RESULT" | awk -F= '/^STATUS=/{print $2}')
-
-            if [ "$RESP_STATUS" = "noop" ]; then
-              echo "Status is noop; no work pending. Stopping after attempt $ATTEMPT"
-              break
-            fi
-
-            if [ "$ATTEMPT" -lt "$TICK_MAX_CALLS" ]; then
-              echo "Work may be pending (status=$RESP_STATUS); sleeping ${TICK_SLEEP_SEC}s before next attempt"
-              sleep "$TICK_SLEEP_SEC"
-            else
-              echo "Reached max attempts ($TICK_MAX_CALLS) with status=$RESP_STATUS"
-            fi
-          done
+          echo "cron-tick completed successfully (HTTP $STATUS)"
