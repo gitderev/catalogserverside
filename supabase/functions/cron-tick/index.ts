@@ -27,9 +27,18 @@ const corsHeaders = {
 const ACTIVE_WINDOW_SEC = 60;
 const STALL_THRESHOLD_SEC = 180;
 const IDLE_TIMEOUT_MINUTES = 30;
+const FINGERPRINT_SALT = "cron-fp-v1";
 
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+/** Compute SHA-256 fingerprint (first 12 hex chars) of input string. */
+async function sha256fp12(input: string): Promise<string> {
+  const data = new TextEncoder().encode(input);
+  const hash = await crypto.subtle.digest('SHA-256', data);
+  const hex = Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
+  return hex.substring(0, 12);
 }
 
 function toRomeTime(date: Date): { hours: number; minutes: number; dateStr: string } {
@@ -69,11 +78,55 @@ serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
 
   try {
-    // 1. AUTHENTICATE
+    // 1. AUTHENTICATE with diagnostics
     const cronSecret = Deno.env.get('CRON_SECRET');
     const providedSecret = req.headers.get('x-cron-secret');
+    const hasSecretHeader = providedSecret !== null;
+    const providedLen = providedSecret?.length ?? 0;
+    const expectedLen = cronSecret?.length ?? 0;
+    const providedFp12 = hasSecretHeader && providedSecret ? await sha256fp12(providedSecret + FINGERPRINT_SALT) : '';
+    const expectedFp12 = cronSecret ? await sha256fp12(cronSecret + FINGERPRINT_SALT) : '';
+    const mismatch = !cronSecret || !providedSecret || providedFp12 !== expectedFp12;
+    const userAgent = req.headers.get('user-agent') || '';
+
+    console.log(JSON.stringify({
+      diag_tag: 'cron_auth_diag',
+      has_secret_header: hasSecretHeader,
+      provided_secret_len: providedLen,
+      expected_secret_len: expectedLen,
+      provided_secret_fp12: providedFp12,
+      expected_secret_fp12: expectedFp12,
+      mismatch,
+      user_agent: userAgent
+    }));
+
     if (!cronSecret || !providedSecret || providedSecret !== cronSecret) {
-      console.log('[cron-tick] Invalid or missing x-cron-secret');
+      console.log('[cron-tick] Auth failed: 401');
+
+      // Persist WARN on most recent running run if exists
+      try {
+        const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
+        const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
+        const sb = createClient(supabaseUrl, supabaseServiceKey);
+        const { data: runningRuns } = await sb
+          .from('sync_runs')
+          .select('id')
+          .eq('status', 'running')
+          .order('started_at', { ascending: false })
+          .limit(1);
+        if (runningRuns?.[0]) {
+          await logDecision(sb, runningRuns[0].id, 'WARN', 'cron_auth_failed', {
+            has_secret_header: hasSecretHeader,
+            provided_secret_len: providedLen,
+            expected_secret_len: expectedLen,
+            provided_secret_fp12: providedFp12,
+            expected_secret_fp12: expectedFp12,
+            mismatch,
+            user_agent: userAgent
+          });
+        }
+      } catch (_) { /* non-blocking */ }
+
       return jsonResp({ status: 'error', message: 'Unauthorized' }, 401);
     }
 

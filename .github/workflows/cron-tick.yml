@@ -20,6 +20,19 @@ jobs:
             exit 1
           fi
 
+      - name: Diagnostic fingerprint (workflow_dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          SECRET="${{ secrets.CRON_SECRET }}"
+          SECRET_LEN=${#SECRET}
+          echo "secret_len=$SECRET_LEN"
+          if [ "$SECRET_LEN" -lt 16 ]; then
+            echo "::error::CRON_SECRET is too short ($SECRET_LEN chars, minimum 16)"
+            exit 1
+          fi
+          FP12=$(printf "%s" "${SECRET}cron-fp-v1" | sha256sum | awk '{print $1}' | cut -c1-12)
+          echo "secret_fp12=$FP12"
+
       - name: Call cron-tick
         run: |
           RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "${{ secrets.CRON_TICK_URL }}" \
