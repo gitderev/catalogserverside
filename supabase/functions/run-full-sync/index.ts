@@ -156,11 +156,17 @@ async function updateCurrentStep(supabase: SupabaseClient, runId: string, stepNa
   await supabase.from('sync_runs').update({ steps: updatedSteps }).eq('id', runId);
 }
 
-/** Merge a step state into steps JSONB without overwriting other steps */
+/** Merge a step state into steps JSONB without overwriting other steps.
+ *  Deep merges the step object: preserves existing fields (e.g. retry, cursor_pos)
+ *  while overlaying the new patch. */
 async function mergeStepState(supabase: SupabaseClient, runId: string, stepName: string, state: Record<string, unknown>): Promise<void> {
   const { data: run } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
   const currentSteps = run?.steps || {};
-  const updatedSteps = { ...currentSteps, [stepName]: state };
+  const existingStepState = currentSteps[stepName];
+  const mergedStepState = (existingStepState && typeof existingStepState === 'object')
+    ? { ...existingStepState, ...state }
+    : state;
+  const updatedSteps = { ...currentSteps, [stepName]: mergedStepState };
   await supabase.from('sync_runs').update({ steps: updatedSteps }).eq('id', runId);
 }
 
@@ -595,6 +601,7 @@ async function runPipeline(
   // ========== STEP 1: FTP Import ==========
   if (resumeFromStep === 'import_ftp') {
     await updateCurrentStep(supabase, runId, 'import_ftp');
+    await mergeStepState(supabase, runId, 'import_ftp', { status: 'in_progress', started_at: new Date().toISOString() });
     console.log('[orchestrator] === STEP 1: FTP Import ===');
     
     for (const fileType of ['material', 'stock', 'price', 'stockLocation']) {
@@ -613,6 +620,7 @@ async function runPipeline(
       
       if (!result.ok && fileType !== 'stockLocation') {
         const errText = typeof result.body === 'string' ? result.body : JSON.stringify(result.body);
+        await mergeStepState(supabase, runId, 'import_ftp', { status: 'failed', error: `FTP ${fileType}: ${errText.substring(0, 200)}` });
         await finalizeRun(supabase, runId, 'failed', runStartTime, `FTP ${fileType}: HTTP ${result.http_status} ${errText.substring(0, 200)}`);
         return new Response(JSON.stringify({ status: 'failed', error: errText.substring(0, 200) }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       }
@@ -636,6 +644,13 @@ async function runPipeline(
         }
       }
     }
+    await mergeStepState(supabase, runId, 'import_ftp', { status: 'completed', finished_at: new Date().toISOString() });
+    try {
+      await supabase.rpc('log_sync_event', {
+        p_run_id: runId, p_level: 'INFO', p_message: 'step_completed',
+        p_details: { step: 'import_ftp' }
+      });
+    } catch (_) {}
     resumeFromStep = 'parse_merge';
   }
 
@@ -715,6 +730,7 @@ async function runPipeline(
   }
 
   function isWorkerLimit(body: unknown): boolean {
+    if (typeof body === 'string') return body.includes('WORKER_LIMIT');
     if (!body || typeof body !== 'object') return false;
     const b = body as Record<string, unknown>;
     if (b.code === 'WORKER_LIMIT' || b.error_code === 'WORKER_LIMIT') return true;
@@ -770,8 +786,8 @@ async function runPipeline(
       }
     }
 
-    // ---- export_*: retry_delay gate ----
-    if (isExportStep) {
+    // ---- retry_delay gate (all steps, generalized 546 WORKER_LIMIT) ----
+    {
       const { data: runData } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
       const stepState = runData?.steps?.[step] || {};
       const stepRetry = stepState.retry || {};
@@ -782,11 +798,10 @@ async function runPipeline(
         if (now < nextRetryAt) {
           const waitSeconds = Math.max(1, Math.ceil((nextRetryAt - now) / 1000));
           console.log(`[orchestrator] ${step} in retry_delay, ${waitSeconds}s remaining`);
-          console.log(JSON.stringify({ diag_tag: 'xlsx_export_retry_decision', run_id: runId, step, decision: 'retry_not_ready', retry_attempt: stepRetry.retry_attempt, wait_seconds: waitSeconds, next_retry_at: stepRetry.next_retry_at }));
           try {
             await supabase.rpc('log_sync_event', {
-              p_run_id: runId, p_level: 'INFO', p_message: 'export_retry_not_ready',
-              p_details: { diag_tag: 'xlsx_export_retry_decision', step, decision: 'retry_not_ready', wait_seconds: waitSeconds, next_retry_at: stepRetry.next_retry_at, retry_attempt: stepRetry.retry_attempt }
+              p_run_id: runId, p_level: 'INFO', p_message: 'retry_not_ready',
+              p_details: { step, decision: 'retry_not_ready', wait_seconds: waitSeconds, next_retry_at: stepRetry.next_retry_at, retry_attempt: stepRetry.retry_attempt }
             });
           } catch (_) {}
           return new Response(JSON.stringify({
@@ -799,14 +814,23 @@ async function runPipeline(
     }
     
     await updateCurrentStep(supabase, runId, step);
+    // CRITICAL: Write in_progress BEFORE callStep to guarantee steps[step] always exists
+    // when current_step points to it. This eliminates the "current_step set but step absent" bug.
+    await mergeStepState(supabase, runId, step, { status: 'in_progress', started_at: new Date().toISOString() });
     console.log(`[orchestrator] === STEP: ${step} ===`);
+    try {
+      await supabase.rpc('log_sync_event', {
+        p_run_id: runId, p_level: 'INFO', p_message: 'step_started',
+        p_details: { step }
+      });
+    } catch (_) {}
     
     const result = await callStep(supabaseUrl, supabaseServiceKey, 'sync-step-runner', { 
       run_id: runId, step, fee_config: feeConfig 
     });
     
     // ---- export_*: handle 546 WORKER_LIMIT as retryable ----
-    if (isExportStep && !result.ok && result.http_status === 546 && isWorkerLimit(result.body)) {
+    if (!result.ok && result.http_status === 546 && isWorkerLimit(result.body)) {
       const { data: runData } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
       const currentSteps = runData?.steps || {};
       const stepState = currentSteps[step] || {};
@@ -863,6 +887,13 @@ async function runPipeline(
       const errText = !result.ok 
         ? (typeof result.body === 'string' ? result.body : JSON.stringify(result.body)).substring(0, 200) 
         : (verification.error || `Step ${step} fallito`);
+      await mergeStepState(supabase, runId, step, { status: 'failed', error: errText });
+      try {
+        await supabase.rpc('log_sync_event', {
+          p_run_id: runId, p_level: 'ERROR', p_message: 'step_failed',
+          p_details: { step, error: errText }
+        });
+      } catch (_) {}
       await finalizeRun(supabase, runId, 'failed', runStartTime, errText);
       return new Response(JSON.stringify({ status: 'failed', error: errText }), { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
@@ -873,8 +904,8 @@ async function runPipeline(
       return await yieldResponse(step, `step ${step} still in_progress, needs resume`);
     }
 
-    // ---- export_*: on success, clear retry state and log ----
-    if (isExportStep && result.ok) {
+    // ---- On success: clear retry state and log step_completed ----
+    {
       const { data: runData } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
       const currentSteps = runData?.steps || {};
       const stepState = currentSteps[step] || {};
@@ -887,20 +918,12 @@ async function runPipeline(
         await supabase.from('sync_runs').update({ steps: updatedSteps }).eq('id', runId);
       }
 
-      const rw = stepState.rows_written ?? stepState.rows ?? 0;
-      const tp = stepState.total_products ?? rw;
-      if (tp > 0 && rw > 0 && rw !== tp) {
-        console.warn(JSON.stringify({ diag_tag: 'xlsx_export_retry_decision', run_id: runId, step, decision: 'row_count_mismatch', rows_written: rw, total_products: tp }));
-        try {
-          await supabase.rpc('log_sync_event', {
-            p_run_id: runId, p_level: 'WARN', p_message: `${step}: rows_written(${rw}) != total_products(${tp})`,
-            p_details: { diag_tag: 'xlsx_export_retry_decision', step, decision: 'row_count_mismatch', rows_written: rw, total_products: tp }
-          });
-        } catch (_) {}
-      }
-
-      const decision = hadRetry ? 'completed_after_retry' : 'completed';
-      console.log(JSON.stringify({ diag_tag: 'xlsx_export_retry_decision', run_id: runId, step, decision, rows_written: rw, total_products: tp, elapsed_ms: Date.now() - runStartTime }));
+      try {
+        await supabase.rpc('log_sync_event', {
+          p_run_id: runId, p_level: 'INFO', p_message: 'step_completed',
+          p_details: { step, had_retry: hadRetry, elapsed_ms: Date.now() - runStartTime }
+        });
+      } catch (_) {}
     }
   }
 
