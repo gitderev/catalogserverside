@@ -924,6 +924,21 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
     //   range: fetch MAX_FETCH_BYTES via Range header from material_source.tsv
     //   chunk_files: download one pre-split chunk file per invocation
     if (state.status === 'in_progress') {
+      // GUARD: if orchestrator set status='in_progress' but Phase 1a/1b/1c never ran,
+      // materialBytes will be missing. Reset to 'pending' to rebuild indices from scratch.
+      if (!state.materialBytes && !state.cursor_pos && !state.chunk_index) {
+        console.warn(`[parse_merge] Phase 2 entered but no materialBytes/cursor_pos — indices were never built. Resetting to pending.`);
+        await updateParseMergeState(supabase, runId, {
+          status: 'pending',
+          offset: 0,
+          cursor_pos: 0,
+          chunk_index: 0,
+          productCount: 0,
+          skipped: { noStock: 0, noPrice: 0, lowStock: 0, noValid: 0 },
+          startTime: Date.now()
+        });
+        return { success: true, status: 'building_stock_index' };
+      }
       const mode = state.mode || 'range';
       const cursorPos = state.cursor_pos ?? 0;
       const chunkIndex = state.chunk_index ?? 0; // output chunk index
