@@ -986,27 +986,32 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
         return { success: false, error, status: 'failed' };
       }
       
-      // Load indices
-      const { index: stockIndex, error: stockError } = await loadStockIndex(supabase);
-      if (!stockIndex) {
-        const error = `Failed to load stock index: ${stockError}`;
+      // Load indices — with deterministic artifact-missing detection
+      const [stockResult, priceResult, metaResult] = await Promise.all([
+        loadStockIndex(supabase),
+        loadPriceIndex(supabase),
+        loadMaterialMeta(supabase),
+      ]);
+      const missingPhase2: string[] = [];
+      if (!stockResult.index) missingPhase2.push(STOCK_INDEX_FILE);
+      if (!priceResult.index) missingPhase2.push(PRICE_INDEX_FILE);
+      if (!metaResult.meta) missingPhase2.push(MATERIAL_META_FILE);
+
+      if (missingPhase2.length > 0) {
+        const error = `pipeline_artifact_missing: Phase 2 artifacts missing despite resume markers: ${missingPhase2.join(', ')}`;
+        console.error(`[parse_merge] ${error}`);
+        try {
+          await supabase.rpc('log_sync_event', {
+            p_run_id: runId, p_level: 'ERROR', p_message: 'pipeline_artifact_missing',
+            p_details: { step: 'parse_merge', missing_artifacts: missingPhase2 }
+          });
+        } catch (_e) { /* non-blocking */ }
         await updateParseMergeState(supabase, runId, { status: 'failed', error });
         return { success: false, error, status: 'failed' };
       }
-      
-      const { index: priceIndex, error: priceError } = await loadPriceIndex(supabase);
-      if (!priceIndex) {
-        const error = `Failed to load price index: ${priceError}`;
-        await updateParseMergeState(supabase, runId, { status: 'failed', error });
-        return { success: false, error, status: 'failed' };
-      }
-      
-      const { meta: materialMeta, error: metaError } = await loadMaterialMeta(supabase);
-      if (!materialMeta) {
-        const error = `Failed to load material metadata: ${metaError}`;
-        await updateParseMergeState(supabase, runId, { status: 'failed', error });
-        return { success: false, error, status: 'failed' };
-      }
+      const stockIndex = stockResult.index!;
+      const priceIndex = priceResult.index!;
+      const materialMeta = metaResult.meta!;
       
       // ===== GUARDRAIL: detect cursor_pos regression to headerEndPos on resume =====
       // If persisted cursor_pos > 0 but we're about to start from headerEndPos,
