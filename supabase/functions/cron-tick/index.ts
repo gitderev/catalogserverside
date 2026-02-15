@@ -6,11 +6,13 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
  * 
  * Responsibilities:
  * 1. Authenticate ONLY via x-cron-secret header (no anon/service role bypass)
- * 2. Check if a sync is due (based on schedule_type, frequency, daily_time)
- * 3. Detect and handle timed-out runs (>run_timeout_minutes)
- * 4. Manage retry logic (max_attempts with retry_delay_minutes)
- * 5. Prevent concurrent runs
- * 6. Auto-disable scheduling after max_attempts consecutive failures (failed OR timeout)
+ * 2. Resume any running run (manual OR cron) that has yielded
+ * 3. Check if a sync is due (based on schedule_type, frequency, daily_time)
+ * 4. Detect and handle timed-out runs (>run_timeout_minutes)
+ * 5. Manage retry logic (max_attempts with retry_delay_minutes)
+ * 6. Prevent concurrent runs
+ * 7. Auto-disable scheduling after max_attempts consecutive failures (failed OR timeout)
+ * 8. Detect stalled runs (running but no recent events) and log warnings
  */
 
 const corsHeaders = {
@@ -33,6 +35,9 @@ function toRomeTime(date: Date): { hours: number; minutes: number; dateStr: stri
     dateStr: parts[0]
   };
 }
+
+// Stale threshold: if no events for this many seconds, consider run stalled
+const STALE_EVENT_THRESHOLD_S = 600; // 10 minutes
 
 serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
@@ -71,23 +76,15 @@ serve(async (req) => {
       );
     }
 
-    if (!config.enabled) {
-      console.log('[cron-tick] Scheduling disabled');
-      return new Response(
-        JSON.stringify({ status: 'skipped', reason: 'disabled' }),
-        { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
     const now = new Date();
     const timeoutMinutes = config.run_timeout_minutes || 60;
     const maxAttempts = config.max_attempts || 3;
     const retryDelay = (config.retry_delay_minutes || 5) * 60 * 1000;
 
-    // 3. CHECK FOR RUNNING RUNS
+    // 3. CHECK FOR RUNNING RUNS (resume ANY running run, manual or cron)
     const { data: runningRuns } = await supabase
       .from('sync_runs')
-      .select('id, started_at, attempt, trigger_type')
+      .select('id, started_at, attempt, trigger_type, steps')
       .eq('status', 'running')
       .limit(1);
 
@@ -125,7 +122,9 @@ serve(async (req) => {
           p_run_id: run.id
         });
         if (!lockReleased) {
-          console.warn(`[cron-tick] WARN: Lock release returned false for timed-out run ${run.id}`);
+          // Also try deleting any expired locks
+          await supabase.from('sync_locks').delete().eq('lock_name', 'global_sync');
+          console.log(`[cron-tick] Force-cleaned lock after timeout for run ${run.id}`);
         }
 
         const shouldDisable = await checkAndHandleMaxAttempts(supabase, supabaseUrl, supabaseServiceKey, maxAttempts);
@@ -145,22 +144,58 @@ serve(async (req) => {
         );
       }
 
-      // Run is still within timeout window - try to resume it (cron-triggered runs)
-      if (run.trigger_type === 'cron') {
-        console.log(`[cron-tick] Run ${run.id} still running (${Math.round(elapsed / 60000)}min), attempting resume...`);
-        
-        const resumeResult = await triggerSyncResume(supabaseUrl, supabaseServiceKey, run.id);
-        
-        return new Response(
-          JSON.stringify({ status: 'resume_attempted', run_id: run.id, ...resumeResult }),
-          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
+      // Run is still within timeout window - check for stall and resume
+      // First check: is the last event too old? (stall detection)
+      const { data: lastEvent } = await supabase
+        .from('sync_events')
+        .select('created_at, message')
+        .eq('run_id', run.id)
+        .order('created_at', { ascending: false })
+        .limit(1);
+      
+      const lastEventAge = lastEvent?.length 
+        ? (now.getTime() - new Date(lastEvent[0].created_at).getTime()) / 1000
+        : elapsed / 1000;
+      
+      if (lastEventAge > STALE_EVENT_THRESHOLD_S) {
+        console.log(`[cron-tick] Run ${run.id} may be stalled: last event ${Math.round(lastEventAge)}s ago`);
+        try {
+          await supabase.rpc('log_sync_event', {
+            p_run_id: run.id,
+            p_level: 'WARN',
+            p_message: 'stalled_no_resume: run ferma senza attività recente, tentativo resume',
+            p_details: { 
+              step: run.steps?.current_step,
+              last_event_age_s: Math.round(lastEventAge),
+              threshold_s: STALE_EVENT_THRESHOLD_S,
+              last_event_message: lastEvent?.[0]?.message
+            }
+          });
+        } catch (_) {}
       }
-
-      // Manual run in progress - don't interfere
-      console.log(`[cron-tick] Manual run ${run.id} still running (${Math.round(elapsed / 60000)}min), skipping`);
+      
+      // Resume the running run (both manual and cron)
+      console.log(`[cron-tick] Run ${run.id} (trigger: ${run.trigger_type}) still running (${Math.round(elapsed / 60000)}min), attempting resume at step ${run.steps?.current_step}...`);
+      
+      const resumeResult = await triggerSyncResume(supabaseUrl, supabaseServiceKey, run.id);
+      
       return new Response(
-        JSON.stringify({ status: 'skipped', reason: 'manual_run_in_progress', run_id: run.id }),
+        JSON.stringify({ 
+          status: 'resume_attempted', 
+          run_id: run.id, 
+          trigger_type: run.trigger_type,
+          current_step: run.steps?.current_step,
+          ...resumeResult 
+        }),
+        { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
+    // No running run - check if scheduling is enabled before proceeding
+    if (!config.enabled) {
+      console.log('[cron-tick] Scheduling disabled, no running runs to resume');
+      return new Response(
+        JSON.stringify({ status: 'skipped', reason: 'disabled' }),
         { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
