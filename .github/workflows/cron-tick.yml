@@ -5,12 +5,19 @@ on:
     - cron: "* * * * *"
   workflow_dispatch: {}
 
+concurrency:
+  group: cron-tick
+  cancel-in-progress: false
+
 jobs:
   cron-tick:
     runs-on: ubuntu-latest
     env:
-      TICK_MAX_CALLS: "8"
-      TICK_SLEEP_SEC: "75"
+      TICK_MAX_CALLS: "4"
+      TICK_SLEEP_ACTIVE_SEC: "75"
+      TICK_SLEEP_STALL_SEC: "210"
+      STALL_THRESHOLD_SEC: "180"
+      STALL_BUFFER_SEC: "15"
     steps:
       - name: Validate secrets
         run: |
@@ -25,20 +32,31 @@ jobs:
 
       - name: Validate tick loop configuration
         run: |
-          if ! [[ "$TICK_MAX_CALLS" =~ ^[0-9]+$ ]]; then
-            echo "::error::TICK_MAX_CALLS must be an integer between 1 and 12 (got: $TICK_MAX_CALLS)"
-            exit 1
-          fi
-          if ! [[ "$TICK_SLEEP_SEC" =~ ^[0-9]+$ ]]; then
-            echo "::error::TICK_SLEEP_SEC must be an integer between 61 and 300 (got: $TICK_SLEEP_SEC)"
-            exit 1
-          fi
+          for VAR_NAME in TICK_MAX_CALLS TICK_SLEEP_ACTIVE_SEC TICK_SLEEP_STALL_SEC STALL_THRESHOLD_SEC STALL_BUFFER_SEC; do
+            VAL=$(eval echo "\$$VAR_NAME")
+            if ! [[ "$VAL" =~ ^[0-9]+$ ]]; then
+              echo "::error::$VAR_NAME must be an integer (got: $VAL)"
+              exit 1
+            fi
+          done
           if [ "$TICK_MAX_CALLS" -lt 1 ] || [ "$TICK_MAX_CALLS" -gt 12 ]; then
             echo "::error::TICK_MAX_CALLS out of range: $TICK_MAX_CALLS (expected 1..12)"
             exit 1
           fi
-          if [ "$TICK_SLEEP_SEC" -lt 61 ] || [ "$TICK_SLEEP_SEC" -gt 300 ]; then
-            echo "::error::TICK_SLEEP_SEC out of range: $TICK_SLEEP_SEC (expected 61..300)"
+          if [ "$TICK_SLEEP_ACTIVE_SEC" -lt 61 ] || [ "$TICK_SLEEP_ACTIVE_SEC" -gt 300 ]; then
+            echo "::error::TICK_SLEEP_ACTIVE_SEC out of range: $TICK_SLEEP_ACTIVE_SEC (expected 61..300)"
+            exit 1
+          fi
+          if [ "$TICK_SLEEP_STALL_SEC" -lt 61 ] || [ "$TICK_SLEEP_STALL_SEC" -gt 300 ]; then
+            echo "::error::TICK_SLEEP_STALL_SEC out of range: $TICK_SLEEP_STALL_SEC (expected 61..300)"
+            exit 1
+          fi
+          if [ "$STALL_THRESHOLD_SEC" -lt 60 ] || [ "$STALL_THRESHOLD_SEC" -gt 600 ]; then
+            echo "::error::STALL_THRESHOLD_SEC out of range: $STALL_THRESHOLD_SEC (expected 60..600)"
+            exit 1
+          fi
+          if [ "$STALL_BUFFER_SEC" -lt 0 ] || [ "$STALL_BUFFER_SEC" -gt 60 ]; then
+            echo "::error::STALL_BUFFER_SEC out of range: $STALL_BUFFER_SEC (expected 0..60)"
             exit 1
           fi
 
@@ -67,45 +85,83 @@ jobs:
             BODY=$(cat "$BODY_FILE")
             BODY_TRUNCATED=$(printf '%s' "$BODY" | head -c 1000)
 
-            echo "attempt=$ATTEMPT timestamp=$TS http_status=$STATUS"
-            echo "body=$BODY_TRUNCATED"
-
             if [ "$STATUS" -ge 400 ]; then
+              echo "attempt=$ATTEMPT timestamp=$TS http_status=$STATUS"
+              echo "body=$BODY_TRUNCATED"
               rm -f "$BODY_FILE"
               echo "::error::cron-tick returned HTTP $STATUS on attempt $ATTEMPT"
               exit 1
             fi
 
             PY_SCRIPT=$(mktemp)
-            printf '%s\n' \
-              'import json' \
-              'import sys' \
-              'path = sys.argv[1]' \
-              'try:' \
-              '    with open(path, "r", encoding="utf-8") as f:' \
-              '        data = json.load(f)' \
-              'except Exception as e:' \
-              '    print("PARSE_OK=false")' \
-              '    print("SHOULD_CONTINUE=false")' \
-              '    print(f"PARSE_ERROR={e}")' \
-              '    sys.exit(0)' \
-              'run_id = data.get("run_id")' \
-              'has_run_id = isinstance(run_id, str) and run_id.strip() != ""' \
-              'should_continue = (' \
-              '    data.get("is_yielded") is True' \
-              '    or data.get("is_stalled") is True' \
-              '    or data.get("status") == "yielded"' \
-              '    or has_run_id' \
-              ')' \
-              'print("PARSE_OK=true")' \
-              'print("SHOULD_CONTINUE=" + ("true" if should_continue else "false"))' \
-              > "$PY_SCRIPT"
-            PARSE_RESULT=$(python3 "$PY_SCRIPT" "$BODY_FILE")
-            rm -f "$PY_SCRIPT"
-            rm -f "$BODY_FILE"
+            cat > "$PY_SCRIPT" << 'PYEOF'
+import json, sys, os
 
-            echo "$PARSE_RESULT"
+path = sys.argv[1]
+active_sleep = int(os.environ.get("TICK_SLEEP_ACTIVE_SEC", "75"))
+stall_threshold = int(os.environ.get("STALL_THRESHOLD_SEC", "180"))
+stall_buffer = int(os.environ.get("STALL_BUFFER_SEC", "15"))
+
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception as e:
+    print("PARSE_OK=false")
+    print("SHOULD_CONTINUE=false")
+    print(f"PARSE_ERROR={e}")
+    print(f"STATUS=parse_error")
+    print("LAST_EVENT_AGE_S=")
+    print(f"SLEEP_SEC={active_sleep}")
+    sys.exit(0)
+
+status = str(data.get("status", ""))
+last_event_age_s = data.get("last_event_age_s")
+
+# Determine SHOULD_CONTINUE
+noop_statuses = {"noop", "no_work", "done", "completed"}
+continue_statuses = {
+    "yielded", "retry_started",
+    "resume_skipped_active_window", "resume_skipped_within_stall_window",
+    "resumed", "resume_triggered",
+}
+
+if status in noop_statuses:
+    should_continue = False
+elif (
+    data.get("is_yielded") is True
+    or data.get("is_stalled") is True
+    or status in continue_statuses
+):
+    should_continue = True
+else:
+    should_continue = False
+
+# Determine SLEEP_SEC
+sleep_sec = active_sleep
+
+if status == "resume_skipped_within_stall_window" and isinstance(last_event_age_s, (int, float)):
+    raw = stall_threshold - int(last_event_age_s) + stall_buffer
+    sleep_sec = max(61, min(300, raw))
+
+age_str = str(int(last_event_age_s)) if isinstance(last_event_age_s, (int, float)) else ""
+
+print("PARSE_OK=true")
+print(f"STATUS={status}")
+print(f"LAST_EVENT_AGE_S={age_str}")
+print(f"SHOULD_CONTINUE={'true' if should_continue else 'false'}")
+print(f"SLEEP_SEC={sleep_sec}")
+PYEOF
+
+            PARSE_RESULT=$(python3 "$PY_SCRIPT" "$BODY_FILE")
+            rm -f "$PY_SCRIPT" "$BODY_FILE"
+
+            RESP_STATUS=$(echo "$PARSE_RESULT" | awk -F= '/^STATUS=/{print $2}')
+            LAST_AGE=$(echo "$PARSE_RESULT" | awk -F= '/^LAST_EVENT_AGE_S=/{print $2}')
             SHOULD_CONTINUE=$(echo "$PARSE_RESULT" | awk -F= '/^SHOULD_CONTINUE=/{print $2}')
+            SLEEP_SEC=$(echo "$PARSE_RESULT" | awk -F= '/^SLEEP_SEC=/{print $2}')
+
+            echo "attempt=$ATTEMPT timestamp=$TS http_status=$STATUS status=$RESP_STATUS last_event_age_s=$LAST_AGE sleep_sec=$SLEEP_SEC should_continue=$SHOULD_CONTINUE"
+            echo "body=$BODY_TRUNCATED"
 
             if [ "$SHOULD_CONTINUE" != "true" ]; then
               echo "No further work detected; stopping after attempt $ATTEMPT"
@@ -113,8 +169,8 @@ jobs:
             fi
 
             if [ "$ATTEMPT" -lt "$TICK_MAX_CALLS" ]; then
-              echo "Work still pending; sleeping ${TICK_SLEEP_SEC}s before next attempt"
-              sleep "$TICK_SLEEP_SEC"
+              echo "Work still pending; sleeping ${SLEEP_SEC}s before next attempt"
+              sleep "$SLEEP_SEC"
             else
               echo "Reached max attempts ($TICK_MAX_CALLS) with work still pending"
             fi
