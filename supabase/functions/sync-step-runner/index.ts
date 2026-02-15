@@ -574,7 +574,12 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
     }
     
     // ========== PHASE 1a: BUILD STOCK INDEX ==========
-    if (!state || state.status === 'pending') {
+    // Trigger on: no state, pending, OR in_progress without any resume markers
+    // (the orchestrator sets in_progress before invoking us, but if Phase 1 never ran
+    // there will be no materialBytes/cursor_pos/chunk_index)
+    const isFirstExecution = !state || state.status === 'pending' ||
+      (state.status === 'in_progress' && !state.materialBytes && !state.cursor_pos && !state.chunk_index);
+    if (isFirstExecution) {
       console.log(`[parse_merge] Phase 1a: Building stock index...`);
       
       await updateParseMergeState(supabase, runId, {
@@ -924,20 +929,20 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
     //   range: fetch MAX_FETCH_BYTES via Range header from material_source.tsv
     //   chunk_files: download one pre-split chunk file per invocation
     if (state.status === 'in_progress') {
-      // GUARD: if orchestrator set status='in_progress' but Phase 1a/1b/1c never ran,
-      // materialBytes will be missing. Reset to 'pending' to rebuild indices from scratch.
+      // PREFLIGHT: verify Phase 2 prerequisites — resume markers OR readable artifacts
       if (!state.materialBytes && !state.cursor_pos && !state.chunk_index) {
-        console.warn(`[parse_merge] Phase 2 entered but no materialBytes/cursor_pos — indices were never built. Resetting to pending.`);
-        await updateParseMergeState(supabase, runId, {
-          status: 'pending',
-          offset: 0,
-          cursor_pos: 0,
-          chunk_index: 0,
-          productCount: 0,
-          skipped: { noStock: 0, noPrice: 0, lowStock: 0, noValid: 0 },
-          startTime: Date.now()
-        });
-        return { success: true, status: 'building_stock_index' };
+        // No resume markers — this should have been caught by isFirstExecution above.
+        // If we're here, something unexpected happened. Fail explicitly.
+        const error = 'pipeline_artifact_missing: Phase 2 entered without resume markers or prior Phase 1 execution';
+        console.error(`[parse_merge] ${error}`);
+        try {
+          await supabase.rpc('log_sync_event', {
+            p_run_id: runId, p_level: 'ERROR', p_message: 'pipeline_artifact_missing',
+            p_details: { step: 'parse_merge', expected: 'materialBytes or cursor_pos from Phase 1c', reason: 'Phase 1 never completed' }
+          });
+        } catch (_e) { /* non-blocking */ }
+        await updateParseMergeState(supabase, runId, { status: 'failed', error });
+        return { success: false, error, status: 'failed' };
       }
       const mode = state.mode || 'range';
       const cursorPos = state.cursor_pos ?? 0;
