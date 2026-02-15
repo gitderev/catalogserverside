@@ -343,6 +343,16 @@ serve(async (req) => {
         // ACTIVE WINDOW: last progress event < 60s ago → skip resume
         if (lastEventAgeS <= ACTIVE_WINDOW_SEC) {
           console.log(`[cron-tick] Run ${activeRun.id} active (last progress event ${Math.round(lastEventAgeS)}s ago), skipping resume`);
+          console.log(JSON.stringify({
+            diag_tag: 'cron_tick_decision',
+            run_id: activeRun.id,
+            decision: 'skip',
+            reason: 'active_window',
+            last_event_age_s: Math.round(lastEventAgeS),
+            progress_source: 'last_progress_event',
+            current_step: currentStep,
+            chunk_index: chunkIndex
+          }));
           await logDecision(supabase, activeRun.id, 'INFO', 'resume_skipped_active_window', {
             ...baseDetails,
             active_window_sec: ACTIVE_WINDOW_SEC,
@@ -354,6 +364,16 @@ serve(async (req) => {
         // STALL WINDOW (60-180s): don't resume yet unless yielded (handled above)
         if (lastEventAgeS <= STALL_THRESHOLD_SEC) {
           console.log(`[cron-tick] Run ${activeRun.id} within stall window (${Math.round(lastEventAgeS)}s), skipping resume`);
+          console.log(JSON.stringify({
+            diag_tag: 'cron_tick_decision',
+            run_id: activeRun.id,
+            decision: 'skip',
+            reason: 'stall_window',
+            last_event_age_s: Math.round(lastEventAgeS),
+            progress_source: 'last_progress_event',
+            current_step: currentStep,
+            chunk_index: chunkIndex
+          }));
           await logDecision(supabase, activeRun.id, 'INFO', 'resume_skipped_within_stall_window', {
             ...baseDetails,
             stall_threshold_sec: STALL_THRESHOLD_SEC,
