@@ -889,7 +889,7 @@ async function runPipeline(
               });
             } catch (_) {}
             return makeResponse('retry_delay', { 
-              current_step: step, wait_seconds: waitSeconds, needs_resume: true 
+              current_step: step, wait_seconds: waitSeconds, needs_resume: true, next_retry_at: nextRetryAt 
             });
           }
           console.log(`[orchestrator] ${step} retry_delay expired, retrying (attempt ${stepRetry.retry_attempt || 0})`);
