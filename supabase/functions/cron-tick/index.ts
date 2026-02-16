@@ -399,6 +399,39 @@ serve(async (req) => {
         chunk_index: chunkIndex
       }));
 
+      // PRE-RESUME GUARD: check retry_delay from DB state BEFORE calling orchestrator
+      // This prevents unnecessary orchestrator invocations every minute when step is not due
+      {
+        const currentStepState = (activeRun.steps as Record<string, unknown>)?.[currentStep as string] as Record<string, unknown> | undefined;
+        const stepRetry = currentStepState?.retry as Record<string, unknown> | undefined;
+        const isStepRetryDelay = currentStepState?.status === 'retry_delay' || stepRetry?.status === 'retry_delay';
+        const nextRetryAt = (stepRetry?.next_retry_at || currentStepState?.next_retry_at) as string | undefined;
+
+        if (isStepRetryDelay && nextRetryAt) {
+          const nextRetryTime = new Date(nextRetryAt).getTime();
+          if (now.getTime() < nextRetryTime) {
+            const waitSeconds = Math.ceil((nextRetryTime - now.getTime()) / 1000);
+            console.log(`[cron-tick] Pre-resume guard: ${currentStep} retry_delay not due (${waitSeconds}s remaining)`);
+            await logDecision(supabase, activeRun.id, 'INFO', 'resume_skipped_not_due', {
+              ...baseDetails,
+              origin: 'cron',
+              now_iso: now.toISOString(),
+              next_retry_at: nextRetryAt,
+              seconds_remaining: waitSeconds,
+              source: 'pre_resume_db_check'
+            });
+            return jsonResp({
+              status: 'retry_delay',
+              run_id: activeRun.id,
+              wait_seconds: waitSeconds,
+              current_step: currentStep,
+              next_retry_at: nextRetryAt,
+              needs_resume: true
+            });
+          }
+        }
+      }
+
       await logDecision(supabase, activeRun.id, 'INFO', 'resume_triggered', {
         ...baseDetails,
         is_stalled: isStalled,

@@ -32,13 +32,15 @@ const STEP_LABELS: Record<string, string> = {
   parse_merge: 'Parsing e Merge',
   ean_mapping: 'Mapping EAN',
   pricing: 'Calcolo Prezzi',
-  override: 'Override Prodotti',
+  override_products: 'Override Prodotti',
   export_ean: 'Export Catalogo EAN',
   export_ean_xlsx: 'Export Catalogo EAN (XLSX)',
   export_amazon: 'Export Amazon',
   export_mediaworld: 'Export Mediaworld',
   export_eprice: 'Export ePrice',
-  upload_sftp: 'Upload SFTP'
+  upload_sftp: 'Upload SFTP',
+  versioning: 'Versioning',
+  notification: 'Notifica'
 };
 
 const DECISION_CONFIG: Record<HealthDecision, { label: string; icon: React.ReactNode; className: string }> = {
