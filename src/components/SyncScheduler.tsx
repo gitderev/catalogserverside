@@ -128,13 +128,15 @@ const STEP_LABELS: Record<string, string> = {
   parse_merge: 'Parsing e Merge',
   ean_mapping: 'Mapping EAN',
   pricing: 'Calcolo Prezzi',
-  override: 'Override Prodotti',
+  override_products: 'Override Prodotti',
   export_ean: 'Export Catalogo EAN',
   export_ean_xlsx: 'Export Catalogo EAN (XLSX)',
   export_amazon: 'Export Amazon',
   export_mediaworld: 'Export Mediaworld',
   export_eprice: 'Export ePrice',
-  upload_sftp: 'Upload SFTP'
+  upload_sftp: 'Upload SFTP',
+  versioning: 'Versioning',
+  notification: 'Notifica'
 };
 
 // Helper function to get user-friendly error messages in Italian
@@ -1080,17 +1082,20 @@ export const SyncScheduler: React.FC = () => {
                 <div className="space-y-2">
                   {Object.entries(STEP_LABELS).map(([key, label]) => {
                     const step = selectedRun.steps?.[key];
+                    const st = String(step?.status || '');
                     return (
                       <div key={key} className={`flex items-center justify-between p-3 rounded-lg border ${
-                        step?.status === 'success' ? 'bg-emerald-50 border-emerald-200' :
-                        step?.status === 'failed' ? 'bg-red-50 border-red-200' :
-                        step?.status === 'skipped' ? 'bg-amber-50 border-amber-200' :
+                        (st === 'success' || st === 'completed') ? 'bg-emerald-50 border-emerald-200' :
+                        st === 'failed' ? 'bg-red-50 border-red-200' :
+                        st === 'skipped' ? 'bg-amber-50 border-amber-200' :
+                        (st === 'in_progress' || st === 'retry_delay') ? 'bg-blue-50 border-blue-200' :
                         'bg-slate-50 border-slate-200'
                       }`}>
                         <div className="flex items-center gap-3">
-                          {step?.status === 'success' && <CheckCircle className="h-5 w-5 text-emerald-600" />}
-                          {step?.status === 'failed' && <XCircle className="h-5 w-5 text-red-600" />}
-                          {step?.status === 'skipped' && <AlertTriangle className="h-5 w-5 text-amber-600" />}
+                          {(st === 'success' || st === 'completed') && <CheckCircle className="h-5 w-5 text-emerald-600" />}
+                          {st === 'failed' && <XCircle className="h-5 w-5 text-red-600" />}
+                          {st === 'skipped' && <AlertTriangle className="h-5 w-5 text-amber-600" />}
+                          {(st === 'in_progress' || st === 'retry_delay') && <div className="h-5 w-5 rounded-full bg-blue-400 animate-pulse" />}
                           {!step && <div className="h-5 w-5 rounded-full bg-slate-200" />}
                           <span className={`font-medium ${!step ? 'text-slate-400' : 'text-slate-700'}`}>{label}</span>
                         </div>
