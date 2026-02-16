@@ -518,7 +518,10 @@ serve(async (req) => {
         resume_reason: resumeReason
       });
 
-      let resumeResult = await triggerSyncResume(supabaseUrl, supabaseServiceKey, activeRun.id);
+      // SINGLE RESUME PER TICK: call orchestrator once, then return immediately.
+      // No drain loop — the next tick (1 min later) will handle further progress.
+      // This eliminates concurrent resume calls within the same tick.
+      const resumeResult = await triggerSyncResume(supabaseUrl, supabaseServiceKey, activeRun.id);
 
       if (resumeResult.error) {
         await logDecision(supabase, activeRun.id, 'WARN', 'resume_failed_http', {
@@ -527,166 +530,30 @@ serve(async (req) => {
         });
       }
 
-      // GUARD: if orchestrator returned retry_delay, the step is not due — skip drain loop entirely
-      if (resumeResult.status === 'retry_delay') {
-        const retryWait = resumeResult.wait_seconds || 0;
-        console.log(`[cron-tick] resume response: retry_delay (${retryWait}s remaining), skipping drain loop`);
-        await logDecision(supabase, activeRun.id, 'INFO', 'resume_skipped_not_due', {
-          ...baseDetails,
-          origin: 'cron',
-          now_iso: new Date().toISOString(),
-          next_retry_at: resumeResult.next_retry_at || 'unknown',
-          seconds_remaining: retryWait,
-          source: 'initial_resume_response'
-        });
-        return jsonResp({
-          status: 'retry_delay',
-          run_id: activeRun.id,
-          wait_seconds: retryWait,
-          needs_resume: true
-        });
-      }
+      // STOP CONDITIONS: locked, yielded, retry_delay, error — all terminate the tick immediately.
+      // The next cron tick will pick up from where we left off.
+      const tickTerminateReason =
+        resumeResult.status === 'yielded' ? 'tick_terminated_on_yield' :
+        resumeResult.status === 'retry_delay' ? 'tick_terminated_on_retry_delay' :
+        resumeResult.error ? 'tick_terminated_on_error' :
+        'tick_completed_single_resume';
 
-      // DRAIN LOOP: drive the run to completion using response-JSON-based yield detection.
-      // When run-full-sync responds with status "yielded", we re-trigger immediately
-      // (5s debounce) instead of waiting for the next event-based check.
-      // Budget capped at 20s to avoid consuming too much runtime and blocking resumes.
-      const DRAIN_MAX_ITER = 2;
-      const DRAIN_BUDGET_MS = 20_000; // 20 seconds hard cap
-      const DRAIN_SLEEP_MS = 8_000;   // 8s between poll iterations
-      const FORCE_RESUME_DEBOUNCE_MS = 5_000; // 5s debounce for yield force-resume
-      const drainStart = Date.now();
-      let drainIter = 0;
-      let lastForceResumeAt = 0; // in-memory debounce timestamp
-
-      // Check if initial resume indicated yield → force immediate re-trigger
-      if (resumeResult.status === 'yielded' && !resumeResult.error) {
-        lastForceResumeAt = Date.now();
-        console.log(JSON.stringify({
-          diag_tag: 'cron_tick_decision',
-          run_id: activeRun.id,
-          decision: 'force_resume',
-          reason: 'yield_observed',
-          progress_source: 'response_json_yield',
-          trigger: 'initial_resume_response'
-        }));
-        // Brief debounce then re-trigger
-        await new Promise(resolve => setTimeout(resolve, FORCE_RESUME_DEBOUNCE_MS));
-        resumeResult = await triggerSyncResume(supabaseUrl, supabaseServiceKey, activeRun.id);
-        // If re-trigger returned retry_delay, skip drain entirely
-        if (resumeResult.status === 'retry_delay') {
-          console.log(`[cron-tick] Initial yield re-trigger returned retry_delay, stopping`);
-          await logDecision(supabase, activeRun.id, 'INFO', 'resume_skipped_not_due', {
-            ...baseDetails, origin: 'yield_retrigger', now_iso: new Date().toISOString(),
-            next_retry_at: resumeResult.next_retry_at || 'unknown', seconds_remaining: resumeResult.wait_seconds || 0
-          });
-          return jsonResp({ status: 'retry_delay', run_id: activeRun.id, wait_seconds: resumeResult.wait_seconds || 0, needs_resume: true });
-        }
-      }
-
-      while (drainIter < DRAIN_MAX_ITER && (Date.now() - drainStart) < DRAIN_BUDGET_MS) {
-        drainIter++;
-
-        // If last resume returned "yielded", skip the long sleep and re-trigger quickly
-        if (resumeResult.status === 'yielded' && !resumeResult.error) {
-          const sinceLast = Date.now() - lastForceResumeAt;
-          if (sinceLast >= FORCE_RESUME_DEBOUNCE_MS) {
-            lastForceResumeAt = Date.now();
-            console.log(JSON.stringify({
-              diag_tag: 'cron_tick_decision',
-              run_id: activeRun.id,
-              decision: 'force_resume',
-              reason: 'yield_observed',
-              progress_source: 'response_json_yield',
-              drain_iteration: drainIter
-            }));
-            await new Promise(resolve => setTimeout(resolve, FORCE_RESUME_DEBOUNCE_MS));
-            resumeResult = await triggerSyncResume(supabaseUrl, supabaseServiceKey, activeRun.id);
-            // Guard: retry_delay → stop drain
-            if (resumeResult.status === 'retry_delay') {
-              console.log(`[cron-tick] Drain iter ${drainIter}: yield re-trigger returned retry_delay, stopping`);
-              await logDecision(supabase, activeRun.id, 'INFO', 'resume_skipped_not_due', {
-                run_id: activeRun.id, step: resumeResult.current_step || 'unknown', origin: 'drain_yield_retrigger',
-                now_iso: new Date().toISOString(), next_retry_at: resumeResult.next_retry_at || 'unknown',
-                seconds_remaining: resumeResult.wait_seconds || 0, drain_iteration: drainIter
-              });
-              return jsonResp({ status: 'retry_delay', run_id: activeRun.id, wait_seconds: resumeResult.wait_seconds || 0, needs_resume: true });
-            }
-            continue; // skip the long sleep, re-check immediately
-          }
-        }
-
-        // Normal drain sleep
-        await new Promise(resolve => setTimeout(resolve, DRAIN_SLEEP_MS));
-
-        // Re-read run status
-        const { data: runCheck } = await supabase
-          .from('sync_runs')
-          .select('id, status, steps')
-          .eq('id', activeRun.id)
-          .single();
-
-        if (!runCheck || runCheck.status !== 'running') {
-          const finalStatus = runCheck?.status || 'unknown';
-          console.log(`[cron-tick] Drain complete: run ${activeRun.id} status=${finalStatus} after ${drainIter} drain iterations`);
-          await logDecision(supabase, activeRun.id, 'INFO', 'drain_loop_complete', {
-            final_status: finalStatus,
-            drain_iterations: drainIter,
-            drain_elapsed_ms: Date.now() - drainStart
-          });
-          return jsonResp({
-            status: 'drain_complete',
-            run_id: activeRun.id,
-            final_status: finalStatus,
-            drain_iterations: drainIter
-          });
-        }
-
-        // Resume using full triggerSyncResume to read response JSON
-        console.log(`[cron-tick] Drain iter ${drainIter}: triggering resume`);
-        await logDecision(supabase, activeRun.id, 'INFO', 'drain_resume_triggered', {
-          drain_iteration: drainIter,
-          drain_elapsed_ms: Date.now() - drainStart
-        });
-        resumeResult = await triggerSyncResume(supabaseUrl, supabaseServiceKey, activeRun.id);
-
-        // GUARD: if orchestrator returned retry_delay, stop drain loop — step is not due
-        if (resumeResult.status === 'retry_delay') {
-          const retryWait = resumeResult.wait_seconds || 0;
-          console.log(`[cron-tick] Drain iter ${drainIter}: retry_delay (${retryWait}s), stopping drain loop`);
-          await logDecision(supabase, activeRun.id, 'INFO', 'resume_skipped_not_due', {
-            run_id: activeRun.id,
-            step: resumeResult.current_step || 'unknown',
-            origin: 'drain_loop',
-            now_iso: new Date().toISOString(),
-            next_retry_at: resumeResult.next_retry_at || 'unknown',
-            seconds_remaining: retryWait,
-            drain_iteration: drainIter
-          });
-          return jsonResp({
-            status: 'retry_delay',
-            run_id: activeRun.id,
-            wait_seconds: retryWait,
-            needs_resume: true
-          });
-        }
-      }
-
-      // Drain ended without run completing — safe stop
-      const drainElapsed = Date.now() - drainStart;
-      const drainCapHit = drainElapsed >= DRAIN_BUDGET_MS;
-      console.log(`[cron-tick] Drain incomplete: ${drainIter} iterations (${drainElapsed}ms), run ${activeRun.id} still running`);
-      await logDecision(supabase, activeRun.id, 'INFO', 'drain_loop_incomplete', {
-        drain_iterations: drainIter,
-        drain_elapsed_ms: drainElapsed,
-        drain_budget_ms: DRAIN_BUDGET_MS,
-        reason: drainCapHit ? 'budget_cap_reached' : (drainIter >= DRAIN_MAX_ITER ? 'max_iterations' : 'max_time')
+      await logDecision(supabase, activeRun.id, 'INFO', tickTerminateReason, {
+        run_id: activeRun.id,
+        resume_status: resumeResult.status || 'unknown',
+        resume_error: resumeResult.error || null,
+        current_step: resumeResult.current_step || currentStep,
+        wait_seconds: resumeResult.wait_seconds || null,
+        next_retry_at: resumeResult.next_retry_at || null
       });
 
       return jsonResp({
-        status: 'drain_incomplete',
+        status: resumeResult.status || 'resumed',
         run_id: activeRun.id,
-        drain_iterations: drainIter
+        resume_status: resumeResult.status,
+        current_step: resumeResult.current_step || currentStep,
+        wait_seconds: resumeResult.wait_seconds,
+        needs_resume: resumeResult.status === 'yielded' || resumeResult.status === 'retry_delay'
       });
     }
 
