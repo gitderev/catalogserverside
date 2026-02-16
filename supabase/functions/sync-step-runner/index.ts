@@ -1714,11 +1714,20 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
   
   console.log(`[sync:step:export_mediaworld] Starting for run ${runId}, IT days=${itDays}, EU days=${euDays}, includeEU=${includeEu}`);
   const startTime = Date.now();
+  const logMWStage = (stage: string, t0: number, extra: Record<string, unknown> = {}): Promise<void> => {
+    const mem = getMemMB();
+    const durationMs = Date.now() - t0;
+    return supabase.rpc('log_sync_event', {
+      p_run_id: runId, p_level: 'INFO', p_message: 'export_mediaworld_stage',
+      p_details: { step: 'export_mediaworld', stage, heap_mb: mem, duration_ms: durationMs, ...extra }
+    }).then(() => {}).catch(() => {});
+  };
   
   // Initialize warnings
   const warnings = createEmptyWarnings();
   
   try {
+    await logMWStage('before_data_load', startTime);
     const { products, error: loadError } = await loadProductsTSV(supabase, runId);
     
     if (loadError || !products) {
@@ -1829,6 +1838,7 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
       ].join(';'));
     }
     
+    logMWStage('before_csv_upload', startTime, { rows: mwRows.length, skipped: mwSkipped });
     const mwCSV = [headers.join(';'), ...mwRows].join('\n');
     const saveResult = await uploadToStorage(supabase, 'exports', 'Export Mediaworld.csv', mwCSV, 'text/csv');
     
@@ -1846,6 +1856,7 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
       metrics: { mediaworld_export_rows: mwRows.length, mediaworld_export_skipped: mwSkipped }
     });
     
+    await logMWStage('completed', startTime, { rows: mwRows.length, elapsed_ms: Date.now() - startTime });
     console.log(`[sync:step:export_mediaworld] Completed: ${mwRows.length} rows, ${mwSkipped} skipped, warnings:`, warnings);
     return { success: true };
     
@@ -1864,8 +1875,17 @@ async function stepExportEprice(supabase: SupabaseClient, runId: string, feeConf
   
   console.log(`[sync:step:export_eprice] Starting for run ${runId}, IT days=${itDays}, EU days=${euDays}, includeEU=${includeEu}`);
   const startTime = Date.now();
+  const logEPStage = (stage: string, t0: number, extra: Record<string, unknown> = {}): Promise<void> => {
+    const mem = getMemMB();
+    const durationMs = Date.now() - t0;
+    return supabase.rpc('log_sync_event', {
+      p_run_id: runId, p_level: 'INFO', p_message: 'export_eprice_stage',
+      p_details: { step: 'export_eprice', stage, heap_mb: mem, duration_ms: durationMs, ...extra }
+    }).then(() => {}).catch(() => {});
+  };
   
   try {
+    await logEPStage('before_data_load', startTime);
     const { products, error: loadError } = await loadProductsTSV(supabase, runId);
     
     if (loadError || !products) {
@@ -1932,6 +1952,7 @@ async function stepExportEprice(supabase: SupabaseClient, runId: string, feeConf
       ].join(';'));
     }
     
+    logEPStage('before_csv_upload', startTime, { rows: epRows.length, skipped: epSkipped });
     const epCSV = [exportHeaders.join(';'), ...epRows].join('\n');
     const saveResult = await uploadToStorage(supabase, 'exports', 'Export ePrice.csv', epCSV, 'text/csv');
     
@@ -1946,6 +1967,7 @@ async function stepExportEprice(supabase: SupabaseClient, runId: string, feeConf
       metrics: { eprice_export_rows: epRows.length, eprice_export_skipped: epSkipped }
     });
     
+    await logEPStage('completed', startTime, { rows: epRows.length, elapsed_ms: Date.now() - startTime });
     console.log(`[sync:step:export_eprice] Completed: ${epRows.length} rows, ${epSkipped} skipped`);
     return { success: true };
     
