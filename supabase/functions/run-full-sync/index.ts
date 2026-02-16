@@ -300,7 +300,10 @@ const STEP_MAX_RETRIES = 8;
 const BACKOFF_SECONDS = [60, 120, 240, 480, 600, 600, 600, 600];
 
 function stepBackoffSeconds(attempt: number): number {
-  return BACKOFF_SECONDS[Math.min(attempt - 1, BACKOFF_SECONDS.length - 1)];
+  const base = BACKOFF_SECONDS[Math.min(attempt - 1, BACKOFF_SECONDS.length - 1)];
+  // Add ±10% jitter to avoid synchronized retries across concurrent invocations
+  const jitter = Math.round(base * 0.1 * (Math.random() * 2 - 1));
+  return base + jitter;
 }
 
 function isWorkerLimit(httpStatus: number, body: unknown): boolean {
@@ -1297,11 +1300,22 @@ async function handleWorkerLimitRetry(
     }
   });
 
+  // Extract body snippet for observability (max 1000 chars, no secrets)
+  let bodySnippet = '';
+  try {
+    const raw = typeof result.body === 'string' ? result.body : JSON.stringify(result.body);
+    bodySnippet = raw.substring(0, 1000);
+  } catch { bodySnippet = '[unparseable]'; }
+
   console.log(`[orchestrator] ${step} WORKER_LIMIT retry ${nextAttempt}/${STEP_MAX_RETRIES}, backoff ${backoffSec}s`);
   try {
     await supabase.rpc('log_sync_event', {
       p_run_id: runId, p_level: 'WARN', p_message: 'step_retry_scheduled',
-      p_details: { step, code: 'WORKER_LIMIT', retry_attempt: nextAttempt, backoff_seconds: backoffSec, next_retry_at: nextRetryAt }
+      p_details: { 
+        step, code: 'WORKER_LIMIT', retry_attempt: nextAttempt, 
+        backoff_seconds: backoffSec, next_retry_at: nextRetryAt,
+        http_status: result.http_status, body_snippet: bodySnippet
+      }
     });
   } catch (_) {}
 

@@ -2196,10 +2196,10 @@ async function stepExportAmazon(supabase: SupabaseClient, runId: string, feeConf
   console.log(`[sync:step:export_amazon] Starting for run ${runId}`);
   const startTime = Date.now();
   try {
-    const XLSX = await import("npm:xlsx@0.18.5");
-    const { products, error: loadError } = await loadProductsTSV(supabase, runId);
-    if (loadError || !products) {
-      const error = loadError || 'Products file not found';
+    // Phase 1: Load products and build validRecords (no XLSX needed yet)
+    let productsResult = await loadProductsTSV(supabase, runId);
+    if (productsResult.error || !productsResult.products) {
+      const error = productsResult.error || 'Products file not found';
       await updateStepResult(supabase, runId, 'export_amazon', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
@@ -2212,10 +2212,10 @@ async function stepExportAmazon(supabase: SupabaseClient, runId: string, feeConf
     // Load stock location
     let stockLocationIndex: Record<string, { stockIT: number; stockEU: number }> | null = null;
     const stockLocationPath = `stock-location/runs/${runId}.txt`;
-    const { content: stockLocationContent } = await downloadFromStorage(supabase, 'ftp-import', stockLocationPath);
-    if (stockLocationContent) {
+    const slResult = await downloadFromStorage(supabase, 'ftp-import', stockLocationPath);
+    if (slResult.content) {
       stockLocationIndex = {};
-      const slLines = stockLocationContent.replace(/\r\n/g, '\n').split('\n');
+      const slLines = slResult.content.replace(/\r\n/g, '\n').split('\n');
       const slHeaders = slLines[0]?.split(';').map((h: string) => h.trim().toLowerCase()) || [];
       const mIdx = slHeaders.indexOf('matnr'), sIdx = slHeaders.indexOf('stock'), lIdx = slHeaders.indexOf('locationid');
       if (mIdx >= 0 && sIdx >= 0 && lIdx >= 0) {
@@ -2231,11 +2231,12 @@ async function stepExportAmazon(supabase: SupabaseClient, runId: string, feeConf
         }
       }
     }
+    // slResult.content is now eligible for GC (local scope)
 
     interface AmazonRec { sku: string; ean: string; quantity: number; leadDays: number; priceDisplay: string; }
     const validRecords: AmazonRec[] = [];
     let skipped = 0;
-    for (const p of products) {
+    for (const p of productsResult.products) {
       const norm = normalizeEAN(p.EAN);
       if (!norm.ok || !norm.value || (norm.value.length !== 13 && norm.value.length !== 14)) { skipped++; continue; }
       if (!p.MPN || !p.MPN.trim()) { skipped++; continue; }
@@ -2251,6 +2252,12 @@ async function stepExportAmazon(supabase: SupabaseClient, runId: string, feeConf
       const finalCents = toComma99Cents(afterFees);
       validRecords.push({ sku: p.MPN.replace(/[\x00-\x1f\x7f]/g, ''), ean: norm.value, quantity: stockResult.exportQty, leadDays: stockResult.leadDays, priceDisplay: (finalCents / 100).toFixed(2) });
     }
+
+    // === MEMORY OPTIMIZATION: free large intermediates before XLSX processing ===
+    // @ts-ignore - intentional nullification for GC
+    productsResult = null as any;
+    stockLocationIndex = null;
+
     if (validRecords.length === 0) {
       const error = 'Nessuna riga esportabile per Amazon';
       await updateStepResult(supabase, runId, 'export_amazon', { status: 'failed', error, metrics: {} });
@@ -2258,7 +2265,15 @@ async function stepExportAmazon(supabase: SupabaseClient, runId: string, feeConf
     }
     console.log(`[sync:step:export_amazon] ${validRecords.length} valid, ${skipped} skipped`);
 
-    // Load template
+    // Phase 2: Generate TXT first (no XLSX lib needed, low memory)
+    const txtHeader = 'sku\tprice\tminimum-seller-allowed-price\tmaximum-seller-allowed-price\tquantity\tfulfillment-channel\thandling-time\n';
+    const txtContent = txtHeader + validRecords.map(r => `${r.sku}\t${r.priceDisplay}\t\t\t${r.quantity}\t\t${r.leadDays}\n`).join('');
+    const txtSave = await uploadToStorage(supabase, 'exports', 'amazon_price_inventory.txt', txtContent, 'text/plain');
+    if (!txtSave.success) { await updateStepResult(supabase, runId, 'export_amazon', { status: 'failed', error: txtSave.error!, metrics: {} }); return { success: false, error: txtSave.error }; }
+    // txtContent eligible for GC after upload
+
+    // Phase 3: Load XLSX lib and template (memory-heavy part)
+    const XLSX = await import("npm:xlsx@0.18.5");
     let templateBuffer: ArrayBuffer | null = null;
     const { data: tplData } = await supabase.storage.from('exports').download('templates/amazon/ListingLoader.xlsm');
     if (tplData) { templateBuffer = await tplData.arrayBuffer(); console.log('[export_amazon] Template from Storage'); }
@@ -2283,6 +2298,7 @@ async function stepExportAmazon(supabase: SupabaseClient, runId: string, feeConf
 
     // Build XLSM
     const wb = XLSX.read(new Uint8Array(templateBuffer), { type: 'array', bookVBA: true });
+    templateBuffer = null; // Free template buffer after read
     const ws = wb.Sheets['Modello'];
     if (!ws) { await updateStepResult(supabase, runId, 'export_amazon', { status: 'failed', error: 'Foglio Modello non trovato', metrics: {} }); return { success: false, error: 'Foglio Modello non trovato' }; }
     const COL_A=0,COL_B=1,COL_C=2,COL_H=7,COL_AF=31,COL_AG=32,COL_AH=33,COL_AK=36,COL_BJ=61;
@@ -2310,12 +2326,6 @@ async function stepExportAmazon(supabase: SupabaseClient, runId: string, feeConf
     const xlsmBlob = new Blob([xlsmOut], { type: 'application/vnd.ms-excel.sheet.macroEnabled.12' });
     const { error: xlsmErr } = await supabase.storage.from('exports').upload('amazon_listing_loader.xlsm', xlsmBlob, { upsert: true, contentType: 'application/vnd.ms-excel.sheet.macroEnabled.12' });
     if (xlsmErr) { await updateStepResult(supabase, runId, 'export_amazon', { status: 'failed', error: xlsmErr.message, metrics: {} }); return { success: false, error: xlsmErr.message }; }
-
-    // TXT
-    const txtHeader = 'sku\tprice\tminimum-seller-allowed-price\tmaximum-seller-allowed-price\tquantity\tfulfillment-channel\thandling-time\n';
-    const txtContent = txtHeader + validRecords.map(r => `${r.sku}\t${r.priceDisplay}\t\t\t${r.quantity}\t\t${r.leadDays}\n`).join('');
-    const txtSave = await uploadToStorage(supabase, 'exports', 'amazon_price_inventory.txt', txtContent, 'text/plain');
-    if (!txtSave.success) { await updateStepResult(supabase, runId, 'export_amazon', { status: 'failed', error: txtSave.error!, metrics: {} }); return { success: false, error: txtSave.error }; }
 
     const elapsed = Date.now() - startTime;
     await updateStepResult(supabase, runId, 'export_amazon', {
