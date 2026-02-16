@@ -2196,16 +2196,15 @@ function getMemMB(): number | null {
   try { return Math.round((Deno as any).memoryUsage().heapUsed / 1024 / 1024); } catch { return null; }
 }
 
-// Helper: log stage event with duration tracking (AWAITED to ensure delivery before crash)
-async function logStage(supabase: SupabaseClient, runId: string, stage: string, stageStartMs: number, extra: Record<string, unknown> = {}): Promise<void> {
+// Helper: log stage event - fire-and-forget by default to save CPU budget.
+// Use await logStage(...) only for the first sentinel event.
+function logStage(supabase: SupabaseClient, runId: string, stage: string, stageStartMs: number, extra: Record<string, unknown> = {}): Promise<void> {
   const mem = getMemMB();
   const durationMs = Date.now() - stageStartMs;
-  try {
-    await supabase.rpc('log_sync_event', {
-      p_run_id: runId, p_level: 'INFO', p_message: 'export_amazon_stage',
-      p_details: { step: 'export_amazon', stage, heap_mb: mem, duration_ms: durationMs, ...extra }
-    });
-  } catch { /* non-blocking if RPC itself fails */ }
+  return supabase.rpc('log_sync_event', {
+    p_run_id: runId, p_level: 'INFO', p_message: 'export_amazon_stage',
+    p_details: { step: 'export_amazon', stage, heap_mb: mem, duration_ms: durationMs, ...extra }
+  }).then(() => {}).catch(() => {});
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -2214,35 +2213,48 @@ async function stepExportAmazon(supabase: SupabaseClient, runId: string, feeConf
   const startTime = Date.now();
   let stageStart = Date.now();
   try {
+    // Sentinel stage — awaited to guarantee at least one event before potential crash
     await logStage(supabase, runId, 'before_data_preparation', stageStart);
 
-    // Phase 1: Load products TSV raw and build parallel arrays DIRECTLY
-    // (Never builds Product[] - halves peak memory)
-    const { content: productsContent, error: prodError } = await downloadFromStorage(supabase, 'exports', PRODUCTS_FILE_PATH);
-    if (prodError || !productsContent) {
-      const error = prodError || 'Products file not found';
-      await updateStepResult(supabase, runId, 'export_amazon', { status: 'failed', error, metrics: {} });
-      return { success: false, error };
-    }
-
+    // Phase 1: Download products + stock location IN PARALLEL
     const amazonFeeDrev = feeConfig?.amazonFeeDrev ?? feeConfig?.feeDrev ?? 1.05;
     const amazonFeeMkt = feeConfig?.amazonFeeMkt ?? feeConfig?.feeMkt ?? 1.08;
     const amazonShipping = feeConfig?.amazonShippingCost ?? feeConfig?.shippingCost ?? 6.00;
     const itDays = feeConfig?.amazonItPrepDays ?? 3;
     const euDays = feeConfig?.amazonEuPrepDays ?? 5;
 
-    // Load stock location index (lightweight map)
-    let stockLocationIndex: Record<string, { stockIT: number; stockEU: number }> | null = null;
     const stockLocationPath = `stock-location/runs/${runId}.txt`;
-    const slResult = await downloadFromStorage(supabase, 'ftp-import', stockLocationPath);
+    const [prodResult, slResult] = await Promise.all([
+      downloadFromStorage(supabase, 'exports', PRODUCTS_FILE_PATH),
+      downloadFromStorage(supabase, 'ftp-import', stockLocationPath),
+    ]);
+
+    if (prodResult.error || !prodResult.content) {
+      const error = prodResult.error || 'Products file not found';
+      await updateStepResult(supabase, runId, 'export_amazon', { status: 'failed', error, metrics: {} });
+      return { success: false, error };
+    }
+
+    // Build stock location index (lightweight map)
+    let stockLocationIndex: Record<string, { stockIT: number; stockEU: number }> | null = null;
     if (slResult.content) {
       stockLocationIndex = {};
-      const slLines = slResult.content.replace(/\r\n/g, '\n').split('\n');
-      const slHeaders = slLines[0]?.split(';').map((h: string) => h.trim().toLowerCase()) || [];
+      let slPos = 0;
+      const slText = slResult.content;
+      // Parse header
+      const slFirstNl = slText.indexOf('\n');
+      const slHeaderLine = slFirstNl >= 0 ? slText.substring(0, slFirstNl) : slText;
+      const slHeaders = slHeaderLine.replace(/\r/g, '').split(';').map((h: string) => h.trim().toLowerCase());
       const mIdx = slHeaders.indexOf('matnr'), sIdx = slHeaders.indexOf('stock'), lIdx = slHeaders.indexOf('locationid');
       if (mIdx >= 0 && sIdx >= 0 && lIdx >= 0) {
-        for (let i = 1; i < slLines.length; i++) {
-          const vals = slLines[i].split(';');
+        slPos = slFirstNl + 1;
+        while (slPos < slText.length) {
+          const nlIdx = slText.indexOf('\n', slPos);
+          const lineEnd = nlIdx >= 0 ? nlIdx : slText.length;
+          const line = slText.substring(slPos, lineEnd).replace(/\r/g, '');
+          slPos = lineEnd + 1;
+          if (!line) continue;
+          const vals = line.split(';');
           const matnr = vals[mIdx]?.trim();
           if (!matnr) continue;
           const stock = parseInt(vals[sIdx]) || 0;
@@ -2252,11 +2264,10 @@ async function stepExportAmazon(supabase: SupabaseClient, runId: string, feeConf
           else if (locationId === 4254) stockLocationIndex[matnr].stockEU += stock;
         }
       }
-      // Free raw text immediately
-      slResult.content = undefined as any;
+      slResult.content = undefined as any; // free
     }
 
-    // Build parallel arrays DIRECTLY from TSV lines (no intermediate Product[])
+    // Phase 2: Parse products TSV using cursor (NO split, NO lines array)
     const skus: string[] = [];
     const eans: string[] = [];
     const quantities: number[] = [];
@@ -2264,12 +2275,13 @@ async function stepExportAmazon(supabase: SupabaseClient, runId: string, feeConf
     const prices: string[] = [];
     let skipped = 0;
 
-    const lines = productsContent.split('\n');
-    // Free raw text immediately after splitting
-    (productsContent as any) = undefined;
-    
-    // Parse header to find column indices
-    const headerCols = lines[0]?.split('\t') || [];
+    const tsv = prodResult.content;
+    prodResult.content = undefined as any; // allow GC of the download result wrapper
+
+    // Parse header line
+    const firstNl = tsv.indexOf('\n');
+    const headerLine = firstNl >= 0 ? tsv.substring(0, firstNl) : tsv;
+    const headerCols = headerLine.replace(/\r/g, '').split('\t');
     const colIdx = {
       Matnr: headerCols.indexOf('Matnr'),
       MPN: headerCols.indexOf('MPN'),
@@ -2280,9 +2292,16 @@ async function stepExportAmazon(supabase: SupabaseClient, runId: string, feeConf
       Sur: headerCols.indexOf('Sur'),
     };
 
-    for (let li = 1; li < lines.length; li++) {
-      const line = lines[li];
-      if (!line) continue;
+    // Cursor-based line iteration — never creates a lines[] array
+    let pos = firstNl + 1;
+    while (pos < tsv.length) {
+      const nlIdx = tsv.indexOf('\n', pos);
+      const lineEnd = nlIdx >= 0 ? nlIdx : tsv.length;
+      // Skip empty lines without allocating a substring for them
+      if (lineEnd === pos || (lineEnd === pos + 1 && tsv.charCodeAt(pos) === 13)) { pos = lineEnd + 1; continue; }
+      const line = tsv.substring(pos, lineEnd);
+      pos = lineEnd + 1;
+
       const vals = line.split('\t');
 
       const ean = vals[colIdx.EAN] || '';
@@ -2319,7 +2338,6 @@ async function stepExportAmazon(supabase: SupabaseClient, runId: string, feeConf
     }
 
     // Free intermediates
-    lines.length = 0;
     stockLocationIndex = null;
 
     const validCount = skus.length;
@@ -2329,7 +2347,7 @@ async function stepExportAmazon(supabase: SupabaseClient, runId: string, feeConf
       return { success: false, error };
     }
     stageStart = Date.now();
-    await logStage(supabase, runId, 'after_data_preparation', startTime, { valid: validCount, skipped });
+    logStage(supabase, runId, 'after_data_preparation', startTime, { valid: validCount, skipped });
     console.log(`[sync:step:export_amazon] ${validCount} valid, ${skipped} skipped`);
 
     // Phase 2: Generate TXT first (no XLSX lib needed, low memory)
@@ -2342,11 +2360,11 @@ async function stepExportAmazon(supabase: SupabaseClient, runId: string, feeConf
     const txtSave = await uploadToStorage(supabase, 'exports', 'amazon_price_inventory.txt', txtContent, 'text/plain');
     if (!txtSave.success) { await updateStepResult(supabase, runId, 'export_amazon', { status: 'failed', error: txtSave.error!, metrics: {} }); return { success: false, error: txtSave.error }; }
     stageStart = Date.now();
-    await logStage(supabase, runId, 'after_txt_upload', stageStart);
+    logStage(supabase, runId, 'after_txt_upload', stageStart);
 
     // Phase 3: Load XLSX lib and template
     stageStart = Date.now();
-    await logStage(supabase, runId, 'before_template_load', stageStart);
+    logStage(supabase, runId, 'before_template_load', stageStart);
     const XLSX = await import("npm:xlsx@0.18.5");
 
     let templateBuffer: ArrayBuffer | null = null;
@@ -2371,7 +2389,7 @@ async function stepExportAmazon(supabase: SupabaseClient, runId: string, feeConf
       return { success: false, error };
     }
     stageStart = Date.now();
-    await logStage(supabase, runId, 'after_template_load', stageStart);
+    logStage(supabase, runId, 'after_template_load', stageStart);
 
     // Phase 4: Build XLSM - CPU-optimized: pre-compute cell addresses
     const wb = XLSX.read(new Uint8Array(templateBuffer), { type: 'array', bookVBA: true });
@@ -2418,7 +2436,7 @@ async function stepExportAmazon(supabase: SupabaseClient, runId: string, feeConf
     const hasVBA = Boolean((wb as unknown as Record<string, unknown>).vbaraw);
     const xlsmOut = XLSX.write(wb, { bookType: 'xlsm', bookVBA: hasVBA, type: 'array' });
     stageStart = Date.now();
-    await logStage(supabase, runId, 'after_xlsx_write', stageStart);
+    logStage(supabase, runId, 'after_xlsx_write', stageStart);
 
     const xlsmBlob = new Blob([xlsmOut], { type: 'application/vnd.ms-excel.sheet.macroEnabled.12' });
     const { error: xlsmErr } = await supabase.storage.from('exports').upload('amazon_listing_loader.xlsm', xlsmBlob, { upsert: true, contentType: 'application/vnd.ms-excel.sheet.macroEnabled.12' });
