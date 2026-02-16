@@ -1,5 +1,6 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
+import { getExpectedSteps } from "../_shared/expectedSteps.ts";
 
 /**
  * cron-tick - Called every 1 minute by GitHub Actions
@@ -430,6 +431,79 @@ serve(async (req) => {
         }
       }
 
+      // LOGICALLY COMPLETED GUARDRAIL: if all steps are done, finalize idempotently without re-executing
+      {
+        const { data: freshRun } = await supabase.from('sync_runs').select('steps, started_at, warning_count').eq('id', activeRun.id).single();
+        const runSteps = (freshRun?.steps || {}) as Record<string, unknown>;
+        const expectedSteps = getExpectedSteps(activeRun.trigger_type);
+        const allComplete = expectedSteps.every(s => {
+          const st = runSteps[s] as Record<string, unknown> | undefined;
+          return st && (st.status === 'completed' || st.status === 'success');
+        });
+
+        if (allComplete) {
+          console.log(`[cron-tick] Run ${activeRun.id} logically completed (all ${expectedSteps.length} steps done), finalizing idempotently`);
+
+          // Recalculate real warnings (exclude operational diagnostic events)
+          const OPERATIONAL_WARN_MESSAGES = [
+            'orchestrator_yield_scheduled', 'drain_loop_incomplete', 'step_retry_scheduled',
+            'resume_failed_http', 'lock_ownership_lost', 'yielded_locked',
+            'multiple_running_detected', 'cron_auth_failed'
+          ];
+          let realWarningCount = freshRun?.warning_count || 0;
+          try {
+            const { data: allWarns } = await supabase
+              .from('sync_events')
+              .select('message')
+              .eq('run_id', activeRun.id)
+              .eq('level', 'WARN')
+              .limit(500);
+            realWarningCount = (allWarns || []).filter(
+              (e: { message: string }) => !OPERATIONAL_WARN_MESSAGES.includes(e.message)
+            ).length;
+          } catch (_) { /* fallback to existing count */ }
+
+          const finalStatus = realWarningCount > 0 ? 'success_with_warning' : 'success';
+          const runtimeMs = Math.round(now.getTime() - new Date(freshRun?.started_at || activeRun.started_at).getTime());
+
+          // Idempotent: only update if still running
+          await supabase.from('sync_runs').update({
+            status: finalStatus,
+            finished_at: now.toISOString(),
+            runtime_ms: runtimeMs,
+            warning_count: realWarningCount,
+            error_message: null
+          }).eq('id', activeRun.id).eq('status', 'running');
+
+          // Release lock
+          try {
+            await supabase.rpc('release_sync_lock', { p_lock_name: 'global_sync', p_run_id: activeRun.id });
+          } catch (_) {}
+
+          // Count yield and drain-cap events for diagnostics
+          let yieldCount = 0;
+          let drainCapCount = 0;
+          try {
+            const { data: yieldEvts } = await supabase.from('sync_events').select('id').eq('run_id', activeRun.id).eq('message', 'orchestrator_yield_scheduled').limit(100);
+            const { data: drainEvts } = await supabase.from('sync_events').select('id').eq('run_id', activeRun.id).eq('message', 'drain_loop_incomplete').limit(100);
+            yieldCount = yieldEvts?.length || 0;
+            drainCapCount = drainEvts?.length || 0;
+          } catch (_) {}
+
+          await logDecision(supabase, activeRun.id, 'INFO', 'run_finalized', {
+            status: finalStatus,
+            real_warning_count: realWarningCount,
+            yield_count: yieldCount,
+            drain_cap_count: drainCapCount,
+            runtime_ms: runtimeMs,
+            finished_at: now.toISOString(),
+            source: 'cron_tick_guardrail'
+          });
+
+          return jsonResp({ status: 'finalized', run_id: activeRun.id, final_status: finalStatus });
+        }
+      }
+
       await logDecision(supabase, activeRun.id, 'INFO', 'resume_triggered', {
         ...baseDetails,
         is_stalled: isStalled,
@@ -596,7 +670,7 @@ serve(async (req) => {
       const drainElapsed = Date.now() - drainStart;
       const drainCapHit = drainElapsed >= DRAIN_BUDGET_MS;
       console.log(`[cron-tick] Drain incomplete: ${drainIter} iterations (${drainElapsed}ms), run ${activeRun.id} still running`);
-      await logDecision(supabase, activeRun.id, drainCapHit ? 'WARN' : 'INFO', 'drain_loop_incomplete', {
+      await logDecision(supabase, activeRun.id, 'INFO', 'drain_loop_incomplete', {
         drain_iterations: drainIter,
         drain_elapsed_ms: drainElapsed,
         drain_budget_ms: DRAIN_BUDGET_MS,
