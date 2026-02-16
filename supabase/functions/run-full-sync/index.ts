@@ -1071,9 +1071,9 @@ async function runPipeline(
     if (verState?.status === 'completed' || verState?.status === 'success') {
       console.log('[orchestrator] versioning already completed, skipping');
     } else {
-      if (budgetExceeded()) {
-        return await yieldResponse('versioning', 'orchestrator budget exceeded before versioning');
-      }
+      // NOTE: no budgetExceeded() gate here — versioning is lightweight and must
+      // not yield before starting, which caused unresumable stalls.
+      // It runs inline regardless of remaining budget.
       
       await setStepInProgress(supabase, runId, 'versioning');
       console.log('[orchestrator] === Storage versioning ===');
@@ -1084,9 +1084,22 @@ async function runPipeline(
         });
       } catch (_) {}
       
+      const versioningStart = Date.now();
       try {
+        // Stage: before_versioning_start
+        try {
+          const heapMb = Math.round((Deno as unknown as Record<string,unknown>).memoryUsage
+            ? ((Deno as unknown as { memoryUsage: () => { heapUsed: number } }).memoryUsage().heapUsed / 1048576)
+            : 0);
+          await supabase.rpc('log_sync_event', {
+            p_run_id: runId, p_level: 'INFO', p_message: 'versioning_stage',
+            p_details: { stage: 'before_versioning_start', heap_mb: heapMb, files_expected: EXPORT_FILES.length }
+          });
+        } catch (_) {}
+
         const versionTimestamp = new Date().toISOString().replace(/[:.]/g, '-');
         const fileManifest: Record<string, string> = {};
+        let filesVersioned = 0;
         
         for (const fileName of EXPORT_FILES) {
           try {
@@ -1095,20 +1108,56 @@ async function runPipeline(
               await supabase.storage.from('exports').upload(`latest/${fileName}`, fileBlob, { upsert: true });
               await supabase.storage.from('exports').upload(`versions/${versionTimestamp}/${fileName}`, fileBlob, { upsert: true });
               fileManifest[fileName] = versionTimestamp;
+              filesVersioned++;
             }
           } catch (e: unknown) {
             console.warn(`[orchestrator] Versioning failed for ${fileName}: ${errMsg(e)}`);
           }
         }
+
+        // Stage: after_inputs_loaded (files downloaded and re-uploaded)
+        const afterInputsMs = Date.now() - versioningStart;
+        try {
+          await supabase.rpc('log_sync_event', {
+            p_run_id: runId, p_level: 'INFO', p_message: 'versioning_stage',
+            p_details: { stage: 'after_inputs_loaded', duration_ms: afterInputsMs, items_versioned: filesVersioned }
+          });
+        } catch (_) {}
         
-        await supabase.from('sync_runs').update({ file_manifest: fileManifest }).eq('id', runId);
+        // Idempotent upsert: merge file_manifest into existing (doesn't clobber other fields)
+        const { data: existingRun } = await supabase.from('sync_runs').select('file_manifest').eq('id', runId).single();
+        const mergedManifest = { ...(existingRun?.file_manifest || {}), ...fileManifest };
+        await supabase.from('sync_runs').update({ file_manifest: mergedManifest }).eq('id', runId);
+
         await cleanupVersions(supabase);
+
+        // Stage: after_write_or_upsert
+        const afterWriteMs = Date.now() - versioningStart;
+        try {
+          await supabase.rpc('log_sync_event', {
+            p_run_id: runId, p_level: 'INFO', p_message: 'versioning_stage',
+            p_details: { stage: 'after_write_or_upsert', duration_ms: afterWriteMs, rows_written: filesVersioned }
+          });
+        } catch (_) {}
         
-        await mergeStepState(supabase, runId, 'versioning', { status: 'completed', files: Object.keys(fileManifest).length, finished_at: new Date().toISOString() });
+        await mergeStepState(supabase, runId, 'versioning', { status: 'completed', files: filesVersioned, finished_at: new Date().toISOString() });
+
+        // Stage: completed
+        const completedMs = Date.now() - versioningStart;
+        try {
+          const heapMb2 = Math.round((Deno as unknown as Record<string,unknown>).memoryUsage
+            ? ((Deno as unknown as { memoryUsage: () => { heapUsed: number } }).memoryUsage().heapUsed / 1048576)
+            : 0);
+          await supabase.rpc('log_sync_event', {
+            p_run_id: runId, p_level: 'INFO', p_message: 'versioning_stage',
+            p_details: { stage: 'completed', duration_ms: completedMs, heap_mb: heapMb2, items_versioned: filesVersioned }
+          });
+        } catch (_) {}
+
         try {
           await supabase.rpc('log_sync_event', {
             p_run_id: runId, p_level: 'INFO', p_message: 'step_completed',
-            p_details: { step: 'versioning' }
+            p_details: { step: 'versioning', duration_ms: completedMs }
           });
         } catch (_) {}
       } catch (e: unknown) {
@@ -1117,7 +1166,7 @@ async function runPipeline(
         try {
           await supabase.rpc('log_sync_event', {
             p_run_id: runId, p_level: 'ERROR', p_message: 'step_failed',
-            p_details: { step: 'versioning', error: errMsg(e).substring(0, 200) }
+            p_details: { step: 'versioning', reason: errMsg(e).substring(0, 200), duration_ms: Date.now() - versioningStart }
           });
         } catch (_) {}
         pipelineFailedBeforeNotification = true;

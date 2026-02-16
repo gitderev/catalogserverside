@@ -332,7 +332,8 @@ serve(async (req) => {
         }
       }
 
-      // YIELD FAST-PATH: if last progress event is a yield and > 5s old, bypass gating
+      // YIELD FAST-PATH: if last progress event is a yield and > 5s old, bypass ALL gating
+      // This ensures yields (especially "budget exceeded before step") are resumed immediately
       const YIELD_DEBOUNCE_SEC = 5;
       if (isYieldEvent && lastEventAgeS > YIELD_DEBOUNCE_SEC) {
         console.log(`[cron-tick] Yield fast-path: bypassing gating (event=${lastEvent?.message}, age=${Math.round(lastEventAgeS)}s)`);
@@ -469,10 +470,10 @@ serve(async (req) => {
       // DRAIN LOOP: drive the run to completion using response-JSON-based yield detection.
       // When run-full-sync responds with status "yielded", we re-trigger immediately
       // (5s debounce) instead of waiting for the next event-based check.
-      // Budget is conservative to fit within edge function timeout.
-      const DRAIN_MAX_ITER = 4;
-      const DRAIN_BUDGET_MS = 120_000; // 2 minutes
-      const DRAIN_SLEEP_MS = 25_000;   // 25s between poll iterations
+      // Budget capped at 20s to avoid consuming too much runtime and blocking resumes.
+      const DRAIN_MAX_ITER = 2;
+      const DRAIN_BUDGET_MS = 20_000; // 20 seconds hard cap
+      const DRAIN_SLEEP_MS = 8_000;   // 8s between poll iterations
       const FORCE_RESUME_DEBOUNCE_MS = 5_000; // 5s debounce for yield force-resume
       const drainStart = Date.now();
       let drainIter = 0;
@@ -591,12 +592,15 @@ serve(async (req) => {
         }
       }
 
-      // Drain ended without run completing — safe stop, no destructive status change
-      console.log(`[cron-tick] Drain incomplete: ${drainIter} iterations, run ${activeRun.id} still running`);
-      await logDecision(supabase, activeRun.id, 'INFO', 'drain_loop_incomplete', {
+      // Drain ended without run completing — safe stop
+      const drainElapsed = Date.now() - drainStart;
+      const drainCapHit = drainElapsed >= DRAIN_BUDGET_MS;
+      console.log(`[cron-tick] Drain incomplete: ${drainIter} iterations (${drainElapsed}ms), run ${activeRun.id} still running`);
+      await logDecision(supabase, activeRun.id, drainCapHit ? 'WARN' : 'INFO', 'drain_loop_incomplete', {
         drain_iterations: drainIter,
-        drain_elapsed_ms: Date.now() - drainStart,
-        reason: drainIter >= DRAIN_MAX_ITER ? 'max_iterations' : 'max_time'
+        drain_elapsed_ms: drainElapsed,
+        drain_budget_ms: DRAIN_BUDGET_MS,
+        reason: drainCapHit ? 'budget_cap_reached' : (drainIter >= DRAIN_MAX_ITER ? 'max_iterations' : 'max_time')
       });
 
       return jsonResp({
