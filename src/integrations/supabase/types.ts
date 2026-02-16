@@ -206,6 +206,7 @@ export type Database = {
       sync_locks: {
         Row: {
           acquired_at: string
+          invocation_id: string | null
           lease_until: string
           lock_name: string
           run_id: string
@@ -213,6 +214,7 @@ export type Database = {
         }
         Insert: {
           acquired_at?: string
+          invocation_id?: string | null
           lease_until: string
           lock_name: string
           run_id: string
@@ -220,6 +222,7 @@ export type Database = {
         }
         Update: {
           acquired_at?: string
+          invocation_id?: string | null
           lease_until?: string
           lock_name?: string
           run_id?: string
@@ -305,14 +308,36 @@ export type Database = {
           new_warning_count: number
         }[]
       }
+      merge_sync_run_step: {
+        Args: { p_patch: Json; p_run_id: string; p_step_name: string }
+        Returns: undefined
+      }
       release_sync_lock: {
         Args: { p_lock_name: string; p_run_id: string }
         Returns: boolean
       }
-      try_acquire_sync_lock: {
-        Args: { p_lock_name: string; p_run_id: string; p_ttl_seconds: number }
-        Returns: boolean
+      set_step_in_progress: {
+        Args: { p_extra?: Json; p_run_id: string; p_step_name: string }
+        Returns: undefined
       }
+      try_acquire_sync_lock:
+        | {
+            Args: {
+              p_lock_name: string
+              p_run_id: string
+              p_ttl_seconds: number
+            }
+            Returns: boolean
+          }
+        | {
+            Args: {
+              p_invocation_id?: string
+              p_lock_name: string
+              p_run_id: string
+              p_ttl_seconds: number
+            }
+            Returns: boolean
+          }
     }
     Enums: {
       [_ in never]: never

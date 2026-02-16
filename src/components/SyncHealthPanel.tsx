@@ -60,12 +60,18 @@ function classifyHealth(
 ): HealthDecision {
   if (runStatus === 'failed') return 'failed';
 
-  // Check retry_delay on export_ean_xlsx
-  const xlsxState = steps?.export_ean_xlsx as Record<string, unknown> | undefined;
-  const retry = xlsxState?.retry as Record<string, unknown> | undefined;
-  if (currentStep === 'export_ean_xlsx' && retry?.status === 'retry_delay' && retry?.next_retry_at) {
-    const nextAt = new Date(retry.next_retry_at as string).getTime();
-    if (Date.now() < nextAt) return 'waiting_retry_delay';
+  // Step-agnostic retry_delay detection: check ANY step for retry_delay status
+  if (currentStep && steps) {
+    const currentStepState = steps[currentStep] as Record<string, unknown> | undefined;
+    const retry = currentStepState?.retry as Record<string, unknown> | undefined;
+    if (retry?.status === 'retry_delay' && retry?.next_retry_at) {
+      const nextAt = new Date(retry.next_retry_at as string).getTime();
+      if (Date.now() < nextAt) return 'waiting_retry_delay';
+    }
+    // Also check step-level status directly
+    if (currentStepState?.status === 'retry_delay') {
+      return 'waiting_retry_delay';
+    }
   }
 
   // Stalled: no event in >300s and not in retry_delay
@@ -116,15 +122,16 @@ export const SyncHealthPanel: React.FC<SyncHealthPanelProps> = ({ runId, runStar
         }
       } catch { /* non-blocking */ }
 
-      // Extract retry info
-      const xlsxState = steps?.export_ean_xlsx as Record<string, unknown> | undefined;
-      const retryState = xlsxState?.retry as Record<string, unknown> | undefined;
+      // Extract retry info from current step (step-agnostic)
+      const currentStepName = (steps?.current_step as string) || '';
+      const currentStepState = currentStepName ? steps?.[currentStepName] as Record<string, unknown> | undefined : undefined;
+      const retryState = currentStepState?.retry as Record<string, unknown> | undefined;
       let retryInfo: HealthSnapshot['retry'] = null;
       if (retryState?.status === 'retry_delay') {
         const nextRetryAt = retryState.next_retry_at as string | null;
         const waitSeconds = nextRetryAt ? Math.max(0, Math.ceil((new Date(nextRetryAt).getTime() - now) / 1000)) : null;
         retryInfo = {
-          step: 'export_ean_xlsx',
+          step: currentStepName,
           status: retryState.status as string,
           retry_attempt: (retryState.retry_attempt as number) || 0,
           next_retry_at: nextRetryAt,

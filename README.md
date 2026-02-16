@@ -74,7 +74,7 @@ Read more here: [Setting up a custom domain](https://docs.lovable.dev/tips-trick
 
 ## Automated Sync Scheduling (GitHub Actions)
 
-The automated synchronization is triggered every 5 minutes by a GitHub Actions workflow (`.github/workflows/cron-tick.yml`). To enable it:
+The automated synchronization is triggered every 1 minute by a GitHub Actions workflow (`.github/workflows/cron-tick.yml`). To enable it:
 
 ### 1. Configure GitHub Actions Secrets
 
@@ -91,4 +91,4 @@ The `CRON_SECRET` value set in GitHub Actions **must match** the `CRON_SECRET` s
 
 ### 3. Verify
 
-After committing the workflow, GitHub Actions will call `cron-tick` every 5 minutes. The function will check the scheduling configuration (enabled, frequency, daily time) and trigger a sync run if due.
+After committing the workflow, GitHub Actions will call `cron-tick` every 1 minute. The function will check the scheduling configuration (enabled, frequency, daily time) and trigger a sync run if due.
