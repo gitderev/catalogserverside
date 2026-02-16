@@ -832,14 +832,15 @@ async function runPipeline(
     }
 
     // ---- Legacy cleanup: remove steps.export_ean_xlsx_retry if present ----
+    // Use atomic merge to null-out the legacy key without read-modify-write
     {
       const { data: runData } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
-      const currentSteps = runData?.steps || {};
-      if ('export_ean_xlsx_retry' in currentSteps) {
-        // Atomic removal via RPC: set the key to null won't work, but we can merge an empty object.
-        // Actually for legacy cleanup, we need a direct update - this is a one-time cleanup, acceptable.
-        delete (currentSteps as Record<string, unknown>).export_ean_xlsx_retry;
-        await supabase.from('sync_runs').update({ steps: currentSteps }).eq('id', runId);
+      if (runData?.steps && 'export_ean_xlsx_retry' in (runData.steps as Record<string, unknown>)) {
+        await supabase.rpc('merge_sync_run_step', {
+          p_run_id: runId,
+          p_step_name: 'export_ean_xlsx_retry',
+          p_patch: { _deleted: true }
+        });
       }
     }
 
