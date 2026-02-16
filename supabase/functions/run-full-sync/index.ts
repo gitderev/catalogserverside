@@ -1,5 +1,7 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
+import { acquireOrRenewGlobalLock, assertLockOwned, renewLockLease, LOCK_TTL_SECONDS } from "../_shared/lock.ts";
+import { getExpectedSteps } from "../_shared/expectedSteps.ts";
 
 type SupabaseClient = ReturnType<typeof createClient>;
 
@@ -49,17 +51,6 @@ const ALL_STEPS_AFTER_PARSE = [
   'export_ean', 'export_ean_xlsx', 'export_amazon',
   'export_mediaworld', 'export_eprice'
 ];
-
-// Unified expected steps for ALL triggers (manual + cron). No distinction.
-const EXPECTED_STEPS = [
-  'import_ftp', 'parse_merge',
-  ...ALL_STEPS_AFTER_PARSE,
-  'upload_sftp', 'versioning', 'notification'
-];
-
-function getExpectedSteps(_trigger: string): string[] {
-  return [...EXPECTED_STEPS];
-}
 
 // ============================================================
 // DEEP MERGE (recursive, plain objects only)
@@ -176,6 +167,20 @@ async function isCancelRequested(supabase: SupabaseClient, runId: string): Promi
  * After write, asserts invariant: steps[current_step] exists.
  */
 async function setStepInProgress(supabase: SupabaseClient, runId: string, stepName: string): Promise<void> {
+  // Lock guard: assert ownership and renew lease before writing
+  const lockCheck = await assertLockOwned(supabase, runId);
+  if (!lockCheck.owned) {
+    console.error(`[orchestrator] LOCK NOT OWNED in setStepInProgress: step=${stepName}, holder=${lockCheck.holder_run_id}`);
+    try {
+      await supabase.rpc('log_sync_event', {
+        p_run_id: runId, p_level: 'WARN', p_message: 'lock_ownership_lost',
+        p_details: { step: stepName, context: 'setStepInProgress', holder_run_id: lockCheck.holder_run_id }
+      });
+    } catch (_) {}
+    throw new Error(`lock_ownership_lost: cannot write step ${stepName}, lock held by ${lockCheck.holder_run_id}`);
+  }
+  await renewLockLease(supabase, runId, LOCK_TTL_SECONDS);
+
   const { data: run } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
   const currentSteps = (run?.steps || {}) as Record<string, unknown>;
   const existingStep = currentSteps[stepName];
@@ -201,6 +206,20 @@ async function setStepInProgress(supabase: SupabaseClient, runId: string, stepNa
 
 /** Deep-merge a step state into steps JSONB without overwriting other steps. */
 async function mergeStepState(supabase: SupabaseClient, runId: string, stepName: string, state: Record<string, unknown>): Promise<void> {
+  // Lock guard: assert ownership and renew lease before writing
+  const lockCheck = await assertLockOwned(supabase, runId);
+  if (!lockCheck.owned) {
+    console.error(`[orchestrator] LOCK NOT OWNED in mergeStepState: step=${stepName}, holder=${lockCheck.holder_run_id}`);
+    try {
+      await supabase.rpc('log_sync_event', {
+        p_run_id: runId, p_level: 'WARN', p_message: 'lock_ownership_lost',
+        p_details: { step: stepName, context: 'mergeStepState', holder_run_id: lockCheck.holder_run_id }
+      });
+    } catch (_) {}
+    throw new Error(`lock_ownership_lost: cannot merge step ${stepName}, lock held by ${lockCheck.holder_run_id}`);
+  }
+  await renewLockLease(supabase, runId, LOCK_TTL_SECONDS);
+
   const { data: run } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
   const currentSteps = (run?.steps || {}) as Record<string, unknown>;
   const existingStepState = currentSteps[stepName];
@@ -332,7 +351,7 @@ serve(async (req) => {
     }
 
     const { data: syncConfig } = await supabase.from('sync_config').select('run_timeout_minutes').eq('id', 1).single();
-    const lockTtlSeconds = 120;
+    const lockTtlSeconds = LOCK_TTL_SECONDS;
 
     // ========== RESUME MODE ==========
     if (resumeRunId) {
@@ -356,13 +375,9 @@ serve(async (req) => {
           { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       }
       
-      const { data: lockResult } = await supabase.rpc('try_acquire_sync_lock', {
-        p_lock_name: 'global_sync',
-        p_run_id: runId,
-        p_ttl_seconds: lockTtlSeconds
-      });
+      const lockAcquired = await acquireOrRenewGlobalLock(supabase, runId, lockTtlSeconds);
       
-      if (!lockResult) {
+      if (!lockAcquired) {
         const { data: existingLock } = await supabase
           .from('sync_locks')
           .select('run_id, lease_until')
@@ -440,10 +455,13 @@ serve(async (req) => {
       }
       console.log(`[orchestrator] Manual trigger by user: ${userData.user.id}`);
       
+      // DETERMINISTIC selection: order by started_at DESC, id DESC
       const { data: existingRunning } = await supabase
         .from('sync_runs')
         .select('id, steps, started_at, trigger_type')
         .eq('status', 'running')
+        .order('started_at', { ascending: false })
+        .order('id', { ascending: false })
         .limit(1);
       
       if (existingRunning?.length) {
@@ -451,33 +469,19 @@ serve(async (req) => {
         console.log(`[orchestrator] Found existing running run ${existing.id}, resuming instead of creating new`);
         runId = existing.id;
         
-        const { data: lockOk } = await supabase.rpc('try_acquire_sync_lock', {
-          p_lock_name: 'global_sync',
-          p_run_id: runId,
-          p_ttl_seconds: lockTtlSeconds
-        });
+        const lockOk = await acquireOrRenewGlobalLock(supabase, runId, lockTtlSeconds);
         
         if (!lockOk) {
-          const { data: lockUpdate } = await supabase
-            .from('sync_locks')
-            .update({ lease_until: new Date(Date.now() + lockTtlSeconds * 1000).toISOString(), updated_at: new Date().toISOString() })
-            .eq('lock_name', 'global_sync')
-            .eq('run_id', runId)
-            .select('lock_name')
-            .maybeSingle();
-          
-          if (!lockUpdate) {
-            try {
-              await supabase.rpc('log_sync_event', {
-                p_run_id: runId,
-                p_level: 'INFO',
-                p_message: 'start_resuming_existing_run: lock occupato, resume delegato a cron-tick',
-                p_details: { origin: 'manual' }
-              });
-            } catch (_) {}
-            return new Response(JSON.stringify({ status: 'yielded', reason: 'locked', message: 'run in corso, resume delegato a cron-tick', run_id: runId, needs_resume: true }), 
-              { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-          }
+          try {
+            await supabase.rpc('log_sync_event', {
+              p_run_id: runId,
+              p_level: 'INFO',
+              p_message: 'start_resuming_existing_run: lock occupato, resume delegato a cron-tick',
+              p_details: { origin: 'manual' }
+            });
+          } catch (_) {}
+          return new Response(JSON.stringify({ status: 'yielded', reason: 'locked', message: 'run in corso, resume delegato a cron-tick', run_id: runId, needs_resume: true }), 
+            { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
         }
         
         try {
@@ -502,13 +506,9 @@ serve(async (req) => {
 
     runId = crypto.randomUUID();
     
-    const { data: lockResult } = await supabase.rpc('try_acquire_sync_lock', {
-      p_lock_name: 'global_sync',
-      p_run_id: runId,
-      p_ttl_seconds: lockTtlSeconds
-    });
+    const lockAcquired = await acquireOrRenewGlobalLock(supabase, runId, lockTtlSeconds);
     
-    if (!lockResult) {
+    if (!lockAcquired) {
       console.log('[orchestrator] INFO: Lock not acquired, sync already in progress');
       runId = null;
       return new Response(JSON.stringify({ status: 'yielded', reason: 'locked', message: 'not_started', run_id: null, needs_resume: true }), 

@@ -270,8 +270,6 @@ serve(async (req) => {
         try {
           await supabase.rpc('release_sync_lock', { p_lock_name: 'global_sync', p_run_id: activeRun.id });
         } catch (_) {}
-        // Force-clean lock if not owned
-        await supabase.from('sync_locks').delete().eq('lock_name', 'global_sync');
 
         // Reload cron runs after marking timeout, then check max attempts
         const { data: refreshedRuns1 } = await supabase
@@ -319,7 +317,6 @@ serve(async (req) => {
           try {
             await supabase.rpc('release_sync_lock', { p_lock_name: 'global_sync', p_run_id: activeRun.id });
           } catch (_) {}
-          await supabase.from('sync_locks').delete().eq('lock_name', 'global_sync');
 
           // Reload cron runs after marking timeout, then check max attempts
           const { data: refreshedRuns2 } = await supabase
@@ -633,7 +630,8 @@ serve(async (req) => {
       if (sinceFinished >= retryDelay) {
         console.log(`[cron-tick] Retrying: attempt ${lastCronRun.attempt + 1}/${maxAttempts}`);
         const result = await triggerSync(supabaseUrl, supabaseServiceKey, 'cron', lastCronRun.attempt + 1);
-        return jsonResp({ status: 'retry_started', attempt: lastCronRun.attempt + 1, ...result });
+        const respStatus = result.error ? 'error' : 'retry_started';
+        return jsonResp({ status: respStatus, attempt: lastCronRun.attempt + 1, ...result });
       } else {
         const waitSec = Math.round((retryDelay - sinceFinished) / 1000);
         console.log(`[cron-tick] Retry delay not elapsed, wait ${waitSec}s more`);
@@ -662,7 +660,8 @@ serve(async (req) => {
 
     // 7. TRIGGER SYNC
     const result = await triggerSync(supabaseUrl, supabaseServiceKey, 'cron', 1);
-    return jsonResp({ status: 'sync_started', ...result });
+    const respStatus = result.error ? 'error' : 'sync_started';
+    return jsonResp({ status: respStatus, ...result });
 
   } catch (error: unknown) {
     console.error('[cron-tick] Unexpected error:', errMsg(error));
@@ -751,7 +750,7 @@ async function triggerSync(
   serviceKey: string,
   trigger: string,
   attempt: number
-): Promise<{ run_id?: string; error?: string }> {
+): Promise<{ run_id?: string; error?: string; http_status?: number }> {
   try {
     const resp = await fetch(`${supabaseUrl}/functions/v1/run-full-sync`, {
       method: 'POST',
@@ -759,9 +758,22 @@ async function triggerSync(
       body: JSON.stringify({ trigger, attempt })
     });
 
-    const data = await resp.json().catch(() => ({ status: 'error', message: 'Invalid response' }));
+    const rawText = await resp.text().catch(() => '');
+    let data: Record<string, unknown>;
+    try {
+      data = JSON.parse(rawText);
+    } catch {
+      console.error(`[cron-tick] run-full-sync returned non-JSON (HTTP ${resp.status}): ${rawText.substring(0, 1000)}`);
+      return { error: 'Invalid response from orchestrator', http_status: resp.status };
+    }
+
+    if (!resp.ok) {
+      console.error(`[cron-tick] run-full-sync HTTP error ${resp.status}: ${rawText.substring(0, 1000)}`);
+      return { error: (data.message as string) || `HTTP ${resp.status}`, http_status: resp.status };
+    }
+
     console.log(`[cron-tick] run-full-sync response:`, data.status, data.run_id || data.message || '');
-    return { run_id: data.run_id, error: data.status === 'error' ? data.message : undefined };
+    return { run_id: data.run_id as string | undefined, error: data.status === 'error' ? (data.message as string) : undefined, http_status: resp.status };
   } catch (e: unknown) {
     console.error('[cron-tick] Failed to trigger sync:', errMsg(e));
     return { error: errMsg(e) };
@@ -772,7 +784,7 @@ async function triggerSyncResume(
   supabaseUrl: string,
   serviceKey: string,
   runId: string
-): Promise<{ status?: string; error?: string; wait_seconds?: number; current_step?: string; next_retry_at?: string }> {
+): Promise<{ status?: string; error?: string; wait_seconds?: number; current_step?: string; next_retry_at?: string; http_status?: number }> {
   try {
     const resp = await fetch(`${supabaseUrl}/functions/v1/run-full-sync`, {
       method: 'POST',
@@ -780,40 +792,69 @@ async function triggerSyncResume(
       body: JSON.stringify({ trigger: 'cron', resume_run_id: runId })
     });
 
-    const data = await resp.json().catch(() => ({ status: 'error', message: 'Invalid response' }));
+    const rawText = await resp.text().catch(() => '');
+    let data: Record<string, unknown>;
+    try {
+      data = JSON.parse(rawText);
+    } catch {
+      console.error(`[cron-tick] resume returned non-JSON (HTTP ${resp.status}): ${rawText.substring(0, 1000)}`);
+      return { status: 'error', error: 'Invalid response from orchestrator', http_status: resp.status };
+    }
+
+    if (!resp.ok) {
+      console.error(`[cron-tick] resume HTTP error ${resp.status}: ${rawText.substring(0, 1000)}`);
+      return { status: 'error', error: (data.message as string) || `HTTP ${resp.status}`, http_status: resp.status };
+    }
+
     console.log(`[cron-tick] resume response for ${runId}:`, data.status);
     return {
-      status: data.status,
-      error: data.status === 'error' ? data.message : undefined,
-      wait_seconds: data.wait_seconds,
-      current_step: data.current_step,
-      next_retry_at: data.next_retry_at
+      status: data.status as string,
+      error: data.status === 'error' ? (data.message as string) : undefined,
+      wait_seconds: data.wait_seconds as number | undefined,
+      current_step: data.current_step as string | undefined,
+      next_retry_at: data.next_retry_at as string | undefined,
+      http_status: resp.status
     };
   } catch (e: unknown) {
     console.error('[cron-tick] Failed to resume sync:', errMsg(e));
-    return { error: errMsg(e) };
+    return { status: 'error', error: errMsg(e) };
   }
 }
 
 /** Fire-and-forget resume: triggers run-full-sync but aborts waiting after timeoutMs.
- *  The edge function continues processing server-side even after abort. */
+ *  The edge function continues processing server-side even after abort.
+ *  Returns explicit status about what happened. */
 async function triggerSyncResumeQuick(
   supabaseUrl: string,
   serviceKey: string,
   runId: string,
   timeoutMs: number
-): Promise<void> {
+): Promise<{ resume_request: string }> {
   const controller = new AbortController();
   const tid = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    await fetch(`${supabaseUrl}/functions/v1/run-full-sync`, {
+    const resp = await fetch(`${supabaseUrl}/functions/v1/run-full-sync`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${serviceKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ trigger: 'cron', resume_run_id: runId }),
       signal: controller.signal
     });
-  } catch { /* timeout or network error — function keeps running server-side */ }
-  clearTimeout(tid);
+    clearTimeout(tid);
+    if (!resp.ok) {
+      console.warn(`[cron-tick] resumeQuick HTTP error ${resp.status} for run ${runId}`);
+      return { resume_request: 'error' };
+    }
+    return { resume_request: 'confirmed' };
+  } catch (e: unknown) {
+    clearTimeout(tid);
+    const isAbort = e instanceof DOMException && e.name === 'AbortError';
+    if (isAbort) {
+      // Timeout — function keeps running server-side
+      return { resume_request: 'sent_without_confirmation' };
+    }
+    console.warn(`[cron-tick] resumeQuick network error for run ${runId}: ${errMsg(e)}`);
+    return { resume_request: 'error' };
+  }
 }
 
 async function callNotification(
