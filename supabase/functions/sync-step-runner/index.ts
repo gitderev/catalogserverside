@@ -2196,36 +2196,42 @@ function getMemMB(): number | null {
   try { return Math.round((Deno as any).memoryUsage().heapUsed / 1024 / 1024); } catch { return null; }
 }
 
-// Helper: log stage event (non-blocking, fire-and-forget)
-function logStage(supabase: SupabaseClient, runId: string, stage: string, extra: Record<string, unknown> = {}) {
+// Helper: log stage event with duration tracking (AWAITED to ensure delivery before crash)
+async function logStage(supabase: SupabaseClient, runId: string, stage: string, stageStartMs: number, extra: Record<string, unknown> = {}): Promise<void> {
   const mem = getMemMB();
-  supabase.rpc('log_sync_event', {
-    p_run_id: runId, p_level: 'INFO', p_message: 'export_amazon_stage',
-    p_details: { step: 'export_amazon', stage, heap_mb: mem, ...extra }
-  }).then(() => {}).catch(() => {});
+  const durationMs = Date.now() - stageStartMs;
+  try {
+    await supabase.rpc('log_sync_event', {
+      p_run_id: runId, p_level: 'INFO', p_message: 'export_amazon_stage',
+      p_details: { step: 'export_amazon', stage, heap_mb: mem, duration_ms: durationMs, ...extra }
+    });
+  } catch { /* non-blocking if RPC itself fails */ }
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function stepExportAmazon(supabase: SupabaseClient, runId: string, feeConfig: any): Promise<{ success: boolean; error?: string }> {
   console.log(`[sync:step:export_amazon] Starting for run ${runId}`);
   const startTime = Date.now();
+  let stageStart = Date.now();
   try {
-    logStage(supabase, runId, 'before_data_preparation');
+    await logStage(supabase, runId, 'before_data_preparation', stageStart);
 
-    // Phase 1: Load products and build validRecords (no XLSX needed yet)
-    let productsResult = await loadProductsTSV(supabase, runId);
-    if (productsResult.error || !productsResult.products) {
-      const error = productsResult.error || 'Products file not found';
+    // Phase 1: Load products TSV raw and build parallel arrays DIRECTLY
+    // (Never builds Product[] - halves peak memory)
+    const { content: productsContent, error: prodError } = await downloadFromStorage(supabase, 'exports', PRODUCTS_FILE_PATH);
+    if (prodError || !productsContent) {
+      const error = prodError || 'Products file not found';
       await updateStepResult(supabase, runId, 'export_amazon', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
+
     const amazonFeeDrev = feeConfig?.amazonFeeDrev ?? feeConfig?.feeDrev ?? 1.05;
     const amazonFeeMkt = feeConfig?.amazonFeeMkt ?? feeConfig?.feeMkt ?? 1.08;
     const amazonShipping = feeConfig?.amazonShippingCost ?? feeConfig?.shippingCost ?? 6.00;
     const itDays = feeConfig?.amazonItPrepDays ?? 3;
     const euDays = feeConfig?.amazonEuPrepDays ?? 5;
 
-    // Load stock location
+    // Load stock location index (lightweight map)
     let stockLocationIndex: Record<string, { stockIT: number; stockEU: number }> | null = null;
     const stockLocationPath = `stock-location/runs/${runId}.txt`;
     const slResult = await downloadFromStorage(supabase, 'ftp-import', stockLocationPath);
@@ -2246,10 +2252,11 @@ async function stepExportAmazon(supabase: SupabaseClient, runId: string, feeConf
           else if (locationId === 4254) stockLocationIndex[matnr].stockEU += stock;
         }
       }
+      // Free raw text immediately
+      slResult.content = undefined as any;
     }
 
-    // Build lightweight arrays instead of object records to reduce GC pressure
-    // Arrays: sku[], ean[], quantity[], leadDays[], priceDisplay[]
+    // Build parallel arrays DIRECTLY from TSV lines (no intermediate Product[])
     const skus: string[] = [];
     const eans: string[] = [];
     const quantities: number[] = [];
@@ -2257,30 +2264,62 @@ async function stepExportAmazon(supabase: SupabaseClient, runId: string, feeConf
     const prices: string[] = [];
     let skipped = 0;
 
-    for (const p of productsResult.products) {
-      const norm = normalizeEAN(p.EAN);
+    const lines = productsContent.split('\n');
+    // Free raw text immediately after splitting
+    (productsContent as any) = undefined;
+    
+    // Parse header to find column indices
+    const headerCols = lines[0]?.split('\t') || [];
+    const colIdx = {
+      Matnr: headerCols.indexOf('Matnr'),
+      MPN: headerCols.indexOf('MPN'),
+      EAN: headerCols.indexOf('EAN'),
+      Stock: headerCols.indexOf('Stock'),
+      LP: headerCols.indexOf('LP'),
+      CBP: headerCols.indexOf('CBP'),
+      Sur: headerCols.indexOf('Sur'),
+    };
+
+    for (let li = 1; li < lines.length; li++) {
+      const line = lines[li];
+      if (!line) continue;
+      const vals = line.split('\t');
+
+      const ean = vals[colIdx.EAN] || '';
+      const norm = normalizeEAN(ean);
       if (!norm.ok || !norm.value || (norm.value.length !== 13 && norm.value.length !== 14)) { skipped++; continue; }
-      if (!p.MPN || !p.MPN.trim()) { skipped++; continue; }
-      let stockIT = p.Stock || 0, stockEU = 0;
-      if (stockLocationIndex?.[p.Matnr]) { stockIT = stockLocationIndex[p.Matnr].stockIT; stockEU = stockLocationIndex[p.Matnr].stockEU; }
+
+      const mpn = vals[colIdx.MPN] || '';
+      if (!mpn.trim()) { skipped++; continue; }
+
+      const matnr = vals[colIdx.Matnr] || '';
+      const stockRaw = parseInt(vals[colIdx.Stock]) || 0;
+      const lp = parseFloat(vals[colIdx.LP]) || 0;
+      const cbp = parseFloat(vals[colIdx.CBP]) || 0;
+      const sur = parseFloat(vals[colIdx.Sur]) || 0;
+
+      let stockIT = stockRaw, stockEU = 0;
+      if (stockLocationIndex?.[matnr]) { stockIT = stockLocationIndex[matnr].stockIT; stockEU = stockLocationIndex[matnr].stockEU; }
       const stockResult = resolveMarketplaceStock(stockIT, stockEU, true, itDays, euDays);
       if (!stockResult.shouldExport || stockResult.exportQty < 2) { skipped++; continue; }
+
       let baseCents = 0;
-      if (p.CBP > 0) baseCents = Math.round((p.CBP + (p.Sur || 0)) * 100);
-      else if (p.LP > 0) baseCents = Math.round(p.LP * 100);
+      if (cbp > 0) baseCents = Math.round((cbp + sur) * 100);
+      else if (lp > 0) baseCents = Math.round(lp * 100);
       if (baseCents <= 0) { skipped++; continue; }
+
       const afterFees = Math.round(Math.round(Math.round((baseCents + Math.round(amazonShipping * 100)) * 1.22) * amazonFeeDrev) * amazonFeeMkt);
       const finalCents = toComma99Cents(afterFees);
-      skus.push(p.MPN.replace(/[\x00-\x1f\x7f]/g, ''));
+
+      skus.push(mpn.replace(/[\x00-\x1f\x7f]/g, ''));
       eans.push(norm.value);
       quantities.push(stockResult.exportQty);
       leadDaysArr.push(stockResult.leadDays);
       prices.push((finalCents / 100).toFixed(2));
     }
 
-    // Free large intermediates before XLSX processing
-    // @ts-ignore - intentional nullification for GC
-    productsResult = null as any;
+    // Free intermediates
+    lines.length = 0;
     stockLocationIndex = null;
 
     const validCount = skus.length;
@@ -2289,7 +2328,8 @@ async function stepExportAmazon(supabase: SupabaseClient, runId: string, feeConf
       await updateStepResult(supabase, runId, 'export_amazon', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
-    logStage(supabase, runId, 'after_data_preparation', { valid: validCount, skipped });
+    stageStart = Date.now();
+    await logStage(supabase, runId, 'after_data_preparation', startTime, { valid: validCount, skipped });
     console.log(`[sync:step:export_amazon] ${validCount} valid, ${skipped} skipped`);
 
     // Phase 2: Generate TXT first (no XLSX lib needed, low memory)
@@ -2298,13 +2338,15 @@ async function stepExportAmazon(supabase: SupabaseClient, runId: string, feeConf
       txtParts.push(`${skus[i]}\t${prices[i]}\t\t\t${quantities[i]}\t\t${leadDaysArr[i]}\n`);
     }
     const txtContent = txtParts.join('');
-    txtParts.length = 0; // free array
+    txtParts.length = 0;
     const txtSave = await uploadToStorage(supabase, 'exports', 'amazon_price_inventory.txt', txtContent, 'text/plain');
     if (!txtSave.success) { await updateStepResult(supabase, runId, 'export_amazon', { status: 'failed', error: txtSave.error!, metrics: {} }); return { success: false, error: txtSave.error }; }
-    logStage(supabase, runId, 'after_txt_upload');
+    stageStart = Date.now();
+    await logStage(supabase, runId, 'after_txt_upload', stageStart);
 
     // Phase 3: Load XLSX lib and template
-    logStage(supabase, runId, 'before_template_load');
+    stageStart = Date.now();
+    await logStage(supabase, runId, 'before_template_load', stageStart);
     const XLSX = await import("npm:xlsx@0.18.5");
 
     let templateBuffer: ArrayBuffer | null = null;
@@ -2328,7 +2370,8 @@ async function stepExportAmazon(supabase: SupabaseClient, runId: string, feeConf
       await updateStepResult(supabase, runId, 'export_amazon', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
-    logStage(supabase, runId, 'after_template_load');
+    stageStart = Date.now();
+    await logStage(supabase, runId, 'after_template_load', stageStart);
 
     // Phase 4: Build XLSM - CPU-optimized: pre-compute cell addresses
     const wb = XLSX.read(new Uint8Array(templateBuffer), { type: 'array', bookVBA: true });
@@ -2336,7 +2379,6 @@ async function stepExportAmazon(supabase: SupabaseClient, runId: string, feeConf
     const ws = wb.Sheets['Modello'];
     if (!ws) { await updateStepResult(supabase, runId, 'export_amazon', { status: 'failed', error: 'Foglio Modello non trovato', metrics: {} }); return { success: false, error: 'Foglio Modello non trovato' }; }
 
-    // Pre-compute column letters to avoid encode_cell overhead per cell
     const colLetters = ['A','B','C','H','AF','AG','AH','AK','BJ'];
     const DS = 4;
 
@@ -2352,7 +2394,7 @@ async function stepExportAmazon(supabase: SupabaseClient, runId: string, feeConf
 
     // Write cells using pre-computed addresses (no encode_cell calls)
     for (let i = 0; i < validCount; i++) {
-      const row = DS + i + 1; // 1-indexed for XLSX cell refs
+      const row = DS + i + 1;
       ws[`A${row}`] = { t: 's', v: skus[i] };
       ws[`B${row}`] = { t: 's', v: 'EAN' };
       ws[`C${row}`] = { t: 's', v: eans[i], z: '@' };
@@ -2367,18 +2409,106 @@ async function stepExportAmazon(supabase: SupabaseClient, runId: string, feeConf
     if (ws['!ref']) {
       const r = XLSX.utils.decode_range(ws['!ref']);
       r.e.r = Math.max(r.e.r, lastRow);
-      r.e.c = Math.max(r.e.c, 61); // COL_BJ = 61
+      r.e.c = Math.max(r.e.c, 61);
       ws['!ref'] = XLSX.utils.encode_range(r);
     }
-    logStage(supabase, runId, 'before_xlsx_write', { rows: validCount });
+    stageStart = Date.now();
+    await logStage(supabase, runId, 'before_xlsx_write', stageStart, { rows: validCount });
 
     const hasVBA = Boolean((wb as unknown as Record<string, unknown>).vbaraw);
     const xlsmOut = XLSX.write(wb, { bookType: 'xlsm', bookVBA: hasVBA, type: 'array' });
-    logStage(supabase, runId, 'after_xlsx_write');
+    stageStart = Date.now();
+    await logStage(supabase, runId, 'after_xlsx_write', stageStart);
 
     const xlsmBlob = new Blob([xlsmOut], { type: 'application/vnd.ms-excel.sheet.macroEnabled.12' });
     const { error: xlsmErr } = await supabase.storage.from('exports').upload('amazon_listing_loader.xlsm', xlsmBlob, { upsert: true, contentType: 'application/vnd.ms-excel.sheet.macroEnabled.12' });
     if (xlsmErr) { await updateStepResult(supabase, runId, 'export_amazon', { status: 'failed', error: xlsmErr.message, metrics: {} }); return { success: false, error: xlsmErr.message }; }
+
+    // ========== SELFTEST (only when EXPORT_AMAZON_SELFTEST=true) ==========
+    if (Deno.env.get('EXPORT_AMAZON_SELFTEST') === 'true') {
+      try {
+        console.log('[export_amazon] Running selftest...');
+        // Re-read the generated XLSM
+        const { data: testBlob } = await supabase.storage.from('exports').download('amazon_listing_loader.xlsm');
+        if (testBlob) {
+          const testBuf = await testBlob.arrayBuffer();
+          const testWb = XLSX.read(new Uint8Array(testBuf), { type: 'array' });
+          const testWs = testWb.Sheets['Modello'];
+          if (!testWs) throw new Error('selftest: sheet Modello not found in output');
+
+          // Invariant 1: row count
+          const testRange = XLSX.utils.decode_range(testWs['!ref'] || 'A1');
+          const writtenRows = testRange.e.r - DS + 1;
+          if (writtenRows < validCount) {
+            throw new Error(`selftest: row_count mismatch: written=${writtenRows} expected=${validCount}`);
+          }
+
+          // Invariant 2: sample rows (first, middle, last)
+          const sampleIndices = [0, Math.floor(validCount / 2), validCount - 1];
+          for (const idx of sampleIndices) {
+            const row = DS + idx + 1;
+            const cellA = testWs[`A${row}`];
+            const cellC = testWs[`C${row}`];
+            const cellAK = testWs[`AK${row}`];
+            const cellBJ = testWs[`BJ${row}`];
+
+            // Check SKU matches
+            if (!cellA || String(cellA.v) !== skus[idx]) {
+              throw new Error(`selftest: SKU mismatch at row ${row}: got=${cellA?.v} expected=${skus[idx]}`);
+            }
+            // Check EAN matches and is text type
+            if (!cellC || String(cellC.v) !== eans[idx]) {
+              throw new Error(`selftest: EAN mismatch at row ${row}: got=${cellC?.v} expected=${eans[idx]}`);
+            }
+            if (cellC.t !== 's') {
+              throw new Error(`selftest: EAN not string type at row ${row}: type=${cellC.t}`);
+            }
+            // Check price matches
+            if (!cellAK || String(cellAK.v) !== prices[idx]) {
+              throw new Error(`selftest: price mismatch at row ${row}: got=${cellAK?.v} expected=${prices[idx]}`);
+            }
+            // Check BJ column (beyond Z)
+            if (!cellBJ || String(cellBJ.v) !== 'Modello Amazon predefinito') {
+              throw new Error(`selftest: BJ mismatch at row ${row}: got=${cellBJ?.v}`);
+            }
+          }
+
+          // Invariant 3: no formula injection in text cells
+          for (const idx of sampleIndices) {
+            const row = DS + idx + 1;
+            for (const col of ['A', 'C', 'AK']) {
+              const cell = testWs[`${col}${row}`];
+              if (cell && cell.t === 's' && typeof cell.v === 'string') {
+                const v = cell.v;
+                if (v.startsWith('=') || v.startsWith('+') || v.startsWith('-') || v.startsWith('@')) {
+                  throw new Error(`selftest: potential formula injection at ${col}${row}: starts with ${v[0]}`);
+                }
+              }
+            }
+          }
+
+          // Invariant 4: EAN preserves leading zeros
+          for (const idx of sampleIndices) {
+            const row = DS + idx + 1;
+            const cellC = testWs[`C${row}`];
+            if (cellC && eans[idx].startsWith('0') && !String(cellC.v).startsWith('0')) {
+              throw new Error(`selftest: EAN leading zero lost at row ${row}: got=${cellC.v} expected=${eans[idx]}`);
+            }
+          }
+
+          console.log(`[export_amazon] Selftest PASSED: ${sampleIndices.length} sample rows verified, ${validCount} total rows`);
+        }
+      } catch (selfTestErr: unknown) {
+        const reason = errMsg(selfTestErr);
+        console.error(`[export_amazon] Selftest FAILED: ${reason}`);
+        await supabase.rpc('log_sync_event', {
+          p_run_id: runId, p_level: 'ERROR', p_message: 'step_failed',
+          p_details: { step: 'export_amazon', reason: `selftest: ${reason}`, selftest: true }
+        });
+        await updateStepResult(supabase, runId, 'export_amazon', { status: 'failed', error: `selftest: ${reason}`, metrics: {} });
+        return { success: false, error: `selftest: ${reason}` };
+      }
+    }
 
     const elapsed = Date.now() - startTime;
     await updateStepResult(supabase, runId, 'export_amazon', {
@@ -2387,7 +2517,8 @@ async function stepExportAmazon(supabase: SupabaseClient, runId: string, feeConf
       rows_written: validCount,
       total_products: validCount
     });
-    logStage(supabase, runId, 'completed', { rows: validCount, elapsed_ms: elapsed });
+    stageStart = Date.now();
+    await logStage(supabase, runId, 'completed', stageStart, { rows: validCount, elapsed_ms: elapsed });
     console.log(`[sync:step:export_amazon] Completed: ${validCount} rows in ${elapsed}ms`);
     console.log(JSON.stringify({ diag_tag: 'xlsx_export_retry_decision', run_id: runId, step: 'export_amazon', decision: 'completed', rows_written: validCount, total_products: validCount, elapsed_ms: elapsed }));
     return { success: true };
