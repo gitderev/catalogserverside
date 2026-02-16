@@ -2400,15 +2400,20 @@ async function stepExportAmazon(supabase: SupabaseClient, runId: string, feeConf
     const colLetters = ['A','B','C','H','AF','AG','AH','AK','BJ'];
     const DS = 4;
 
-    // Clear existing data rows in target columns
-    if (ws['!ref']) {
-      const range = XLSX.utils.decode_range(ws['!ref']);
-      for (let R = DS; R <= range.e.r; R++) {
-        for (const col of colLetters) {
-          delete ws[`${col}${R + 1}`];
-        }
-      }
+    // Clear ALL existing cells from template beyond header rows to avoid serializing stale data.
+    // This also dramatically reduces the effective cell count for XLSX.write.
+    const templateRef = ws['!ref'] || 'A1';
+    const templateRange = XLSX.utils.decode_range(templateRef);
+    const keysToDelete: string[] = [];
+    for (const key of Object.keys(ws)) {
+      if (key.startsWith('!')) continue;
+      // Parse row number from cell address (e.g. "A5" → 5)
+      const rowMatch = key.match(/(\d+)$/);
+      if (!rowMatch) continue;
+      const cellRow = parseInt(rowMatch[1], 10);
+      if (cellRow > DS) keysToDelete.push(key); // DS=4, so row 5+ are data rows (1-indexed in addresses)
     }
+    for (const k of keysToDelete) delete ws[k];
 
     // Write cells using pre-computed addresses (no encode_cell calls)
     for (let i = 0; i < validCount; i++) {
@@ -2423,20 +2428,43 @@ async function stepExportAmazon(supabase: SupabaseClient, runId: string, feeConf
       ws[`AK${row}`] = { t: 's', v: prices[i] };
       ws[`BJ${row}`] = { t: 's', v: 'Modello Amazon predefinito' };
     }
-    const lastRow = DS + validCount - 1;
-    if (ws['!ref']) {
-      const r = XLSX.utils.decode_range(ws['!ref']);
-      r.e.r = Math.max(r.e.r, lastRow);
-      r.e.c = Math.max(r.e.c, 61);
-      ws['!ref'] = XLSX.utils.encode_range(r);
-    }
-    stageStart = Date.now();
-    await logStage(supabase, runId, 'before_xlsx_write', stageStart, { rows: validCount });
 
-    const hasVBA = Boolean((wb as unknown as Record<string, unknown>).vbaraw);
-    const xlsmOut = XLSX.write(wb, { bookType: 'xlsm', bookVBA: hasVBA, type: 'array' });
+    // TRIM !ref to minimum effective range — critical for reducing XLSX.write CPU cost
+    const lastDataRow = DS + validCount; // 1-indexed: header rows 1-4 + validCount data rows
+    ws['!ref'] = `A1:BJ${lastDataRow}`;
+
+    // Strip heavy template metadata that inflates serialization cost
+    delete ws['!rows'];
+    delete ws['!cols'];
+    delete ws['!merges'];
+    delete ws['!autofilter'];
+    delete ws['!images'];
+
+    // Count actual cells set for diagnostics
+    let approxCellsSet = 0;
+    for (const key of Object.keys(ws)) { if (!key.startsWith('!')) approxCellsSet++; }
+
     stageStart = Date.now();
-    logStage(supabase, runId, 'after_xlsx_write', stageStart);
+    const writeOptions = { bookType: 'xlsm' as const, bookVBA: Boolean((wb as unknown as Record<string, unknown>).vbaraw), type: 'array' as const, compression: false, bookSST: false, cellStyles: false };
+    await logStage(supabase, runId, 'before_xlsx_write', stageStart, {
+      rows: validCount,
+      write_options: { compression: false, bookSST: false, cellStyles: false },
+      sheet_ref_before: templateRef,
+      sheet_ref_after: ws['!ref'],
+      last_row: lastDataRow,
+      last_col: 'BJ',
+      approx_cells_set_count: approxCellsSet,
+      template_sheet_name: 'Modello',
+      template_range_rows: templateRange.e.r + 1,
+      template_range_cols: templateRange.e.c + 1,
+    });
+
+    const writeT0 = Date.now();
+    const xlsmOut = XLSX.write(wb, writeOptions);
+    const writeDurationMs = Date.now() - writeT0;
+    const writeSizeBytes = xlsmOut.byteLength || xlsmOut.length || 0;
+    stageStart = Date.now();
+    await logStage(supabase, runId, 'after_xlsx_write', stageStart, { duration_ms: writeDurationMs, size_bytes: writeSizeBytes });
 
     const xlsmBlob = new Blob([xlsmOut], { type: 'application/vnd.ms-excel.sheet.macroEnabled.12' });
     const { error: xlsmErr } = await supabase.storage.from('exports').upload('amazon_listing_loader.xlsm', xlsmBlob, { upsert: true, contentType: 'application/vnd.ms-excel.sheet.macroEnabled.12' });
