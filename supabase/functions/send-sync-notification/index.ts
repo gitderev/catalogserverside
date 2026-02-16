@@ -121,7 +121,7 @@ serve(async (req) => {
 
     // ========== Build email content ==========
     const subject = buildSubject(runId, run.status, run.attempt);
-    const textBody = buildTextBody(run);
+    const textBody = await buildTextBody(run, supabase);
 
     // ========== Send via SMTP using nodemailer ==========
     try {
@@ -245,11 +245,12 @@ function buildSubject(runId: string, status: string, attempt: number): string {
   return `[CATALOG SYNC] run ${runId.substring(0, 8)} - ${tag}`;
 }
 
-function buildTextBody(run: Record<string, unknown>): string {
+async function buildTextBody(run: Record<string, unknown>, supabase: ReturnType<typeof createClient>): Promise<string> {
   const metrics = run.metrics as Record<string, unknown> || {};
   const steps = run.steps as Record<string, unknown> || {};
   const warningCount = (run.warning_count as number) || 0;
   const runtimeSec = run.runtime_ms ? Math.round((run.runtime_ms as number) / 1000) : 0;
+  const currentStep = (steps as Record<string, unknown>).current_step as string || 'N/A';
 
   // Use shared expected steps (single source of truth, no manual/cron divergence)
   const expectedSteps = getExpectedSteps(run.trigger_type as string);
@@ -258,6 +259,13 @@ function buildTextBody(run: Record<string, unknown>): string {
     const st = steps[s] as Record<string, unknown> | undefined;
     return !st || !st.status;
   });
+
+  // Derive failing step
+  let failingStep = 'N/A';
+  for (const s of expectedSteps) {
+    const st = steps[s] as Record<string, unknown> | undefined;
+    if (st?.status === 'failed') { failingStep = s; break; }
+  }
 
   const lines: string[] = [
     `CATALOG SYNC REPORT`,
@@ -269,14 +277,28 @@ function buildTextBody(run: Record<string, unknown>): string {
     `Attempt:      ${run.attempt || 1}`,
     `Runtime:      ${runtimeSec}s`,
     `Warnings:     ${warningCount}`,
+    `Current Step: ${currentStep}`,
+    `Failing Step: ${failingStep}`,
     `Started:      ${run.started_at}`,
     `Finished:     ${run.finished_at || 'N/A'}`,
   ];
 
   if (run.error_message) {
-    lines.push(`Error:        ${run.error_message}`);
+    lines.push(`Error:        ${String(run.error_message).substring(0, 500)}`);
   }
 
+  lines.push('');
+
+  // Step timeline
+  lines.push(`STEP TIMELINE`);
+  lines.push(`-------------`);
+  for (const s of expectedSteps) {
+    const st = steps[s] as Record<string, unknown> | undefined;
+    const status = st?.status || 'pending';
+    const dur = st?.duration_ms ? `${Math.round(st.duration_ms as number)}ms` : '-';
+    const rows = st?.rows_written || st?.rows || '';
+    lines.push(`  ${s.padEnd(22)} ${String(status).padEnd(12)} ${dur}${rows ? ` (${rows} rows)` : ''}`);
+  }
   lines.push('');
 
   // Metrics
@@ -304,6 +326,39 @@ function buildTextBody(run: Record<string, unknown>): string {
     lines.push('');
     lines.push(`⚠️ ${warningCount} warning(s) recorded during this run.`);
   }
+
+  // Last 30 events extract
+  try {
+    const { data: evts } = await supabase
+      .from('sync_events')
+      .select('created_at, level, message, step, details')
+      .eq('run_id', run.id as string)
+      .order('created_at', { ascending: false })
+      .limit(30);
+    
+    if (evts && evts.length > 0) {
+      lines.push('');
+      lines.push(`RECENT EVENTS (last ${evts.length})`);
+      lines.push(`---------------------------------`);
+      for (const e of evts) {
+        const ts = new Date(e.created_at).toISOString().substring(11, 19);
+        const det = e.details as Record<string, unknown> | null;
+        let detStr = '';
+        if (det) {
+          // Show only relevant diagnostic fields, truncated
+          const pick: string[] = [];
+          for (const k of ['stage', 'duration_ms', 'http_status', 'code', 'body_snippet', 'retry_attempt', 'heap_mb', 'rows', 'error']) {
+            if (det[k] !== undefined) {
+              const v = String(det[k]);
+              pick.push(`${k}=${v.substring(0, 120)}`);
+            }
+          }
+          if (pick.length) detStr = ` | ${pick.join(', ')}`;
+        }
+        lines.push(`  ${ts} ${e.level} ${e.message}${e.step ? ` [${e.step}]` : ''}${detStr}`);
+      }
+    }
+  } catch { /* non-blocking */ }
 
   return lines.join('\n');
 }
