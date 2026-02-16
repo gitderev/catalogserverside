@@ -1275,8 +1275,11 @@ async function runPipeline(
     }
   }
 
+  const allStepsSuccess = missingSteps.length === 0 && incompleteSteps.length === 0;
   let finalStatus: string;
-  if (missingSteps.length > 0 || incompleteSteps.length > 0) {
+  let realWarningCount = finalRun?.warning_count || 0;
+
+  if (!allStepsSuccess) {
     const errorMsg = pipelineFailError || `Pipeline incomplete: missing=[${missingSteps.join(',')}] incomplete=[${incompleteSteps.join(',')}]`;
     console.warn(`[orchestrator] ${errorMsg}`);
     try {
@@ -1288,10 +1291,68 @@ async function runPipeline(
     finalStatus = 'failed';
     await finalizeRun(supabase, runId, 'failed', runStartTime, errorMsg);
   } else {
-    finalStatus = (finalRun?.warning_count || 0) > 0 ? 'success_with_warning' : 'success';
-    await finalizeRun(supabase, runId, finalStatus, runStartTime);
+    // Recalculate real warnings: exclude operational/diagnostic WARN events
+    // that are normal during yield/resume cycles and don't represent actual data issues
+    const OPERATIONAL_WARN_MESSAGES = [
+      'orchestrator_yield_scheduled', 'drain_loop_incomplete', 'step_retry_scheduled',
+      'resume_failed_http', 'lock_ownership_lost', 'yielded_locked',
+      'multiple_running_detected', 'cron_auth_failed'
+    ];
+
+    try {
+      const { data: allWarns } = await supabase
+        .from('sync_events')
+        .select('message')
+        .eq('run_id', runId)
+        .eq('level', 'WARN')
+        .limit(500);
+      realWarningCount = (allWarns || []).filter(
+        (e: { message: string }) => !OPERATIONAL_WARN_MESSAGES.includes(e.message)
+      ).length;
+    } catch (_) {
+      // Fallback: keep existing warning_count
+      realWarningCount = finalRun?.warning_count || 0;
+    }
+
+    finalStatus = realWarningCount > 0 ? 'success_with_warning' : 'success';
+
+    // Direct update with corrected warning_count (bypass finalizeRun to include warning_count)
+    await supabase.from('sync_runs').update({
+      status: finalStatus,
+      finished_at: new Date().toISOString(),
+      runtime_ms: Date.now() - runStartTime,
+      error_message: null,
+      warning_count: realWarningCount
+    }).eq('id', runId);
+    console.log(`[orchestrator] Run ${runId} finalized: ${finalStatus} (real_warnings=${realWarningCount})`);
   }
-  
+
+  // Emit run_finalized event with diagnostic counters
+  try {
+    let yieldCount = 0;
+    let drainCapCount = 0;
+    try {
+      const { data: yieldEvts } = await supabase.from('sync_events').select('id').eq('run_id', runId).eq('message', 'orchestrator_yield_scheduled').limit(100);
+      const { data: drainEvts } = await supabase.from('sync_events').select('id').eq('run_id', runId).eq('message', 'drain_loop_incomplete').limit(100);
+      yieldCount = yieldEvts?.length || 0;
+      drainCapCount = drainEvts?.length || 0;
+    } catch (_) {}
+
+    await supabase.rpc('log_sync_event', {
+      p_run_id: runId,
+      p_level: 'INFO',
+      p_message: 'run_finalized',
+      p_details: {
+        status: finalStatus,
+        real_warning_count: realWarningCount,
+        yield_count: yieldCount,
+        drain_cap_count: drainCapCount,
+        finished_at: new Date().toISOString(),
+        source: 'orchestrator'
+      }
+    });
+  } catch (_) {}
+
   console.log(`[orchestrator] Pipeline completed: ${runId}, status: ${finalStatus}`);
   
   // Use standardized response status
