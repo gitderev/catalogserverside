@@ -1,5 +1,6 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
+import { getExpectedSteps } from "../_shared/expectedSteps.ts";
 
 /**
  * send-sync-notification - Sends email via SMTP
@@ -250,10 +251,8 @@ function buildTextBody(run: Record<string, unknown>): string {
   const warningCount = (run.warning_count as number) || 0;
   const runtimeSec = run.runtime_ms ? Math.round((run.runtime_ms as number) / 1000) : 0;
 
-  // Compute missing steps
-  const expectedSteps = run.trigger_type === 'cron'
-    ? ['import_ftp', 'parse_merge', 'ean_mapping', 'pricing', 'export_ean', 'export_ean_xlsx', 'export_amazon', 'export_mediaworld', 'export_eprice', 'upload_sftp', 'versioning', 'notification']
-    : ['import_ftp', 'parse_merge', 'ean_mapping', 'pricing', 'export_ean', 'export_ean_xlsx', 'export_amazon', 'export_mediaworld', 'export_eprice', 'versioning', 'notification'];
+  // Use shared expected steps (single source of truth, no manual/cron divergence)
+  const expectedSteps = getExpectedSteps(run.trigger_type as string);
   
   const missingSteps = expectedSteps.filter(s => {
     const st = steps[s] as Record<string, unknown> | undefined;

@@ -1,5 +1,6 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
+import { assertLockOwned, renewLockLease, LOCK_TTL_SECONDS } from "../_shared/lock.ts";
 
 type SupabaseClient = ReturnType<typeof createClient>;
 
@@ -434,6 +435,14 @@ async function getParseMergeState(supabase: SupabaseClient, runId: string): Prom
 }
 
 async function updateParseMergeState(supabase: SupabaseClient, runId: string, state: Partial<ParseMergeState>): Promise<void> {
+  // Lock guard: assert ownership and renew lease before writing steps/metrics
+  const lockCheck = await assertLockOwned(supabase, runId);
+  if (!lockCheck.owned) {
+    console.error(`[parse_merge] LOCK NOT OWNED in updateParseMergeState: holder=${lockCheck.holder_run_id}`);
+    throw new Error(`lock_ownership_lost: cannot update parse_merge state, lock held by ${lockCheck.holder_run_id}`);
+  }
+  await renewLockLease(supabase, runId, LOCK_TTL_SECONDS);
+
   const { data: run } = await supabase.from('sync_runs').select('steps, metrics').eq('id', runId).single();
   const currentSteps = run?.steps || {};
   const currentMetrics = run?.metrics || {};
@@ -1547,6 +1556,14 @@ async function stepEanMapping(supabase: SupabaseClient, runId: string): Promise<
 }
 
 async function updateStepResult(supabase: SupabaseClient, runId: string, stepName: string, result: StepResultData): Promise<void> {
+  // Lock guard: assert ownership and renew lease before writing steps/metrics
+  const lockCheck = await assertLockOwned(supabase, runId);
+  if (!lockCheck.owned) {
+    console.error(`[sync-step-runner] LOCK NOT OWNED in updateStepResult: step=${stepName}, holder=${lockCheck.holder_run_id}`);
+    throw new Error(`lock_ownership_lost: cannot update ${stepName} result, lock held by ${lockCheck.holder_run_id}`);
+  }
+  await renewLockLease(supabase, runId, LOCK_TTL_SECONDS);
+
   const { data: run } = await supabase.from('sync_runs').select('steps, metrics').eq('id', runId).single();
   const steps = { ...(run?.steps || {}), [stepName]: result, current_step: stepName };
   const metrics = { ...(run?.metrics || {}), ...result.metrics };
