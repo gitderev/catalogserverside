@@ -1,9 +1,13 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
-import { acquireOrRenewGlobalLock, assertLockOwned, renewLockLease, LOCK_TTL_SECONDS } from "../_shared/lock.ts";
+import { acquireOrRenewGlobalLock, assertLockOwned, renewLockLease, generateInvocationId, LOCK_TTL_SECONDS } from "../_shared/lock.ts";
 import { getExpectedSteps } from "../_shared/expectedSteps.ts";
 
 type SupabaseClient = ReturnType<typeof createClient>;
+
+// Per-invocation nonce: generated once per edge function call.
+// Used to guarantee non-reentrant locking even for the same run_id.
+const INVOCATION_ID = generateInvocationId();
 
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -167,35 +171,26 @@ async function isCancelRequested(supabase: SupabaseClient, runId: string): Promi
  * After write, asserts invariant: steps[current_step] exists.
  */
 async function setStepInProgress(supabase: SupabaseClient, runId: string, stepName: string): Promise<void> {
-  // Lock guard: assert ownership and renew lease before writing
-  const lockCheck = await assertLockOwned(supabase, runId);
+  // Lock guard: assert ownership with invocation_id and renew lease before writing
+  const lockCheck = await assertLockOwned(supabase, runId, INVOCATION_ID);
   if (!lockCheck.owned) {
-    console.error(`[orchestrator] LOCK NOT OWNED in setStepInProgress: step=${stepName}, holder=${lockCheck.holder_run_id}`);
+    console.error(`[orchestrator] LOCK NOT OWNED in setStepInProgress: step=${stepName}, holder=${lockCheck.holder_run_id}, holder_inv=${lockCheck.holder_invocation_id}`);
     try {
       await supabase.rpc('log_sync_event', {
         p_run_id: runId, p_level: 'WARN', p_message: 'lock_ownership_lost',
-        p_details: { step: stepName, context: 'setStepInProgress', holder_run_id: lockCheck.holder_run_id }
+        p_details: { step: stepName, context: 'setStepInProgress', holder_run_id: lockCheck.holder_run_id, holder_invocation_id: lockCheck.holder_invocation_id, our_invocation_id: INVOCATION_ID }
       });
     } catch (_) {}
-    throw new Error(`lock_ownership_lost: cannot write step ${stepName}, lock held by ${lockCheck.holder_run_id}`);
+    throw new Error(`lock_ownership_lost: cannot write step ${stepName}, lock held by ${lockCheck.holder_run_id} inv=${lockCheck.holder_invocation_id}`);
   }
-  await renewLockLease(supabase, runId, LOCK_TTL_SECONDS);
+  await renewLockLease(supabase, runId, LOCK_TTL_SECONDS, INVOCATION_ID);
 
-  const { data: run } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
-  const currentSteps = (run?.steps || {}) as Record<string, unknown>;
-  const existingStep = currentSteps[stepName];
-  const patch: Record<string, unknown> = { status: 'in_progress' };
-  if (!existingStep || !(existingStep as Record<string, unknown>).started_at) {
-    patch.started_at = new Date().toISOString();
-  }
-  
-  const mergedStep = (existingStep && typeof existingStep === 'object' && !Array.isArray(existingStep))
-    ? deepMerge(existingStep as Record<string, unknown>, patch)
-    : patch;
-  
-  const updatedSteps = { ...currentSteps, [stepName]: mergedStep, current_step: stepName };
-  await supabase.from('sync_runs').update({ steps: updatedSteps }).eq('id', runId);
-  
+  // Use atomic DB RPC instead of read-modify-write
+  await supabase.rpc('set_step_in_progress', {
+    p_run_id: runId,
+    p_step_name: stepName
+  });
+
   // Invariant assert: steps[current_step] must exist
   const { data: verify } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
   if (!verify?.steps?.[stepName]) {
@@ -204,30 +199,28 @@ async function setStepInProgress(supabase: SupabaseClient, runId: string, stepNa
   }
 }
 
-/** Deep-merge a step state into steps JSONB without overwriting other steps. */
+/** Atomic deep-merge a step state into steps JSONB via DB RPC, without overwriting other steps. */
 async function mergeStepState(supabase: SupabaseClient, runId: string, stepName: string, state: Record<string, unknown>): Promise<void> {
-  // Lock guard: assert ownership and renew lease before writing
-  const lockCheck = await assertLockOwned(supabase, runId);
+  // Lock guard: assert ownership with invocation_id and renew lease before writing
+  const lockCheck = await assertLockOwned(supabase, runId, INVOCATION_ID);
   if (!lockCheck.owned) {
-    console.error(`[orchestrator] LOCK NOT OWNED in mergeStepState: step=${stepName}, holder=${lockCheck.holder_run_id}`);
+    console.error(`[orchestrator] LOCK NOT OWNED in mergeStepState: step=${stepName}, holder=${lockCheck.holder_run_id}, holder_inv=${lockCheck.holder_invocation_id}`);
     try {
       await supabase.rpc('log_sync_event', {
         p_run_id: runId, p_level: 'WARN', p_message: 'lock_ownership_lost',
-        p_details: { step: stepName, context: 'mergeStepState', holder_run_id: lockCheck.holder_run_id }
+        p_details: { step: stepName, context: 'mergeStepState', holder_run_id: lockCheck.holder_run_id, holder_invocation_id: lockCheck.holder_invocation_id, our_invocation_id: INVOCATION_ID }
       });
     } catch (_) {}
     throw new Error(`lock_ownership_lost: cannot merge step ${stepName}, lock held by ${lockCheck.holder_run_id}`);
   }
-  await renewLockLease(supabase, runId, LOCK_TTL_SECONDS);
+  await renewLockLease(supabase, runId, LOCK_TTL_SECONDS, INVOCATION_ID);
 
-  const { data: run } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
-  const currentSteps = (run?.steps || {}) as Record<string, unknown>;
-  const existingStepState = currentSteps[stepName];
-  const mergedStepState = (existingStepState && typeof existingStepState === 'object' && !Array.isArray(existingStepState))
-    ? deepMerge(existingStepState as Record<string, unknown>, state)
-    : state;
-  const updatedSteps = { ...currentSteps, [stepName]: mergedStepState };
-  await supabase.from('sync_runs').update({ steps: updatedSteps }).eq('id', runId);
+  // Use atomic DB RPC for merge (no read-modify-write race)
+  await supabase.rpc('merge_sync_run_step', {
+    p_run_id: runId,
+    p_step_name: stepName,
+    p_patch: state
+  });
 }
 
 async function finalizeRun(supabase: SupabaseClient, runId: string, status: string, startTime: number, errorMessage?: string): Promise<void> {
@@ -378,16 +371,16 @@ serve(async (req) => {
           { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
       }
       
-      const lockAcquired = await acquireOrRenewGlobalLock(supabase, runId, lockTtlSeconds);
+      const lockAcquired = await acquireOrRenewGlobalLock(supabase, runId, lockTtlSeconds, INVOCATION_ID);
       
       if (!lockAcquired) {
         const { data: existingLock } = await supabase
           .from('sync_locks')
-          .select('run_id, lease_until')
+          .select('run_id, invocation_id, lease_until')
           .eq('lock_name', 'global_sync')
           .maybeSingle();
         
-        console.log(`[orchestrator] Cannot acquire lock for resume: held by ${existingLock?.run_id}`);
+        console.log(`[orchestrator] Cannot acquire lock for resume: held by run=${existingLock?.run_id} inv=${existingLock?.invocation_id}`);
         try {
           await supabase.rpc('log_sync_event', {
             p_run_id: runId,
@@ -396,10 +389,12 @@ serve(async (req) => {
             p_details: { 
               step: 'orchestrator_resume', 
               lock_name: 'global_sync',
-              owner_run_id: existingLock?.run_id, 
+              owner_run_id: existingLock?.run_id,
+              owner_invocation_id: existingLock?.invocation_id,
+              our_invocation_id: INVOCATION_ID,
               lease_until: existingLock?.lease_until,
               origin: trigger,
-              reason: 'lock_held_by_other'
+              reason: 'lock_held_by_other_invocation'
             }
           });
         } catch (_) {}
@@ -472,7 +467,7 @@ serve(async (req) => {
         console.log(`[orchestrator] Found existing running run ${existing.id}, resuming instead of creating new`);
         runId = existing.id;
         
-        const lockOk = await acquireOrRenewGlobalLock(supabase, runId, lockTtlSeconds);
+        const lockOk = await acquireOrRenewGlobalLock(supabase, runId, lockTtlSeconds, INVOCATION_ID);
         
         if (!lockOk) {
           try {
@@ -509,7 +504,7 @@ serve(async (req) => {
 
     runId = crypto.randomUUID();
     
-    const lockAcquired = await acquireOrRenewGlobalLock(supabase, runId, lockTtlSeconds);
+    const lockAcquired = await acquireOrRenewGlobalLock(supabase, runId, lockTtlSeconds, INVOCATION_ID);
     
     if (!lockAcquired) {
       console.log('[orchestrator] INFO: Lock not acquired, sync already in progress');
@@ -841,6 +836,8 @@ async function runPipeline(
       const { data: runData } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
       const currentSteps = runData?.steps || {};
       if ('export_ean_xlsx_retry' in currentSteps) {
+        // Atomic removal via RPC: set the key to null won't work, but we can merge an empty object.
+        // Actually for legacy cleanup, we need a direct update - this is a one-time cleanup, acceptable.
         delete (currentSteps as Record<string, unknown>).export_ean_xlsx_retry;
         await supabase.from('sync_runs').update({ steps: currentSteps }).eq('id', runId);
       }
@@ -959,10 +956,12 @@ async function runPipeline(
         const hadRetry = stepState.retry?.retry_attempt > 0;
 
         if (stepState.retry) {
-          const cleanedState = { ...stepState };
-          delete cleanedState.retry;
-          const updatedSteps = { ...currentSteps, [step]: cleanedState };
-          await supabase.from('sync_runs').update({ steps: updatedSteps }).eq('id', runId);
+          // Use atomic RPC to clear retry sub-key: merge with retry set to null
+          await supabase.rpc('merge_sync_run_step', {
+            p_run_id: runId,
+            p_step_name: step,
+            p_patch: { retry: null }
+          });
         }
 
         try {

@@ -152,7 +152,13 @@ serve(async (req) => {
 
     const timeoutMinutes = config.run_timeout_minutes || 60;
     const hardTimeoutMinutes = 2 * timeoutMinutes;
-    const maxAttempts = config.max_attempts || 3;
+    // Clamp max_attempts to 5 (DB trigger enforces this on write, but clamp on read for safety)
+    const MAX_ATTEMPTS_CAP = 5;
+    const rawMaxAttempts = config.max_attempts || 3;
+    const maxAttempts = Math.min(rawMaxAttempts, MAX_ATTEMPTS_CAP);
+    if (rawMaxAttempts > MAX_ATTEMPTS_CAP) {
+      console.warn(`[cron-tick] WARN: max_attempts=${rawMaxAttempts} exceeds cap=${MAX_ATTEMPTS_CAP}, clamping to ${MAX_ATTEMPTS_CAP}`);
+    }
     const retryDelay = (config.retry_delay_minutes || 5) * 60 * 1000;
 
     // 3. DETERMINISTIC RUN SELECTION: most recent running run

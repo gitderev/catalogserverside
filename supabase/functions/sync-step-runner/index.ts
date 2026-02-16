@@ -443,21 +443,32 @@ async function updateParseMergeState(supabase: SupabaseClient, runId: string, st
   }
   await renewLockLease(supabase, runId, LOCK_TTL_SECONDS);
 
-  const { data: run } = await supabase.from('sync_runs').select('steps, metrics').eq('id', runId).single();
-  const currentSteps = run?.steps || {};
-  const currentMetrics = run?.metrics || {};
-  
-  const updatedParseMerge = { ...currentSteps.parse_merge, ...state };
-  const updatedSteps = { ...currentSteps, parse_merge: updatedParseMerge, current_step: 'parse_merge' };
+  // Use atomic RPC for step state merge
+  await supabase.rpc('merge_sync_run_step', {
+    p_run_id: runId,
+    p_step_name: 'parse_merge',
+    p_patch: { ...state, current_step: undefined } // current_step is set separately
+  });
+
+  // Also set current_step atomically
+  await supabase.rpc('set_step_in_progress', {
+    p_run_id: runId,
+    p_step_name: 'parse_merge',
+    p_extra: {}
+  });
   
   // Update metrics if completed
-  const updatedMetrics = state.status === 'completed' ? {
-    ...currentMetrics,
-    products_total: (state.productCount || 0) + Object.values(state.skipped || {}).reduce((a: number, b: unknown) => a + (Number(b) || 0), 0),
-    products_processed: state.productCount || 0
-  } : currentMetrics;
+  if (state.status === 'completed') {
+    const { data: run } = await supabase.from('sync_runs').select('metrics').eq('id', runId).single();
+    const currentMetrics = run?.metrics || {};
+    const updatedMetrics = {
+      ...currentMetrics,
+      products_total: (state.productCount || 0) + Object.values(state.skipped || {}).reduce((a: number, b: unknown) => a + (Number(b) || 0), 0),
+      products_processed: state.productCount || 0
+    };
+    await supabase.from('sync_runs').update({ metrics: updatedMetrics }).eq('id', runId);
+  }
   
-  await supabase.from('sync_runs').update({ steps: updatedSteps, metrics: updatedMetrics }).eq('id', runId);
   console.log(`[parse_merge] State updated: status=${state.status}, offset=${state.offset ?? 'N/A'}, products=${state.productCount ?? 'N/A'}`);
 }
 
@@ -1111,6 +1122,60 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
             const rawBytes = new Uint8Array(await resp.arrayBuffer());
             bytesFetched = rawBytes.byteLength;
             
+            // CONTENT-RANGE VALIDATION (Codex fix): strict check when we expect 206
+            if (httpStatus === 206 && contentRangeHeader) {
+              // Parse Content-Range: bytes <start>-<end>/<total>
+              const crMatch = contentRangeHeader.match(/bytes\s+(\d+)-(\d+)\/(\d+|\*)/);
+              if (crMatch) {
+                const receivedStart = parseInt(crMatch[1], 10);
+                const receivedEnd = parseInt(crMatch[2], 10);
+                const receivedTotal = crMatch[3] !== '*' ? parseInt(crMatch[3], 10) : null;
+
+                // Validate: receivedStart must match requestedStart (cursorPos)
+                if (receivedStart !== cursorPos) {
+                  const error = `content_range_mismatch: requestedStart=${cursorPos} but receivedStart=${receivedStart}`;
+                  try {
+                    await supabase.rpc('log_sync_event', {
+                      p_run_id: runId, p_level: 'ERROR', p_message: 'content_range_mismatch',
+                      p_details: { step: 'parse_merge', requestedStart: cursorPos, receivedStart, receivedEnd, total: receivedTotal, content_range: contentRangeHeader }
+                    });
+                  } catch (_e) { /* non-blocking */ }
+                  await updateParseMergeState(supabase, runId, { status: 'failed', error });
+                  return { success: false, error, status: 'failed' };
+                }
+
+                // Validate: end >= start
+                if (receivedEnd < receivedStart) {
+                  const error = `content_range_mismatch: receivedEnd=${receivedEnd} < receivedStart=${receivedStart}`;
+                  try {
+                    await supabase.rpc('log_sync_event', {
+                      p_run_id: runId, p_level: 'ERROR', p_message: 'content_range_mismatch',
+                      p_details: { step: 'parse_merge', requestedStart: cursorPos, receivedStart, receivedEnd, total: receivedTotal, content_range: contentRangeHeader }
+                    });
+                  } catch (_e) { /* non-blocking */ }
+                  await updateParseMergeState(supabase, runId, { status: 'failed', error });
+                  return { success: false, error, status: 'failed' };
+                }
+
+                // Validate: byte count consistency
+                const expectedBytes = receivedEnd - receivedStart + 1;
+                if (Math.abs(bytesFetched - expectedBytes) > 1) {
+                  const error = `content_range_mismatch: expected ${expectedBytes} bytes from Content-Range but got ${bytesFetched}`;
+                  try {
+                    await supabase.rpc('log_sync_event', {
+                      p_run_id: runId, p_level: 'ERROR', p_message: 'content_range_mismatch',
+                      p_details: { step: 'parse_merge', requestedStart: cursorPos, receivedStart, receivedEnd, total: receivedTotal, bytesFetched, expectedBytes, content_range: contentRangeHeader }
+                    });
+                  } catch (_e) { /* non-blocking */ }
+                  await updateParseMergeState(supabase, runId, { status: 'failed', error });
+                  return { success: false, error, status: 'failed' };
+                }
+
+                // DETERMINISTIC CURSOR: use receivedEnd+1 instead of cursorPos + bytesFetched
+                // This is set below after rawText decode
+              }
+            }
+            
             // TASK B: first chunk (cursor=0) with HTTP 200 — check if full file was returned
             if (cursorPos === 0 && httpStatus === 200 && bytesFetched > MAX_FETCH_BYTES + RANGE_FETCH_MARGIN) {
               const error = `Server ha ignorato Range e ha restituito full content al primo chunk (${bytesFetched} bytes > ${MAX_FETCH_BYTES + RANGE_FETCH_MARGIN} limite).`;
@@ -1227,8 +1292,31 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
         return { success: false, error, status: 'failed' };
       }
       
-      // Advance cursor_pos by bytes actually fetched
-      const newCursorPos = cursorPos + bytesFetched;
+      // DETERMINISTIC CURSOR: use Content-Range receivedEnd+1 if available, otherwise fallback to cursorPos + bytesFetched
+      let newCursorPos: number;
+      if (httpStatus === 206 && contentRangeHeader) {
+        const crMatch = contentRangeHeader.match(/bytes\s+(\d+)-(\d+)\//);
+        if (crMatch) {
+          const receivedEnd = parseInt(crMatch[2], 10);
+          newCursorPos = receivedEnd + 1;
+        } else {
+          newCursorPos = cursorPos + bytesFetched;
+        }
+      } else {
+        newCursorPos = cursorPos + bytesFetched;
+      }
+      // Monotonicity guard: cursor must never regress
+      if (newCursorPos < cursorPos) {
+        const error = `cursor_regression: newCursorPos=${newCursorPos} < cursorPos=${cursorPos}`;
+        try {
+          await supabase.rpc('log_sync_event', {
+            p_run_id: runId, p_level: 'ERROR', p_message: 'cursor_regression',
+            p_details: { step: 'parse_merge', cursorPos, newCursorPos, bytesFetched, contentRangeHeader }
+          });
+        } catch (_e) { /* non-blocking */ }
+        await updateParseMergeState(supabase, runId, { status: 'failed', error });
+        return { success: false, error, status: 'failed' };
+      }
       const newMaterialChunkIndex = materialChunkIndex + 1; // legacy, kept for logging
       const elapsedMs = Date.now() - invocationStart;
       
