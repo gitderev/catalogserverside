@@ -450,11 +450,12 @@ async function updateParseMergeState(supabase: SupabaseClient, runId: string, st
     p_patch: { ...state, current_step: undefined } // current_step is set separately
   });
 
-  // Also set current_step atomically
+  // Also set current_step atomically — preserve sub-statuses (building_stock_index etc.)
+  // by passing the actual status as p_extra so it overrides the default 'in_progress'
   await supabase.rpc('set_step_in_progress', {
     p_run_id: runId,
     p_step_name: 'parse_merge',
-    p_extra: {}
+    p_extra: state.status ? { status: state.status } : {}
   });
   
   // Update metrics if completed
@@ -540,6 +541,18 @@ async function loadMaterialMeta(supabase: SupabaseClient): Promise<{ meta: Mater
   } catch (e: unknown) {
     return { meta: null, error: `JSON parse error: ${errMsg(e)}` };
   }
+}
+
+// ========== ARTIFACT ERROR CLASSIFICATION ==========
+// Conservative: only classify as "not found" if clear signal; anything else is non-recoverable
+function isNotFoundArtifactError(errorStr: string | undefined | null): boolean {
+  if (!errorStr) return false;
+  const lower = errorStr.toLowerCase();
+  return lower.includes('file not found') ||
+    lower.includes('not found') ||
+    lower.includes('nosuchkey') ||
+    lower.includes('enoent') ||
+    (lower.includes('404') && (lower.includes('object') || lower.includes('file') || lower.includes('key')));
 }
 
 async function cleanupIndexFiles(supabase: SupabaseClient, runId?: string): Promise<void> {
@@ -1006,28 +1019,96 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
         return { success: false, error, status: 'failed' };
       }
       
-      // Load indices — with deterministic artifact-missing detection
-      const [stockResult, priceResult, metaResult] = await Promise.all([
+      // Load indices — with deterministic artifact-missing detection and rebuild logic
+      let [stockResult, priceResult, metaResult] = await Promise.all([
         loadStockIndex(supabase),
         loadPriceIndex(supabase),
         loadMaterialMeta(supabase),
       ]);
-      const missingPhase2: string[] = [];
-      if (!stockResult.index) missingPhase2.push(STOCK_INDEX_FILE);
-      if (!priceResult.index) missingPhase2.push(PRICE_INDEX_FILE);
-      if (!metaResult.meta) missingPhase2.push(MATERIAL_META_FILE);
+      let missingPhase2: string[] = [];
+      const collectMissing = () => {
+        missingPhase2 = [];
+        if (!stockResult.index) missingPhase2.push(STOCK_INDEX_FILE);
+        if (!priceResult.index) missingPhase2.push(PRICE_INDEX_FILE);
+        if (!metaResult.meta) missingPhase2.push(MATERIAL_META_FILE);
+      };
+      collectMissing();
 
       if (missingPhase2.length > 0) {
-        const error = `pipeline_artifact_missing: Phase 2 artifacts missing despite resume markers: ${missingPhase2.join(', ')}`;
-        console.error(`[parse_merge] ${error}`);
+        // Classify errors: only "not found" is recoverable via rebuild
+        const errorStrings = [
+          !stockResult.index ? stockResult.error : null,
+          !priceResult.index ? priceResult.error : null,
+          !metaResult.meta ? metaResult.error : null,
+        ].filter(Boolean) as string[];
+
+        const allNotFound = errorStrings.length > 0 && errorStrings.every(e => isNotFoundArtifactError(e));
+        if (!allNotFound) {
+          // Non-recoverable (permissions, corruption, parse error, etc.)
+          const error = `pipeline_artifact_error: non-recoverable errors loading Phase 2 artifacts: ${errorStrings.join('; ')}`;
+          console.error(`[parse_merge] ${error}`);
+          await updateParseMergeState(supabase, runId, { status: 'failed', error });
+          return { success: false, error, status: 'failed' };
+        }
+
+        // Check rebuild stop rule
+        const rebuildAlreadyAttempted = !!(state as Record<string, unknown>).artifact_rebuild_attempted;
+        if (rebuildAlreadyAttempted) {
+          const error = `pipeline_artifact_missing_after_rebuild: artifacts still missing after rebuild: ${missingPhase2.join(', ')}. Verifica che i file sorgente (stock, price, material) siano presenti e leggibili in ftp-import.`;
+          console.error(`[parse_merge] ${error}`);
+          try {
+            await supabase.rpc('log_sync_event', {
+              p_run_id: runId, p_level: 'ERROR', p_message: 'pipeline_artifact_missing_after_rebuild',
+              p_details: { step: 'parse_merge', missing_artifacts: missingPhase2 }
+            });
+          } catch (_e) { /* non-blocking */ }
+          await updateParseMergeState(supabase, runId, { status: 'failed', error });
+          return { success: false, error, status: 'failed' };
+        }
+
+        // Attempt rebuild: log, set flag, reset state to re-run Phase 1, yield
+        console.log(`[parse_merge] Artifacts missing with resume markers — attempting rebuild`);
         try {
           await supabase.rpc('log_sync_event', {
-            p_run_id: runId, p_level: 'ERROR', p_message: 'pipeline_artifact_missing',
+            p_run_id: runId, p_level: 'WARN', p_message: 'pipeline_artifact_missing',
             p_details: { step: 'parse_merge', missing_artifacts: missingPhase2 }
           });
         } catch (_e) { /* non-blocking */ }
-        await updateParseMergeState(supabase, runId, { status: 'failed', error });
-        return { success: false, error, status: 'failed' };
+
+        const rebuildStart = Date.now();
+        try {
+          await supabase.rpc('log_sync_event', {
+            p_run_id: runId, p_level: 'INFO', p_message: 'pipeline_artifact_rebuild_started',
+            p_details: { step: 'parse_merge', missing_artifacts: missingPhase2, rebuild_attempt: 1 }
+          });
+        } catch (_e) { /* non-blocking */ }
+
+        // Set rebuild flag and reset to pending so Phase 1 re-runs on next loop iteration
+        await supabase.rpc('merge_sync_run_step', {
+          p_run_id: runId,
+          p_step_name: 'parse_merge',
+          p_patch: {
+            artifact_rebuild_attempted: true,
+            artifact_rebuild_attempted_at: new Date().toISOString(),
+            status: 'pending',
+            materialBytes: 0,
+            cursor_pos: 0,
+            chunk_index: 0,
+            partial_line: '',
+            productCount: 0,
+            skipped: { noStock: 0, noPrice: 0, lowStock: 0, noValid: 0 },
+          }
+        });
+
+        try {
+          await supabase.rpc('log_sync_event', {
+            p_run_id: runId, p_level: 'INFO', p_message: 'pipeline_artifact_rebuild_completed',
+            p_details: { step: 'parse_merge', duration_ms: Date.now() - rebuildStart, note: 'State reset to pending; Phase 1 will re-run on next invocation' }
+          });
+        } catch (_e) { /* non-blocking */ }
+
+        // Return in_progress so orchestrator re-invokes (isFirstExecution will trigger Phase 1)
+        return { success: true, status: 'in_progress' };
       }
       const stockIndex = stockResult.index!;
       const priceIndex = priceResult.index!;
