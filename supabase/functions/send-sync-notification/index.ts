@@ -267,6 +267,15 @@ async function buildTextBody(run: Record<string, unknown>, supabase: ReturnType<
     if (st?.status === 'failed') { failingStep = s; break; }
   }
 
+  const fmtTs = (iso: string | unknown) => {
+    if (!iso || typeof iso !== 'string') return 'N/A';
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return String(iso);
+    const rome = d.toLocaleString('it-IT', { timeZone: 'Europe/Rome', day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    const utc = d.toLocaleString('it-IT', { timeZone: 'UTC', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    return `${rome} Europe/Rome (UTC ${utc})`;
+  };
+
   const lines: string[] = [
     `CATALOG SYNC REPORT`,
     `====================`,
@@ -279,8 +288,8 @@ async function buildTextBody(run: Record<string, unknown>, supabase: ReturnType<
     `Warnings:     ${warningCount}`,
     `Current Step: ${currentStep}`,
     `Failing Step: ${failingStep}`,
-    `Started:      ${run.started_at}`,
-    `Finished:     ${run.finished_at || 'N/A'}`,
+    `Started:      ${fmtTs(run.started_at)}`,
+    `Finished:     ${fmtTs(run.finished_at)}`,
   ];
 
   if (run.error_message) {
@@ -341,7 +350,7 @@ async function buildTextBody(run: Record<string, unknown>, supabase: ReturnType<
       lines.push(`RECENT EVENTS (last ${evts.length})`);
       lines.push(`---------------------------------`);
       for (const e of evts) {
-        const ts = new Date(e.created_at).toISOString().substring(11, 19);
+        const ts = fmtTs(e.created_at);
         const det = e.details as Record<string, unknown> | null;
         let detStr = '';
         if (det) {

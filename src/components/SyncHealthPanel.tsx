@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { supabase } from '@/integrations/supabase/client';
 import { Activity, Clock, Loader2, CheckCircle, AlertTriangle, XCircle, Timer, RotateCcw } from 'lucide-react';
+import { STEP_LABELS } from '@/shared/expectedSteps';
 
 type HealthDecision = 'healthy_progress' | 'waiting_retry_delay' | 'stalled' | 'failed' | 'unknown';
 
@@ -26,22 +27,6 @@ interface HealthSnapshot {
     file_total_size: number | null;
   };
 }
-
-const STEP_LABELS: Record<string, string> = {
-  import_ftp: 'Import FTP',
-  parse_merge: 'Parsing e Merge',
-  ean_mapping: 'Mapping EAN',
-  pricing: 'Calcolo Prezzi',
-  override_products: 'Override Prodotti',
-  export_ean: 'Export Catalogo EAN',
-  export_ean_xlsx: 'Export Catalogo EAN (XLSX)',
-  export_amazon: 'Export Amazon',
-  export_mediaworld: 'Export Mediaworld',
-  export_eprice: 'Export ePrice',
-  upload_sftp: 'Upload SFTP',
-  versioning: 'Versioning',
-  notification: 'Notifica'
-};
 
 const DECISION_CONFIG: Record<HealthDecision, { label: string; icon: React.ReactNode; className: string }> = {
   healthy_progress: { label: 'Progresso attivo', icon: <CheckCircle className="h-4 w-4" />, className: 'text-success bg-success/10 border-success/30' },
