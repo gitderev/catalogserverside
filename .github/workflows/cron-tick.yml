@@ -1,8 +1,10 @@
 name: Cron Tick (every 1 minute)
 
 on:
-  schedule:
-    - cron: "* * * * *"
+  # Schedule disabled: cron-tick is now invoked by Supabase pg_cron (job: cron-tick-every-minute)
+  # To re-enable GitHub Actions as fallback, uncomment the next two lines:
+  # schedule:
+  #   - cron: "* * * * *"
   workflow_dispatch: {}
 
 concurrency:
