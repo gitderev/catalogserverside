@@ -38,7 +38,7 @@ const corsHeaders = {
  * Se SFTP non configurato: run failed "SFTP misconfigured".
  */
 
-const ORCHESTRATOR_BUDGET_MS = 25_000;
+const ORCHESTRATOR_BUDGET_MS = 50_000;
 const MAX_PARSE_MERGE_CHUNKS = 100;
 
 const EXPORT_FILES = [
