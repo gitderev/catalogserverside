@@ -38,7 +38,8 @@ const corsHeaders = {
  * Se SFTP non configurato: run failed "SFTP misconfigured".
  */
 
-const ORCHESTRATOR_BUDGET_MS = 50_000;
+const ORCHESTRATOR_BUDGET_MS = 25_000;
+const PARSE_MERGE_BUDGET_MS = 50_000;
 const MAX_PARSE_MERGE_CHUNKS = 100;
 
 const EXPORT_FILES = [
@@ -616,7 +617,10 @@ async function runPipeline(
   orchestratorStart: number,
 ): Promise<Response> {
   
-  const budgetExceeded = () => (Date.now() - orchestratorStart) > ORCHESTRATOR_BUDGET_MS;
+  const budgetExceeded = (stepName?: string) => {
+    const limit = stepName === 'parse_merge' ? PARSE_MERGE_BUDGET_MS : ORCHESTRATOR_BUDGET_MS;
+    return (Date.now() - orchestratorStart) > limit;
+  };
   
   // Track if a step failed before notification - we still want to run notification
   let pipelineFailedBeforeNotification = false;
@@ -647,7 +651,7 @@ async function runPipeline(
         p_details: { 
           step: currentStep, 
           orchestrator_elapsed_ms: Date.now() - orchestratorStart,
-          budget_ms: ORCHESTRATOR_BUDGET_MS,
+          budget_ms: currentStep === 'parse_merge' ? PARSE_MERGE_BUDGET_MS : ORCHESTRATOR_BUDGET_MS,
           reason,
           cursor_pos_end: stepState.cursor_pos,
           file_total_size: stepState.materialBytes,
@@ -756,7 +760,7 @@ async function runPipeline(
         return makeResponse('failed_definitive', { error: 'Cancelled' });
       }
       
-      if (budgetExceeded()) {
+      if (budgetExceeded('parse_merge')) {
         return await yieldResponse('parse_merge', `orchestrator budget exceeded after ${chunkCount} chunks this invocation`);
       }
       

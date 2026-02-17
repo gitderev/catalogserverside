@@ -29,6 +29,7 @@ const ACTIVE_WINDOW_SEC = 60;
 const STALL_THRESHOLD_SEC = 180;
 const IDLE_TIMEOUT_MINUTES = 30;
 const FINGERPRINT_SALT = "cron-fp-v1";
+let _tickStartMs = 0; // set per request for jsonResp duration calc
 
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -77,6 +78,7 @@ async function logDecision(
 
 serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
+  _tickStartMs = Date.now();
 
   try {
     // 1. AUTHENTICATE with diagnostics
@@ -136,7 +138,10 @@ serve(async (req) => {
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
     const now = new Date();
-    console.log('[cron-tick] Tick received');
+    console.log(JSON.stringify({
+      diag_tag: 'tick_started',
+      ts: now.toISOString()
+    }));
 
     // 2. LOAD CONFIG
     const { data: config, error: configError } = await supabase
@@ -620,11 +625,26 @@ serve(async (req) => {
   }
 });
 
+// Wrapper: wrap the serve handler to add tick_started/tick_completed logging
+// (implemented inline below via helper in jsonResp path)
+
 // ============================================================
 // HELPERS
 // ============================================================
 
 function jsonResp(body: Record<string, unknown>, status = 200): Response {
+  // Structured tick_completed log for every tick outcome
+  console.log(JSON.stringify({
+    diag_tag: 'tick_completed',
+    ts: new Date().toISOString(),
+    duration_ms: _tickStartMs > 0 ? Date.now() - _tickStartMs : undefined,
+    outcome_status: body.status,
+    run_id: body.run_id || null,
+    current_step: body.current_step || null,
+    reason: body.reason || null,
+    resume_status: body.resume_status || null,
+    http_status: status
+  }));
   return new Response(JSON.stringify(body), {
     status,
     headers: { ...corsHeaders, 'Content-Type': 'application/json' }
