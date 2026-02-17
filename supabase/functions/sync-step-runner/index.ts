@@ -1070,7 +1070,7 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
         console.log(`[parse_merge] Artifacts missing with resume markers — attempting rebuild`);
         try {
           await supabase.rpc('log_sync_event', {
-            p_run_id: runId, p_level: 'WARN', p_message: 'pipeline_artifact_missing',
+            p_run_id: runId, p_level: 'ERROR', p_message: 'pipeline_artifact_missing',
             p_details: { step: 'parse_merge', missing_artifacts: missingPhase2 }
           });
         } catch (_e) { /* non-blocking */ }
@@ -1099,6 +1099,21 @@ async function stepParseMerge(supabase: SupabaseClient, runId: string): Promise<
             skipped: { noStock: 0, noPrice: 0, lowStock: 0, noValid: 0 },
           }
         });
+
+        // Verify persistence: re-read state and assert artifact_rebuild_attempted is true
+        const verifyState = await getParseMergeState(supabase, runId);
+        if (!(verifyState as Record<string, unknown> | null)?.artifact_rebuild_attempted) {
+          const verifyError = `pipeline_artifact_rebuild_persist_failed: artifact_rebuild_attempted not persisted after merge. State persistence unreliable.`;
+          console.error(`[parse_merge] ${verifyError}`);
+          try {
+            await supabase.rpc('log_sync_event', {
+              p_run_id: runId, p_level: 'ERROR', p_message: 'pipeline_artifact_rebuild_persist_failed',
+              p_details: { step: 'parse_merge', missing_artifacts: missingPhase2 }
+            });
+          } catch (_e) { /* non-blocking */ }
+          await updateParseMergeState(supabase, runId, { status: 'failed', error: verifyError });
+          return { success: false, error: verifyError, status: 'failed' };
+        }
 
         try {
           await supabase.rpc('log_sync_event', {
@@ -1740,11 +1755,95 @@ async function updateStepResult(supabase: SupabaseClient, runId: string, stepNam
 }
 
 // ========== STEP: PRICING ==========
+// ========== PRICING FEE VALIDATION ==========
+function validatePricingFeeConfig(feeConfig: FeeConfig | null | undefined): {
+  ok: boolean;
+  missing_fields: string[];
+  invalid_fields: string[];
+  safe_summary: Record<string, string>;
+} {
+  const missing: string[] = [];
+  const invalid: string[] = [];
+  const safe: Record<string, string> = {};
+
+  if (!feeConfig) {
+    return {
+      ok: false,
+      missing_fields: ['feeDrev', 'feeMkt', 'shippingCost'],
+      invalid_fields: [],
+      safe_summary: { feeDrev: 'missing', feeMkt: 'missing', shippingCost: 'missing' }
+    };
+  }
+
+  const requiredFields: Array<{ key: keyof FeeConfig; label: string; allowZero: boolean }> = [
+    { key: 'feeDrev', label: 'feeDrev', allowZero: false },
+    { key: 'feeMkt', label: 'feeMkt', allowZero: false },
+    { key: 'shippingCost', label: 'shippingCost', allowZero: true },
+  ];
+
+  for (const { key, label, allowZero } of requiredFields) {
+    const val = feeConfig[key];
+    if (val === undefined || val === null) {
+      missing.push(label);
+      safe[label] = 'missing';
+    } else if (typeof val !== 'number' || isNaN(val) || !isFinite(val)) {
+      invalid.push(label);
+      safe[label] = String(val);
+    } else if (!allowZero && val <= 0) {
+      invalid.push(label);
+      safe[label] = String(val);
+    } else if (val < 0) {
+      invalid.push(label);
+      safe[label] = String(val);
+    } else {
+      safe[label] = String(val);
+    }
+  }
+
+  return { ok: missing.length === 0 && invalid.length === 0, missing_fields: missing, invalid_fields: invalid, safe_summary: safe };
+}
+
 async function stepPricing(supabase: SupabaseClient, runId: string, feeConfig: FeeConfig): Promise<{ success: boolean; error?: string }> {
   console.log(`[sync:step:pricing] Starting for run ${runId}`);
   const startTime = Date.now();
   
   try {
+    // ========== FEE CONFIG VALIDATION ==========
+    if (!feeConfig) {
+      const error = 'Errore calcolo prezzi: configurazione fee non disponibile';
+      console.error(`[sync:step:pricing] ${error}`);
+      try {
+        await supabase.rpc('log_sync_event', {
+          p_run_id: runId, p_level: 'ERROR', p_message: 'pricing_config_missing_source',
+          p_details: { step: 'pricing', source: 'fee_config (payload from orchestrator)', reason: 'feeConfig is null or undefined' }
+        });
+      } catch (_e) { /* non-blocking */ }
+      await updateStepResult(supabase, runId, 'pricing', { status: 'failed', error, metrics: {} });
+      return { success: false, error };
+    }
+
+    const validation = validatePricingFeeConfig(feeConfig);
+    if (!validation.ok) {
+      const missingStr = validation.missing_fields.length > 0 ? `Mancano: ${validation.missing_fields.join(', ')}` : '';
+      const invalidStr = validation.invalid_fields.length > 0 ? `Non validi: ${validation.invalid_fields.join(', ')}` : '';
+      const parts = [missingStr, invalidStr].filter(Boolean).join('. ');
+      const error = `Errore calcolo prezzi: configurazione fee non valida. ${parts}.`;
+      console.error(`[sync:step:pricing] ${error}`);
+      try {
+        await supabase.rpc('log_sync_event', {
+          p_run_id: runId, p_level: 'ERROR', p_message: 'pricing_config_invalid',
+          p_details: {
+            step: 'pricing',
+            missing_fields: validation.missing_fields,
+            invalid_fields: validation.invalid_fields,
+            safe_values_summary: validation.safe_summary
+          }
+        });
+      } catch (_e) { /* non-blocking */ }
+      await updateStepResult(supabase, runId, 'pricing', { status: 'failed', error, metrics: {} });
+      return { success: false, error };
+    }
+
     const { products, error: loadError } = await loadProductsTSV(supabase, runId);
     
     if (loadError || !products) {
@@ -1753,9 +1852,9 @@ async function stepPricing(supabase: SupabaseClient, runId: string, feeConfig: F
       return { success: false, error };
     }
     
-    const feeDrev = feeConfig?.feeDrev || 1.05;
-    const feeMkt = feeConfig?.feeMkt || 1.08;
-    const shippingCost = feeConfig?.shippingCost || 6.00;
+    const feeDrev = feeConfig.feeDrev!;
+    const feeMkt = feeConfig.feeMkt!;
+    const shippingCost = feeConfig.shippingCost!;
     
     console.log(`[sync:step:pricing] Processing ${products.length} products with fees: DREV=${feeDrev}, MKT=${feeMkt}, SHIP=${shippingCost}`);
     
