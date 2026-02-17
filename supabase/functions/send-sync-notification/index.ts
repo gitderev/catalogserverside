@@ -306,7 +306,13 @@ async function buildTextBody(run: Record<string, unknown>, supabase: ReturnType<
     const status = st?.status || 'pending';
     const dur = st?.duration_ms ? `${Math.round(st.duration_ms as number)}ms` : '-';
     const rows = st?.rows_written || st?.rows || '';
-    lines.push(`  ${s.padEnd(22)} ${String(status).padEnd(12)} ${dur}${rows ? ` (${rows} rows)` : ''}`);
+    let stepLine = `  ${s.padEnd(22)} ${String(status).padEnd(12)} ${dur}${rows ? ` (${rows} rows)` : ''}`;
+    // Show step error message for failed steps
+    if (status === 'failed' && st?.error) {
+      const errStr = String(st.error).substring(0, 200);
+      stepLine += `\n    ↳ ${errStr}`;
+    }
+    lines.push(stepLine);
   }
   lines.push('');
 
