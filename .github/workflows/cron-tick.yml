@@ -45,26 +45,24 @@ jobs:
           CURL_EXIT=$?
           set -e
 
+          BODY=$(cat "$BODY_FILE" 2>/dev/null || echo "")
+          rm -f "$BODY_FILE"
+          BODY_TRUNCATED=$(printf '%s' "$BODY" | head -c 500)
+
+          echo "curl_exit=$CURL_EXIT http_status=$HTTP_STATUS ts=$TS"
+          echo "body=$BODY_TRUNCATED"
+
           # TIMEOUT (curl 28): log and exit cleanly — next minute's tick will handle it.
-          # Do NOT retry in the same minute to avoid concurrent resume calls.
           if [ "$CURL_EXIT" -eq 28 ]; then
-            echo "::warning::curl timeout (28), delegating to next tick"
-            rm -f "$BODY_FILE"
+            echo "::warning::curl timeout (exit=28, http=$HTTP_STATUS) at $TS — delegating to next tick"
             exit 0
           fi
 
           if [ "$CURL_EXIT" -ne 0 ]; then
-            echo "::error::cron-tick curl failed (exit code $CURL_EXIT, HTTP $HTTP_STATUS)"
-            cat "$BODY_FILE" | head -c 1000
-            rm -f "$BODY_FILE"
+            echo "::error::cron-tick curl failed (exit=$CURL_EXIT, http=$HTTP_STATUS) at $TS"
+            echo "::error::body=$BODY_TRUNCATED"
             exit 1
           fi
-
-          BODY=$(cat "$BODY_FILE")
-          rm -f "$BODY_FILE"
-
-          BODY_TRUNCATED=$(printf '%s' "$BODY" | head -c 1000)
-          echo "http_status=$HTTP_STATUS body=$BODY_TRUNCATED"
 
           # Parse status from JSON response
           RESP_STATUS=$(python3 -c "
@@ -76,9 +74,5 @@ jobs:
               print('unknown')
           " "$BODY" 2>/dev/null || echo "unknown")
 
-          echo "parsed_status=$RESP_STATUS"
-
-          # STOP CONDITIONS: if the response indicates locked, yielded, or retry_delay,
-          # the tick has done its job — do not make additional calls.
-          # The next tick (1 minute later) will pick up from here.
+          echo "parsed_status=$RESP_STATUS http=$HTTP_STATUS curl_exit=$CURL_EXIT ts=$TS"
           echo "cron-tick completed (status=$RESP_STATUS)"
