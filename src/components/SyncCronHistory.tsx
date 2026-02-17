@@ -12,6 +12,8 @@ import {
   Activity, ChevronDown, ChevronRight, Zap, Copy, Filter
 } from 'lucide-react';
 import { toast } from '@/hooks/use-toast';
+import { STEP_LABELS, EXPECTED_STEPS } from '@/shared/expectedSteps';
+import { formatTimestamp } from '@/shared/formatTimestamp';
 
 interface CronRun {
   id: string;
@@ -36,23 +38,7 @@ interface SyncEvent {
   details: Record<string, any> | null;
 }
 
-const STEP_LABELS: Record<string, string> = {
-  import_ftp: 'Import FTP',
-  parse_merge: 'Parsing e Merge',
-  ean_mapping: 'Mapping EAN',
-  pricing: 'Calcolo Prezzi',
-  override_products: 'Override Prodotti',
-  export_ean: 'Export Catalogo EAN',
-  export_ean_xlsx: 'Export EAN (XLSX)',
-  export_amazon: 'Export Amazon',
-  export_mediaworld: 'Export Mediaworld',
-  export_eprice: 'Export ePrice',
-  upload_sftp: 'Upload SFTP',
-  versioning: 'Versioning',
-  notification: 'Notifica',
-};
-
-const CANONICAL_STEPS = Object.keys(STEP_LABELS);
+const CANONICAL_STEPS = [...EXPECTED_STEPS];
 
 const STATUS_LABELS: Record<string, string> = {
   running: 'In esecuzione',
@@ -70,10 +56,7 @@ function formatDuration(ms: number | null): string {
 }
 
 function formatTime(iso: string): string {
-  return new Date(iso).toLocaleString('it-IT', {
-    day: '2-digit', month: '2-digit', year: '2-digit',
-    hour: '2-digit', minute: '2-digit', second: '2-digit',
-  });
+  return formatTimestamp(iso);
 }
 
 function deriveFailingStep(steps: Record<string, any>): string | null {

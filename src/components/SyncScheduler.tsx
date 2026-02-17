@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { supabase } from '@/integrations/supabase/client';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -13,25 +13,19 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } f
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { toast } from '@/hooks/use-toast';
 import { 
-  Clock, 
-  Play, 
-  Square, 
-  RefreshCw, 
-  CheckCircle, 
-  XCircle, 
-  AlertTriangle, 
-  Loader2,
-  Calendar,
-  Activity,
-  FileText,
-  Upload,
-  ChevronDown,
-  ChevronRight,
-  Server,
-  Zap,
-  Copy
+  Clock, Play, Square, RefreshCw, CheckCircle, XCircle, AlertTriangle, Loader2,
+  Calendar, Activity, FileText, Upload, ChevronDown, ChevronRight, Server, Zap, Copy
 } from 'lucide-react';
 import { SyncHealthPanel } from '@/components/SyncHealthPanel';
+import { STEP_LABELS, EXPECTED_STEPS, assertExpectedSteps } from '@/shared/expectedSteps';
+import { formatTimestamp, formatTimestampShort } from '@/shared/formatTimestamp';
+import {
+  SyncRunRecord, classifyRun, getLastRunAll, getLastRunByTrigger,
+  deriveAutoDisableInfo, sortRunsDeterministically
+} from '@/shared/syncDerivations';
+
+// Runtime assert on mount (non-blocking)
+assertExpectedSteps();
 
 interface SyncConfig {
   id: number;
@@ -47,56 +41,6 @@ interface SyncConfig {
   run_timeout_minutes: number;
   max_attempts: number;
   last_disabled_reason: string | null;
-}
-
-/**
- * Valori di stato possibili nella tabella sync_runs:
- * - running: sincronizzazione in corso
- * - success: sincronizzazione completata con successo
- * - failed: sincronizzazione fallita (per errore, timeout, cancel, o reset)
- * - timeout: sincronizzazione interrotta per superamento tempo massimo
- * - skipped: sincronizzazione saltata (es. frequenza non ancora raggiunta)
- */
-interface SyncRun {
-  id: string;
-  started_at: string;
-  finished_at: string | null;
-  status: 'running' | 'success' | 'success_with_warning' | 'failed' | 'timeout' | 'skipped';
-  trigger_type: 'cron' | 'manual';
-  attempt: number;
-  runtime_ms: number | null;
-  error_message: string | null;
-  error_details: unknown;
-  steps: Record<string, StepResult>;
-  metrics: PipelineMetrics;
-  cancel_requested: boolean;
-  cancelled_by_user: boolean;
-  warning_count: number;
-  location_warnings: Record<string, number>;
-}
-
-// Stale run threshold is dynamic: uses config.run_timeout_minutes (default 60min)
-
-interface StepResult {
-  status: 'success' | 'failed' | 'skipped';
-  duration_ms: number;
-  [key: string]: unknown;
-}
-
-interface PipelineMetrics {
-  products_total: number;
-  products_processed: number;
-  products_ean_mapped: number;
-  products_ean_missing: number;
-  products_ean_invalid: number;
-  products_after_override: number;
-  mediaworld_export_rows: number;
-  mediaworld_export_skipped: number;
-  eprice_export_rows: number;
-  eprice_export_skipped: number;
-  exported_files_count: number;
-  sftp_uploaded_files: number;
-  warnings: string[];
 }
 
 const FREQUENCY_OPTIONS = [
@@ -123,76 +67,16 @@ const NOTIFICATION_MODE_LABELS: Record<string, string> = {
   only_on_problem: 'Solo in caso di problemi'
 };
 
-const STEP_LABELS: Record<string, string> = {
-  import_ftp: 'Import FTP',
-  parse_merge: 'Parsing e Merge',
-  ean_mapping: 'Mapping EAN',
-  pricing: 'Calcolo Prezzi',
-  override_products: 'Override Prodotti',
-  export_ean: 'Export Catalogo EAN',
-  export_ean_xlsx: 'Export Catalogo EAN (XLSX)',
-  export_amazon: 'Export Amazon',
-  export_mediaworld: 'Export Mediaworld',
-  export_eprice: 'Export ePrice',
-  upload_sftp: 'Upload SFTP',
-  versioning: 'Versioning',
-  notification: 'Notifica'
-};
-
 // Helper function to get user-friendly error messages in Italian
-const getFriendlyErrorMessage = (errorMessage: string | null, errorDetails: unknown): string => {
-  if (!errorMessage) return 'Errore sconosciuto';
+const getFriendlyErrorMessage = (run: SyncRunRecord): string => {
+  const classification = classifyRun(run);
   
-  const msg = errorMessage.toLowerCase();
-  const details = errorDetails ? JSON.stringify(errorDetails).toLowerCase() : '';
-  
-  // FTP authentication errors
-  if (msg.includes('ftp') || msg.includes('authentication') || msg.includes('login') || details.includes('530')) {
-    if (msg.includes('credential') || msg.includes('password') || msg.includes('auth') || details.includes('530') || details.includes('login')) {
-      return 'Errore import FTP: credenziali non valide (verifica host, utente e password FTP)';
-    }
-    if (msg.includes('connection') || msg.includes('connect') || msg.includes('timeout') || msg.includes('refused')) {
-      return 'Errore import FTP: impossibile connettersi al server (verifica host e porta FTP)';
-    }
-    if (msg.includes('host') || msg.includes('resolve') || msg.includes('dns')) {
-      return 'Errore import FTP: server non raggiungibile (verifica l\'indirizzo host)';
-    }
-  }
-  
-  // SFTP errors
-  if (msg.includes('sftp') || msg.includes('upload')) {
-    if (msg.includes('credential') || msg.includes('password') || msg.includes('auth')) {
-      return 'Errore upload SFTP: credenziali non valide (verifica utente e password SFTP)';
-    }
-    if (msg.includes('connection') || msg.includes('connect')) {
-      return 'Errore upload SFTP: impossibile connettersi al server';
-    }
-    return 'Errore upload SFTP: caricamento file non riuscito';
-  }
-  
-  // Pricing errors
-  if (msg.includes('pricing') || msg.includes('prezzo') || msg.includes('price')) {
-    return 'Errore calcolo prezzi: verifica la configurazione delle fee';
-  }
-  
-  // Override errors
-  if (msg.includes('override') && msg.includes('.99')) {
-    return 'Errore override: il prezzo finale deve terminare con ,99';
-  }
-  
-  // User cancelled
-  if (msg.includes('interrotta') || msg.includes('cancel')) {
+  // Use classifyRun's deterministic classification
+  if (classification.isCancelled) {
     return 'Sincronizzazione interrotta manualmente dall\'utente';
   }
   
-  // Timeout
-  if (msg.includes('timeout') || msg.includes('30 minuti')) {
-    return 'Sincronizzazione interrotta per timeout (superati 30 minuti)';
-  }
-  
-  // IMPORTANT: Do NOT mask file/parse errors with a generic message.
-  // Pass through the original error so the user sees the real cause.
-  return errorMessage.length > 200 ? errorMessage.substring(0, 200) + '...' : errorMessage;
+  return classification.displayReason || run.error_message || 'Errore sconosciuto';
 };
 
 // Status badge with proper colors
@@ -225,12 +109,20 @@ const getStatusBadge = (status: string, size: 'sm' | 'md' = 'sm') => {
   );
 };
 
+const TriggerBadge: React.FC<{ trigger: string }> = ({ trigger }) => (
+  <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium ${
+    trigger === 'cron' ? 'alt-badge alt-badge-info' : 'alt-badge alt-badge-success'
+  }`}>
+    {trigger === 'cron' ? <><Zap className="h-3 w-3" /> Automatica</> : <><Play className="h-3 w-3" /> Manuale</>}
+  </span>
+);
+
 export const SyncScheduler: React.FC = () => {
   const [config, setConfig] = useState<SyncConfig | null>(null);
-  const [runs, setRuns] = useState<SyncRun[]>([]);
-  const [currentRun, setCurrentRun] = useState<SyncRun | null>(null);
+  const [runs, setRuns] = useState<SyncRunRecord[]>([]);
+  const [currentRun, setCurrentRun] = useState<SyncRunRecord | null>(null);
   const [isStaleRun, setIsStaleRun] = useState(false);
-  const [selectedRun, setSelectedRun] = useState<SyncRun | null>(null);
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
@@ -240,6 +132,23 @@ export const SyncScheduler: React.FC = () => {
   const [expandedLogDetails, setExpandedLogDetails] = useState<string | null>(null);
   const [runEvents, setRunEvents] = useState<Array<{ id: string; level: string; message: string; details: unknown; created_at: string; step: string | null }>>([]);
   const [isLoadingEvents, setIsLoadingEvents] = useState(false);
+
+  // Derive selectedRun from runs by ID (always fresh)
+  const selectedRun = useMemo(() => {
+    if (!selectedRunId) return null;
+    return runs.find(r => r.id === selectedRunId) || null;
+  }, [selectedRunId, runs]);
+
+  // Derive last run (any trigger) and last cron run using deterministic sort
+  const lastRunAll = useMemo(() => getLastRunAll(runs), [runs]);
+  const lastCronRun = useMemo(() => getLastRunByTrigger(runs, 'cron'), [runs]);
+
+  // Derive auto-disable banner info deterministically
+  const autoDisableInfo = useMemo(() => {
+    if (!config) return { shouldShowBanner: false, streak: 0, maxAttempts: 3, targetRunId: null, reason: null };
+    const cronRuns = runs.filter(r => r.trigger_type === 'cron');
+    return deriveAutoDisableInfo(config, cronRuns);
+  }, [config, runs]);
 
   // Load config and runs
   const loadData = useCallback(async () => {
@@ -260,28 +169,23 @@ export const SyncScheduler: React.FC = () => {
         .from('sync_runs')
         .select('*')
         .order('started_at', { ascending: false })
-        .limit(20);
+        .limit(50);
 
       if (runsError) throw runsError;
       
-      setRuns((runsData || []) as unknown as SyncRun[]);
+      setRuns((runsData || []) as unknown as SyncRunRecord[]);
 
-      // Trova run in stato running
+      // Find running run
       const running = (runsData || []).find((r: Record<string, unknown>) => r.status === 'running');
       
       if (running) {
-        // Use config.run_timeout_minutes for stale detection (default 60)
         const staleThresholdMs = ((configData as SyncConfig)?.run_timeout_minutes || 60) * 60 * 1000;
-        const startedAt = new Date(running.started_at).getTime();
+        const startedAt = new Date(running.started_at as string).getTime();
         const elapsed = Date.now() - startedAt;
         const isStale = elapsed > staleThresholdMs;
         
-        setCurrentRun(running as unknown as SyncRun);
+        setCurrentRun(running as unknown as SyncRunRecord);
         setIsStaleRun(isStale);
-        
-        if (isStale) {
-          console.log(`[SyncScheduler] Detected stale run: ${running.id}, running for ${Math.round(elapsed / 60000)} minutes`);
-        }
       } else {
         setCurrentRun(null);
         setIsStaleRun(false);
@@ -299,15 +203,17 @@ export const SyncScheduler: React.FC = () => {
     }
   }, []);
 
+  // Adaptive polling: 10s if running, 60s if idle
   useEffect(() => {
     loadData();
-    const interval = setInterval(loadData, 10000);
+    const intervalMs = currentRun ? 10_000 : 60_000;
+    const interval = setInterval(loadData, intervalMs);
     return () => clearInterval(interval);
-  }, [loadData]);
+  }, [loadData, !!currentRun]);
 
-  // Load sync_events when a run is selected
+  // Load sync_events when a run is selected (by ID)
   useEffect(() => {
-    if (!selectedRun) {
+    if (!selectedRunId) {
       setRunEvents([]);
       return;
     }
@@ -317,7 +223,7 @@ export const SyncScheduler: React.FC = () => {
         const { data, error } = await supabase
           .from('sync_events')
           .select('id, level, message, details, created_at, step')
-          .eq('run_id', selectedRun.id)
+          .eq('run_id', selectedRunId)
           .order('created_at', { ascending: false })
           .limit(50);
         if (!error && data) {
@@ -330,46 +236,41 @@ export const SyncScheduler: React.FC = () => {
       }
     };
     loadEvents();
-  }, [selectedRun?.id]);
+  }, [selectedRunId]);
 
   const saveConfig = async (updates: Partial<SyncConfig>) => {
     if (!config) {
-      // Config not loaded yet — try to create singleton
       toast({ title: 'Errore', description: 'Configurazione non ancora caricata', variant: 'destructive' });
       return;
     }
 
-    if (import.meta.env.DEV) {
-      console.log('[SyncScheduler] saveConfig called:', JSON.stringify(updates), new Date().toISOString());
+    // Validate max_attempts <= 5
+    if (updates.max_attempts !== undefined && updates.max_attempts > 5) {
+      updates.max_attempts = 5;
     }
 
-    // Optimistic update
     const previousConfig = { ...config };
     setConfig({ ...config, ...updates });
     setIsSaving(true);
 
     try {
-      const { error, count } = await supabase
+      const { error } = await supabase
         .from('sync_config')
         .update(updates)
         .eq('id', 1);
 
       if (error) throw error;
 
-      toast({
-        title: 'Salvato',
-        description: 'Configurazione aggiornata'
-      });
+      toast({ title: 'Salvato', description: 'Configurazione aggiornata' });
+      // Refetch after config change
+      await loadData();
     } catch (error: unknown) {
-      // Rollback on failure
       setConfig(previousConfig);
       const supaError = error as { code?: string; message?: string };
-      const errorCode = supaError?.code || 'UNKNOWN';
-      const errorMessage = supaError?.message || 'Errore sconosciuto';
-      console.error('Error saving config:', errorCode, errorMessage);
+      console.error('Error saving config:', supaError?.code, supaError?.message);
       toast({
         title: 'Errore salvataggio',
-        description: `Impossibile salvare (${errorCode}): ${errorMessage}`,
+        description: `Impossibile salvare: ${supaError?.message || 'Errore sconosciuto'}`,
         variant: 'destructive'
       });
     } finally {
@@ -385,26 +286,20 @@ export const SyncScheduler: React.FC = () => {
         throw new Error('Sessione non valida');
       }
 
-      // Single invocation - cron-tick handles resume automatically
       const response = await supabase.functions.invoke('run-full-sync', {
         body: { trigger: 'manual' }
       });
 
-      if (response.error) {
-        throw new Error(response.error.message);
-      }
+      if (response.error) throw new Error(response.error.message);
 
       const data = response.data;
-
-      if (data.status === 'error') {
-        throw new Error(data.message);
-      }
+      if (data.status === 'error') throw new Error(data.message);
 
       if (data.status === 'yielded' && data.reason === 'locked') {
         toast({
           title: 'Sincronizzazione in corso',
           description: data.run_id 
-            ? `Run ${data.run_id.substring(0, 8)}… già in esecuzione, verrà ripresa automaticamente` 
+            ? `Run ${data.run_id.substring(0, 8)}… già in esecuzione` 
             : 'Attendi il completamento della sincronizzazione corrente',
         });
       } else if (data.status === 'resumed' || data.status === 'yielded') {
@@ -412,14 +307,12 @@ export const SyncScheduler: React.FC = () => {
           title: data.status === 'resumed' ? 'Ripresa sincronizzazione' : 'Sincronizzazione in pausa',
           description: data.status === 'resumed'
             ? `Ripresa run esistente ${(data.run_id || '').substring(0, 8)}…`
-            : `Run ${(data.run_id || '').substring(0, 8)}… in pausa (yield), verrà ripresa dal cron`,
+            : `Run ${(data.run_id || '').substring(0, 8)}… in pausa, verrà ripresa dal cron`,
         });
       } else {
         toast({
           title: 'Sincronizzazione avviata',
-          description: data.needs_resume 
-            ? 'La pipeline è in esecuzione. Il resume continuerà automaticamente.' 
-            : 'La pipeline è in esecuzione'
+          description: 'La pipeline è in esecuzione'
         });
       }
 
@@ -439,10 +332,7 @@ export const SyncScheduler: React.FC = () => {
 
   const stopSync = async (force = false) => {
     if (!currentRun) {
-      toast({
-        title: 'Nessuna sync in corso',
-        description: 'Non c\'è alcuna sincronizzazione da interrompere'
-      });
+      toast({ title: 'Nessuna sync in corso', description: 'Non c\'è alcuna sincronizzazione da interrompere' });
       return;
     }
 
@@ -451,16 +341,9 @@ export const SyncScheduler: React.FC = () => {
       const response = await supabase.functions.invoke('stop-sync', {
         body: { run_id: currentRun.id, force }
       });
-
-      if (response.error) {
-        throw new Error(response.error.message);
-      }
-
+      if (response.error) throw new Error(response.error.message);
       const data = response.data;
-
-      if (data.status === 'error') {
-        throw new Error(data.message);
-      }
+      if (data.status === 'error') throw new Error(data.message);
 
       toast({
         title: force ? 'Sincronizzazione interrotta' : 'Richiesta inviata',
@@ -468,9 +351,7 @@ export const SyncScheduler: React.FC = () => {
           ? 'La sincronizzazione è stata interrotta immediatamente' 
           : 'La sincronizzazione verrà interrotta al prossimo step'
       });
-
       await loadData();
-
     } catch (error: unknown) {
       console.error('Error stopping sync:', error);
       toast({
@@ -483,13 +364,9 @@ export const SyncScheduler: React.FC = () => {
     }
   };
 
-  // Funzione per forzare il reset di run zombie/bloccate
   const forceResetSync = async () => {
     if (!currentRun) {
-      toast({
-        title: 'Nessuna sync da resettare',
-        description: 'Non c\'è alcuna sincronizzazione bloccata'
-      });
+      toast({ title: 'Nessuna sync da resettare', description: 'Non c\'è alcuna sincronizzazione bloccata' });
       return;
     }
 
@@ -498,24 +375,12 @@ export const SyncScheduler: React.FC = () => {
       const response = await supabase.functions.invoke('force-reset-sync', {
         body: { run_id: currentRun.id }
       });
-
-      if (response.error) {
-        throw new Error(response.error.message);
-      }
-
+      if (response.error) throw new Error(response.error.message);
       const data = response.data;
+      if (data.status === 'error') throw new Error(data.message);
 
-      if (data.status === 'error') {
-        throw new Error(data.message);
-      }
-
-      toast({
-        title: 'Reset completato',
-        description: 'La sincronizzazione bloccata è stata resettata'
-      });
-
+      toast({ title: 'Reset completato', description: 'La sincronizzazione bloccata è stata resettata' });
       await loadData();
-
     } catch (error: unknown) {
       console.error('Error resetting sync:', error);
       toast({
@@ -535,38 +400,20 @@ export const SyncScheduler: React.FC = () => {
       const dailyTime = config.daily_time || '03:00';
       const [hours, minutes] = dailyTime.split(':').map(Number);
       const now = new Date();
-      // Display in Europe/Rome timezone
       const romeNow = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Rome' }));
       const target = new Date(romeNow);
       target.setHours(hours, minutes, 0, 0);
-      
-      if (target <= romeNow) {
-        target.setDate(target.getDate() + 1);
-      }
-      
+      if (target <= romeNow) target.setDate(target.getDate() + 1);
       return `${target.toLocaleDateString('it-IT')} alle ${dailyTime} (Europe/Rome)`;
     }
 
     // Hours mode
-    const lastCronRun = runs.find(r => r.trigger_type === 'cron' && r.attempt === 1);
-    if (!lastCronRun) return 'Prossima esecuzione programmata';
+    const lastCron = runs.find(r => r.trigger_type === 'cron' && r.attempt === 1);
+    if (!lastCron) return 'Prossima esecuzione programmata';
 
-    const lastStarted = new Date(lastCronRun.started_at);
+    const lastStarted = new Date(lastCron.started_at);
     const nextRun = new Date(lastStarted.getTime() + config.frequency_minutes * 60 * 1000);
-
-    return nextRun.toLocaleString('it-IT', {
-      day: '2-digit',
-      month: '2-digit',
-      year: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit'
-    });
-  };
-
-  const hasMaxRetriesWarning = (): boolean => {
-    const maxAttempts = config?.max_attempts || 3;
-    const lastCronRun = runs.find(r => r.trigger_type === 'cron');
-    return lastCronRun?.attempt === maxAttempts && ['failed', 'timeout'].includes(lastCronRun.status);
+    return formatTimestampShort(nextRun.toISOString());
   };
 
   const formatDuration = (ms: number | null): string => {
@@ -588,7 +435,6 @@ export const SyncScheduler: React.FC = () => {
 
   return (
     <>
-      {/* Main Scheduling Card */}
       <Card className="mb-6 alt-card">
         <CardHeader className="pb-4">
           <CardTitle className="flex items-center gap-2 text-xl font-bold">
@@ -601,27 +447,26 @@ export const SyncScheduler: React.FC = () => {
         </CardHeader>
 
         <CardContent className="space-y-6">
-          {/* Warning for max retries */}
-          {hasMaxRetriesWarning() && (
+          {/* Auto-disable banner: deterministic, only for auto-disable, points to correct run */}
+          {autoDisableInfo.shouldShowBanner && (
             <div className="alt-alert alt-alert-error">
               <AlertTriangle className="h-5 w-5 text-error flex-shrink-0 mt-0.5" />
               <div>
                 <p className="font-semibold text-error">
-                  Attenzione: la sincronizzazione automatica ha fallito {config?.max_attempts || 3} volte consecutive.
+                  Sincronizzazione automatica disabilitata: {autoDisableInfo.streak} fallimenti cron consecutivi (soglia: {autoDisableInfo.maxAttempts}).
                 </p>
                 <p className="text-sm alt-text-muted mt-1">
-                  Controlla i log per verificare il problema e correggerlo.
+                  Controlla i log per verificare il problema e correggerlo, poi riabilita lo scheduler.
                 </p>
-                <Button
-                  variant="link"
-                  className="p-0 h-auto text-error hover:text-error/80 font-medium"
-                  onClick={() => {
-                    const failedRun = runs.find(r => r.trigger_type === 'cron' && r.attempt === (config?.max_attempts || 3));
-                    if (failedRun) setSelectedRun(failedRun);
-                  }}
-                >
-                  Visualizza ultimo job fallito -&gt;
-                </Button>
+                {autoDisableInfo.targetRunId && (
+                  <Button
+                    variant="link"
+                    className="p-0 h-auto text-error hover:text-error/80 font-medium"
+                    onClick={() => setSelectedRunId(autoDisableInfo.targetRunId)}
+                  >
+                    Visualizza ultimo job fallito →
+                  </Button>
+                )}
               </div>
             </div>
           )}
@@ -637,12 +482,7 @@ export const SyncScheduler: React.FC = () => {
                   <Switch
                     id="sync-enabled"
                     checked={config?.enabled || false}
-                    onCheckedChange={(checked: boolean) => {
-                      if (import.meta.env.DEV) {
-                        console.log('[SyncScheduler] toggle_click', { checked, ts: Date.now() });
-                      }
-                      saveConfig({ enabled: checked });
-                    }}
+                    onCheckedChange={(checked: boolean) => saveConfig({ enabled: checked })}
                     disabled={isSaving || !config}
                     className="data-[state=checked]:bg-primary"
                   />
@@ -706,9 +546,7 @@ export const SyncScheduler: React.FC = () => {
                     </SelectTrigger>
                     <SelectContent>
                       {FREQUENCY_OPTIONS.map(opt => (
-                        <SelectItem key={opt.value} value={opt.value}>
-                          {opt.label}
-                        </SelectItem>
+                        <SelectItem key={opt.value} value={opt.value}>{opt.label}</SelectItem>
                       ))}
                     </SelectContent>
                   </Select>
@@ -797,29 +635,35 @@ export const SyncScheduler: React.FC = () => {
 
           {/* Status Summary Section */}
           <div className="grid gap-4 md:grid-cols-3">
-            {/* Last sync */}
+            {/* Last sync (any trigger) */}
             <div className="alt-panel rounded-lg p-4">
               <div className="flex items-center gap-2 mb-2">
                 <Activity className="h-4 w-4 alt-text-muted" />
                 <span className="text-xs font-semibold alt-text-muted uppercase tracking-wide">Ultima sincronizzazione</span>
               </div>
-              {runs.length > 0 ? (
+              {lastRunAll ? (
                 <div className="space-y-2">
-                  <div className="flex items-center gap-2">
-                    {getStatusBadge(runs[0].status, 'md')}
+                  <div className="flex items-center gap-2 flex-wrap">
+                    {getStatusBadge(lastRunAll.status, 'md')}
+                    <TriggerBadge trigger={lastRunAll.trigger_type} />
                   </div>
                   <p className="text-sm alt-text-muted">
-                    {new Date(runs[0].started_at).toLocaleString('it-IT', {
-                      day: '2-digit',
-                      month: '2-digit',
-                      hour: '2-digit',
-                      minute: '2-digit'
-                    })}
+                    {formatTimestampShort(lastRunAll.started_at)}
                   </p>
-                  {runs[0].error_message && runs[0].status === 'failed' && (
+                  {lastRunAll.status === 'failed' && (
                     <p className="text-xs text-error alt-info-box px-2 py-1 rounded">
-                      {getFriendlyErrorMessage(runs[0].error_message, runs[0].error_details)}
+                      {getFriendlyErrorMessage(lastRunAll)}
                     </p>
+                  )}
+                  {/* Show last cron run if different from last run overall */}
+                  {lastCronRun && lastCronRun.id !== lastRunAll.id && (
+                    <div className="mt-2 pt-2 border-t border-border">
+                      <p className="text-xs alt-text-muted mb-1">Ultima automatica:</p>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        {getStatusBadge(lastCronRun.status)}
+                        <span className="text-xs alt-text-muted">{formatTimestampShort(lastCronRun.started_at)}</span>
+                      </div>
+                    </div>
                   )}
                 </div>
               ) : (
@@ -833,15 +677,15 @@ export const SyncScheduler: React.FC = () => {
                 <Server className="h-4 w-4 alt-text-muted" />
                 <span className="text-xs font-semibold alt-text-muted uppercase tracking-wide">Riepilogo</span>
               </div>
-              {runs.length > 0 && runs[0].metrics ? (
+              {lastRunAll && lastRunAll.metrics ? (
                 <div className="space-y-1">
                   <div className="flex justify-between">
                     <span className="text-sm alt-text-muted">Prodotti</span>
-                    <span className="text-sm font-semibold">{runs[0].metrics.products_processed || 0}</span>
+                    <span className="text-sm font-semibold">{(lastRunAll.metrics as Record<string, unknown>).products_processed as number || 0}</span>
                   </div>
                   <div className="flex justify-between">
                     <span className="text-sm alt-text-muted">File caricati</span>
-                    <span className="text-sm font-semibold">{runs[0].metrics.sftp_uploaded_files || 0}</span>
+                    <span className="text-sm font-semibold">{(lastRunAll.metrics as Record<string, unknown>).sftp_uploaded_files as number || 0}</span>
                   </div>
                 </div>
               ) : (
@@ -858,9 +702,7 @@ export const SyncScheduler: React.FC = () => {
               {config?.enabled ? (
                 <p className="text-sm font-medium">{getNextSyncTime() || '-'}</p>
               ) : (
-                <span className="alt-badge alt-badge-idle">
-                  Disattivata
-                </span>
+                <span className="alt-badge alt-badge-idle">Disattivata</span>
               )}
             </div>
           </div>
@@ -874,15 +716,10 @@ export const SyncScheduler: React.FC = () => {
               disabled={isStarting || !!currentRun}
               className="bg-emerald-600 hover:bg-emerald-700 text-white font-semibold shadow-sm disabled:bg-slate-300 disabled:text-slate-500"
             >
-              {isStarting ? (
-                <Loader2 className="h-4 w-4 animate-spin mr-2" />
-              ) : (
-                <Play className="h-4 w-4 mr-2" />
-              )}
+              {isStarting ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : <Play className="h-4 w-4 mr-2" />}
               Esegui sincronizzazione ora
             </Button>
             
-            {/* Mostra pulsante diverso se la run è bloccata/zombie */}
             {isStaleRun && currentRun ? (
               <Button
                 variant="outline"
@@ -890,11 +727,7 @@ export const SyncScheduler: React.FC = () => {
                 disabled={isResetting}
                 className="border-warning text-warning hover:bg-warning/10 hover:border-warning font-semibold"
               >
-                {isResetting ? (
-                  <Loader2 className="h-4 w-4 animate-spin mr-2" />
-                ) : (
-                  <AlertTriangle className="h-4 w-4 mr-2" />
-                )}
+                {isResetting ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : <AlertTriangle className="h-4 w-4 mr-2" />}
                 Sblocca sincronizzazione
               </Button>
             ) : (
@@ -904,16 +737,11 @@ export const SyncScheduler: React.FC = () => {
                 disabled={isStopping || !currentRun}
                 className="border-error/50 text-error hover:bg-error/10 hover:border-error font-semibold disabled:border-muted disabled:text-muted disabled:bg-transparent"
               >
-                {isStopping ? (
-                  <Loader2 className="h-4 w-4 animate-spin mr-2" />
-                ) : (
-                  <Square className="h-4 w-4 mr-2" />
-                )}
+                {isStopping ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : <Square className="h-4 w-4 mr-2" />}
                 Ferma sincronizzazione
               </Button>
             )}
 
-            {/* Pulsante per forzare l'interruzione (sempre visibile se c'è una run) */}
             {currentRun && !isStaleRun && (
               <Button
                 variant="ghost"
@@ -943,12 +771,10 @@ export const SyncScheduler: React.FC = () => {
             <div className="alt-alert alt-alert-warning">
               <AlertTriangle className="h-5 w-5 text-warning flex-shrink-0 mt-0.5" />
               <div>
-                <p className="font-semibold text-warning">
-                  Sincronizzazione bloccata
-                </p>
+                <p className="font-semibold text-warning">Sincronizzazione bloccata</p>
                 <p className="text-sm alt-text-muted mt-1">
                    La sincronizzazione è in esecuzione da più di {config?.run_timeout_minutes || 60} minuti e potrebbe essere bloccata.
-                   Usa il pulsante "Sblocca sincronizzazione" per resettare lo stato e poter avviare una nuova run.
+                   Usa il pulsante "Sblocca sincronizzazione" per resettare lo stato.
                 </p>
               </div>
             </div>
@@ -962,81 +788,67 @@ export const SyncScheduler: React.FC = () => {
               </div>
               <ScrollArea className="h-[350px]">
                 <div className="divide-y divide-border">
-                  {runs.map(run => (
-                    <div key={run.id} className="hover:bg-muted/10 transition-colors">
-                      <div
-                        className="p-4 cursor-pointer"
-                        onClick={() => setSelectedRun(run)}
-                      >
-                        <div className="flex flex-wrap items-center justify-between gap-2">
-                          <div className="flex flex-wrap items-center gap-2">
-                            {getStatusBadge(run.status)}
-                            <span className="text-sm font-medium">
-                              {new Date(run.started_at).toLocaleString('it-IT', {
-                                day: '2-digit',
-                                month: '2-digit',
-                                year: 'numeric',
-                                hour: '2-digit',
-                                minute: '2-digit'
-                              })}
-                            </span>
-                            <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium ${
-                              run.trigger_type === 'cron' 
-                                ? 'alt-badge alt-badge-info' 
-                                : 'alt-badge alt-badge-success'
-                            }`}>
-                              {run.trigger_type === 'cron' ? (
-                                <><Zap className="h-3 w-3" /> Cron</>
-                              ) : (
-                                <><Play className="h-3 w-3" /> Manuale</>
-                              )}
-                            </span>
-                            {run.attempt > 1 && (
-                              <span className="alt-badge alt-badge-warning">
-                                Tentativo {run.attempt}
+                  {runs.map(run => {
+                    const classification = classifyRun(run);
+                    return (
+                      <div key={run.id} className="hover:bg-muted/10 transition-colors">
+                        <div
+                          className="p-4 cursor-pointer"
+                          onClick={() => setSelectedRunId(run.id)}
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="flex flex-wrap items-center gap-2">
+                              {getStatusBadge(run.status)}
+                              <span className="text-sm font-medium">
+                                {formatTimestampShort(run.started_at)}
                               </span>
-                            )}
+                              <TriggerBadge trigger={run.trigger_type} />
+                              {run.attempt > 1 && (
+                                <span className="alt-badge alt-badge-warning">
+                                  Tentativo {run.attempt}
+                                </span>
+                              )}
+                            </div>
+                            <span className="text-sm font-medium alt-text-muted">
+                              {formatDuration(run.runtime_ms)}
+                            </span>
                           </div>
-                          <span className="text-sm font-medium alt-text-muted">
-                            {formatDuration(run.runtime_ms)}
-                          </span>
-                        </div>
-                        
-                        {/* Error message with friendly text */}
-                        {run.error_message && (
-                          <div className="mt-2">
-                            <p className="text-sm text-error font-medium">
-                              {getFriendlyErrorMessage(run.error_message, run.error_details)}
-                            </p>
-                            
-                            {/* Expandable technical details */}
-                            {run.error_details && (
-                              <Collapsible 
-                                open={expandedLogDetails === run.id}
-                                onOpenChange={(open) => setExpandedLogDetails(open ? run.id : null)}
-                              >
-                                <CollapsibleTrigger 
-                                  className="text-xs alt-text-muted hover:text-foreground mt-1 flex items-center gap-1"
-                                  onClick={(e) => e.stopPropagation()}
+                          
+                          {/* Error message with deterministic classification */}
+                          {run.status !== 'running' && run.status !== 'success' && run.error_message && (
+                            <div className="mt-2">
+                              <p className="text-sm text-error font-medium">
+                                {getFriendlyErrorMessage(run)}
+                              </p>
+                              
+                              {run.error_details && (
+                                <Collapsible 
+                                  open={expandedLogDetails === run.id}
+                                  onOpenChange={(open) => setExpandedLogDetails(open ? run.id : null)}
                                 >
-                                  {expandedLogDetails === run.id ? (
-                                    <><ChevronDown className="h-3 w-3" /> Nascondi dettagli tecnici</>
-                                  ) : (
-                                    <><ChevronRight className="h-3 w-3" /> Mostra dettagli tecnici</>
-                                  )}
-                                </CollapsibleTrigger>
-                                <CollapsibleContent onClick={(e) => e.stopPropagation()}>
-                                  <pre className="mt-2 p-2 alt-info-box rounded text-xs overflow-x-auto max-h-32">
-                                    {JSON.stringify(run.error_details, null, 2)}
-                                  </pre>
-                                </CollapsibleContent>
-                              </Collapsible>
-                            )}
-                          </div>
-                        )}
+                                  <CollapsibleTrigger 
+                                    className="text-xs alt-text-muted hover:text-foreground mt-1 flex items-center gap-1"
+                                    onClick={(e) => e.stopPropagation()}
+                                  >
+                                    {expandedLogDetails === run.id ? (
+                                      <><ChevronDown className="h-3 w-3" /> Nascondi dettagli tecnici</>
+                                    ) : (
+                                      <><ChevronRight className="h-3 w-3" /> Mostra dettagli tecnici</>
+                                    )}
+                                  </CollapsibleTrigger>
+                                  <CollapsibleContent onClick={(e) => e.stopPropagation()}>
+                                    <pre className="mt-2 p-2 alt-info-box rounded text-xs overflow-x-auto max-h-32">
+                                      {JSON.stringify(run.error_details, null, 2)}
+                                    </pre>
+                                  </CollapsibleContent>
+                                </Collapsible>
+                              )}
+                            </div>
+                          )}
+                        </div>
                       </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                   {runs.length === 0 && (
                     <div className="p-12 text-center alt-text-muted">
                       <FileText className="h-8 w-8 mx-auto mb-2 opacity-50" />
@@ -1050,8 +862,8 @@ export const SyncScheduler: React.FC = () => {
         </CardContent>
       </Card>
 
-      {/* Run Detail Dialog */}
-      <Dialog open={!!selectedRun} onOpenChange={() => setSelectedRun(null)}>
+      {/* Run Detail Dialog - always opens by explicit run_id */}
+      <Dialog open={!!selectedRun} onOpenChange={() => setSelectedRunId(null)}>
         <DialogContent className="max-w-2xl max-h-[85vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-3 text-lg">
@@ -1059,29 +871,39 @@ export const SyncScheduler: React.FC = () => {
               {selectedRun && getStatusBadge(selectedRun.status, 'md')}
             </DialogTitle>
             <DialogDescription className="text-slate-600">
-              {selectedRun && new Date(selectedRun.started_at).toLocaleString('it-IT')}
-              {selectedRun?.trigger_type === 'cron' ? ' (Automatica)' : ' (Manuale)'}
-              {selectedRun?.attempt && selectedRun.attempt > 1 && ` - Tentativo ${selectedRun.attempt}`}
+              {selectedRun && (
+                <>
+                  {formatTimestamp(selectedRun.started_at)}
+                  {' — '}
+                  <TriggerBadge trigger={selectedRun.trigger_type} />
+                  {selectedRun.attempt > 1 && ` — Tentativo ${selectedRun.attempt}`}
+                </>
+              )}
             </DialogDescription>
           </DialogHeader>
 
           {selectedRun && (
             <div className="space-y-6 mt-4">
-              {/* Friendly error message */}
-              {selectedRun.error_message && (
-                <div className="bg-red-50 border border-red-200 rounded-lg p-4">
-                  <p className="font-semibold text-red-800">
-                    {getFriendlyErrorMessage(selectedRun.error_message, selectedRun.error_details)}
-                  </p>
-                </div>
-              )}
+              {/* Error message using deterministic classification */}
+              {selectedRun.error_message && (() => {
+                const classification = classifyRun(selectedRun);
+                return (
+                  <div className="bg-red-50 border border-red-200 rounded-lg p-4">
+                    <p className="font-semibold text-red-800">
+                      {classification.isCancelled
+                        ? 'Sincronizzazione interrotta manualmente dall\'utente'
+                        : classification.displayReason || selectedRun.error_message}
+                    </p>
+                  </div>
+                );
+              })()}
 
-              {/* Steps timeline */}
+              {/* Steps timeline - always 13 steps */}
               <div>
                 <h4 className="font-semibold text-slate-800 mb-3">Timeline degli step</h4>
                 <div className="space-y-2">
-                  {Object.entries(STEP_LABELS).map(([key, label]) => {
-                    const step = selectedRun.steps?.[key];
+                  {EXPECTED_STEPS.map((key) => {
+                    const step = selectedRun.steps?.[key] as Record<string, unknown> | undefined;
                     const st = String(step?.status || '');
                     return (
                       <div key={key} className={`flex items-center justify-between p-3 rounded-lg border ${
@@ -1097,10 +919,13 @@ export const SyncScheduler: React.FC = () => {
                           {st === 'skipped' && <AlertTriangle className="h-5 w-5 text-amber-600" />}
                           {(st === 'in_progress' || st === 'retry_delay') && <div className="h-5 w-5 rounded-full bg-blue-400 animate-pulse" />}
                           {!step && <div className="h-5 w-5 rounded-full bg-slate-200" />}
-                          <span className={`font-medium ${!step ? 'text-slate-400' : 'text-slate-700'}`}>{label}</span>
+                          <span className={`font-medium ${!step ? 'text-slate-400' : 'text-slate-700'}`}>
+                            {STEP_LABELS[key]}
+                            {!step && <span className="text-xs text-slate-400 ml-2">(Non eseguito)</span>}
+                          </span>
                         </div>
                         <span className="text-sm font-medium text-slate-500">
-                          {step ? formatDuration(step.duration_ms) : '-'}
+                          {step ? formatDuration(step.duration_ms as number) : '-'}
                         </span>
                       </div>
                     );
@@ -1109,29 +934,29 @@ export const SyncScheduler: React.FC = () => {
               </div>
 
               {/* Metrics */}
-              {selectedRun.metrics && (
+              {selectedRun.metrics && Object.keys(selectedRun.metrics).length > 0 && (
                 <div>
                   <h4 className="font-semibold text-slate-800 mb-3">Metriche</h4>
                   <div className="grid grid-cols-2 gap-2">
                     {[
-                      { label: 'Prodotti totali', value: selectedRun.metrics.products_total },
-                      { label: 'Prodotti elaborati', value: selectedRun.metrics.products_processed },
-                      { label: 'EAN mappati', value: selectedRun.metrics.products_ean_mapped },
-                      { label: 'EAN mancanti', value: selectedRun.metrics.products_ean_missing },
-                      { label: 'Export Mediaworld', value: selectedRun.metrics.mediaworld_export_rows },
-                      { label: 'Export ePrice', value: selectedRun.metrics.eprice_export_rows },
-                      { label: 'File SFTP caricati', value: selectedRun.metrics.sftp_uploaded_files },
+                      { label: 'Prodotti totali', value: (selectedRun.metrics as Record<string, unknown>).products_total },
+                      { label: 'Prodotti elaborati', value: (selectedRun.metrics as Record<string, unknown>).products_processed },
+                      { label: 'EAN mappati', value: (selectedRun.metrics as Record<string, unknown>).products_ean_mapped },
+                      { label: 'EAN mancanti', value: (selectedRun.metrics as Record<string, unknown>).products_ean_missing },
+                      { label: 'Export Mediaworld', value: (selectedRun.metrics as Record<string, unknown>).mediaworld_export_rows },
+                      { label: 'Export ePrice', value: (selectedRun.metrics as Record<string, unknown>).eprice_export_rows },
+                      { label: 'File SFTP caricati', value: (selectedRun.metrics as Record<string, unknown>).sftp_uploaded_files },
                     ].map(({ label, value }) => (
                       <div key={label} className="flex justify-between p-3 bg-slate-50 rounded-lg">
                         <span className="text-sm text-slate-600">{label}</span>
-                        <span className="text-sm font-semibold text-slate-800">{value ?? 0}</span>
+                        <span className="text-sm font-semibold text-slate-800">{(value as number) ?? 0}</span>
                       </div>
                     ))}
                   </div>
                 </div>
               )}
 
-              {/* Technical details - collapsible */}
+              {/* Technical details */}
               {selectedRun.error_details && (
                 <Collapsible>
                   <CollapsibleTrigger className="flex items-center gap-2 text-sm font-medium text-slate-600 hover:text-slate-800">
@@ -1146,7 +971,7 @@ export const SyncScheduler: React.FC = () => {
                 </Collapsible>
               )}
 
-              {/* Steps details - collapsible */}
+              {/* Steps JSON */}
               {selectedRun.steps && Object.keys(selectedRun.steps).length > 0 && (
                 <Collapsible>
                   <CollapsibleTrigger className="flex items-center gap-2 text-sm font-medium text-slate-600 hover:text-slate-800">
@@ -1161,7 +986,7 @@ export const SyncScheduler: React.FC = () => {
                 </Collapsible>
               )}
 
-              {/* Sync Events (ERROR/WARN) */}
+              {/* Sync Events */}
               <div>
                 <div className="flex items-center justify-between mb-3">
                   <h4 className="font-semibold text-slate-800">Eventi diagnostici</h4>
@@ -1172,11 +997,8 @@ export const SyncScheduler: React.FC = () => {
                       className="text-xs"
                       onClick={() => {
                         const safeEvents = runEvents.map(e => ({
-                          level: e.level,
-                          step: e.step,
-                          message: e.message,
-                          details: e.details,
-                          time: e.created_at
+                          level: e.level, step: e.step, message: e.message,
+                          details: e.details, time: e.created_at
                         }));
                         navigator.clipboard.writeText(JSON.stringify(safeEvents, null, 2));
                         toast({ title: 'Copiato', description: 'Dettagli eventi copiati negli appunti' });
@@ -1210,7 +1032,7 @@ export const SyncScheduler: React.FC = () => {
                             }`}>{event.level}</span>
                             {event.step && <span className="text-xs text-slate-500">[{STEP_LABELS[event.step] || event.step}]</span>}
                             <span className="text-xs text-slate-400 ml-auto">
-                              {new Date(event.created_at).toLocaleTimeString('it-IT')}
+                              {formatTimestamp(event.created_at)}
                             </span>
                           </div>
                           <p className="text-slate-700">{event.message}</p>
