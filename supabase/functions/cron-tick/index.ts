@@ -286,11 +286,11 @@ serve(async (req) => {
         // Reload cron runs after marking timeout, then check max attempts
         const { data: refreshedRuns1 } = await supabase
           .from('sync_runs')
-          .select('id, status, attempt, finished_at, started_at, trigger_type')
+          .select('id, status, attempt, finished_at, started_at, trigger_type, error_message, cancelled_by_user')
           .eq('trigger_type', 'cron')
           .order('started_at', { ascending: false })
           .limit(50);
-        await checkAndHandleMaxAttempts(supabase, supabaseUrl, supabaseServiceKey, maxAttempts, refreshedRuns1 || []);
+        await checkAndHandleMaxAttempts(supabase, supabaseUrl, supabaseServiceKey, maxAttempts, refreshedRuns1 || [], config.updated_at as string);
         await callNotification(supabaseUrl, supabaseServiceKey, activeRun.id, 'timeout');
 
         return jsonResp({ status: 'timeout_marked', run_id: activeRun.id, reason: 'hard_timeout' });
@@ -333,11 +333,11 @@ serve(async (req) => {
           // Reload cron runs after marking timeout, then check max attempts
           const { data: refreshedRuns2 } = await supabase
             .from('sync_runs')
-            .select('id, status, attempt, finished_at, started_at, trigger_type')
+            .select('id, status, attempt, finished_at, started_at, trigger_type, error_message, cancelled_by_user')
             .eq('trigger_type', 'cron')
             .order('started_at', { ascending: false })
             .limit(50);
-          await checkAndHandleMaxAttempts(supabase, supabaseUrl, supabaseServiceKey, maxAttempts, refreshedRuns2 || []);
+          await checkAndHandleMaxAttempts(supabase, supabaseUrl, supabaseServiceKey, maxAttempts, refreshedRuns2 || [], config.updated_at as string);
           await callNotification(supabaseUrl, supabaseServiceKey, activeRun.id, 'timeout');
 
           return jsonResp({ status: 'timeout_marked', run_id: activeRun.id, reason: 'idle_timeout' });
@@ -571,7 +571,7 @@ serve(async (req) => {
     // 5. LOAD RECENT CRON RUNS (shared by retry, max-attempts, and scheduling logic)
     const { data: lastCronRuns } = await supabase
       .from('sync_runs')
-      .select('id, status, attempt, finished_at, started_at, trigger_type')
+      .select('id, status, attempt, finished_at, started_at, trigger_type, error_message, cancelled_by_user')
       .eq('trigger_type', 'cron')
       .order('started_at', { ascending: false })
       .limit(50);
@@ -598,7 +598,7 @@ serve(async (req) => {
     // 5b. CHECK MAX ATTEMPTS (only when last run is terminal failure at max attempt)
     // Uses consecutive-failure-since-last-success algorithm (see checkAndHandleMaxAttempts).
     if (lastCronRun && ['failed', 'timeout'].includes(lastCronRun.status) && lastCronRun.attempt >= maxAttempts) {
-      const shouldDisable = await checkAndHandleMaxAttempts(supabase, supabaseUrl, supabaseServiceKey, maxAttempts, lastCronRuns || []);
+      const shouldDisable = await checkAndHandleMaxAttempts(supabase, supabaseUrl, supabaseServiceKey, maxAttempts, lastCronRuns || [], config.updated_at as string);
       if (shouldDisable) {
         return jsonResp({ status: 'max_attempts_exceeded', disabled: true });
       }
@@ -849,25 +849,26 @@ async function callNotification(
  * Determines whether the scheduler should be auto-disabled due to consecutive cron failures.
  *
  * Algorithm (deterministic):
- *   1. Filter runs to attempt=1 only (primary runs, not retries) for chain counting.
- *   2. Walk from most recent to oldest.
- *   3. Count consecutive failed/timeout runs until a success/success_with_warning is found (reset point).
- *   4. If consecutive failures >= maxAttempts AND no cron run is currently running → disable.
- *   5. If a success exists more recent than the failure chain → do NOT disable (chain is reset).
+ *   1. Only consider runs started AFTER the last config update (prevents re-disable loop when user re-enables).
+ *   2. Filter runs to attempt=1 only (primary runs, not retries) for chain counting.
+ *   3. Walk from most recent to oldest.
+ *   4. Skip TRANSIENT failures: timeout, WORKER_LIMIT/546, cancelled, manual stop, network errors (429/503/502).
+ *      These don't count and don't break the chain.
+ *   5. Count consecutive PERMANENT failures (misconfig, schema errors, invariant broken, unknown errors).
+ *   6. If consecutive permanent failures >= maxAttempts AND no cron run is currently running → disable.
+ *   7. If a success exists more recent than the failure chain → do NOT disable (chain is reset).
  *
- * Example sequences (max_attempts=3):
- *   [timeout, timeout, timeout]                         → 3 consecutive → DISABLE
- *   [timeout, timeout, success, timeout, timeout]       → 2 consecutive → NO disable (reset by success)
- *   [timeout, timeout, timeout, success_with_warning]   → 3 consecutive → DISABLE (success is older)
- *   [success, timeout, timeout, timeout]                → 0 consecutive → NO disable (success is most recent)
- *   [running, timeout, timeout, timeout]                → skip (running exists)
+ * Rationale: transient errors (infrastructure limits, timeouts, network) should cause yield+backoff,
+ * not auto-disable. Only deterministic permanent errors (misconfigured secrets, missing schema) should
+ * trigger auto-disable, as they won't resolve without human intervention.
  */
 async function checkAndHandleMaxAttempts(
   supabase: SClient,
   supabaseUrl: string,
   serviceKey: string,
   maxAttempts: number,
-  allCronRuns: Array<Record<string, unknown>>
+  allCronRuns: Array<Record<string, unknown>>,
+  configUpdatedAt: string
 ): Promise<boolean> {
   // Guard: if any cron run is currently running, don't disable
   const hasRunning = allCronRuns.some((r) => r.status === 'running');
@@ -876,46 +877,75 @@ async function checkAndHandleMaxAttempts(
     return false;
   }
 
+  // Only consider runs started after the last config change (prevents re-disable loop
+  // when user re-enables after an auto-disable: old failures are ignored)
+  const configUpdatedMs = configUpdatedAt ? new Date(configUpdatedAt).getTime() : 0;
+  const recentRuns = allCronRuns.filter((r) => {
+    const startedMs = new Date(r.started_at as string).getTime();
+    return !configUpdatedAt || startedMs > configUpdatedMs;
+  });
+
   // Filter to primary runs only (attempt=1) for chain determination
-  const primaryRuns = allCronRuns.filter((r) => r.attempt === 1);
+  const primaryRuns = recentRuns.filter((r) => r.attempt === 1);
 
   let consecutiveFailures = 0;
   let resetPoint: { id: string; started_at: string } | null = null;
   const failedRunIds: string[] = [];
 
+  // Transient error patterns: these failures should NOT count toward auto-disable
+  const TRANSIENT_PATTERNS = [
+    'worker_limit', '546', 'timeout', 'interrotta', 'cancelled',
+    'econnreset', 'econnrefused', 'etimedout', '429', '503', '502'
+  ];
+
   for (const run of primaryRuns) {
     const status = run.status as string;
+
+    // Success/success_with_warning resets the chain
     if (['success', 'success_with_warning'].includes(status)) {
       resetPoint = { id: run.id as string, started_at: run.started_at as string };
-      break; // chain is reset
+      break;
     }
-    if (['failed', 'timeout'].includes(status)) {
+
+    // Skip cancelled runs entirely (don't count, don't break chain)
+    if (run.cancelled_by_user === true) continue;
+
+    // Skip timeout status entirely (transient by nature)
+    if (status === 'timeout') {
+      console.log(`[cron-tick] checkMaxAttempts: skipping timeout run ${run.id} (transient)`);
+      continue;
+    }
+
+    if (status === 'failed') {
+      const errMsg = ((run.error_message as string) || '').toLowerCase();
+      const isTransient = TRANSIENT_PATTERNS.some(p => errMsg.includes(p));
+
+      if (isTransient) {
+        console.log(`[cron-tick] checkMaxAttempts: skipping transient failure ${run.id}: ${errMsg.substring(0, 100)}`);
+        continue; // don't count, don't break chain
+      }
+
+      // PERMANENT failure: counts toward auto-disable
       consecutiveFailures++;
       failedRunIds.push(run.id as string);
     }
-    // skip other statuses (cancelled, etc.) — don't count, don't break
+    // skip other statuses (cancelled, running, etc.) — don't count, don't break
   }
 
   if (consecutiveFailures < maxAttempts) {
-    // Not enough failures to disable. Log only if we were close (avoid spam).
-    if (consecutiveFailures >= maxAttempts - 1 && resetPoint) {
-      console.log(`[cron-tick] checkMaxAttempts: ${consecutiveFailures} failures but reset by success ${resetPoint.id}`);
-      await logDecision(supabase, failedRunIds[0] || 'unknown', 'INFO', 'max_attempts_reset_by_success', {
-        max_attempts: maxAttempts,
-        consecutive_failures_count: consecutiveFailures,
-        reset_point: resetPoint,
-        sample_run_ids: failedRunIds.slice(0, 5)
-      });
+    // Not enough permanent failures to disable.
+    if (consecutiveFailures > 0) {
+      console.log(`[cron-tick] checkMaxAttempts: ${consecutiveFailures} permanent failures (< ${maxAttempts} threshold)${resetPoint ? `, reset by success ${resetPoint.id}` : ''}`);
     }
     return false;
   }
 
   // Disable scheduler
-  console.log(`[cron-tick] ${consecutiveFailures} consecutive primary cron failures (>= ${maxAttempts}), disabling`);
+  console.log(`[cron-tick] ${consecutiveFailures} consecutive permanent cron failures (>= ${maxAttempts}), disabling`);
 
   await supabase.from('sync_config').update({
     enabled: false,
-    last_disabled_reason: `Auto-disabilitato: ${consecutiveFailures} fallimenti consecutivi cron primari (failed/timeout)`
+    last_disabled_reason: `Auto-disabilitato: ${consecutiveFailures} fallimenti permanenti consecutivi cron (esclusi transitori: WORKER_LIMIT, timeout, cancellati)`
   }).eq('id', 1);
 
   // Log persistent decision event
@@ -924,7 +954,9 @@ async function checkAndHandleMaxAttempts(
       max_attempts: maxAttempts,
       consecutive_failures_count: consecutiveFailures,
       reset_point: resetPoint,
-      sample_run_ids: failedRunIds.slice(0, 5)
+      sample_run_ids: failedRunIds.slice(0, 5),
+      filter: 'permanent_only',
+      config_updated_at: configUpdatedAt
     });
   }
 
