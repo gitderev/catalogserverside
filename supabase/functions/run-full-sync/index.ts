@@ -1084,7 +1084,7 @@ async function runPipeline(
             const exportStepsToCheck = ['export_ean_xlsx', 'export_mediaworld', 'export_eprice'];
             for (const es of exportStepsToCheck) {
               const stepState = steps[es];
-              if (!stepState || stepState.status !== 'success') {
+              if (!stepState || (stepState.status !== 'success' && stepState.status !== 'completed')) {
                 const reason = `Pre-SFTP: step ${es} non completato (status=${stepState?.status || 'missing'})`;
                 console.error(`[orchestrator] ${reason}`);
                 await mergeStepState(supabase, runId, 'upload_sftp', { status: 'failed', error: reason, validation: 'step_validation' });
@@ -1096,6 +1096,14 @@ async function runPipeline(
                 console.error(`[orchestrator] ${reason}`);
                 await mergeStepState(supabase, runId, 'upload_sftp', { status: 'failed', error: reason, validation: 'template_identity' });
                 try { await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'ERROR', p_message: 'sftp_pre_validation_failed', p_details: { step: 'upload_sftp', failed_export: es, reason: 'template_identity_check_failed' } }); } catch (_) {}
+                pipelineFailedBeforeNotification = true; pipelineFailError = reason;
+                break;
+              }
+              // Check validation_passed must be explicitly true (not just absent)
+              if (stepState.validation_passed !== true) {
+                const reason = `Pre-SFTP: step ${es} missing validation_passed=true (got ${stepState.validation_passed})`;
+                console.error(`[orchestrator] ${reason}`);
+                await mergeStepState(supabase, runId, 'upload_sftp', { status: 'failed', error: reason, validation: 'missing_validation' });
                 pipelineFailedBeforeNotification = true; pipelineFailError = reason;
                 break;
               }
