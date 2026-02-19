@@ -845,9 +845,9 @@ async function validateExportVsTemplate(
           continue;
         }
 
-        // 12c. Compare full worksheet XML content (byte-level via string comparison)
-        const tmplXmlBytes = tmplZipEntries[tmplXmlPath];
-        const outXmlBytes = extractedOutZip[outXmlPath];
+        // 12c. Compare worksheet XML via SHA-256 digest on raw Uint8Array (no string decode)
+        let tmplXmlBytes: Uint8Array | null = tmplZipEntries[tmplXmlPath] ?? null;
+        let outXmlBytes: Uint8Array | null = extractedOutZip[outXmlPath] ?? null;
         if (!tmplXmlBytes) {
           errors.push(`protected_sheet_xml_missing_in_template_zip: ${sheetName} (${tmplXmlPath})`);
           continue;
@@ -857,14 +857,37 @@ async function validateExportVsTemplate(
           continue;
         }
 
-        const tmplXml = new TextDecoder().decode(tmplXmlBytes);
-        const outXml = new TextDecoder().decode(outXmlBytes);
+        const tmplLen = tmplXmlBytes.byteLength;
+        const outLen = outXmlBytes.byteLength;
 
-        if (tmplXml !== outXml) {
-          errors.push(`protected_sheet_content_mismatch: ${sheetName} (template XML ${tmplXmlBytes.length}b vs output XML ${outXmlBytes.length}b)`);
-          console.error(`[validate:${exportName}] Protected sheet ${sheetName}: XML MISMATCH (tmpl=${tmplXmlBytes.length}b, out=${outXmlBytes.length}b)`);
+        // Fast path: different lengths => guaranteed mismatch, skip digest
+        if (tmplLen !== outLen) {
+          errors.push(`protected_sheet_content_mismatch: ${sheetName} (template XML ${tmplLen}b vs output XML ${outLen}b)`);
+          console.error(`[validate:${exportName}] Protected sheet ${sheetName}: SIZE MISMATCH (tmpl=${tmplLen}b, out=${outLen}b)`);
+          tmplXmlBytes = null; outXmlBytes = null;
+          continue;
+        }
+
+        // SHA-256 digest comparison on raw bytes (no TextDecoder allocation)
+        const [tmplDigest, outDigest] = await Promise.all([
+          crypto.subtle.digest('SHA-256', tmplXmlBytes),
+          crypto.subtle.digest('SHA-256', outXmlBytes),
+        ]);
+        // Release byte references immediately after digest
+        tmplXmlBytes = null; outXmlBytes = null;
+
+        const tmplHash = new Uint8Array(tmplDigest);
+        const outHash = new Uint8Array(outDigest);
+        let match = true;
+        for (let i = 0; i < tmplHash.length; i++) {
+          if (tmplHash[i] !== outHash[i]) { match = false; break; }
+        }
+
+        if (!match) {
+          errors.push(`protected_sheet_content_mismatch: ${sheetName} (template XML ${tmplLen}b vs output XML ${outLen}b)`);
+          console.error(`[validate:${exportName}] Protected sheet ${sheetName}: XML MISMATCH (tmpl=${tmplLen}b, out=${outLen}b)`);
         } else {
-          console.log(`[validate:${exportName}] Protected sheet ${sheetName}: XML IDENTICAL (${tmplXmlBytes.length}b)`);
+          console.log(`[validate:${exportName}] Protected sheet ${sheetName}: XML IDENTICAL (${tmplLen}b)`);
         }
       }
     }
