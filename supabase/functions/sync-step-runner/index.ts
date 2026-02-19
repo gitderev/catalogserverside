@@ -2767,6 +2767,14 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     // Release preExtractedTmplZip BEFORE write to free ~50MB heap (will re-extract from mwTemplateBytes during validation)
     preExtractedTmplZip = null;
     
+    // Release data structures no longer needed — frees ~15MB heap before memory-intensive XLSX.write()
+    // products: ~6MB (28K Product objects), stockLocationIndex: ~7MB (65K entries), Sets: ~1MB
+    stockLocationIndex = null;
+    products.length = 0; // release Product objects (array is const but .length=0 drops references)
+    entries4254.clear();
+    entries4255.clear();
+    await logMWStage('after_release_data_structures', startTime, { heap_mb: getMemMB() });
+    
     // Serialize XLSX first (needed for ZIP-level comparison)
     const mwWriteT0 = Date.now();
     await logMWStage('before_write', mwWriteT0, { rows: mwWritten, heap_mb: getMemMB() });
