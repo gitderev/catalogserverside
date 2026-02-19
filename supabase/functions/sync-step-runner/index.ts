@@ -552,7 +552,7 @@ async function compareZipXmlIntegrity(
   exportName: string,
   preExtractedTmplZip?: Record<string, Uint8Array>,
   logStage?: (stage: string, extra?: Record<string, unknown>) => Promise<void>
-): Promise<{ errors: string[]; outZip?: Record<string, Uint8Array> }> {
+): Promise<{ errors: string[]; outZip?: Record<string, Uint8Array>; tmplZip?: Record<string, Uint8Array> }> {
   const errors: string[] = [];
 
   await logStage?.('validation_start');
@@ -652,7 +652,7 @@ async function compareZipXmlIntegrity(
   }
   await logStage?.('compare_sheetviews_done');
 
-  return { errors, outZip };
+  return { errors, outZip, tmplZip };
 }
 
 // ========== EXPORT VALIDATION: compare generated XLSX vs template ==========
@@ -772,9 +772,11 @@ async function validateExportVsTemplate(
   // we unzip both XLSX files and compare the raw XML sections directly.
   // This is a BLOCKING check: any mismatch fails validation.
   let extractedOutZip: Record<string, Uint8Array> | undefined;
+  let extractedTmplZip: Record<string, Uint8Array> | undefined;
   if (outputBytes) {
     const zipResult = await compareZipXmlIntegrity(templateBytes, outputBytes, dataSheet, exportName, options?.preExtractedTmplZip, options?.logStage);
     extractedOutZip = zipResult.outZip;
+    extractedTmplZip = zipResult.tmplZip;
     for (const e of zipResult.errors) {
       errors.push(e);
     }
@@ -872,7 +874,7 @@ async function validateExportVsTemplate(
   // No hardcoded hashes; digest computed dynamically from template at runtime.
   // ============================================================
   if (options?.protectedSheets) {
-    const tmplZipEntries = options?.preExtractedTmplZip;
+    const tmplZipEntries = extractedTmplZip;
     if (!tmplZipEntries || !extractedOutZip) {
       // Cannot perform ZIP-level protected sheet validation without ZIP entries
       for (const sheetName of options.protectedSheets) {
@@ -2645,7 +2647,7 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     // Pre-extract template ZIP entries ONCE for validation later.
     // This avoids a redundant unzipSync(12.8MB) during compareZipXmlIntegrity.
     const preZipT0 = Date.now();
-    const preExtractedTmplZip = unzipSync(mwTemplateBytes);
+    let preExtractedTmplZip: Record<string, Uint8Array> | null = unzipSync(mwTemplateBytes);
     const preZipMs = Date.now() - preZipT0;
     console.log(`[sync:step:export_mediaworld] Pre-extracted template ZIP in ${preZipMs}ms`);
     
@@ -2666,8 +2668,8 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
         size_bytes: mwTemplateBytes.length, phase: 'template_parse'
       });
     }
-    // Release template bytes immediately after parse — pre-extracted ZIP entries remain for validation
-    mwTemplateBytes = null as unknown as Uint8Array;
+    // Keep mwTemplateBytes alive (12.8MB) — needed for deferred re-extraction during validation
+    // preExtractedTmplZip will be released before XLSX.write() to free ~50MB heap
     
     // Validate template sheets
     const requiredSheets = ['Data', 'ReferenceData', 'Columns'];
@@ -2762,9 +2764,12 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     
     await logMWStage('data_filled_done', startTime, { rows: mwWritten });
     
+    // Release preExtractedTmplZip BEFORE write to free ~50MB heap (will re-extract from mwTemplateBytes during validation)
+    preExtractedTmplZip = null;
+    
     // Serialize XLSX first (needed for ZIP-level comparison)
     const mwWriteT0 = Date.now();
-    await logMWStage('before_write', mwWriteT0, { rows: mwWritten });
+    await logMWStage('before_write', mwWriteT0, { rows: mwWritten, heap_mb: getMemMB() });
     const xlsxBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: false, bookSST: false });
     const mwOutputBytes = new Uint8Array(xlsxBuffer);
     const mwOutSize = mwOutputBytes.length;
@@ -2784,13 +2789,13 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     const mwValT0 = Date.now();
     await logMWStage('before_validation', mwValT0);
     const mwValidation = await validateExportVsTemplate(
-      XLSX, wb, new Uint8Array(0), 'Export Mediaworld', 'Data', 'ID Prodotto', supabase, runId,
+      XLSX, wb, mwTemplateBytes, 'Export Mediaworld', 'Data', 'ID Prodotto', supabase, runId,
       {
         protectedSheets: ['ReferenceData', 'Columns'],
         headerCellsModifiedCount: 0,
         cellsWrittenBySheet: { 'Data': mwWritten * 22 },
         tmplWbOverride: wb,
-        preExtractedTmplZip: preExtractedTmplZip,
+        // preExtractedTmplZip not passed — compareZipXmlIntegrity will re-extract from mwTemplateBytes (deferred to reduce write-phase RAM)
         logStage: async (stage: string, extra: Record<string, unknown> = {}) => {
           await logMWStage(stage, mwValT0, extra);
         }
@@ -2820,9 +2825,8 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
       return { success: false, error };
     }
     
-    // Release ZIP entries after validation to reduce peak RAM
-    // deno-lint-ignore no-explicit-any
-    (preExtractedTmplZip as any) = null;
+    // Release template bytes after validation to reduce peak RAM
+    mwTemplateBytes = null as unknown as Uint8Array;
     
     const mwBlob = new Blob([xlsxBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
     
