@@ -439,16 +439,22 @@ async function verifyTemplateChecksum(
   runId: string
 ): Promise<{ ok: boolean; actual: string; expected: string }> {
   const actual = await computeSHA256(templateBytes);
-  const expected = TEMPLATE_SHA256[templateName] || '';
+  const expected = TEMPLATE_SHA256[templateName];
 
-  if (!expected || expected === '__PLACEHOLDER__') {
-    console.error(`[checksum] Template ${templateName}: NO PINNED CHECKSUM (placeholder) — BLOCKING`);
-    await safeLogEvent(supabase, runId, 'ERROR', 'template_checksum_missing', { template: templateName, actual_sha256: actual });
-    return { ok: false, actual, expected };
+  // BLOCKING: template must have a pinned checksum
+  if (expected === undefined || expected === '' || expected === '__PLACEHOLDER__') {
+    console.error(`[checksum] Template ${templateName}: NOT PINNED — BLOCKING (template_checksum_not_pinned)`);
+    await safeLogEvent(supabase, runId, 'ERROR', 'template_checksum_not_pinned', { template: templateName, actual_sha256: actual });
+    return { ok: false, actual, expected: '(not pinned)' };
   }
 
+  // Log the compare operation explicitly
+  console.log(`[checksum] INFO template_checksum_compare`, JSON.stringify({ templateName, expected, actual }));
+  await safeLogEvent(supabase, runId, 'INFO', 'template_checksum_compare', { templateName, expected, actual });
+
+  // BLOCKING: checksum must match
   if (actual !== expected) {
-    console.error(`[checksum] Template ${templateName}: MISMATCH! expected=${expected}, actual=${actual}`);
+    console.error(`[checksum] ERROR template_checksum_mismatch`, JSON.stringify({ templateName, expected, actual }));
     await safeLogEvent(supabase, runId, 'ERROR', 'template_checksum_mismatch', { template: templateName, expected, actual, bytes: templateBytes.length });
     return { ok: false, actual, expected };
   }
