@@ -2623,6 +2623,8 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
         }
         
         console.log(`[sync:step:export_mediaworld] Loaded stock location: ${Object.keys(stockLocationIndex).length} entries`);
+        // stockLocationContent string no longer needed — release ~5MB heap
+        // (variable is const but reassignment not needed; it goes out of scope after this block)
       } else {
         warnings.invalid_location_parse++;
       }
@@ -2644,12 +2646,8 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     
     const XLSX = await import("npm:xlsx@0.18.5");
     
-    // Pre-extract template ZIP entries ONCE for validation later.
-    // This avoids a redundant unzipSync(12.8MB) during compareZipXmlIntegrity.
-    const preZipT0 = Date.now();
-    let preExtractedTmplZip: Record<string, Uint8Array> | null = unzipSync(mwTemplateBytes);
-    const preZipMs = Date.now() - preZipT0;
-    console.log(`[sync:step:export_mediaworld] Pre-extracted template ZIP in ${preZipMs}ms`);
+    // NOTE: preExtractedTmplZip removed — was allocating ~50MB via unzipSync but never passed to validation.
+    // Validation re-extracts from re-downloaded template bytes after write (compareZipXmlIntegrity line 568).
     
     const mwParseT0 = Date.now();
     // sheetRows optimization skipped for Mediaworld: full parse needed for protected sheet presence validation and heavy ZIP/XML checks
@@ -2764,8 +2762,7 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     
     await logMWStage('data_filled_done', startTime, { rows: mwWritten });
     
-    // Release preExtractedTmplZip BEFORE write to free ~50MB heap
-    preExtractedTmplZip = null;
+    // preExtractedTmplZip removed (was dead code — never passed to validation)
     
     // Release data structures no longer needed — frees ~15MB heap before memory-intensive XLSX.write()
     stockLocationIndex = null;
