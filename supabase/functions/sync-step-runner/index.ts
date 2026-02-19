@@ -2337,16 +2337,17 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
       warnings.missing_location_file++;
     }
     
-    // Load Mediaworld template from storage
-    console.log('[sync:step:export_mediaworld] Loading XLSX template from filesystem (deploy-safe)');
+    // Load Mediaworld template from storage bucket
+    console.log('[sync:step:export_mediaworld] Loading XLSX template from storage (exports/templates/)');
     let mwTemplateBytes: Uint8Array;
     try {
-      const templateUrl = new URL("./_templates/Export Mediaworld.xlsx", import.meta.url);
-      mwTemplateBytes = await Deno.readFile(templateUrl);
+      const { data: tmplBlob, error: tmplErr } = await supabase.storage.from('exports').download('templates/Export Mediaworld.xlsx');
+      if (tmplErr || !tmplBlob) throw new Error(tmplErr?.message || 'empty');
+      mwTemplateBytes = new Uint8Array(await tmplBlob.arrayBuffer());
       console.log(`[sync:step:export_mediaworld] Template loaded: ${mwTemplateBytes.length} bytes`);
-      await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'INFO', p_message: 'template_loaded', p_details: { step: 'export_mediaworld', file: 'Export Mediaworld.xlsx', bytes: mwTemplateBytes.length } }).catch(() => {});
+      await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'INFO', p_message: 'template_loaded', p_details: { step: 'export_mediaworld', file: 'Export Mediaworld.xlsx', bytes: mwTemplateBytes.length, source: 'storage' } }).catch(() => {});
     } catch (e: unknown) {
-      const error = `Template Export Mediaworld.xlsx non trovato nel filesystem: ${errMsg(e)}`;
+      const error = `Template Export Mediaworld.xlsx non trovato in storage: ${errMsg(e)}`;
       await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
@@ -2551,15 +2552,16 @@ async function stepExportEprice(supabase: SupabaseClient, runId: string, feeConf
     
     const XLSX = await import("npm:xlsx@0.18.5");
     
-    // Load template from filesystem (deploy-safe)
+    // Load template from storage bucket
     let epTemplateBytes: Uint8Array;
     try {
-      const templateUrl = new URL("./_templates/Export ePrice.xlsx", import.meta.url);
-      epTemplateBytes = await Deno.readFile(templateUrl);
+      const { data: tmplBlob, error: tmplErr } = await supabase.storage.from('exports').download('templates/Export ePrice.xlsx');
+      if (tmplErr || !tmplBlob) throw new Error(tmplErr?.message || 'empty');
+      epTemplateBytes = new Uint8Array(await tmplBlob.arrayBuffer());
       console.log(`[sync:step:export_eprice] Template loaded: ${epTemplateBytes.length} bytes`);
-      await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'INFO', p_message: 'template_loaded', p_details: { step: 'export_eprice', file: 'Export ePrice.xlsx', bytes: epTemplateBytes.length } }).catch(() => {});
+      await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'INFO', p_message: 'template_loaded', p_details: { step: 'export_eprice', file: 'Export ePrice.xlsx', bytes: epTemplateBytes.length, source: 'storage' } }).catch(() => {});
     } catch (e: unknown) {
-      const error = `Template Export ePrice.xlsx non trovato nel filesystem: ${errMsg(e)}`;
+      const error = `Template Export ePrice.xlsx non trovato in storage: ${errMsg(e)}`;
       await updateStepResult(supabase, runId, 'export_eprice', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
@@ -2733,12 +2735,13 @@ async function stepExportEanXlsx(supabase: SupabaseClient, runId: string): Promi
     // Load template from filesystem (deploy-safe)
     let eanTemplateBytes: Uint8Array;
     try {
-      const eanTmplUrl = new URL("./_templates/Catalogo EAN.xlsx", import.meta.url);
-      eanTemplateBytes = await Deno.readFile(eanTmplUrl);
+      const { data: tmplBlob, error: tmplErr } = await supabase.storage.from('exports').download('templates/Catalogo EAN.xlsx');
+      if (tmplErr || !tmplBlob) throw new Error(tmplErr?.message || 'empty');
+      eanTemplateBytes = new Uint8Array(await tmplBlob.arrayBuffer());
       console.log(`[sync:step:export_ean_xlsx] Template loaded: ${eanTemplateBytes.length} bytes`);
-      await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'INFO', p_message: 'template_loaded', p_details: { step: 'export_ean_xlsx', file: 'Catalogo EAN.xlsx', bytes: eanTemplateBytes.length } }).catch(() => {});
+      await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'INFO', p_message: 'template_loaded', p_details: { step: 'export_ean_xlsx', file: 'Catalogo EAN.xlsx', bytes: eanTemplateBytes.length, source: 'storage' } }).catch(() => {});
     } catch (e: unknown) {
-      const error = `Template Catalogo EAN.xlsx non trovato nel filesystem: ${errMsg(e)}`;
+      const error = `Template Catalogo EAN.xlsx non trovato in storage: ${errMsg(e)}`;
       await updateStepResult(supabase, runId, 'export_ean_xlsx', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
@@ -2907,9 +2910,10 @@ async function processEanXlsxFromContent(supabase: SupabaseClient, runId: string
     // Load template from filesystem
     let eanTmplBytes: Uint8Array;
     try {
-      const tmplUrl = new URL("./_templates/Catalogo EAN.xlsx", import.meta.url);
-      eanTmplBytes = await Deno.readFile(tmplUrl);
-      await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'INFO', p_message: 'template_loaded', p_details: { step: 'export_ean_xlsx', file: 'Catalogo EAN.xlsx', bytes: eanTmplBytes.length, mode: 'direct' } }).catch(() => {});
+      const { data: tmplBlob, error: tmplErr } = await supabase.storage.from('exports').download('templates/Catalogo EAN.xlsx');
+      if (tmplErr || !tmplBlob) throw new Error(tmplErr?.message || 'empty');
+      eanTmplBytes = new Uint8Array(await tmplBlob.arrayBuffer());
+      await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'INFO', p_message: 'template_loaded', p_details: { step: 'export_ean_xlsx', file: 'Catalogo EAN.xlsx', bytes: eanTmplBytes.length, source: 'storage', mode: 'direct' } }).catch(() => {});
     } catch (e: unknown) {
       const error = `Template Catalogo EAN.xlsx non trovato: ${errMsg(e)}`;
       await updateStepResult(supabase, runId, 'export_ean_xlsx', { status: 'failed', error, metrics: {} });
