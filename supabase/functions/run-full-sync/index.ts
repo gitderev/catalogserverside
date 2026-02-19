@@ -1137,7 +1137,11 @@ async function runPipeline(
               if (allCsvInBucket.length > 0) {
                 console.warn(`[orchestrator] CSV files in bucket (not in SFTP selection but present): ${allCsvInBucket.join(', ')}`);
               }
-              await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'INFO', p_message: 'sftp_pre_validation_passed', p_details: { step: 'upload_sftp', whitelist: EXPORT_FILES, amazon_present: amazonPresent, amazon_missing: amazonMissing, csv_in_bucket: allCsvInBucket } }).catch(() => {});
+              try {
+                await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'INFO', p_message: 'sftp_pre_validation_passed', p_details: { step: 'upload_sftp', whitelist: EXPORT_FILES, amazon_present: amazonPresent, amazon_missing: amazonMissing, csv_in_bucket: allCsvInBucket } });
+              } catch (logErr: unknown) {
+                console.warn(`[orchestrator] Failed to log sftp_pre_validation_passed: ${logErr instanceof Error ? logErr.message : String(logErr)}`);
+              }
             }
           }
         }
