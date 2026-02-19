@@ -4003,7 +4003,7 @@ const AltersideCatalogGenerator: React.FC = () => {
       });
       
       // Download
-      downloadEpriceBlob(epriceResult.blob, "Tracciato_Pubblicazione_Offerte_new.xlsx");
+      downloadEpriceBlob(epriceResult.blob, "Export ePrice.xlsx");
       
       // Save validation report for UI
       setLastEpriceValidation(validationReport);

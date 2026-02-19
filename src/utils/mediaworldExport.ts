@@ -1357,9 +1357,7 @@ export async function exportMediaworldCatalog({
     const url = URL.createObjectURL(blob);
     
     // Generate filename with timestamp YYYYMMDD
-    const now = new Date();
-    const dateStamp = now.toISOString().slice(0, 10).replace(/-/g, '');
-    const fileName = `mediaworld-offers-${dateStamp}.xlsx`;
+    const fileName = 'Export Mediaworld.xlsx';
     
     // Create anchor and trigger download
     const a = document.createElement('a');
