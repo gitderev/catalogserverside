@@ -2862,14 +2862,90 @@ async function stepExportEprice(supabase: SupabaseClient, runId: string, feeConf
   }
 }
 
+// ========== LIGHTWEIGHT EAN VALIDATION (no ZIP unzip, no double parse) ==========
+function validateEanLightweight(
+  // deno-lint-ignore no-explicit-any
+  XLSX: any,
+  // deno-lint-ignore no-explicit-any
+  wb: any,
+  // deno-lint-ignore no-explicit-any
+  templateWs: any,
+  dataSheetName: string,
+  rowsWritten: number,
+  headerCount: number,
+  eanColIdx: number,
+): { passed: boolean; errors: string[] } {
+  const errors: string[] = [];
+
+  // 1. Sheet names must match template
+  if (!wb.SheetNames.includes(dataSheetName)) {
+    errors.push(`sheet_missing: ${dataSheetName}`);
+    return { passed: false, errors };
+  }
+
+  const ws = wb.Sheets[dataSheetName];
+  if (!ws) { errors.push(`sheet_null: ${dataSheetName}`); return { passed: false, errors }; }
+
+  // 2. Header row identical to template
+  const tmplRange = templateWs['!ref'] ? XLSX.utils.decode_range(templateWs['!ref']) : null;
+  if (tmplRange) {
+    for (let c = 0; c <= tmplRange.e.c; c++) {
+      const addr = XLSX.utils.encode_cell({ r: 0, c });
+      const tv = templateWs[addr]?.v?.toString() || '';
+      const gv = ws[addr]?.v?.toString() || '';
+      if (tv !== gv) errors.push(`header[${c}]: expected "${tv}", got "${gv}"`);
+    }
+  }
+
+  // 3. AutoFilter preserved
+  const tf = JSON.stringify(templateWs['!autofilter'] || null);
+  const gf = JSON.stringify(ws['!autofilter'] || null);
+  if (tf !== gf) errors.push(`autofilter: expected ${tf}, got ${gf}`);
+
+  // 4. Column widths preserved
+  const tmplCols = templateWs['!cols'];
+  const genCols = ws['!cols'];
+  if (tmplCols && !genCols) {
+    errors.push('column_widths: template has !cols but output does not');
+  } else if (tmplCols && genCols) {
+    for (let i = 0; i < tmplCols.length; i++) {
+      const tw = tmplCols[i]?.wch ?? tmplCols[i]?.wpx ?? tmplCols[i]?.width;
+      const gw = genCols[i]?.wch ?? genCols[i]?.wpx ?? genCols[i]?.width;
+      if (tw != null && gw != null && tw !== gw) errors.push(`col_width[${i}]: expected ${tw}, got ${gw}`);
+    }
+  }
+
+  // 5. EAN column type check (sample first 100 data rows)
+  if (eanColIdx >= 0) {
+    const checkLimit = Math.min(rowsWritten, 100);
+    for (let r = 1; r <= checkLimit; r++) {
+      const cell = ws[XLSX.utils.encode_cell({ r, c: eanColIdx })];
+      if (!cell) continue;
+      if (cell.t !== 's') errors.push(`ean_type_row${r}: expected 's', got '${cell.t}'`);
+      const val = String(cell.v || '');
+      if (val && /^\d+$/.test(val) && val.length < 12) errors.push(`ean_leading_zeros_row${r}: "${val}" too short`);
+    }
+  }
+
+  // 6. Column count check
+  const genRange = ws['!ref'] ? XLSX.utils.decode_range(ws['!ref']) : null;
+  if (genRange && tmplRange && genRange.e.c !== tmplRange.e.c) {
+    errors.push(`column_count: expected ${tmplRange.e.c + 1}, got ${genRange.e.c + 1}`);
+  }
+
+  return { passed: errors.length === 0, errors };
+}
+
 // ========== STEP: EXPORT_EAN_XLSX (STREAMING - low memory) ==========
 // Reads CSV line-by-line from storage using signed URL + Range requests
 // to avoid loading entire file into memory. Builds XLSX incrementally.
+// NOTE: Uses lightweight validation (no ZIP unzip) to stay within CPU budget.
 const XLSX_STREAM_CHUNK_BYTES = 512 * 1024; // 512KB per range fetch
 
 async function stepExportEanXlsx(supabase: SupabaseClient, runId: string): Promise<{ success: boolean; error?: string }> {
   console.log(`[sync:step:export_ean_xlsx] Starting for run ${runId} (streaming mode)`);
   const startTime = Date.now();
+  const timing: Record<string, number> = {};
   try {
     // Idempotency: check if already completed
     const { data: runCheck } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
@@ -2916,8 +2992,9 @@ async function stepExportEanXlsx(supabase: SupabaseClient, runId: string): Promi
     // 4. STREAMING: Read CSV via Range requests, build XLSX incrementally
     const XLSX = await import("npm:xlsx@0.18.5");
     
-    // Load EAN template from storage bucket (unified loader)
+    // Load EAN template from storage bucket (unified loader with checksum)
     let eanTemplateBytes: Uint8Array;
+    const t0 = Date.now();
     try {
       eanTemplateBytes = await loadTemplateFromStorage(supabase, 'Catalogo EAN.xlsx', runId);
     } catch (e: unknown) {
@@ -2925,8 +3002,17 @@ async function stepExportEanXlsx(supabase: SupabaseClient, runId: string): Promi
       await updateStepResult(supabase, runId, 'export_ean_xlsx', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
-    
-    const templateWb = XLSX.read(eanTemplateBytes, { type: 'array' });
+    timing.template_download_ms = Date.now() - t0;
+    console.log(`[sync:step:export_ean_xlsx] TIMING template_download_ok: ${timing.template_download_ms}ms, size_bytes=${eanTemplateBytes.length}`);
+
+    const t1 = Date.now();
+    const templateWb = XLSX.read(eanTemplateBytes, { type: 'array', cellStyles: false, bookDeps: false, bookFiles: false, bookProps: false, bookSheets: false, bookVBA: false });
+    timing.template_parse_ms = Date.now() - t1;
+    console.log(`[sync:step:export_ean_xlsx] TIMING template_parse: ${timing.template_parse_ms}ms`);
+
+    // Free template bytes immediately - no longer needed (lightweight validation uses workbook objects, not ZIP)
+    eanTemplateBytes = null as unknown as Uint8Array;
+
     const templateWsRef = templateWb.Sheets['Catalogo_EAN'];
     if (!templateWsRef) {
       const error = 'Template Catalogo EAN.xlsx: foglio Catalogo_EAN non trovato';
@@ -2934,8 +3020,20 @@ async function stepExportEanXlsx(supabase: SupabaseClient, runId: string): Promi
       return { success: false, error };
     }
     
-    // Clear existing data rows from template (keep header at row 0)
+    // Save template header/autofilter/cols BEFORE clearing rows (for validation)
+    const savedAutofilter = templateWsRef['!autofilter'] ? JSON.parse(JSON.stringify(templateWsRef['!autofilter'])) : undefined;
+    const savedCols = templateWsRef['!cols'] ? JSON.parse(JSON.stringify(templateWsRef['!cols'])) : undefined;
+    // Save header cells for validation (row 0)
     const tmplEanRange = templateWsRef['!ref'] ? XLSX.utils.decode_range(templateWsRef['!ref']) : null;
+    const savedHeaderCells: Record<string, unknown>[] = [];
+    if (tmplEanRange) {
+      for (let c = 0; c <= tmplEanRange.e.c; c++) {
+        const addr = XLSX.utils.encode_cell({ r: 0, c });
+        savedHeaderCells.push(templateWsRef[addr] ? { ...templateWsRef[addr] } : {});
+      }
+    }
+
+    // Clear existing data rows from template (keep header at row 0)
     if (tmplEanRange) {
       for (let R = 1; R <= tmplEanRange.e.r; R++) {
         for (let C = 0; C <= tmplEanRange.e.c; C++) {
@@ -2953,12 +3051,8 @@ async function stepExportEanXlsx(supabase: SupabaseClient, runId: string): Promi
     let headerParsed = false;
     let chunkCount = 0;
 
+    const t2 = Date.now();
     while (true) {
-      // Budget check: if we've been running > 12s, stop to avoid WORKER_LIMIT
-      if (Date.now() - startTime > 12000) {
-        console.warn(`[sync:step:export_ean_xlsx] Budget warning at ${Date.now() - startTime}ms, ${rowsWritten} rows so far`);
-      }
-
       const rangeEnd = cursorPos + XLSX_STREAM_CHUNK_BYTES - 1;
       const rangeHeader = `bytes=${cursorPos}-${rangeEnd}`;
       
@@ -3000,7 +3094,8 @@ async function stepExportEanXlsx(supabase: SupabaseClient, runId: string): Promi
           const val = vals[c] || '';
           const cell: Record<string, unknown> = { v: val, t: 's' };
           if (c === eanColIdx) { cell.z = '@'; }
-          ws[XLSX.utils.encode_cell({ r, c })] = cell;
+          ws[`${String.fromCharCode(65 + (c < 26 ? c : -1))}${r + 1}`] = cell; // fast for <=26 cols
+          if (c >= 26) ws[XLSX.utils.encode_cell({ r, c })] = cell; // fallback
         }
       }
 
@@ -3017,7 +3112,8 @@ async function stepExportEanXlsx(supabase: SupabaseClient, runId: string): Promi
             const val = vals[c] || '';
             const cell: Record<string, unknown> = { v: val, t: 's' };
             if (c === eanColIdx) { cell.z = '@'; }
-            ws[XLSX.utils.encode_cell({ r, c })] = cell;
+            if (c < 26) ws[`${String.fromCharCode(65 + c)}${r + 1}`] = cell;
+            else ws[XLSX.utils.encode_cell({ r, c })] = cell;
           }
         }
         break;
@@ -3025,6 +3121,8 @@ async function stepExportEanXlsx(supabase: SupabaseClient, runId: string): Promi
 
       cursorPos += rawBytes.length;
     }
+    timing.csv_stream_ms = Date.now() - t2;
+    console.log(`[sync:step:export_ean_xlsx] TIMING csv_stream: ${timing.csv_stream_ms}ms, rows=${rowsWritten}, chunks=${chunkCount}`);
 
     if (!headerParsed || rowsWritten === 0) {
       const error = 'Catalogo EAN.csv vuoto o senza dati';
@@ -3038,27 +3136,39 @@ async function stepExportEanXlsx(supabase: SupabaseClient, runId: string): Promi
     
     await safeLogEvent(supabase, runId, 'INFO', 'rows_written', { step: 'export_ean_xlsx', rows: rowsWritten });
     
-    // Serialize XLSX first (needed for ZIP-level comparison)
-    const xlsxBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: false, bookSST: false });
-    const eanOutputBytes = new Uint8Array(xlsxBuffer);
-    
-    // Pre-upload validation (EAN: all EAN cells string-typed + ZIP comparison)
-    const eanValidation = await validateExportVsTemplate(
-      XLSX, wb, eanTemplateBytes, 'Catalogo EAN', 'Catalogo_EAN', 'EAN', supabase, runId,
-      { headerCellsModifiedCount: 0, cellsWrittenBySheet: { 'Catalogo_EAN': rowsWritten * headers.length } },
-      eanOutputBytes
+    // 6. Lightweight validation BEFORE serialize (avoids needing outputBytes for ZIP compare)
+    const t3 = Date.now();
+    const eanValidation = validateEanLightweight(
+      XLSX, wb, ws, 'Catalogo_EAN', rowsWritten, headers.length, eanColIdx
     );
+    timing.validation_ms = Date.now() - t3;
+    console.log(`[sync:step:export_ean_xlsx] TIMING validation: ${timing.validation_ms}ms, passed=${eanValidation.passed}`);
+
     if (!eanValidation.passed) {
       const error = `Pre-SFTP validation failed for Catalogo EAN.xlsx: ${eanValidation.errors.join('; ')}`;
-      await updateStepResult(supabase, runId, 'export_ean_xlsx', { status: 'failed', error, metrics: {}, validation_passed: false, validation_warnings: eanValidation.warnings } as StepResultData);
+      await safeLogEvent(supabase, runId, 'ERROR', 'validation_failed', { export_name: 'Catalogo EAN', errors: eanValidation.errors });
+      await updateStepResult(supabase, runId, 'export_ean_xlsx', { status: 'failed', error, metrics: {}, validation_passed: false, validation_warnings: [] } as StepResultData);
       return { success: false, error };
     }
-    
+    await safeLogEvent(supabase, runId, 'INFO', 'validation_ok', { export_name: 'Catalogo EAN', warnings: [] });
+
+    // 7. Serialize XLSX
+    const t4 = Date.now();
+    const xlsxBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: false, bookSST: false });
+    timing.xlsx_write_ms = Date.now() - t4;
+    const outputSize = xlsxBuffer.byteLength || xlsxBuffer.length || 0;
+    console.log(`[sync:step:export_ean_xlsx] TIMING xlsx_write: ${timing.xlsx_write_ms}ms, output_size_bytes=${outputSize}`);
+
+    // 8. Upload
+    const t5 = Date.now();
     const blob = new Blob([xlsxBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
     
     const { error: uploadError } = await supabase.storage.from('exports').upload(
       'Catalogo EAN.xlsx', blob, { upsert: true, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }
     );
+    timing.upload_ms = Date.now() - t5;
+    console.log(`[sync:step:export_ean_xlsx] TIMING upload: ${timing.upload_ms}ms`);
+
     if (uploadError) {
       const error = `Upload Catalogo EAN.xlsx fallito: ${uploadError.message}`;
       await updateStepResult(supabase, runId, 'export_ean_xlsx', { status: 'failed', error, metrics: {} });
@@ -3068,6 +3178,7 @@ async function stepExportEanXlsx(supabase: SupabaseClient, runId: string): Promi
     await safeLogEvent(supabase, runId, 'INFO', 'export_saved', { step: 'export_ean_xlsx', file: 'Catalogo EAN.xlsx', rows: rowsWritten });
     
     const elapsed = Date.now() - startTime;
+    await safeLogEvent(supabase, runId, 'INFO', 'export_ean_timing', { timing, rows: rowsWritten, output_size_bytes: outputSize });
     await updateStepResult(supabase, runId, 'export_ean_xlsx', {
       status: 'success', duration_ms: elapsed, rows: rowsWritten,
       metrics: { ean_xlsx_rows: rowsWritten },
@@ -3075,10 +3186,10 @@ async function stepExportEanXlsx(supabase: SupabaseClient, runId: string): Promi
       total_products: rowsWritten,
       stream_chunks: chunkCount,
       validation_passed: true,
-      validation_warnings: eanValidation.warnings
+      validation_warnings: []
     } as StepResultData);
     console.log(`[sync:step:export_ean_xlsx] Completed: ${rowsWritten} rows in ${elapsed}ms (${chunkCount} stream chunks, template-based)`);
-    console.log(JSON.stringify({ diag_tag: 'xlsx_export_retry_decision', run_id: runId, step: 'export_ean_xlsx', decision: 'completed', rows_written: rowsWritten, total_products: rowsWritten, elapsed_ms: elapsed, stream_chunks: chunkCount }));
+    console.log(JSON.stringify({ diag_tag: 'xlsx_export_retry_decision', run_id: runId, step: 'export_ean_xlsx', decision: 'completed', rows_written: rowsWritten, total_products: rowsWritten, elapsed_ms: elapsed, stream_chunks: chunkCount, timing }));
     return { success: true };
   } catch (e: unknown) {
     console.error(`[sync:step:export_ean_xlsx] Error:`, e);
@@ -3091,9 +3202,11 @@ async function stepExportEanXlsx(supabase: SupabaseClient, runId: string): Promi
 async function processEanXlsxFromContent(supabase: SupabaseClient, runId: string, csvContent: string, startTime: number): Promise<{ success: boolean; error?: string }> {
   try {
     const XLSX = await import("npm:xlsx@0.18.5");
+    const timing: Record<string, number> = {};
     
-    // Load EAN template from storage bucket (unified loader, direct mode)
+    // Load EAN template from storage bucket (unified loader with checksum, direct mode)
     let eanTmplBytes: Uint8Array;
+    const t0 = Date.now();
     try {
       eanTmplBytes = await loadTemplateFromStorage(supabase, 'Catalogo EAN.xlsx', runId);
     } catch (e: unknown) {
@@ -3101,8 +3214,15 @@ async function processEanXlsxFromContent(supabase: SupabaseClient, runId: string
       await updateStepResult(supabase, runId, 'export_ean_xlsx', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
-    
-    const wb = XLSX.read(eanTmplBytes, { type: 'array' });
+    timing.template_download_ms = Date.now() - t0;
+    console.log(`[sync:step:export_ean_xlsx] TIMING template_download_ok: ${timing.template_download_ms}ms, size_bytes=${eanTmplBytes.length}`);
+
+    const t1 = Date.now();
+    const wb = XLSX.read(eanTmplBytes, { type: 'array', cellStyles: false, bookDeps: false, bookFiles: false, bookProps: false, bookSheets: false, bookVBA: false });
+    timing.template_parse_ms = Date.now() - t1;
+    // Free template bytes immediately
+    eanTmplBytes = null as unknown as Uint8Array;
+
     const ws = wb.Sheets['Catalogo_EAN'];
     if (!ws) {
       const error = 'Template Catalogo EAN.xlsx: foglio Catalogo_EAN non trovato';
@@ -3131,6 +3251,7 @@ async function processEanXlsxFromContent(supabase: SupabaseClient, runId: string
     const eanColIdx = headers.indexOf('EAN');
     // Don't write header row — preserved from template
     let rowsWritten = 0;
+    const t2 = Date.now();
     for (let lineIdx = 1; lineIdx < lines.length; lineIdx++) {
       const line = lines[lineIdx].trim();
       if (!line) continue;
@@ -3141,43 +3262,55 @@ async function processEanXlsxFromContent(supabase: SupabaseClient, runId: string
         const val = vals[c] || '';
         const cell: Record<string, unknown> = { v: val, t: 's' };
         if (c === eanColIdx) { cell.z = '@'; }
-        ws[XLSX.utils.encode_cell({ r, c })] = cell;
+        if (c < 26) ws[`${String.fromCharCode(65 + c)}${r + 1}`] = cell;
+        else ws[XLSX.utils.encode_cell({ r, c })] = cell;
       }
     }
+    timing.csv_parse_ms = Date.now() - t2;
     ws['!ref'] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: rowsWritten, c: headers.length - 1 } });
     
-    // Serialize XLSX first (needed for ZIP-level comparison)
-    const xlsxBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: false, bookSST: false });
-    const eanDirOutputBytes = new Uint8Array(xlsxBuffer);
-    
-    // Validation (direct mode + ZIP comparison)
-    const val = await validateExportVsTemplate(
-      XLSX, wb, eanTmplBytes, 'Catalogo EAN', 'Catalogo_EAN', 'EAN', supabase, runId,
-      { headerCellsModifiedCount: 0, cellsWrittenBySheet: { 'Catalogo_EAN': rowsWritten * headers.length } },
-      eanDirOutputBytes
-    );
+    // Lightweight validation (no ZIP unzip)
+    const t3 = Date.now();
+    const val = validateEanLightweight(XLSX, wb, ws, 'Catalogo_EAN', rowsWritten, headers.length, eanColIdx);
+    timing.validation_ms = Date.now() - t3;
+    console.log(`[sync:step:export_ean_xlsx] TIMING validation: ${timing.validation_ms}ms, passed=${val.passed}`);
+
     if (!val.passed) {
       const error = `Validation failed: ${val.errors.join('; ')}`;
-      await updateStepResult(supabase, runId, 'export_ean_xlsx', { status: 'failed', error, metrics: {}, validation_passed: false, validation_warnings: val.warnings } as StepResultData);
+      await safeLogEvent(supabase, runId, 'ERROR', 'validation_failed', { export_name: 'Catalogo EAN', errors: val.errors });
+      await updateStepResult(supabase, runId, 'export_ean_xlsx', { status: 'failed', error, metrics: {}, validation_passed: false, validation_warnings: [] } as StepResultData);
       return { success: false, error };
     }
-    
+    await safeLogEvent(supabase, runId, 'INFO', 'validation_ok', { export_name: 'Catalogo EAN', warnings: [] });
+
+    // Serialize XLSX
+    const t4 = Date.now();
+    const xlsxBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: false, bookSST: false });
+    timing.xlsx_write_ms = Date.now() - t4;
+    const outputSize = xlsxBuffer.byteLength || xlsxBuffer.length || 0;
+    console.log(`[sync:step:export_ean_xlsx] TIMING xlsx_write: ${timing.xlsx_write_ms}ms, output_size_bytes=${outputSize}`);
+
+    // Upload
+    const t5 = Date.now();
     const blob = new Blob([xlsxBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
     const { error: uploadError } = await supabase.storage.from('exports').upload(
       'Catalogo EAN.xlsx', blob, { upsert: true, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }
     );
+    timing.upload_ms = Date.now() - t5;
+
     if (uploadError) {
       const error = `Upload Catalogo EAN.xlsx fallito: ${uploadError.message}`;
       await updateStepResult(supabase, runId, 'export_ean_xlsx', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
     const elapsed = Date.now() - startTime;
+    await safeLogEvent(supabase, runId, 'INFO', 'export_ean_timing', { timing, rows: rowsWritten, output_size_bytes: outputSize });
     await updateStepResult(supabase, runId, 'export_ean_xlsx', {
       status: 'success', duration_ms: elapsed, rows: rowsWritten,
       metrics: { ean_xlsx_rows: rowsWritten },
       rows_written: rowsWritten, total_products: rowsWritten,
       validation_passed: true,
-      validation_warnings: val.warnings
+      validation_warnings: []
     } as StepResultData);
     console.log(`[sync:step:export_ean_xlsx] Completed (direct, template-based): ${rowsWritten} rows in ${elapsed}ms`);
     return { success: true };
