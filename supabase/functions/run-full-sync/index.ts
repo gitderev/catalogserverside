@@ -1116,6 +1116,16 @@ async function runPipeline(
                 pipelineFailedBeforeNotification = true; pipelineFailError = reason;
                 break;
               }
+              // Check for any validation warnings (hard block — no warnings allowed pre-SFTP)
+              const stepWarnings = stepState.validation_warnings;
+              if (Array.isArray(stepWarnings) && stepWarnings.length > 0) {
+                const reason = `Pre-SFTP: step ${es} has ${stepWarnings.length} validation warning(s): ${stepWarnings.slice(0, 3).join('; ')}`;
+                console.error(`[orchestrator] ${reason}`);
+                await mergeStepState(supabase, runId, 'upload_sftp', { status: 'failed', error: reason, validation: 'validation_warnings_present' });
+                try { await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'ERROR', p_message: 'sftp_pre_validation_failed', p_details: { step: 'upload_sftp', failed_export: es, reason: 'validation_warnings', warnings: stepWarnings } }); } catch (_) {}
+                pipelineFailedBeforeNotification = true; pipelineFailError = reason;
+                break;
+              }
             }
             
             // Log Amazon non-regression check + CSV audit

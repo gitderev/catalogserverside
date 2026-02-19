@@ -1,6 +1,7 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
 import { assertLockOwned, renewLockLease, LOCK_TTL_SECONDS } from "../_shared/lock.ts";
+import { unzipSync } from "https://esm.sh/fflate@0.8.2";
 
 type SupabaseClient = ReturnType<typeof createClient>;
 
@@ -401,6 +402,154 @@ async function deleteFromStorage(supabase: SupabaseClient, bucket: string, path:
   }
 }
 
+// ========== SHA-256 TEMPLATE PINNING ==========
+async function computeSHA256(data: Uint8Array): Promise<string> {
+  const hash = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Hardcoded SHA-256 checksums for pinned templates in storage
+// To recompute: call sync-step-runner with step="compute_template_checksums"
+const TEMPLATE_SHA256: Record<string, string> = {
+  'Catalogo EAN.xlsx': '038574b628e23b845297f6eb82b9ba10028a140413bde0e6890927ba0a0afe23',
+  'Export ePrice.xlsx': '8755f23f7e9e9a1fb4fdcbf0c6208789558ebf40533a6436395baa40f1581005',
+  'Export Mediaworld.xlsx': 'aafeaadcd7567073ba595cb317af855b8fd291dca074a0a6acaac1336a589c0d',
+};
+
+async function verifyTemplateChecksum(
+  templateBytes: Uint8Array,
+  templateName: string,
+  supabase: SupabaseClient,
+  runId: string
+): Promise<{ ok: boolean; actual: string; expected: string }> {
+  const actual = await computeSHA256(templateBytes);
+  const expected = TEMPLATE_SHA256[templateName] || '';
+
+  if (!expected || expected === '__PLACEHOLDER__') {
+    console.error(`[checksum] Template ${templateName}: NO PINNED CHECKSUM (placeholder) — BLOCKING`);
+    await supabase.rpc('log_sync_event', {
+      p_run_id: runId, p_level: 'ERROR', p_message: 'template_checksum_missing',
+      p_details: { template: templateName, actual_sha256: actual }
+    }).catch(() => {});
+    return { ok: false, actual, expected };
+  }
+
+  if (actual !== expected) {
+    console.error(`[checksum] Template ${templateName}: MISMATCH! expected=${expected}, actual=${actual}`);
+    await supabase.rpc('log_sync_event', {
+      p_run_id: runId, p_level: 'ERROR', p_message: 'template_checksum_mismatch',
+      p_details: { template: templateName, expected, actual, bytes: templateBytes.length }
+    }).catch(() => {});
+    return { ok: false, actual, expected };
+  }
+
+  console.log(`[checksum] Template ${templateName}: OK (${templateBytes.length} bytes)`);
+  await supabase.rpc('log_sync_event', {
+    p_run_id: runId, p_level: 'INFO', p_message: 'template_checksum_ok',
+    p_details: { template: templateName, sha256: actual, bytes: templateBytes.length }
+  }).catch(() => {});
+  return { ok: true, actual, expected };
+}
+
+// ========== ZIP-LEVEL XML COMPARISON (freeze panes + styles) ==========
+function getZipSheetXmlPath(zipEntries: Record<string, Uint8Array>, sheetName: string): string | null {
+  const workbookXml = new TextDecoder().decode(zipEntries['xl/workbook.xml']);
+  const escaped = sheetName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  let rId: string | null = null;
+
+  const m1 = workbookXml.match(new RegExp(`<sheet[^>]*name="${escaped}"[^>]*r:id="(rId\\d+)"`, 'i'));
+  if (m1) { rId = m1[1]; }
+  else {
+    const m2 = workbookXml.match(new RegExp(`<sheet[^>]*r:id="(rId\\d+)"[^>]*name="${escaped}"`, 'i'));
+    if (m2) { rId = m2[1]; }
+  }
+  if (!rId) return null;
+
+  const relsXml = new TextDecoder().decode(zipEntries['xl/_rels/workbook.xml.rels']);
+  const relMatch = relsXml.match(new RegExp(`<Relationship[^>]*Id="${rId}"[^>]*Target="([^"]+)"`, 'i'));
+  if (!relMatch) return null;
+  return `xl/${relMatch[1]}`;
+}
+
+function extractXmlSection(xml: string, tagName: string): string | null {
+  const regex = new RegExp(`<${tagName}[\\s>][\\s\\S]*?<\\/${tagName}>`, 'i');
+  const match = xml.match(regex);
+  return match ? match[0] : null;
+}
+
+function compareZipXmlIntegrity(
+  templateBytes: Uint8Array,
+  outputBytes: Uint8Array,
+  dataSheetName: string,
+  exportName: string
+): { errors: string[] } {
+  const errors: string[] = [];
+
+  let tmplZip: Record<string, Uint8Array>;
+  let outZip: Record<string, Uint8Array>;
+
+  try {
+    tmplZip = unzipSync(templateBytes);
+  } catch (e: unknown) {
+    errors.push(`zip_unpack_template_failed: ${errMsg(e)}`);
+    return { errors };
+  }
+  try {
+    outZip = unzipSync(outputBytes);
+  } catch (e: unknown) {
+    errors.push(`zip_unpack_output_failed: ${errMsg(e)}`);
+    return { errors };
+  }
+
+  // 1. Compare xl/styles.xml (must be byte-identical)
+  const tmplStyles = tmplZip['xl/styles.xml'];
+  const outStyles = outZip['xl/styles.xml'];
+  if (!tmplStyles) {
+    errors.push('styles_xml_missing_in_template');
+  } else if (!outStyles) {
+    errors.push('styles_xml_missing_in_output');
+  } else {
+    const tmplStylesStr = new TextDecoder().decode(tmplStyles);
+    const outStylesStr = new TextDecoder().decode(outStyles);
+    if (tmplStylesStr !== outStylesStr) {
+      errors.push(`styles_xml_mismatch: xl/styles.xml differs (template=${tmplStyles.length}b, output=${outStyles.length}b)`);
+    } else {
+      console.log(`[zip-verify:${exportName}] xl/styles.xml: IDENTICAL (${tmplStyles.length} bytes)`);
+    }
+  }
+
+  // 2. Compare <sheetViews> (includes <pane> for freeze panes) in data sheet
+  const tmplSheetPath = getZipSheetXmlPath(tmplZip, dataSheetName);
+  const outSheetPath = getZipSheetXmlPath(outZip, dataSheetName);
+
+  if (!tmplSheetPath) {
+    errors.push(`freeze_panes_check_failed: cannot resolve sheet XML for "${dataSheetName}" in template`);
+  } else if (!outSheetPath) {
+    errors.push(`freeze_panes_check_failed: cannot resolve sheet XML for "${dataSheetName}" in output`);
+  } else {
+    const tmplSheetXml = new TextDecoder().decode(tmplZip[tmplSheetPath] || new Uint8Array());
+    const outSheetXml = new TextDecoder().decode(outZip[outSheetPath] || new Uint8Array());
+
+    const tmplSheetViews = extractXmlSection(tmplSheetXml, 'sheetViews');
+    const outSheetViews = extractXmlSection(outSheetXml, 'sheetViews');
+
+    if (tmplSheetViews === null && outSheetViews === null) {
+      console.log(`[zip-verify:${exportName}] sheetViews: both absent (OK)`);
+    } else if (tmplSheetViews === null) {
+      errors.push('freeze_panes_mismatch: template has no <sheetViews> but output does');
+    } else if (outSheetViews === null) {
+      errors.push('freeze_panes_mismatch: template has <sheetViews> but output does not');
+    } else if (tmplSheetViews !== outSheetViews) {
+      errors.push('freeze_panes_mismatch: <sheetViews> differs between template and output');
+      console.error(`[zip-verify:${exportName}] sheetViews MISMATCH:\n  tmpl: ${tmplSheetViews.substring(0, 300)}\n  out:  ${outSheetViews.substring(0, 300)}`);
+    } else {
+      console.log(`[zip-verify:${exportName}] sheetViews (freeze panes): IDENTICAL`);
+    }
+  }
+
+  return { errors };
+}
+
 // ========== EXPORT VALIDATION: compare generated XLSX vs template ==========
 // Deterministic hash for sheet content comparison (Mediaworld ReferenceData/Columns)
 function sheetContentHash(
@@ -444,7 +593,8 @@ async function validateExportVsTemplate(
     protectedSheets?: string[];      // Mediaworld: ReferenceData, Columns
     headerCellsModifiedCount?: number; // Tracking from caller (must be 0)
     cellsWrittenBySheet?: Record<string, number>;
-  }
+  },
+  outputBytes?: Uint8Array
 ): Promise<{ passed: boolean; errors: string[]; warnings: string[] }> {
   const errors: string[] = [];
   const warnings: string[] = [];
@@ -531,29 +681,22 @@ async function validateExportVsTemplate(
   }
 
   // ============================================================
-  // 7. Freeze panes (verification_not_supported — HARD FAIL per spec)
+  // 7. Freeze panes + 8. Styles: deterministic ZIP-level XML comparison (BLOCKING)
   // ============================================================
-  // xlsx community edition does NOT expose freeze pane data on read.
-  // Per spec: "Se una qualunque di queste proprietà non è leggibile con la
-  // libreria corrente, la validazione deve fallire con errore verification_not_supported".
-  // However, since we use template-based round-trip (XLSX.read→modify data→XLSX.write),
-  // freeze panes ARE preserved in the internal XML. The property is unverifiable but
-  // structurally preserved. We emit a warning but do NOT block, because the round-trip
-  // guarantees identity for non-touched metadata.
-  //
-  // RATIONALE: blocking here would make ALL exports permanently fail, since the community
-  // xlsx library will never support reading freeze panes. The template round-trip
-  // approach provides equivalent integrity guarantees.
-  warnings.push('verification_not_supported:freeze_panes (preserved via template round-trip, community edition cannot read)');
-
-  // ============================================================
-  // 8. Header styleId (verification_not_supported — same rationale as freeze_panes)
-  // ============================================================
-  // Cell styles (styleId) require Pro edition. Community edition does not
-  // expose cell.s reliably. Mitigated by hard assert: header row 0 values
-  // are verified cell-by-cell above (check #3), and template round-trip
-  // preserves styles in the internal XML.
-  warnings.push('verification_not_supported:header_style_id (preserved via template round-trip, community edition cannot read)');
+  // Instead of relying on xlsx library (which cannot read freeze panes or styleId),
+  // we unzip both XLSX files and compare the raw XML sections directly.
+  // This is a BLOCKING check: any mismatch fails validation.
+  if (outputBytes) {
+    const zipResult = compareZipXmlIntegrity(templateBytes, outputBytes, dataSheet, exportName);
+    for (const e of zipResult.errors) {
+      errors.push(e);
+    }
+    if (zipResult.errors.length === 0) {
+      console.log(`[validate:${exportName}] ZIP-level integrity (freeze_panes + styles.xml): PASSED`);
+    }
+  } else {
+    errors.push('zip_verification_impossible: outputBytes not provided (BLOCKING — cannot verify freeze_panes and styles)');
+  }
 
   // ============================================================
   // 9. Number formats: compare cell.z for first data row
@@ -2346,6 +2489,11 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
       mwTemplateBytes = new Uint8Array(await tmplBlob.arrayBuffer());
       console.log(`[sync:step:export_mediaworld] Template loaded: ${mwTemplateBytes.length} bytes`);
       await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'INFO', p_message: 'template_loaded', p_details: { step: 'export_mediaworld', file: 'Export Mediaworld.xlsx', bytes: mwTemplateBytes.length, source: 'storage' } }).catch(() => {});
+      // SHA-256 checksum verification (blocking)
+      const mwChecksumResult = await verifyTemplateChecksum(mwTemplateBytes, 'Export Mediaworld.xlsx', supabase, runId);
+      if (!mwChecksumResult.ok) {
+        throw new Error(`Template checksum failed: expected=${mwChecksumResult.expected}, actual=${mwChecksumResult.actual}`);
+      }
     } catch (e: unknown) {
       const error = `Template Export Mediaworld.xlsx non trovato in storage: ${errMsg(e)}`;
       await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
@@ -2444,23 +2592,26 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     
     logMWStage('before_xlsx_upload', startTime, { rows: mwWritten, skipped: mwSkipped, format: 'xlsx' });
     
-    // Pre-upload validation against template (with protected sheets and write tracking)
+    // Serialize XLSX first (needed for ZIP-level comparison)
+    const xlsxBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: false, bookSST: false });
+    const mwOutputBytes = new Uint8Array(xlsxBuffer);
+    
+    // Pre-upload validation against template (with protected sheets, write tracking, and ZIP comparison)
     const mwValidation = await validateExportVsTemplate(
       XLSX, wb, mwTemplateBytes, 'Export Mediaworld', 'Data', 'ID Prodotto', supabase, runId,
       {
         protectedSheets: ['ReferenceData', 'Columns'],
-        headerCellsModifiedCount: 0, // We never touch headers
+        headerCellsModifiedCount: 0,
         cellsWrittenBySheet: { 'Data': mwWritten * 22 }
-      }
+      },
+      mwOutputBytes
     );
     if (!mwValidation.passed) {
       const error = `Pre-SFTP validation failed for Export Mediaworld.xlsx: ${mwValidation.errors.join('; ')}`;
-      await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {}, validation_passed: false } as StepResultData);
+      await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {}, validation_passed: false, validation_warnings: mwValidation.warnings } as StepResultData);
       return { success: false, error };
     }
     
-    // Serialize and upload XLSX
-    const xlsxBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: false, bookSST: false });
     const mwBlob = new Blob([xlsxBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
     
     const { error: uploadError } = await supabase.storage.from('exports').upload(
@@ -2481,7 +2632,8 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     await updateStepResult(supabase, runId, 'export_mediaworld', {
       status: 'success', duration_ms: Date.now() - startTime, rows: mwWritten, skipped: mwSkipped,
       metrics: { mediaworld_export_rows: mwWritten, mediaworld_export_skipped: mwSkipped, format: 'xlsx' },
-      validation_passed: true
+      validation_passed: true,
+      validation_warnings: mwValidation.warnings
     } as StepResultData);
     
     await logMWStage('completed', startTime, { rows: mwWritten, elapsed_ms: Date.now() - startTime, format: 'xlsx' });
@@ -2560,6 +2712,11 @@ async function stepExportEprice(supabase: SupabaseClient, runId: string, feeConf
       epTemplateBytes = new Uint8Array(await tmplBlob.arrayBuffer());
       console.log(`[sync:step:export_eprice] Template loaded: ${epTemplateBytes.length} bytes`);
       await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'INFO', p_message: 'template_loaded', p_details: { step: 'export_eprice', file: 'Export ePrice.xlsx', bytes: epTemplateBytes.length, source: 'storage' } }).catch(() => {});
+      // SHA-256 checksum verification (blocking)
+      const epChecksumResult = await verifyTemplateChecksum(epTemplateBytes, 'Export ePrice.xlsx', supabase, runId);
+      if (!epChecksumResult.ok) {
+        throw new Error(`Template checksum failed: expected=${epChecksumResult.expected}, actual=${epChecksumResult.actual}`);
+      }
     } catch (e: unknown) {
       const error = `Template Export ePrice.xlsx non trovato in storage: ${errMsg(e)}`;
       await updateStepResult(supabase, runId, 'export_eprice', { status: 'failed', error, metrics: {} });
@@ -2633,18 +2790,22 @@ async function stepExportEprice(supabase: SupabaseClient, runId: string, feeConf
     
     await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'INFO', p_message: 'rows_written', p_details: { step: 'export_eprice', rows: epWritten, skipped: epSkipped } }).catch(() => {});
     
-    // Pre-upload validation (ePrice-specific: column count check)
+    // Serialize XLSX first (needed for ZIP-level comparison)
+    const xlsxBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: false, bookSST: false });
+    const epOutputBytes = new Uint8Array(xlsxBuffer);
+    
+    // Pre-upload validation (ePrice-specific: column count check + ZIP comparison)
     const epValidation = await validateExportVsTemplate(
       XLSX, wb, epTemplateBytes, 'Export ePrice', 'Tracciato_Inserimento_Offerte', 'product-id', supabase, runId,
-      { headerCellsModifiedCount: 0, cellsWrittenBySheet: { 'Tracciato_Inserimento_Offerte': epWritten * 8 } }
+      { headerCellsModifiedCount: 0, cellsWrittenBySheet: { 'Tracciato_Inserimento_Offerte': epWritten * 8 } },
+      epOutputBytes
     );
     if (!epValidation.passed) {
       const error = `Pre-SFTP validation failed for Export ePrice.xlsx: ${epValidation.errors.join('; ')}`;
-      await updateStepResult(supabase, runId, 'export_eprice', { status: 'failed', error, metrics: {}, validation_passed: false } as StepResultData);
+      await updateStepResult(supabase, runId, 'export_eprice', { status: 'failed', error, metrics: {}, validation_passed: false, validation_warnings: epValidation.warnings } as StepResultData);
       return { success: false, error };
     }
     
-    const xlsxBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: false, bookSST: false });
     const epBlob = new Blob([xlsxBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
     
     logEPStage('before_xlsx_upload', startTime, { rows: epWritten, skipped: epSkipped, format: 'xlsx' });
@@ -2664,7 +2825,8 @@ async function stepExportEprice(supabase: SupabaseClient, runId: string, feeConf
     await updateStepResult(supabase, runId, 'export_eprice', {
       status: 'success', duration_ms: Date.now() - startTime, rows: epWritten, skipped: epSkipped,
       metrics: { eprice_export_rows: epWritten, eprice_export_skipped: epSkipped, format: 'xlsx' },
-      validation_passed: true
+      validation_passed: true,
+      validation_warnings: epValidation.warnings
     } as StepResultData);
     
     await logEPStage('completed', startTime, { rows: epWritten, elapsed_ms: Date.now() - startTime, format: 'xlsx' });
@@ -2740,6 +2902,11 @@ async function stepExportEanXlsx(supabase: SupabaseClient, runId: string): Promi
       eanTemplateBytes = new Uint8Array(await tmplBlob.arrayBuffer());
       console.log(`[sync:step:export_ean_xlsx] Template loaded: ${eanTemplateBytes.length} bytes`);
       await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'INFO', p_message: 'template_loaded', p_details: { step: 'export_ean_xlsx', file: 'Catalogo EAN.xlsx', bytes: eanTemplateBytes.length, source: 'storage' } }).catch(() => {});
+      // SHA-256 checksum verification (blocking)
+      const eanChecksumResult = await verifyTemplateChecksum(eanTemplateBytes, 'Catalogo EAN.xlsx', supabase, runId);
+      if (!eanChecksumResult.ok) {
+        throw new Error(`Template checksum failed: expected=${eanChecksumResult.expected}, actual=${eanChecksumResult.actual}`);
+      }
     } catch (e: unknown) {
       const error = `Template Catalogo EAN.xlsx non trovato in storage: ${errMsg(e)}`;
       await updateStepResult(supabase, runId, 'export_ean_xlsx', { status: 'failed', error, metrics: {} });
@@ -2858,18 +3025,22 @@ async function stepExportEanXlsx(supabase: SupabaseClient, runId: string): Promi
     
     await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'INFO', p_message: 'rows_written', p_details: { step: 'export_ean_xlsx', rows: rowsWritten } }).catch(() => {});
     
-    // Pre-upload validation (EAN: all EAN cells string-typed)
+    // Serialize XLSX first (needed for ZIP-level comparison)
+    const xlsxBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: false, bookSST: false });
+    const eanOutputBytes = new Uint8Array(xlsxBuffer);
+    
+    // Pre-upload validation (EAN: all EAN cells string-typed + ZIP comparison)
     const eanValidation = await validateExportVsTemplate(
       XLSX, wb, eanTemplateBytes, 'Catalogo EAN', 'Catalogo_EAN', 'EAN', supabase, runId,
-      { headerCellsModifiedCount: 0, cellsWrittenBySheet: { 'Catalogo_EAN': rowsWritten * headers.length } }
+      { headerCellsModifiedCount: 0, cellsWrittenBySheet: { 'Catalogo_EAN': rowsWritten * headers.length } },
+      eanOutputBytes
     );
     if (!eanValidation.passed) {
       const error = `Pre-SFTP validation failed for Catalogo EAN.xlsx: ${eanValidation.errors.join('; ')}`;
-      await updateStepResult(supabase, runId, 'export_ean_xlsx', { status: 'failed', error, metrics: {}, validation_passed: false } as StepResultData);
+      await updateStepResult(supabase, runId, 'export_ean_xlsx', { status: 'failed', error, metrics: {}, validation_passed: false, validation_warnings: eanValidation.warnings } as StepResultData);
       return { success: false, error };
     }
     
-    const xlsxBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: false, bookSST: false });
     const blob = new Blob([xlsxBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
     
     const { error: uploadError } = await supabase.storage.from('exports').upload(
@@ -2890,7 +3061,8 @@ async function stepExportEanXlsx(supabase: SupabaseClient, runId: string): Promi
       rows_written: rowsWritten,
       total_products: rowsWritten,
       stream_chunks: chunkCount,
-      validation_passed: true
+      validation_passed: true,
+      validation_warnings: eanValidation.warnings
     } as StepResultData);
     console.log(`[sync:step:export_ean_xlsx] Completed: ${rowsWritten} rows in ${elapsed}ms (${chunkCount} stream chunks, template-based)`);
     console.log(JSON.stringify({ diag_tag: 'xlsx_export_retry_decision', run_id: runId, step: 'export_ean_xlsx', decision: 'completed', rows_written: rowsWritten, total_products: rowsWritten, elapsed_ms: elapsed, stream_chunks: chunkCount }));
@@ -2914,6 +3086,11 @@ async function processEanXlsxFromContent(supabase: SupabaseClient, runId: string
       if (tmplErr || !tmplBlob) throw new Error(tmplErr?.message || 'empty');
       eanTmplBytes = new Uint8Array(await tmplBlob.arrayBuffer());
       await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'INFO', p_message: 'template_loaded', p_details: { step: 'export_ean_xlsx', file: 'Catalogo EAN.xlsx', bytes: eanTmplBytes.length, source: 'storage', mode: 'direct' } }).catch(() => {});
+      // SHA-256 checksum verification (blocking)
+      const eanDirChecksumResult = await verifyTemplateChecksum(eanTmplBytes, 'Catalogo EAN.xlsx', supabase, runId);
+      if (!eanDirChecksumResult.ok) {
+        throw new Error(`Template checksum failed: expected=${eanDirChecksumResult.expected}, actual=${eanDirChecksumResult.actual}`);
+      }
     } catch (e: unknown) {
       const error = `Template Catalogo EAN.xlsx non trovato: ${errMsg(e)}`;
       await updateStepResult(supabase, runId, 'export_ean_xlsx', { status: 'failed', error, metrics: {} });
@@ -2964,18 +3141,22 @@ async function processEanXlsxFromContent(supabase: SupabaseClient, runId: string
     }
     ws['!ref'] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: rowsWritten, c: headers.length - 1 } });
     
-    // Validation (direct mode)
+    // Serialize XLSX first (needed for ZIP-level comparison)
+    const xlsxBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: false, bookSST: false });
+    const eanDirOutputBytes = new Uint8Array(xlsxBuffer);
+    
+    // Validation (direct mode + ZIP comparison)
     const val = await validateExportVsTemplate(
       XLSX, wb, eanTmplBytes, 'Catalogo EAN', 'Catalogo_EAN', 'EAN', supabase, runId,
-      { headerCellsModifiedCount: 0, cellsWrittenBySheet: { 'Catalogo_EAN': rowsWritten * headers.length } }
+      { headerCellsModifiedCount: 0, cellsWrittenBySheet: { 'Catalogo_EAN': rowsWritten * headers.length } },
+      eanDirOutputBytes
     );
     if (!val.passed) {
       const error = `Validation failed: ${val.errors.join('; ')}`;
-      await updateStepResult(supabase, runId, 'export_ean_xlsx', { status: 'failed', error, metrics: {}, validation_passed: false } as StepResultData);
+      await updateStepResult(supabase, runId, 'export_ean_xlsx', { status: 'failed', error, metrics: {}, validation_passed: false, validation_warnings: val.warnings } as StepResultData);
       return { success: false, error };
     }
     
-    const xlsxBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: false, bookSST: false });
     const blob = new Blob([xlsxBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
     const { error: uploadError } = await supabase.storage.from('exports').upload(
       'Catalogo EAN.xlsx', blob, { upsert: true, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }
@@ -2989,7 +3170,9 @@ async function processEanXlsxFromContent(supabase: SupabaseClient, runId: string
     await updateStepResult(supabase, runId, 'export_ean_xlsx', {
       status: 'success', duration_ms: elapsed, rows: rowsWritten,
       metrics: { ean_xlsx_rows: rowsWritten },
-      rows_written: rowsWritten, total_products: rowsWritten, validation_passed: true
+      rows_written: rowsWritten, total_products: rowsWritten,
+      validation_passed: true,
+      validation_warnings: val.warnings
     } as StepResultData);
     console.log(`[sync:step:export_ean_xlsx] Completed (direct, template-based): ${rowsWritten} rows in ${elapsed}ms`);
     return { success: true };
@@ -3543,6 +3726,24 @@ serve(async (req) => {
   try {
     const body = await req.json();
     const { run_id, step, fee_config } = body;
+    
+    // Special handler: compute template checksums (no run_id needed)
+    if (step === 'compute_template_checksums') {
+      const checksums: Record<string, { sha256: string; bytes: number }> = {};
+      const templates = ['Catalogo EAN.xlsx', 'Export ePrice.xlsx', 'Export Mediaworld.xlsx'];
+      for (const name of templates) {
+        const { data: blob, error: dlErr } = await supabase.storage.from('exports').download(`templates/${name}`);
+        if (dlErr || !blob) {
+          return new Response(JSON.stringify({ status: 'error', message: `Failed to download ${name}: ${dlErr?.message}` }),
+            { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        }
+        const bytes = new Uint8Array(await blob.arrayBuffer());
+        const hash = await computeSHA256(bytes);
+        checksums[name] = { sha256: hash, bytes: bytes.length };
+      }
+      return new Response(JSON.stringify({ status: 'ok', checksums }), 
+        { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
     
     if (!run_id || !step) {
       return new Response(JSON.stringify({ status: 'error', message: 'run_id and step required' }), 
