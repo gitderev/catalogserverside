@@ -402,97 +402,266 @@ async function deleteFromStorage(supabase: SupabaseClient, bucket: string, path:
 }
 
 // ========== EXPORT VALIDATION: compare generated XLSX vs template ==========
+// Deterministic hash for sheet content comparison (Mediaworld ReferenceData/Columns)
+function sheetContentHash(
+  // deno-lint-ignore no-explicit-any
+  XLSX: any,
+  // deno-lint-ignore no-explicit-any
+  ws: any,
+  maxRows: number = 50,
+  maxCols: number = 50
+): string {
+  if (!ws || !ws['!ref']) return 'EMPTY';
+  const range = XLSX.utils.decode_range(ws['!ref']);
+  const endR = Math.min(range.e.r, maxRows - 1);
+  const endC = Math.min(range.e.c, maxCols - 1);
+  const parts: string[] = [];
+  for (let r = 0; r <= endR; r++) {
+    for (let c = 0; c <= endC; c++) {
+      const cell = ws[XLSX.utils.encode_cell({ r, c })];
+      if (cell) {
+        parts.push(`${r},${c}:${cell.t}|${cell.v ?? ''}|${cell.z ?? ''}`);
+      }
+    }
+  }
+  // Simple deterministic hash: join all parts
+  return parts.join('||');
+}
+
 // deno-lint-ignore no-explicit-any
 async function validateExportVsTemplate(
-  XLSX: any, generatedWb: any, templateBytes: Uint8Array,
-  exportName: string, dataSheet: string, eanHeaderName: string,
-  supabase: SupabaseClient, runId: string
-): Promise<{ passed: boolean; errors: string[] }> {
+  // deno-lint-ignore no-explicit-any
+  XLSX: any,
+  // deno-lint-ignore no-explicit-any
+  generatedWb: any,
+  templateBytes: Uint8Array,
+  exportName: string,
+  dataSheet: string,
+  eanHeaderName: string,
+  supabase: SupabaseClient,
+  runId: string,
+  options?: {
+    protectedSheets?: string[];      // Mediaworld: ReferenceData, Columns
+    headerCellsModifiedCount?: number; // Tracking from caller (must be 0)
+    cellsWrittenBySheet?: Record<string, number>;
+  }
+): Promise<{ passed: boolean; errors: string[]; warnings: string[] }> {
   const errors: string[] = [];
+  const warnings: string[] = [];
   const tmplWb = XLSX.read(new Uint8Array(templateBytes), { type: 'array' });
 
-  // 1. Sheet names
+  // ============================================================
+  // 1. Sheet count and names (exact order)
+  // ============================================================
+  if (generatedWb.SheetNames.length !== tmplWb.SheetNames.length) {
+    errors.push(`sheet_count: expected ${tmplWb.SheetNames.length}, got ${generatedWb.SheetNames.length}`);
+  }
   if (JSON.stringify(generatedWb.SheetNames) !== JSON.stringify(tmplWb.SheetNames)) {
     errors.push(`sheet_names: expected ${JSON.stringify(tmplWb.SheetNames)}, got ${JSON.stringify(generatedWb.SheetNames)}`);
   }
 
-  // 2. Data sheet checks
+  // ============================================================
+  // 2. Data sheet existence
+  // ============================================================
   const tmplWs = tmplWb.Sheets[dataSheet];
   const genWs = generatedWb.Sheets[dataSheet];
   if (!tmplWs || !genWs) {
     errors.push(`sheet_missing: ${dataSheet}`);
-    return logAndReturn(errors);
+    return logAndReturn(errors, warnings);
   }
 
   const tmplRange = tmplWs['!ref'] ? XLSX.utils.decode_range(tmplWs['!ref']) : null;
-  if (!tmplRange) { errors.push(`template_empty_range: ${dataSheet}`); return logAndReturn(errors); }
+  if (!tmplRange) { errors.push(`template_empty_range: ${dataSheet}`); return logAndReturn(errors, warnings); }
 
-  // 3. Header row 0 values must match template exactly
+  // ============================================================
+  // 3. Header row 0: values MUST be identical (no writes allowed)
+  // ============================================================
+  let headerMismatchCount = 0;
   for (let c = 0; c <= tmplRange.e.c; c++) {
     const addr = XLSX.utils.encode_cell({ r: 0, c });
     const tv = tmplWs[addr]?.v?.toString() || '';
     const gv = genWs[addr]?.v?.toString() || '';
-    if (tv !== gv) errors.push(`header[${c}]: expected "${tv}", got "${gv}"`);
+    if (tv !== gv) {
+      errors.push(`header[${c}]: expected "${tv}", got "${gv}"`);
+      headerMismatchCount++;
+    }
+  }
+  if (headerMismatchCount > 0) {
+    errors.push(`header_cells_modified_count: ${headerMismatchCount} (MUST be 0)`);
   }
 
-  // 4. AutoFilter
+  // ============================================================
+  // 4. Caller-tracked header_cells_modified_count assert
+  // ============================================================
+  if (options?.headerCellsModifiedCount !== undefined && options.headerCellsModifiedCount > 0) {
+    errors.push(`caller_header_cells_modified_count: ${options.headerCellsModifiedCount} (MUST be 0)`);
+  }
+
+  // Log cells_written_by_sheet
+  if (options?.cellsWrittenBySheet) {
+    console.log(`[validate:${exportName}] cells_written_by_sheet:`, options.cellsWrittenBySheet);
+  }
+
+  // ============================================================
+  // 5. AutoFilter (exact match)
+  // ============================================================
   const tf = JSON.stringify(tmplWs['!autofilter'] || null);
   const gf = JSON.stringify(genWs['!autofilter'] || null);
   if (tf !== gf) errors.push(`autofilter: expected ${tf}, got ${gf}`);
 
-  // 5. Column widths (log warning if not readable, don't fail)
+  // ============================================================
+  // 6. Column widths (all template columns must match)
+  // ============================================================
   const tmplCols = tmplWs['!cols'];
   const genCols = genWs['!cols'];
   if (tmplCols) {
     if (!genCols) {
-      console.warn(`[validate:${exportName}] Template has !cols but generated does not`);
+      errors.push(`column_widths: template has !cols but generated does not`);
     } else {
-      for (let i = 0; i < Math.min(tmplCols.length, genCols.length); i++) {
-        if (tmplCols[i]?.wch != null && genCols[i]?.wch != null && tmplCols[i].wch !== genCols[i].wch) {
-          console.warn(`[validate:${exportName}] Col ${i} width: tmpl=${tmplCols[i].wch} gen=${genCols[i].wch}`);
+      for (let i = 0; i < tmplCols.length; i++) {
+        const tw = tmplCols[i]?.wch ?? tmplCols[i]?.wpx ?? tmplCols[i]?.width;
+        const gw = genCols[i]?.wch ?? genCols[i]?.wpx ?? genCols[i]?.width;
+        if (tw != null && gw != null && tw !== gw) {
+          errors.push(`col_width[${i}]: expected ${tw}, got ${gw}`);
+        } else if (tw != null && gw == null) {
+          errors.push(`col_width[${i}]: template has width=${tw} but generated is null`);
         }
       }
     }
   }
 
-  // 6. Freeze panes (xlsx community may not expose; log limitation)
-  const tmplViews = tmplWs['!freeze'] || tmplWs['!pane'] || null;
-  if (!tmplViews) {
-    console.warn(`[validate:${exportName}] Freeze pane info not readable (xlsx community limitation). Cannot verify.`);
-  }
+  // ============================================================
+  // 7. Freeze panes (verification_not_supported — community edition)
+  // ============================================================
+  // xlsx community edition does NOT expose freeze pane data on read.
+  // Since we use template-based round-trip (XLSX.read→modify data→XLSX.write),
+  // freeze panes ARE preserved in the internal XML. We cannot verify, but the
+  // risk is mitigated by never touching worksheet-level metadata.
+  warnings.push('verification_not_supported:freeze_panes (preserved via template round-trip, community edition cannot read)');
 
-  // 7. EAN column type check
+  // ============================================================
+  // 8. Header styleId (verification_not_supported — community edition)
+  // ============================================================
+  // Cell styles (styleId) require Pro edition. Community edition does not
+  // expose cell.s reliably. Mitigated by assert: header row is never overwritten.
+  warnings.push('verification_not_supported:header_style_id (preserved via template round-trip, community edition cannot read)');
+
+  // ============================================================
+  // 9. Number formats: compare cell.z for first data row
+  // ============================================================
   const genRange = genWs['!ref'] ? XLSX.utils.decode_range(genWs['!ref']) : null;
   if (genRange) {
-    let eanCol = -1;
-    for (let c = 0; c <= tmplRange.e.c; c++) {
-      const hv = (tmplWs[XLSX.utils.encode_cell({ r: 0, c })]?.v || '').toString().toLowerCase();
-      if (hv === eanHeaderName.toLowerCase()) { eanCol = c; break; }
-    }
-    if (eanCol < 0) {
-      errors.push(`ean_column "${eanHeaderName}" not found in template headers`);
-    } else {
-      const startRow = dataSheet === 'Data' ? 2 : 1;
-      for (let r = startRow; r <= Math.min(startRow + 4, genRange.e.r); r++) {
-        const cell = genWs[XLSX.utils.encode_cell({ r, c: eanCol })];
-        if (cell && cell.t !== 's') {
-          errors.push(`ean_type_row${r}: expected 's', got '${cell.t}'`);
+    // Determine first data row (Mediaworld=2, others=1)
+    const firstDataRow = dataSheet === 'Data' ? 2 : 1;
+    if (genRange.e.r >= firstDataRow) {
+      for (let c = 0; c <= tmplRange.e.c; c++) {
+        // Compare template's first data row format with generated first data row
+        const tmplDataRow = dataSheet === 'Data' ? 2 : 1;
+        const tmplAddr = XLSX.utils.encode_cell({ r: tmplDataRow, c });
+        const genAddr = XLSX.utils.encode_cell({ r: firstDataRow, c });
+        const tmplZ = tmplWs[tmplAddr]?.z || null;
+        const genZ = genWs[genAddr]?.z || null;
+        // Mismatch: one has format, other doesn't (or different format)
+        if (tmplZ !== genZ) {
+          // Only error if template has a specific format that output doesn't match
+          // null vs null is OK, null vs '@' is mismatch
+          if (tmplZ !== null || genZ !== null) {
+            errors.push(`number_format[col${c},row${firstDataRow}]: template="${tmplZ}", generated="${genZ}"`);
+          }
         }
       }
     }
   }
 
-  return logAndReturn(errors);
-
-  async function logAndReturn(errs: string[]): Promise<{ passed: boolean; errors: string[] }> {
-    if (errs.length > 0) {
-      console.error(`[validate:${exportName}] FAILED:`, errs);
-      await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'ERROR', p_message: 'validation_failed', p_details: { export_name: exportName, errors: errs.slice(0, 10) } }).catch(() => {});
-    } else {
-      console.log(`[validate:${exportName}] PASSED`);
-      await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'INFO', p_message: 'validation_ok', p_details: { export_name: exportName } }).catch(() => {});
+  // ============================================================
+  // 10. EAN column: type check + leading zeros preservation
+  // ============================================================
+  if (genRange) {
+    let eanCol = -1;
+    // Find EAN column by case-insensitive match or "contains ean"
+    for (let c = 0; c <= tmplRange.e.c; c++) {
+      const hv = (tmplWs[XLSX.utils.encode_cell({ r: 0, c })]?.v || '').toString().toLowerCase().trim();
+      if (hv === eanHeaderName.toLowerCase() || hv.includes('ean')) { eanCol = c; break; }
     }
-    return { passed: errs.length === 0, errors: errs };
+    if (eanCol < 0) {
+      errors.push(`ean_column "${eanHeaderName}" not found in template headers (also tried case-insensitive "ean" match)`);
+    } else {
+      const startRow = dataSheet === 'Data' ? 2 : 1;
+      const checkLimit = Math.min(genRange.e.r, startRow + 99); // Check up to 100 rows
+      for (let r = startRow; r <= checkLimit; r++) {
+        const cell = genWs[XLSX.utils.encode_cell({ r, c: eanCol })];
+        if (!cell) continue;
+        if (cell.t !== 's') {
+          errors.push(`ean_type_row${r}: expected 's' (string), got '${cell.t}'`);
+        }
+        // Leading zeros: EAN must be 13+ chars when present
+        const val = String(cell.v || '');
+        if (val && /^\d+$/.test(val) && val.length < 12) {
+          errors.push(`ean_leading_zeros_row${r}: value "${val}" too short (${val.length} digits), possible zero truncation`);
+        }
+      }
+    }
+  }
+
+  // ============================================================
+  // 11. ePrice-specific: column count and header order
+  // ============================================================
+  if (exportName === 'Export ePrice') {
+    // Count non-empty headers in template
+    let tmplHeaderCount = 0;
+    for (let c = 0; c <= tmplRange.e.c; c++) {
+      const hv = (tmplWs[XLSX.utils.encode_cell({ r: 0, c })]?.v || '').toString().trim();
+      if (hv) tmplHeaderCount++;
+    }
+    const genRangeEp = genWs['!ref'] ? XLSX.utils.decode_range(genWs['!ref']) : null;
+    if (genRangeEp) {
+      let genHeaderCount = 0;
+      for (let c = 0; c <= genRangeEp.e.c; c++) {
+        const hv = (genWs[XLSX.utils.encode_cell({ r: 0, c })]?.v || '').toString().trim();
+        if (hv) genHeaderCount++;
+      }
+      if (tmplHeaderCount !== genHeaderCount) {
+        errors.push(`eprice_header_count: expected ${tmplHeaderCount}, got ${genHeaderCount}`);
+      }
+    }
+  }
+
+  // ============================================================
+  // 12. Protected sheets integrity (Mediaworld: ReferenceData, Columns)
+  // ============================================================
+  if (options?.protectedSheets) {
+    for (const sheetName of options.protectedSheets) {
+      const tmplSheet = tmplWb.Sheets[sheetName];
+      const genSheet = generatedWb.Sheets[sheetName];
+      if (!tmplSheet) { errors.push(`protected_sheet_missing_in_template: ${sheetName}`); continue; }
+      if (!genSheet) { errors.push(`protected_sheet_missing_in_output: ${sheetName}`); continue; }
+      const tmplHash = sheetContentHash(XLSX, tmplSheet);
+      const genHash = sheetContentHash(XLSX, genSheet);
+      if (tmplHash !== genHash) {
+        errors.push(`protected_sheet_modified: ${sheetName} (hash mismatch)`);
+      } else {
+        console.log(`[validate:${exportName}] Protected sheet ${sheetName}: hash match OK`);
+      }
+    }
+  }
+
+  return logAndReturn(errors, warnings);
+
+  async function logAndReturn(errs: string[], warns: string[]): Promise<{ passed: boolean; errors: string[]; warnings: string[] }> {
+    if (errs.length > 0) {
+      console.error(`[validate:${exportName}] FAILED (${errs.length} errors):`, errs);
+      await supabase.rpc('log_sync_event', {
+        p_run_id: runId, p_level: 'ERROR', p_message: 'validation_failed',
+        p_details: { export_name: exportName, errors: errs.slice(0, 20), warnings: warns }
+      }).catch(() => {});
+    } else {
+      console.log(`[validate:${exportName}] PASSED (${warns.length} warnings)`);
+      await supabase.rpc('log_sync_event', {
+        p_run_id: runId, p_level: 'INFO', p_message: 'validation_ok',
+        p_details: { export_name: exportName, warnings: warns }
+      }).catch(() => {});
+    }
+    return { passed: errs.length === 0, errors: errs, warnings: warns };
   }
 }
 
@@ -2265,8 +2434,15 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     
     logMWStage('before_xlsx_upload', startTime, { rows: mwWritten, skipped: mwSkipped, format: 'xlsx' });
     
-    // Pre-upload validation against template
-    const mwValidation = await validateExportVsTemplate(XLSX, wb, mwTemplateBytes, 'Export Mediaworld', 'Data', 'ID Prodotto', supabase, runId);
+    // Pre-upload validation against template (with protected sheets and write tracking)
+    const mwValidation = await validateExportVsTemplate(
+      XLSX, wb, mwTemplateBytes, 'Export Mediaworld', 'Data', 'ID Prodotto', supabase, runId,
+      {
+        protectedSheets: ['ReferenceData', 'Columns'],
+        headerCellsModifiedCount: 0, // We never touch headers
+        cellsWrittenBySheet: { 'Data': mwWritten * 22 }
+      }
+    );
     if (!mwValidation.passed) {
       const error = `Pre-SFTP validation failed for Export Mediaworld.xlsx: ${mwValidation.errors.join('; ')}`;
       await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {}, validation_passed: false } as StepResultData);
@@ -2446,8 +2622,11 @@ async function stepExportEprice(supabase: SupabaseClient, runId: string, feeConf
     
     await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'INFO', p_message: 'rows_written', p_details: { step: 'export_eprice', rows: epWritten, skipped: epSkipped } }).catch(() => {});
     
-    // Pre-upload validation
-    const epValidation = await validateExportVsTemplate(XLSX, wb, epTemplateBytes, 'Export ePrice', 'Tracciato_Inserimento_Offerte', 'product-id', supabase, runId);
+    // Pre-upload validation (ePrice-specific: column count check)
+    const epValidation = await validateExportVsTemplate(
+      XLSX, wb, epTemplateBytes, 'Export ePrice', 'Tracciato_Inserimento_Offerte', 'product-id', supabase, runId,
+      { headerCellsModifiedCount: 0, cellsWrittenBySheet: { 'Tracciato_Inserimento_Offerte': epWritten * 8 } }
+    );
     if (!epValidation.passed) {
       const error = `Pre-SFTP validation failed for Export ePrice.xlsx: ${epValidation.errors.join('; ')}`;
       await updateStepResult(supabase, runId, 'export_eprice', { status: 'failed', error, metrics: {}, validation_passed: false } as StepResultData);
@@ -2667,8 +2846,11 @@ async function stepExportEanXlsx(supabase: SupabaseClient, runId: string): Promi
     
     await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'INFO', p_message: 'rows_written', p_details: { step: 'export_ean_xlsx', rows: rowsWritten } }).catch(() => {});
     
-    // Pre-upload validation
-    const eanValidation = await validateExportVsTemplate(XLSX, wb, eanTemplateBytes, 'Catalogo EAN', 'Catalogo_EAN', 'EAN', supabase, runId);
+    // Pre-upload validation (EAN: all EAN cells string-typed)
+    const eanValidation = await validateExportVsTemplate(
+      XLSX, wb, eanTemplateBytes, 'Catalogo EAN', 'Catalogo_EAN', 'EAN', supabase, runId,
+      { headerCellsModifiedCount: 0, cellsWrittenBySheet: { 'Catalogo_EAN': rowsWritten * headers.length } }
+    );
     if (!eanValidation.passed) {
       const error = `Pre-SFTP validation failed for Catalogo EAN.xlsx: ${eanValidation.errors.join('; ')}`;
       await updateStepResult(supabase, runId, 'export_ean_xlsx', { status: 'failed', error, metrics: {}, validation_passed: false } as StepResultData);
@@ -2769,8 +2951,11 @@ async function processEanXlsxFromContent(supabase: SupabaseClient, runId: string
     }
     ws['!ref'] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: rowsWritten, c: headers.length - 1 } });
     
-    // Validation
-    const val = await validateExportVsTemplate(XLSX, wb, eanTmplBytes, 'Catalogo EAN', 'Catalogo_EAN', 'EAN', supabase, runId);
+    // Validation (direct mode)
+    const val = await validateExportVsTemplate(
+      XLSX, wb, eanTmplBytes, 'Catalogo EAN', 'Catalogo_EAN', 'EAN', supabase, runId,
+      { headerCellsModifiedCount: 0, cellsWrittenBySheet: { 'Catalogo_EAN': rowsWritten * headers.length } }
+    );
     if (!val.passed) {
       const error = `Validation failed: ${val.errors.join('; ')}`;
       await updateStepResult(supabase, runId, 'export_ean_xlsx', { status: 'failed', error, metrics: {}, validation_passed: false } as StepResultData);

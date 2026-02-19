@@ -1046,9 +1046,14 @@ async function runPipeline(
           const bucketNames = new Set((bucketContents || []).map((f: { name: string }) => f.name));
           const missingXlsx = REQUIRED_MARKETPLACE_XLSX.filter(f => !bucketNames.has(f));
           
-          // C) Nessun CSV nella selezione
+          // C) Nessun CSV nella selezione SFTP
           const csvInSelection = EXPORT_FILES.filter(f => f.endsWith('.csv'));
           const blockedCsvInBucket = BLOCKED_CSV_NAMES.filter(f => bucketNames.has(f));
+          
+          // C-bis) Nessun CSV nel bucket (blocco extra)
+          const allCsvInBucket = (bucketContents || [])
+            .filter((f: { name: string }) => f.name.endsWith('.csv'))
+            .map((f: { name: string }) => f.name);
           
           if (!pipelineFailedBeforeNotification && (missingXlsx.length > 0 || csvInSelection.length > 0)) {
             const reason = missingXlsx.length > 0
@@ -1061,7 +1066,18 @@ async function runPipeline(
             pipelineFailError = reason;
           }
           
-          // D+E) Check export step validation flags
+          // D) Check for extra files in SFTP selection (beyond whitelist)
+          if (!pipelineFailedBeforeNotification) {
+            const extraFiles = EXPORT_FILES.filter(f => !SFTP_WHITELIST.has(f));
+            if (extraFiles.length > 0) {
+              const reason = `Pre-SFTP: file extra nella selezione (non in whitelist): ${extraFiles.join(', ')}`;
+              console.error(`[orchestrator] ${reason}`);
+              await mergeStepState(supabase, runId, 'upload_sftp', { status: 'failed', error: reason, validation: 'extra_files' });
+              pipelineFailedBeforeNotification = true; pipelineFailError = reason;
+            }
+          }
+          
+          // E) Check export step validation flags + verification_not_supported
           if (!pipelineFailedBeforeNotification) {
             const { data: runData } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
             const steps = runData?.steps || {};
@@ -1083,15 +1099,27 @@ async function runPipeline(
                 pipelineFailedBeforeNotification = true; pipelineFailError = reason;
                 break;
               }
+              // Check for verification_not_supported in error field (hard block)
+              if (stepState.error && typeof stepState.error === 'string' && stepState.error.includes('verification_not_supported')) {
+                const reason = `Pre-SFTP: step ${es} has verification_not_supported error: ${stepState.error}`;
+                console.error(`[orchestrator] ${reason}`);
+                await mergeStepState(supabase, runId, 'upload_sftp', { status: 'failed', error: reason, validation: 'verification_not_supported' });
+                try { await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'ERROR', p_message: 'sftp_pre_validation_failed', p_details: { step: 'upload_sftp', failed_export: es, reason: 'verification_not_supported' } }); } catch (_) {}
+                pipelineFailedBeforeNotification = true; pipelineFailError = reason;
+                break;
+              }
             }
             
-            // Log Amazon non-regression check
+            // Log Amazon non-regression check + CSV audit
             if (!pipelineFailedBeforeNotification) {
               const amazonFiles = ['amazon_listing_loader.xlsm', 'amazon_price_inventory.txt'];
               const amazonPresent = amazonFiles.filter(f => bucketNames.has(f));
               const amazonMissing = amazonFiles.filter(f => !bucketNames.has(f));
               console.log(`[orchestrator] Amazon non-regression: present=${amazonPresent.join(',')}, missing=${amazonMissing.join(',')}`);
-              await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'INFO', p_message: 'sftp_pre_validation_passed', p_details: { step: 'upload_sftp', whitelist: EXPORT_FILES, amazon_present: amazonPresent, amazon_missing: amazonMissing } }).catch(() => {});
+              if (allCsvInBucket.length > 0) {
+                console.warn(`[orchestrator] CSV files in bucket (not in SFTP selection but present): ${allCsvInBucket.join(', ')}`);
+              }
+              await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'INFO', p_message: 'sftp_pre_validation_passed', p_details: { step: 'upload_sftp', whitelist: EXPORT_FILES, amazon_present: amazonPresent, amazon_missing: amazonMissing, csv_in_bucket: allCsvInBucket } }).catch(() => {});
             }
           }
         }
