@@ -2782,7 +2782,8 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     // Serialize XLSX (needed for ZIP-level comparison)
     const mwWriteT0 = Date.now();
     await logMWStage('before_write', mwWriteT0, { rows: mwWritten, heap_mb: getMemMB() });
-    const xlsxBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: false, bookSST: false });
+    // deno-lint-ignore no-explicit-any
+    let xlsxBuffer: any = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: false, bookSST: false });
     let mwOutputBytes: Uint8Array | null = new Uint8Array(xlsxBuffer);
     const mwOutSize = mwOutputBytes.length;
     const mwWriteMs = Date.now() - mwWriteT0;
@@ -2853,7 +2854,7 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     wb = null;
     mwOutputBytes = null;
     
-    const mwBlob = new Blob([xlsxBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    let mwBlob: Blob | null = new Blob([xlsxBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
     
     const mwUpT0 = Date.now();
     await logMWStage('before_upload', mwUpT0, { size_bytes: mwOutSize });
@@ -2874,6 +2875,10 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
       await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
+    
+    // Release upload buffers — upload completed successfully, bytes no longer needed
+    xlsxBuffer = null;
+    mwBlob = null;
     
     await safeLogEvent(supabase, runId, 'INFO', 'export_saved', { step: 'export_mediaworld', file: 'Export Mediaworld.xlsx', rows: mwWritten });
     
@@ -2899,8 +2904,10 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     
   } catch (e: unknown) {
     console.error(`[sync:step:export_mediaworld] Error:`, e);
+    const failMem = getMemMB();
+    if (failMem > heapPeakMb) heapPeakMb = failMem;
     await safeLogEvent(supabase, runId, 'ERROR', 'export_mediaworld_stage', {
-      step: 'export_mediaworld', stage: 'failed', heap_mb: getMemMB(), duration_ms: Date.now() - startTime,
+      step: 'export_mediaworld', stage: 'failed', heap_mb: failMem, heap_peak_mb: heapPeakMb, duration_ms: Date.now() - startTime,
       reason: errMsg(e), last_stage: 'unknown'
     });
     await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error: errMsg(e), metrics: {} });
