@@ -1028,26 +1028,71 @@ async function runPipeline(
           });
         } catch (_) {}
         
-        // === PRE-SFTP VALIDATION ===
+        // === PRE-SFTP VALIDATION (fail fast) ===
         const REQUIRED_MARKETPLACE_XLSX = ['Catalogo EAN.xlsx', 'Export ePrice.xlsx', 'Export Mediaworld.xlsx'];
-        const BLOCKED_CSV_NAMES = ['Export Mediaworld.csv', 'Export ePrice.csv'];
+        const BLOCKED_CSV_NAMES = ['Export Mediaworld.csv', 'Export ePrice.csv', 'Catalogo EAN.csv'];
+        const SFTP_WHITELIST = new Set(EXPORT_FILES);
         {
+          // A) Whitelist check: exactly 5 files
+          if (EXPORT_FILES.length !== 5) {
+            const reason = `Pre-SFTP: EXPORT_FILES count ${EXPORT_FILES.length} !== 5`;
+            console.error(`[orchestrator] ${reason}`);
+            await mergeStepState(supabase, runId, 'upload_sftp', { status: 'failed', error: reason, validation: 'whitelist_count' });
+            pipelineFailedBeforeNotification = true; pipelineFailError = reason;
+          }
+          
+          // B) XLSX presenti nel bucket
           const { data: bucketContents } = await supabase.storage.from('exports').list('', { limit: 200 });
           const bucketNames = new Set((bucketContents || []).map((f: { name: string }) => f.name));
           const missingXlsx = REQUIRED_MARKETPLACE_XLSX.filter(f => !bucketNames.has(f));
           
-          // Check EXPORT_FILES has no CSV for marketplace
-          const csvInSelection = EXPORT_FILES.filter(f => BLOCKED_CSV_NAMES.includes(f));
+          // C) Nessun CSV nella selezione
+          const csvInSelection = EXPORT_FILES.filter(f => f.endsWith('.csv'));
+          const blockedCsvInBucket = BLOCKED_CSV_NAMES.filter(f => bucketNames.has(f));
           
-          if (missingXlsx.length > 0 || csvInSelection.length > 0) {
+          if (!pipelineFailedBeforeNotification && (missingXlsx.length > 0 || csvInSelection.length > 0)) {
             const reason = missingXlsx.length > 0
               ? `Pre-SFTP: file XLSX mancanti nel bucket: ${missingXlsx.join(', ')}`
               : `Pre-SFTP: file CSV non ammessi nella selezione SFTP: ${csvInSelection.join(', ')}`;
             console.error(`[orchestrator] ${reason}`);
             await mergeStepState(supabase, runId, 'upload_sftp', { status: 'failed', error: reason, validation: 'pre_sftp_check' });
-            try { await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'ERROR', p_message: 'sftp_pre_validation_failed', p_details: { step: 'upload_sftp', missing: missingXlsx, csv_blocked: csvInSelection } }); } catch (_) {}
+            try { await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'ERROR', p_message: 'sftp_pre_validation_failed', p_details: { step: 'upload_sftp', missing: missingXlsx, csv_blocked: csvInSelection, csv_in_bucket: blockedCsvInBucket } }); } catch (_) {}
             pipelineFailedBeforeNotification = true;
             pipelineFailError = reason;
+          }
+          
+          // D+E) Check export step validation flags
+          if (!pipelineFailedBeforeNotification) {
+            const { data: runData } = await supabase.from('sync_runs').select('steps').eq('id', runId).single();
+            const steps = runData?.steps || {};
+            const exportStepsToCheck = ['export_ean_xlsx', 'export_mediaworld', 'export_eprice'];
+            for (const es of exportStepsToCheck) {
+              const stepState = steps[es];
+              if (!stepState || stepState.status !== 'success') {
+                const reason = `Pre-SFTP: step ${es} non completato (status=${stepState?.status || 'missing'})`;
+                console.error(`[orchestrator] ${reason}`);
+                await mergeStepState(supabase, runId, 'upload_sftp', { status: 'failed', error: reason, validation: 'step_validation' });
+                pipelineFailedBeforeNotification = true; pipelineFailError = reason;
+                break;
+              }
+              if (stepState.validation_passed === false) {
+                const reason = `Pre-SFTP: step ${es} template validation failed`;
+                console.error(`[orchestrator] ${reason}`);
+                await mergeStepState(supabase, runId, 'upload_sftp', { status: 'failed', error: reason, validation: 'template_identity' });
+                try { await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'ERROR', p_message: 'sftp_pre_validation_failed', p_details: { step: 'upload_sftp', failed_export: es, reason: 'template_identity_check_failed' } }); } catch (_) {}
+                pipelineFailedBeforeNotification = true; pipelineFailError = reason;
+                break;
+              }
+            }
+            
+            // Log Amazon non-regression check
+            if (!pipelineFailedBeforeNotification) {
+              const amazonFiles = ['amazon_listing_loader.xlsm', 'amazon_price_inventory.txt'];
+              const amazonPresent = amazonFiles.filter(f => bucketNames.has(f));
+              const amazonMissing = amazonFiles.filter(f => !bucketNames.has(f));
+              console.log(`[orchestrator] Amazon non-regression: present=${amazonPresent.join(',')}, missing=${amazonMissing.join(',')}`);
+              await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'INFO', p_message: 'sftp_pre_validation_passed', p_details: { step: 'upload_sftp', whitelist: EXPORT_FILES, amazon_present: amazonPresent, amazon_missing: amazonMissing } }).catch(() => {});
+            }
           }
         }
         
