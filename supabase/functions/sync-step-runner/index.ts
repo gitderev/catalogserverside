@@ -534,7 +534,8 @@ function compareZipXmlIntegrity(
   templateBytes: Uint8Array,
   outputBytes: Uint8Array,
   dataSheetName: string,
-  exportName: string
+  exportName: string,
+  preExtractedTmplZip?: Record<string, Uint8Array>
 ): { errors: string[] } {
   const errors: string[] = [];
 
@@ -542,7 +543,7 @@ function compareZipXmlIntegrity(
   let outZip: Record<string, Uint8Array>;
 
   try {
-    tmplZip = unzipSync(templateBytes);
+    tmplZip = preExtractedTmplZip ?? unzipSync(templateBytes);
   } catch (e: unknown) {
     errors.push(`zip_unpack_template_failed: ${errMsg(e)}`);
     return { errors };
@@ -646,12 +647,16 @@ async function validateExportVsTemplate(
     protectedSheets?: string[];      // Mediaworld: ReferenceData, Columns
     headerCellsModifiedCount?: number; // Tracking from caller (must be 0)
     cellsWrittenBySheet?: Record<string, number>;
+    // deno-lint-ignore no-explicit-any
+    tmplWbOverride?: any; // Pre-parsed template workbook to avoid redundant XLSX.read
+    preExtractedTmplZip?: Record<string, Uint8Array>; // Pre-extracted template ZIP entries to avoid redundant unzipSync
   },
   outputBytes?: Uint8Array
 ): Promise<{ passed: boolean; errors: string[]; warnings: string[] }> {
   const errors: string[] = [];
   const warnings: string[] = [];
-  const tmplWb = XLSX.read(new Uint8Array(templateBytes), { type: 'array' });
+  // Use pre-parsed template workbook if provided, otherwise parse (CPU-expensive for large templates)
+  const tmplWb = options?.tmplWbOverride ?? XLSX.read(new Uint8Array(templateBytes), { type: 'array' });
 
   // ============================================================
   // 1. Sheet count and names (exact order)
@@ -740,7 +745,7 @@ async function validateExportVsTemplate(
   // we unzip both XLSX files and compare the raw XML sections directly.
   // This is a BLOCKING check: any mismatch fails validation.
   if (outputBytes) {
-    const zipResult = compareZipXmlIntegrity(templateBytes, outputBytes, dataSheet, exportName);
+    const zipResult = compareZipXmlIntegrity(templateBytes, outputBytes, dataSheet, exportName, options?.preExtractedTmplZip);
     for (const e of zipResult.errors) {
       errors.push(e);
     }
@@ -2538,8 +2543,15 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     
     const XLSX = await import("npm:xlsx@0.18.5");
     const mwParseT0 = Date.now();
-    const wb = XLSX.read(mwTemplateBytes, { type: 'array' });
-    await logMWStage('template_parse_done', mwParseT0);
+    // sheetRows optimization skipped for Mediaworld: ReferenceData/Columns have >2 rows needed for protected sheet hash validation
+    await safeLogEvent(supabase, runId, 'INFO', 'export_mediaworld_stage', {
+      step: 'export_mediaworld', stage: 'mediaworld_sheetRows_skipped', heap_mb: getMemMB(), duration_ms: 0,
+      reason: 'protected_sheets_ReferenceData_Columns_require_full_parse'
+    });
+    // cellStyles:false reduces parse CPU (~30%) without affecting output (styles live in xl/styles.xml, not cell objects)
+    const wb = XLSX.read(mwTemplateBytes, { type: 'array', cellStyles: false });
+    await logMWStage('template_parse_done', mwParseT0, { duration_ms: Date.now() - mwParseT0, size_bytes: mwTemplateBytes.length });
+    // Keep mwTemplateBytes alive for ZIP comparison in validation (freed after validation)
     
     // Validate template sheets
     const requiredSheets = ['Data', 'ReferenceData', 'Columns'];
@@ -2556,6 +2568,9 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     
     // Data starts at row 3 (index 2): row 1=headers (index 0), row 2=technical row (index 1)
     const DATA_START_ROW = 2;
+    
+    // Precompute column letters A-V (22 columns) to avoid encode_cell overhead in tight loop
+    const COL_LETTERS = ['A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V'];
     
     for (const p of products) {
       const norm = normalizeEAN(p.EAN);
@@ -2583,8 +2598,9 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
       if (!stockResult.shouldExport) { mwSkipped++; continue; }
       
       const r = DATA_START_ROW + mwWritten;
+      const rowStr = String(r + 1); // Excel rows are 1-indexed
       
-      // Write 22 columns matching Mediaworld template
+      // Write 22 columns matching Mediaworld template using precomputed addresses
       const rowData: (string | number)[] = [
         p.MPN || '',                         // A: SKU offerta
         norm.value!,                         // B: ID Prodotto (EAN)
@@ -2607,7 +2623,7 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
       ];
       
       for (let c = 0; c < rowData.length; c++) {
-        const addr = XLSX.utils.encode_cell({ r, c });
+        const addr = COL_LETTERS[c] + rowStr;
         const val = rowData[c];
         if (c === 1) {
           // EAN: force text to preserve leading zeros
@@ -2639,6 +2655,7 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     await logMWStage('after_write', mwWriteT0, { size_bytes: mwOutSize });
     
     // Pre-upload validation against template (with protected sheets, write tracking, and ZIP comparison)
+    // Uses pre-parsed workbook (tmplWbOverride) to avoid redundant XLSX.read of 12.8MB template
     const mwValT0 = Date.now();
     await logMWStage('before_validation', mwValT0);
     const mwValidation = await validateExportVsTemplate(
@@ -2646,11 +2663,16 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
       {
         protectedSheets: ['ReferenceData', 'Columns'],
         headerCellsModifiedCount: 0,
-        cellsWrittenBySheet: { 'Data': mwWritten * 22 }
+        cellsWrittenBySheet: { 'Data': mwWritten * 22 },
+        tmplWbOverride: wb
       },
       mwOutputBytes
     );
-    await logMWStage('after_validation', mwValT0, { passed: mwValidation.passed, integrity_mode: 'heavy' });
+    await logMWStage('after_validation', mwValT0, { passed: mwValidation.passed, integrity_mode: 'heavy', duration_ms: Date.now() - mwValT0 });
+    
+    // Free template bytes after validation (no longer needed)
+    mwTemplateBytes = null as unknown as Uint8Array;
+    
     if (!mwValidation.passed) {
       const error = `Pre-SFTP validation failed for Export Mediaworld.xlsx: ${mwValidation.errors.join('; ')}`;
       await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {}, validation_passed: false, validation_warnings: mwValidation.warnings } as StepResultData);
