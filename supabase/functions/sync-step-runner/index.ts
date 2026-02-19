@@ -402,6 +402,22 @@ async function deleteFromStorage(supabase: SupabaseClient, bucket: string, path:
   }
 }
 
+// ========== TEMPLATE CONSTANTS ==========
+const TEMPLATE_BUCKET = 'exports';
+const TEMPLATE_BASE_PATH = 'templates';
+
+// ========== SAFE RPC LOG (no .catch on PromiseLike) ==========
+async function safeLogEvent(supabase: SupabaseClient, runId: string, level: string, message: string, details: Record<string, unknown> = {}): Promise<void> {
+  try {
+    const { error } = await supabase.rpc('log_sync_event', {
+      p_run_id: runId, p_level: level, p_message: message, p_details: details
+    });
+    if (error) console.warn(`[safeLogEvent] rpc error: ${error.message}`);
+  } catch (e: unknown) {
+    console.warn(`[safeLogEvent] exception: ${errMsg(e)}`);
+  }
+}
+
 // ========== SHA-256 TEMPLATE PINNING ==========
 async function computeSHA256(data: Uint8Array): Promise<string> {
   const hash = await crypto.subtle.digest('SHA-256', data);
@@ -427,28 +443,59 @@ async function verifyTemplateChecksum(
 
   if (!expected || expected === '__PLACEHOLDER__') {
     console.error(`[checksum] Template ${templateName}: NO PINNED CHECKSUM (placeholder) — BLOCKING`);
-    await supabase.rpc('log_sync_event', {
-      p_run_id: runId, p_level: 'ERROR', p_message: 'template_checksum_missing',
-      p_details: { template: templateName, actual_sha256: actual }
-    }).catch(() => {});
+    await safeLogEvent(supabase, runId, 'ERROR', 'template_checksum_missing', { template: templateName, actual_sha256: actual });
     return { ok: false, actual, expected };
   }
 
   if (actual !== expected) {
     console.error(`[checksum] Template ${templateName}: MISMATCH! expected=${expected}, actual=${actual}`);
-    await supabase.rpc('log_sync_event', {
-      p_run_id: runId, p_level: 'ERROR', p_message: 'template_checksum_mismatch',
-      p_details: { template: templateName, expected, actual, bytes: templateBytes.length }
-    }).catch(() => {});
+    await safeLogEvent(supabase, runId, 'ERROR', 'template_checksum_mismatch', { template: templateName, expected, actual, bytes: templateBytes.length });
     return { ok: false, actual, expected };
   }
 
   console.log(`[checksum] Template ${templateName}: OK (${templateBytes.length} bytes)`);
-  await supabase.rpc('log_sync_event', {
-    p_run_id: runId, p_level: 'INFO', p_message: 'template_checksum_ok',
-    p_details: { template: templateName, sha256: actual, bytes: templateBytes.length }
-  }).catch(() => {});
+  await safeLogEvent(supabase, runId, 'INFO', 'template_checksum_ok', { template: templateName, sha256: actual, bytes: templateBytes.length });
   return { ok: true, actual, expected };
+}
+
+// ========== UNIFIED TEMPLATE LOADER (Storage API only) ==========
+async function loadTemplateFromStorage(
+  supabase: SupabaseClient,
+  templateName: string,
+  runId: string
+): Promise<Uint8Array> {
+  const path = `${TEMPLATE_BASE_PATH}/${templateName}`;
+  console.log(`[template] INFO template_config`, JSON.stringify({ bucketName: TEMPLATE_BUCKET, basePath: TEMPLATE_BASE_PATH }));
+  await safeLogEvent(supabase, runId, 'INFO', 'template_download_started', { templateName, bucketName: TEMPLATE_BUCKET, path });
+
+  const { data, error } = await supabase.storage.from(TEMPLATE_BUCKET).download(path);
+
+  if (error || !data) {
+    const msg = `template_missing: ${TEMPLATE_BUCKET}/${path} — ${error?.message || 'data is null'}`;
+    console.error(`[template] ERROR template_download_failed`, JSON.stringify({ templateName, bucketName: TEMPLATE_BUCKET, path, error_message: error?.message || 'null data' }));
+    await safeLogEvent(supabase, runId, 'ERROR', 'template_download_failed', { templateName, bucketName: TEMPLATE_BUCKET, path, error_message: error?.message || 'null data' });
+    throw new Error(msg);
+  }
+
+  const bytes = new Uint8Array(await data.arrayBuffer());
+
+  if (bytes.length === 0) {
+    const msg = `template_empty: ${TEMPLATE_BUCKET}/${path} has 0 bytes`;
+    console.error(`[template] ERROR template_download_failed`, JSON.stringify({ templateName, bucketName: TEMPLATE_BUCKET, path, error_message: 'template_empty' }));
+    await safeLogEvent(supabase, runId, 'ERROR', 'template_download_failed', { templateName, bucketName: TEMPLATE_BUCKET, path, error_message: 'template_empty' });
+    throw new Error(msg);
+  }
+
+  console.log(`[template] INFO template_download_ok`, JSON.stringify({ templateName, size_bytes: bytes.length }));
+  await safeLogEvent(supabase, runId, 'INFO', 'template_download_ok', { templateName, size_bytes: bytes.length });
+
+  // SHA-256 checksum verification (blocking)
+  const checksumResult = await verifyTemplateChecksum(bytes, templateName, supabase, runId);
+  if (!checksumResult.ok) {
+    throw new Error(`Template checksum failed for ${templateName}: expected=${checksumResult.expected}, actual=${checksumResult.actual}`);
+  }
+
+  return bytes;
 }
 
 // ========== ZIP-LEVEL XML COMPARISON (freeze panes + styles) ==========
@@ -802,16 +849,10 @@ async function validateExportVsTemplate(
   async function logAndReturn(errs: string[], warns: string[]): Promise<{ passed: boolean; errors: string[]; warnings: string[] }> {
     if (errs.length > 0) {
       console.error(`[validate:${exportName}] FAILED (${errs.length} errors):`, errs);
-      await supabase.rpc('log_sync_event', {
-        p_run_id: runId, p_level: 'ERROR', p_message: 'validation_failed',
-        p_details: { export_name: exportName, errors: errs.slice(0, 20), warnings: warns }
-      }).catch(() => {});
+      await safeLogEvent(supabase, runId, 'ERROR', 'validation_failed', { export_name: exportName, errors: errs.slice(0, 20), warnings: warns });
     } else {
       console.log(`[validate:${exportName}] PASSED (${warns.length} warnings)`);
-      await supabase.rpc('log_sync_event', {
-        p_run_id: runId, p_level: 'INFO', p_message: 'validation_ok',
-        p_details: { export_name: exportName, warnings: warns }
-      }).catch(() => {});
+      await safeLogEvent(supabase, runId, 'INFO', 'validation_ok', { export_name: exportName, warnings: warns });
     }
     return { passed: errs.length === 0, errors: errs, warnings: warns };
   }
@@ -2398,13 +2439,10 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
   
   console.log(`[sync:step:export_mediaworld] Starting for run ${runId}, IT days=${itDays}, EU days=${euDays}, includeEU=${includeEu}`);
   const startTime = Date.now();
-  const logMWStage = (stage: string, t0: number, extra: Record<string, unknown> = {}): Promise<void> => {
+  const logMWStage = async (stage: string, t0: number, extra: Record<string, unknown> = {}): Promise<void> => {
     const mem = getMemMB();
     const durationMs = Date.now() - t0;
-    return supabase.rpc('log_sync_event', {
-      p_run_id: runId, p_level: 'INFO', p_message: 'export_mediaworld_stage',
-      p_details: { step: 'export_mediaworld', stage, heap_mb: mem, duration_ms: durationMs, ...extra }
-    }).then(() => {}).catch(() => {});
+    await safeLogEvent(supabase, runId, 'INFO', 'export_mediaworld_stage', { step: 'export_mediaworld', stage, heap_mb: mem, duration_ms: durationMs, ...extra });
   };
   
   // Initialize warnings
@@ -2480,20 +2518,10 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
       warnings.missing_location_file++;
     }
     
-    // Load Mediaworld template from storage bucket
-    console.log('[sync:step:export_mediaworld] Loading XLSX template from storage (exports/templates/)');
+    // Load Mediaworld template from storage bucket (unified loader)
     let mwTemplateBytes: Uint8Array;
     try {
-      const { data: tmplBlob, error: tmplErr } = await supabase.storage.from('exports').download('templates/Export Mediaworld.xlsx');
-      if (tmplErr || !tmplBlob) throw new Error(tmplErr?.message || 'empty');
-      mwTemplateBytes = new Uint8Array(await tmplBlob.arrayBuffer());
-      console.log(`[sync:step:export_mediaworld] Template loaded: ${mwTemplateBytes.length} bytes`);
-      await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'INFO', p_message: 'template_loaded', p_details: { step: 'export_mediaworld', file: 'Export Mediaworld.xlsx', bytes: mwTemplateBytes.length, source: 'storage' } }).catch(() => {});
-      // SHA-256 checksum verification (blocking)
-      const mwChecksumResult = await verifyTemplateChecksum(mwTemplateBytes, 'Export Mediaworld.xlsx', supabase, runId);
-      if (!mwChecksumResult.ok) {
-        throw new Error(`Template checksum failed: expected=${mwChecksumResult.expected}, actual=${mwChecksumResult.actual}`);
-      }
+      mwTemplateBytes = await loadTemplateFromStorage(supabase, 'Export Mediaworld.xlsx', runId);
     } catch (e: unknown) {
       const error = `Template Export Mediaworld.xlsx non trovato in storage: ${errMsg(e)}`;
       await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
@@ -2624,7 +2652,7 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
       return { success: false, error };
     }
     
-    await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'INFO', p_message: 'export_saved', p_details: { step: 'export_mediaworld', file: 'Export Mediaworld.xlsx', rows: mwWritten } }).catch(() => {});
+    await safeLogEvent(supabase, runId, 'INFO', 'export_saved', { step: 'export_mediaworld', file: 'Export Mediaworld.xlsx', rows: mwWritten });
     
     // Update location_warnings in sync_runs
     await updateLocationWarnings(supabase, runId, warnings);
@@ -2655,13 +2683,10 @@ async function stepExportEprice(supabase: SupabaseClient, runId: string, feeConf
   
   console.log(`[sync:step:export_eprice] Starting for run ${runId}, IT days=${itDays}, EU days=${euDays}, includeEU=${includeEu}`);
   const startTime = Date.now();
-  const logEPStage = (stage: string, t0: number, extra: Record<string, unknown> = {}): Promise<void> => {
+  const logEPStage = async (stage: string, t0: number, extra: Record<string, unknown> = {}): Promise<void> => {
     const mem = getMemMB();
     const durationMs = Date.now() - t0;
-    return supabase.rpc('log_sync_event', {
-      p_run_id: runId, p_level: 'INFO', p_message: 'export_eprice_stage',
-      p_details: { step: 'export_eprice', stage, heap_mb: mem, duration_ms: durationMs, ...extra }
-    }).then(() => {}).catch(() => {});
+    await safeLogEvent(supabase, runId, 'INFO', 'export_eprice_stage', { step: 'export_eprice', stage, heap_mb: mem, duration_ms: durationMs, ...extra });
   };
   
   try {
@@ -2704,19 +2729,10 @@ async function stepExportEprice(supabase: SupabaseClient, runId: string, feeConf
     
     const XLSX = await import("npm:xlsx@0.18.5");
     
-    // Load template from storage bucket
+    // Load ePrice template from storage bucket (unified loader)
     let epTemplateBytes: Uint8Array;
     try {
-      const { data: tmplBlob, error: tmplErr } = await supabase.storage.from('exports').download('templates/Export ePrice.xlsx');
-      if (tmplErr || !tmplBlob) throw new Error(tmplErr?.message || 'empty');
-      epTemplateBytes = new Uint8Array(await tmplBlob.arrayBuffer());
-      console.log(`[sync:step:export_eprice] Template loaded: ${epTemplateBytes.length} bytes`);
-      await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'INFO', p_message: 'template_loaded', p_details: { step: 'export_eprice', file: 'Export ePrice.xlsx', bytes: epTemplateBytes.length, source: 'storage' } }).catch(() => {});
-      // SHA-256 checksum verification (blocking)
-      const epChecksumResult = await verifyTemplateChecksum(epTemplateBytes, 'Export ePrice.xlsx', supabase, runId);
-      if (!epChecksumResult.ok) {
-        throw new Error(`Template checksum failed: expected=${epChecksumResult.expected}, actual=${epChecksumResult.actual}`);
-      }
+      epTemplateBytes = await loadTemplateFromStorage(supabase, 'Export ePrice.xlsx', runId);
     } catch (e: unknown) {
       const error = `Template Export ePrice.xlsx non trovato in storage: ${errMsg(e)}`;
       await updateStepResult(supabase, runId, 'export_eprice', { status: 'failed', error, metrics: {} });
@@ -2741,7 +2757,7 @@ async function stepExportEprice(supabase: SupabaseClient, runId: string, feeConf
       }
     }
     
-    await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'INFO', p_message: 'export_started', p_details: { step: 'export_eprice', products: products.length } }).catch(() => {});
+    await safeLogEvent(supabase, runId, 'INFO', 'export_started', { step: 'export_eprice', products: products.length });
     
     const EP_DATA_START = 1; // Data starts at row 2 (index 1)
     let epWritten = 0;
@@ -2788,7 +2804,7 @@ async function stepExportEprice(supabase: SupabaseClient, runId: string, feeConf
       ws['!ref'] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: EP_DATA_START + epWritten - 1, c: 7 } });
     }
     
-    await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'INFO', p_message: 'rows_written', p_details: { step: 'export_eprice', rows: epWritten, skipped: epSkipped } }).catch(() => {});
+    await safeLogEvent(supabase, runId, 'INFO', 'rows_written', { step: 'export_eprice', rows: epWritten, skipped: epSkipped });
     
     // Serialize XLSX first (needed for ZIP-level comparison)
     const xlsxBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: false, bookSST: false });
@@ -2820,7 +2836,7 @@ async function stepExportEprice(supabase: SupabaseClient, runId: string, feeConf
       return { success: false, error };
     }
     
-    await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'INFO', p_message: 'export_saved', p_details: { step: 'export_eprice', file: 'Export ePrice.xlsx', rows: epWritten } }).catch(() => {});
+    await safeLogEvent(supabase, runId, 'INFO', 'export_saved', { step: 'export_eprice', file: 'Export ePrice.xlsx', rows: epWritten });
     
     await updateStepResult(supabase, runId, 'export_eprice', {
       status: 'success', duration_ms: Date.now() - startTime, rows: epWritten, skipped: epSkipped,
@@ -2894,19 +2910,10 @@ async function stepExportEanXlsx(supabase: SupabaseClient, runId: string): Promi
     // 4. STREAMING: Read CSV via Range requests, build XLSX incrementally
     const XLSX = await import("npm:xlsx@0.18.5");
     
-    // Load template from filesystem (deploy-safe)
+    // Load EAN template from storage bucket (unified loader)
     let eanTemplateBytes: Uint8Array;
     try {
-      const { data: tmplBlob, error: tmplErr } = await supabase.storage.from('exports').download('templates/Catalogo EAN.xlsx');
-      if (tmplErr || !tmplBlob) throw new Error(tmplErr?.message || 'empty');
-      eanTemplateBytes = new Uint8Array(await tmplBlob.arrayBuffer());
-      console.log(`[sync:step:export_ean_xlsx] Template loaded: ${eanTemplateBytes.length} bytes`);
-      await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'INFO', p_message: 'template_loaded', p_details: { step: 'export_ean_xlsx', file: 'Catalogo EAN.xlsx', bytes: eanTemplateBytes.length, source: 'storage' } }).catch(() => {});
-      // SHA-256 checksum verification (blocking)
-      const eanChecksumResult = await verifyTemplateChecksum(eanTemplateBytes, 'Catalogo EAN.xlsx', supabase, runId);
-      if (!eanChecksumResult.ok) {
-        throw new Error(`Template checksum failed: expected=${eanChecksumResult.expected}, actual=${eanChecksumResult.actual}`);
-      }
+      eanTemplateBytes = await loadTemplateFromStorage(supabase, 'Catalogo EAN.xlsx', runId);
     } catch (e: unknown) {
       const error = `Template Catalogo EAN.xlsx non trovato in storage: ${errMsg(e)}`;
       await updateStepResult(supabase, runId, 'export_ean_xlsx', { status: 'failed', error, metrics: {} });
@@ -3023,7 +3030,7 @@ async function stepExportEanXlsx(supabase: SupabaseClient, runId: string): Promi
     ws['!ref'] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: rowsWritten, c: headers.length - 1 } });
     const wb = templateWb; // Use template workbook (preserves metadata)
     
-    await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'INFO', p_message: 'rows_written', p_details: { step: 'export_ean_xlsx', rows: rowsWritten } }).catch(() => {});
+    await safeLogEvent(supabase, runId, 'INFO', 'rows_written', { step: 'export_ean_xlsx', rows: rowsWritten });
     
     // Serialize XLSX first (needed for ZIP-level comparison)
     const xlsxBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: false, bookSST: false });
@@ -3052,7 +3059,7 @@ async function stepExportEanXlsx(supabase: SupabaseClient, runId: string): Promi
       return { success: false, error };
     }
     
-    await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'INFO', p_message: 'export_saved', p_details: { step: 'export_ean_xlsx', file: 'Catalogo EAN.xlsx', rows: rowsWritten } }).catch(() => {});
+    await safeLogEvent(supabase, runId, 'INFO', 'export_saved', { step: 'export_ean_xlsx', file: 'Catalogo EAN.xlsx', rows: rowsWritten });
     
     const elapsed = Date.now() - startTime;
     await updateStepResult(supabase, runId, 'export_ean_xlsx', {
@@ -3079,18 +3086,10 @@ async function processEanXlsxFromContent(supabase: SupabaseClient, runId: string
   try {
     const XLSX = await import("npm:xlsx@0.18.5");
     
-    // Load template from filesystem
+    // Load EAN template from storage bucket (unified loader, direct mode)
     let eanTmplBytes: Uint8Array;
     try {
-      const { data: tmplBlob, error: tmplErr } = await supabase.storage.from('exports').download('templates/Catalogo EAN.xlsx');
-      if (tmplErr || !tmplBlob) throw new Error(tmplErr?.message || 'empty');
-      eanTmplBytes = new Uint8Array(await tmplBlob.arrayBuffer());
-      await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'INFO', p_message: 'template_loaded', p_details: { step: 'export_ean_xlsx', file: 'Catalogo EAN.xlsx', bytes: eanTmplBytes.length, source: 'storage', mode: 'direct' } }).catch(() => {});
-      // SHA-256 checksum verification (blocking)
-      const eanDirChecksumResult = await verifyTemplateChecksum(eanTmplBytes, 'Catalogo EAN.xlsx', supabase, runId);
-      if (!eanDirChecksumResult.ok) {
-        throw new Error(`Template checksum failed: expected=${eanDirChecksumResult.expected}, actual=${eanDirChecksumResult.actual}`);
-      }
+      eanTmplBytes = await loadTemplateFromStorage(supabase, 'Catalogo EAN.xlsx', runId);
     } catch (e: unknown) {
       const error = `Template Catalogo EAN.xlsx non trovato: ${errMsg(e)}`;
       await updateStepResult(supabase, runId, 'export_ean_xlsx', { status: 'failed', error, metrics: {} });
@@ -3334,13 +3333,10 @@ function getMemMB(): number | null {
 
 // Helper: log stage event - fire-and-forget by default to save CPU budget.
 // Use await logStage(...) only for the first sentinel event.
-function logStage(supabase: SupabaseClient, runId: string, stage: string, stageStartMs: number, extra: Record<string, unknown> = {}): Promise<void> {
+async function logStage(supabase: SupabaseClient, runId: string, stage: string, stageStartMs: number, extra: Record<string, unknown> = {}): Promise<void> {
   const mem = getMemMB();
   const durationMs = Date.now() - stageStartMs;
-  return supabase.rpc('log_sync_event', {
-    p_run_id: runId, p_level: 'INFO', p_message: 'export_amazon_stage',
-    p_details: { step: 'export_amazon', stage, heap_mb: mem, duration_ms: durationMs, ...extra }
-  }).then(() => {}).catch(() => {});
+  await safeLogEvent(supabase, runId, 'INFO', 'export_amazon_stage', { step: 'export_amazon', stage, heap_mb: mem, duration_ms: durationMs, ...extra });
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
