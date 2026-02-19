@@ -2551,10 +2551,12 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
   
   console.log(`[sync:step:export_mediaworld] Starting for run ${runId}, IT days=${itDays}, EU days=${euDays}, includeEU=${includeEu}`);
   const startTime = Date.now();
+  let heapPeakMb = 0;
   const logMWStage = async (stage: string, t0: number, extra: Record<string, unknown> = {}): Promise<void> => {
     const mem = getMemMB();
+    if (mem > heapPeakMb) heapPeakMb = mem;
     const durationMs = Date.now() - t0;
-    await safeLogEvent(supabase, runId, 'INFO', 'export_mediaworld_stage', { step: 'export_mediaworld', stage, heap_mb: mem, duration_ms: durationMs, ...extra });
+    await safeLogEvent(supabase, runId, 'INFO', 'export_mediaworld_stage', { step: 'export_mediaworld', stage, heap_mb: mem, heap_peak_mb: heapPeakMb, duration_ms: durationMs, ...extra });
   };
   
   // Initialize warnings
@@ -2573,8 +2575,11 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     // Load stock location index from per-run file with robust parsing
     let stockLocationIndex: Record<string, { stockIT: number; stockEU: number }> | null = null;
     const stockLocationPath = `stock-location/runs/${runId}.txt`;
-    const { content: stockLocationContent } = await downloadFromStorage(supabase, 'ftp-import', stockLocationPath);
-    
+    let stockLocationContent: string | null = null;
+    {
+      const dlResult = await downloadFromStorage(supabase, 'ftp-import', stockLocationPath);
+      stockLocationContent = dlResult.content ?? null;
+    }
     // Track 4255 vs 4254 entries for orphan detection
     const entries4254 = new Set<string>();
     const entries4255 = new Set<string>();
@@ -2623,8 +2628,7 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
         }
         
         console.log(`[sync:step:export_mediaworld] Loaded stock location: ${Object.keys(stockLocationIndex).length} entries`);
-        // stockLocationContent string no longer needed — release ~5MB heap
-        // (variable is const but reassignment not needed; it goes out of scope after this block)
+        stockLocationContent = null; // release parsed string (~5MB)
       } else {
         warnings.invalid_location_parse++;
       }
@@ -2657,7 +2661,8 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     });
     // cellStyles:false + cellFormula/cellHTML/cellText:false reduces parse CPU without affecting output
     // (styles live in xl/styles.xml preserved by round-trip; formulas/HTML/richtext not used in data writes)
-    const wb = XLSX.read(mwTemplateBytes, { type: 'array', cellStyles: false, cellFormula: false, cellHTML: false, cellText: false });
+    // deno-lint-ignore no-explicit-any
+    let wb: any = XLSX.read(mwTemplateBytes, { type: 'array', cellStyles: false, cellFormula: false, cellHTML: false, cellText: false });
     const mwParseMs = Date.now() - mwParseT0;
     await logMWStage('template_parse_done', mwParseT0, { duration_ms: mwParseMs, size_bytes: mwTemplateBytes.length });
     if (mwParseMs > 1000) {
@@ -2778,7 +2783,7 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     const mwWriteT0 = Date.now();
     await logMWStage('before_write', mwWriteT0, { rows: mwWritten, heap_mb: getMemMB() });
     const xlsxBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: false, bookSST: false });
-    const mwOutputBytes = new Uint8Array(xlsxBuffer);
+    let mwOutputBytes: Uint8Array | null = new Uint8Array(xlsxBuffer);
     const mwOutSize = mwOutputBytes.length;
     const mwWriteMs = Date.now() - mwWriteT0;
     await logMWStage('after_write', mwWriteT0, { size_bytes: mwOutSize, duration_ms: mwWriteMs, heap_mb: getMemMB() });
@@ -2842,8 +2847,11 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
       return { success: false, error };
     }
     
-    // Release template bytes after validation to reduce peak RAM
+    // Release validation-phase objects no longer needed (wb ~60MB, template bytes 12.8MB, outputBytes view)
     mwTemplateBytesForVal = null as unknown as Uint8Array;
+    // wb is not needed after validation — upload uses xlsxBuffer directly
+    wb = null;
+    mwOutputBytes = null;
     
     const mwBlob = new Blob([xlsxBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
     
