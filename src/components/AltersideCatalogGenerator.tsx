@@ -3470,10 +3470,8 @@ const AltersideCatalogGenerator: React.FC = () => {
       
       const url = URL.createObjectURL(blob);
       
-      // Generate filename with timestamp
-      const now = new Date();
-      const timestamp = now.toISOString().slice(0,16).replace(/[-:T]/g, '').replace(/(\d{8})(\d{4})/, '$1_$2');
-      const fileName = `Catalogo_EAN_${timestamp}.xlsx`;
+      // Fixed filename (no timestamp, no underscore)
+      const fileName = 'Catalogo EAN.xlsx';
       
       // Create anchor and trigger download
       const a = document.createElement("a");

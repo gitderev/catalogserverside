@@ -815,9 +815,7 @@ export async function buildMediaworldXlsxFromEanDataset({
  * Download Mediaworld XLSX to browser.
  */
 export function downloadMediaworldBlob(blob: Blob, filename?: string): void {
-  const now = new Date();
-  const dateStamp = now.toISOString().slice(0, 10).replace(/-/g, '');
-  const fileName = filename || `mediaworld-offers-${dateStamp}.xlsx`;
+  const fileName = filename || 'Export Mediaworld.xlsx';
   
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');

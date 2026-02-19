@@ -43,9 +43,9 @@ const PARSE_MERGE_BUDGET_MS = 50_000;
 const MAX_PARSE_MERGE_CHUNKS = 100;
 
 const EXPORT_FILES = [
-  'Export Mediaworld.csv',
-  'Export ePrice.csv',
-  'catalogo_ean.xlsx',
+  'Catalogo EAN.xlsx',
+  'Export ePrice.xlsx',
+  'Export Mediaworld.xlsx',
   'amazon_listing_loader.xlsm',
   'amazon_price_inventory.txt'
 ];
@@ -1028,6 +1028,30 @@ async function runPipeline(
           });
         } catch (_) {}
         
+        // === PRE-SFTP VALIDATION ===
+        const REQUIRED_MARKETPLACE_XLSX = ['Catalogo EAN.xlsx', 'Export ePrice.xlsx', 'Export Mediaworld.xlsx'];
+        const BLOCKED_CSV_NAMES = ['Export Mediaworld.csv', 'Export ePrice.csv'];
+        {
+          const { data: bucketContents } = await supabase.storage.from('exports').list('', { limit: 200 });
+          const bucketNames = new Set((bucketContents || []).map((f: { name: string }) => f.name));
+          const missingXlsx = REQUIRED_MARKETPLACE_XLSX.filter(f => !bucketNames.has(f));
+          
+          // Check EXPORT_FILES has no CSV for marketplace
+          const csvInSelection = EXPORT_FILES.filter(f => BLOCKED_CSV_NAMES.includes(f));
+          
+          if (missingXlsx.length > 0 || csvInSelection.length > 0) {
+            const reason = missingXlsx.length > 0
+              ? `Pre-SFTP: file XLSX mancanti nel bucket: ${missingXlsx.join(', ')}`
+              : `Pre-SFTP: file CSV non ammessi nella selezione SFTP: ${csvInSelection.join(', ')}`;
+            console.error(`[orchestrator] ${reason}`);
+            await mergeStepState(supabase, runId, 'upload_sftp', { status: 'failed', error: reason, validation: 'pre_sftp_check' });
+            try { await supabase.rpc('log_sync_event', { p_run_id: runId, p_level: 'ERROR', p_message: 'sftp_pre_validation_failed', p_details: { step: 'upload_sftp', missing: missingXlsx, csv_blocked: csvInSelection } }); } catch (_) {}
+            pipelineFailedBeforeNotification = true;
+            pipelineFailError = reason;
+          }
+        }
+        
+        if (!pipelineFailedBeforeNotification) {
         const sftpFiles = EXPORT_FILES.map(f => ({
           bucket: 'exports',
           path: f,
@@ -1064,6 +1088,7 @@ async function runPipeline(
             });
           } catch (_) {}
         }
+        } // end if !pipelineFailedBeforeNotification (validation passed)
       }
     }
   }
