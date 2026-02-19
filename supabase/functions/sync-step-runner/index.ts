@@ -2064,54 +2064,120 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
       warnings.missing_location_file++;
     }
     
-    const mwRows: string[] = [];
+    // Load Mediaworld template from storage
+    console.log('[sync:step:export_mediaworld] Loading XLSX template from storage');
+    const { data: templateBlob, error: tmplError } = await supabase.storage
+      .from('exports').download('_templates/Export Mediaworld.xlsx');
+    
+    if (tmplError || !templateBlob) {
+      const error = `Template Export Mediaworld.xlsx non trovato: ${tmplError?.message || 'empty'}`;
+      await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
+      return { success: false, error };
+    }
+    
+    const XLSX = await import("npm:xlsx@0.18.5");
+    const templateBuffer = new Uint8Array(await templateBlob.arrayBuffer());
+    const wb = XLSX.read(templateBuffer, { type: 'array' });
+    
+    // Validate template sheets
+    const requiredSheets = ['Data', 'ReferenceData', 'Columns'];
+    const missingSheets = requiredSheets.filter(s => !wb.SheetNames.includes(s));
+    if (missingSheets.length > 0) {
+      const error = `Template MW: fogli mancanti: ${missingSheets.join(', ')}. Trovati: ${wb.SheetNames.join(', ')}`;
+      await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
+      return { success: false, error };
+    }
+    
+    const ws = wb.Sheets['Data'];
+    let mwWritten = 0;
     let mwSkipped = 0;
     
-    const headers = ['sku', 'ean', 'price', 'leadtime-to-ship', 'quantity'];
+    // Data starts at row 3 (index 2): row 1=headers (index 0), row 2=technical row (index 1)
+    const DATA_START_ROW = 2;
     
     for (const p of products) {
       const norm = normalizeEAN(p.EAN);
       if (!norm.ok) { mwSkipped++; continue; }
       if (!p.PFNum || p.PFNum <= 0) { mwSkipped++; continue; }
       
-      // IT/EU stock resolution using resolveMarketplaceStock
+      // Parse ListPrice con Fee
+      const lpfStr = String(p.LPF || '').replace(',', '.');
+      const lpfValue = parseFloat(lpfStr);
+      const prezzoOfferta = (Number.isFinite(lpfValue) && lpfValue > 0) ? lpfValue : p.PFNum;
+      
+      // IT/EU stock resolution
       let stockIT = p.Stock || 0;
       let stockEU = 0;
-      
       if (stockLocationIndex && stockLocationIndex[p.Matnr]) {
         stockIT = stockLocationIndex[p.Matnr].stockIT;
         stockEU = stockLocationIndex[p.Matnr].stockEU;
       } else if (stockLocationIndex) {
-        // Matnr not found in location file - fallback StockIT=0 StockEU=0
         warnings.missing_location_data++;
         stockIT = 0;
         stockEU = 0;
       }
-      // If stockLocationIndex is null (file missing), use fallback: stockIT = p.Stock, stockEU = 0
       
       const stockResult = resolveMarketplaceStock(stockIT, stockEU, includeEu, itDays, euDays);
-      
       if (!stockResult.shouldExport) { mwSkipped++; continue; }
       
-      // Mediaworld server-side: leadtime-to-ship = stockResult.leadDays (NO offset)
-      // The exported value matches exactly the UI configuration
-      const leadTimeToShip = stockResult.leadDays;
+      const r = DATA_START_ROW + mwWritten;
       
-      mwRows.push([
-        p.Matnr || '',
-        norm.value,
-        p.PFNum.toFixed(2).replace('.', ','),
-        String(leadTimeToShip),
-        String(Math.min(stockResult.exportQty, 99))
-      ].join(';'));
+      // Write 22 columns matching Mediaworld template
+      const rowData: (string | number)[] = [
+        p.MPN || '',                         // A: SKU offerta
+        norm.value!,                         // B: ID Prodotto (EAN)
+        'EAN',                               // C: Tipo ID prodotto
+        p.Desc || '',                        // D: Descrizione offerta
+        '',                                  // E: Descrizione interna
+        prezzoOfferta,                       // F: Prezzo dell'offerta
+        '',                                  // G: Info aggiuntive prezzo
+        Math.min(stockResult.exportQty, 99), // H: Quantità
+        '',                                  // I: Avviso quantità minima
+        'Nuovo',                             // J: Stato dell'offerta
+        '', '',                              // K-L: Date disponibilità
+        'Consegna gratuita',                 // M: Classe logistica
+        p.PFNum,                             // N: Prezzo scontato
+        '', '',                              // O-P: Date sconto
+        stockResult.leadDays,                // Q: Tempo preparazione spedizione
+        '',                                  // R: Aggiorna/Cancella
+        'recommended-retail-price',          // S: Tipo prezzo barrato
+        '', '', ''                           // T-V: RAEE, Cut-off, VAT
+      ];
+      
+      for (let c = 0; c < rowData.length; c++) {
+        const addr = XLSX.utils.encode_cell({ r, c });
+        const val = rowData[c];
+        if (c === 1) {
+          // EAN: force text to preserve leading zeros
+          ws[addr] = { v: String(val), t: 's', z: '@' };
+        } else if (typeof val === 'number') {
+          ws[addr] = { v: val, t: 'n', z: (c === 5 || c === 13) ? '0.00' : undefined };
+        } else {
+          ws[addr] = { v: val, t: 's' };
+        }
+      }
+      
+      mwWritten++;
     }
     
-    logMWStage('before_csv_upload', startTime, { rows: mwRows.length, skipped: mwSkipped });
-    const mwCSV = [headers.join(';'), ...mwRows].join('\n');
-    const saveResult = await uploadToStorage(supabase, 'exports', 'Export Mediaworld.csv', mwCSV, 'text/csv');
+    // Update sheet range to include new data rows
+    if (mwWritten > 0) {
+      const lastRow = DATA_START_ROW + mwWritten - 1;
+      ws['!ref'] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: lastRow, c: 21 } });
+    }
     
-    if (!saveResult.success) {
-      const error = `Failed to save Export Mediaworld.csv: ${saveResult.error}`;
+    logMWStage('before_xlsx_upload', startTime, { rows: mwWritten, skipped: mwSkipped, format: 'xlsx' });
+    
+    // Serialize and upload XLSX
+    const xlsxBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: false, bookSST: false });
+    const mwBlob = new Blob([xlsxBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    
+    const { error: uploadError } = await supabase.storage.from('exports').upload(
+      'Export Mediaworld.xlsx', mwBlob, { upsert: true, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }
+    );
+    
+    if (uploadError) {
+      const error = `Upload Export Mediaworld.xlsx fallito: ${uploadError.message}`;
       await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
@@ -2120,12 +2186,12 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     await updateLocationWarnings(supabase, runId, warnings);
     
     await updateStepResult(supabase, runId, 'export_mediaworld', {
-      status: 'success', duration_ms: Date.now() - startTime, rows: mwRows.length, skipped: mwSkipped,
-      metrics: { mediaworld_export_rows: mwRows.length, mediaworld_export_skipped: mwSkipped }
+      status: 'success', duration_ms: Date.now() - startTime, rows: mwWritten, skipped: mwSkipped,
+      metrics: { mediaworld_export_rows: mwWritten, mediaworld_export_skipped: mwSkipped, format: 'xlsx' }
     });
     
-    await logMWStage('completed', startTime, { rows: mwRows.length, elapsed_ms: Date.now() - startTime });
-    console.log(`[sync:step:export_mediaworld] Completed: ${mwRows.length} rows, ${mwSkipped} skipped, warnings:`, warnings);
+    await logMWStage('completed', startTime, { rows: mwWritten, elapsed_ms: Date.now() - startTime, format: 'xlsx' });
+    console.log(`[sync:step:export_mediaworld] Completed: ${mwWritten} rows XLSX, ${mwSkipped} skipped, warnings:`, warnings);
     return { success: true };
     
   } catch (e: unknown) {
@@ -2190,16 +2256,16 @@ async function stepExportEprice(supabase: SupabaseClient, runId: string, feeConf
       }
     }
     
-    const epRows: string[] = [];
+    const XLSX = await import("npm:xlsx@0.18.5");
+    const epHeaders = ['sku', 'product-id', 'product-id-type', 'price', 'quantity', 'state', 'fulfillment-latency', 'logistic-class'];
+    const aoa: (string | number)[][] = [epHeaders];
     let epSkipped = 0;
-    const exportHeaders = ['sku', 'ean', 'price', 'quantity', 'leadtime'];
     
     for (const p of products) {
       const norm = normalizeEAN(p.EAN);
       if (!norm.ok) { epSkipped++; continue; }
       if (!p.PFNum || p.PFNum <= 0) { epSkipped++; continue; }
       
-      // IT/EU stock resolution using resolveMarketplaceStock (no +2 for ePrice)
       let stockIT = p.Stock || 0;
       let stockEU = 0;
       if (stockLocationIndex && stockLocationIndex[p.Matnr]) {
@@ -2207,36 +2273,72 @@ async function stepExportEprice(supabase: SupabaseClient, runId: string, feeConf
         stockEU = stockLocationIndex[p.Matnr].stockEU;
       }
       
-      const stockResult = resolveMarketplaceStock(stockIT, stockEU, includeEu, itDays, euDays);
+      // ePrice: IT-first with fixed IT fulfillment-latency = 1
+      let exportQty: number, fulfillmentLatency: number, shouldExport: boolean;
+      if (stockIT >= 2) {
+        exportQty = stockIT; fulfillmentLatency = 1; shouldExport = true;
+      } else if (includeEu && (stockIT + stockEU) >= 2) {
+        exportQty = stockIT + stockEU; fulfillmentLatency = euDays; shouldExport = true;
+      } else {
+        shouldExport = false; exportQty = 0; fulfillmentLatency = 0;
+      }
       
-      if (!stockResult.shouldExport) { epSkipped++; continue; }
+      if (!shouldExport) { epSkipped++; continue; }
       
-      epRows.push([
-        p.Matnr || '',
-        norm.value,
-        p.PFNum.toFixed(2).replace('.', ','),
-        String(Math.min(stockResult.exportQty, 99)),
-        String(stockResult.leadDays)  // ePrice: no +2
-      ].join(';'));
+      aoa.push([
+        p.MPN || p.Matnr || '',    // sku
+        norm.value!,                // product-id (EAN)
+        'EAN',                      // product-id-type
+        p.PFNum,                    // price
+        Math.min(exportQty, 99),    // quantity
+        11,                         // state
+        fulfillmentLatency,         // fulfillment-latency
+        'K'                         // logistic-class
+      ]);
     }
     
-    logEPStage('before_csv_upload', startTime, { rows: epRows.length, skipped: epSkipped });
-    const epCSV = [exportHeaders.join(';'), ...epRows].join('\n');
-    const saveResult = await uploadToStorage(supabase, 'exports', 'Export ePrice.csv', epCSV, 'text/csv');
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    // Force EAN column (B, index 1) as text
+    if (ws['!ref']) {
+      const range = XLSX.utils.decode_range(ws['!ref']);
+      for (let R = 1; R <= range.e.r; R++) {
+        const addr = XLSX.utils.encode_cell({ r: R, c: 1 });
+        const cell = ws[addr];
+        if (cell) { cell.v = String(cell.v); cell.t = 's'; cell.z = '@'; }
+      }
+      // Price column (D, index 3) format
+      for (let R = 1; R <= range.e.r; R++) {
+        const addr = XLSX.utils.encode_cell({ r: R, c: 3 });
+        const cell = ws[addr];
+        if (cell && typeof cell.v === 'number') { cell.t = 'n'; cell.z = '0.00'; }
+      }
+    }
     
-    if (!saveResult.success) {
-      const error = `Failed to save Export ePrice.csv: ${saveResult.error}`;
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Tracciato_Inserimento_Offerte');
+    const xlsxBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: false, bookSST: false });
+    const epBlob = new Blob([xlsxBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    
+    logEPStage('before_xlsx_upload', startTime, { rows: aoa.length - 1, skipped: epSkipped, format: 'xlsx' });
+    
+    const { error: uploadError } = await supabase.storage.from('exports').upload(
+      'Export ePrice.xlsx', epBlob, { upsert: true, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }
+    );
+    
+    if (uploadError) {
+      const error = `Upload Export ePrice.xlsx fallito: ${uploadError.message}`;
       await updateStepResult(supabase, runId, 'export_eprice', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
     
+    const epRowCount = aoa.length - 1;
     await updateStepResult(supabase, runId, 'export_eprice', {
-      status: 'success', duration_ms: Date.now() - startTime, rows: epRows.length, skipped: epSkipped,
-      metrics: { eprice_export_rows: epRows.length, eprice_export_skipped: epSkipped }
+      status: 'success', duration_ms: Date.now() - startTime, rows: epRowCount, skipped: epSkipped,
+      metrics: { eprice_export_rows: epRowCount, eprice_export_skipped: epSkipped, format: 'xlsx' }
     });
     
-    await logEPStage('completed', startTime, { rows: epRows.length, elapsed_ms: Date.now() - startTime });
-    console.log(`[sync:step:export_eprice] Completed: ${epRows.length} rows, ${epSkipped} skipped`);
+    await logEPStage('completed', startTime, { rows: epRowCount, elapsed_ms: Date.now() - startTime, format: 'xlsx' });
+    console.log(`[sync:step:export_eprice] Completed: ${epRowCount} rows XLSX, ${epSkipped} skipped`);
     return { success: true };
     
   } catch (e: unknown) {
@@ -2393,15 +2495,15 @@ async function stepExportEanXlsx(supabase: SupabaseClient, runId: string): Promi
     // 5. Build and upload XLSX
     ws['!ref'] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: rowsWritten, c: headers.length - 1 } });
     const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'Catalogo EAN');
+    XLSX.utils.book_append_sheet(wb, ws, 'Catalogo_EAN');
     const xlsxBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: false, bookSST: false });
     const blob = new Blob([xlsxBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
     
     const { error: uploadError } = await supabase.storage.from('exports').upload(
-      'catalogo_ean.xlsx', blob, { upsert: true, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }
+      'Catalogo EAN.xlsx', blob, { upsert: true, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }
     );
     if (uploadError) {
-      const error = `Upload catalogo_ean.xlsx fallito: ${uploadError.message}`;
+      const error = `Upload Catalogo EAN.xlsx fallito: ${uploadError.message}`;
       await updateStepResult(supabase, runId, 'export_ean_xlsx', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
@@ -2457,14 +2559,14 @@ async function processEanXlsxFromContent(supabase: SupabaseClient, runId: string
     }
     ws['!ref'] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: rowsWritten, c: headers.length - 1 } });
     const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'Catalogo EAN');
+    XLSX.utils.book_append_sheet(wb, ws, 'Catalogo_EAN');
     const xlsxBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: false, bookSST: false });
     const blob = new Blob([xlsxBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
     const { error: uploadError } = await supabase.storage.from('exports').upload(
-      'catalogo_ean.xlsx', blob, { upsert: true, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }
+      'Catalogo EAN.xlsx', blob, { upsert: true, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }
     );
     if (uploadError) {
-      const error = `Upload catalogo_ean.xlsx fallito: ${uploadError.message}`;
+      const error = `Upload Catalogo EAN.xlsx fallito: ${uploadError.message}`;
       await updateStepResult(supabase, runId, 'export_ean_xlsx', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
