@@ -530,49 +530,85 @@ function extractXmlSection(xml: string, tagName: string): string | null {
   return match ? match[0] : null;
 }
 
-function compareZipXmlIntegrity(
+// Helper: find byte position of an ASCII needle in a Uint8Array (for prefix-only XML decode)
+function findByteSequencePos(haystack: Uint8Array, needle: string): number {
+  const needleBytes = new TextEncoder().encode(needle);
+  const hLen = haystack.length;
+  const nLen = needleBytes.length;
+  for (let i = 0; i <= hLen - nLen; i++) {
+    let match = true;
+    for (let j = 0; j < nLen; j++) {
+      if (haystack[i + j] !== needleBytes[j]) { match = false; break; }
+    }
+    if (match) return i;
+  }
+  return -1;
+}
+
+async function compareZipXmlIntegrity(
   templateBytes: Uint8Array,
   outputBytes: Uint8Array,
   dataSheetName: string,
   exportName: string,
-  preExtractedTmplZip?: Record<string, Uint8Array>
-): { errors: string[]; outZip?: Record<string, Uint8Array> } {
+  preExtractedTmplZip?: Record<string, Uint8Array>,
+  logStage?: (stage: string, extra?: Record<string, unknown>) => Promise<void>
+): Promise<{ errors: string[]; outZip?: Record<string, Uint8Array> }> {
   const errors: string[] = [];
+
+  await logStage?.('validation_start');
 
   let tmplZip: Record<string, Uint8Array>;
   let outZip: Record<string, Uint8Array>;
 
   try {
-    tmplZip = preExtractedTmplZip ?? unzipSync(templateBytes);
+    if (preExtractedTmplZip) {
+      tmplZip = preExtractedTmplZip;
+      await logStage?.('unzip_template_reused');
+    } else {
+      tmplZip = unzipSync(templateBytes);
+      await logStage?.('unzip_template_done');
+    }
   } catch (e: unknown) {
     errors.push(`zip_unpack_template_failed: ${errMsg(e)}`);
     return { errors };
   }
   try {
     outZip = unzipSync(outputBytes);
+    await logStage?.('unzip_output_done', { entry_count: Object.keys(outZip).length });
   } catch (e: unknown) {
     errors.push(`zip_unpack_output_failed: ${errMsg(e)}`);
     return { errors };
   }
 
-  // 1. Compare xl/styles.xml (must be byte-identical)
+  // 1. Compare xl/styles.xml via SHA-256 digest (no string allocation)
   const tmplStyles = tmplZip['xl/styles.xml'];
   const outStyles = outZip['xl/styles.xml'];
   if (!tmplStyles) {
     errors.push('styles_xml_missing_in_template');
   } else if (!outStyles) {
     errors.push('styles_xml_missing_in_output');
+  } else if (tmplStyles.byteLength !== outStyles.byteLength) {
+    errors.push(`styles_xml_mismatch: xl/styles.xml differs (template=${tmplStyles.byteLength}b, output=${outStyles.byteLength}b)`);
   } else {
-    const tmplStylesStr = new TextDecoder().decode(tmplStyles);
-    const outStylesStr = new TextDecoder().decode(outStyles);
-    if (tmplStylesStr !== outStylesStr) {
-      errors.push(`styles_xml_mismatch: xl/styles.xml differs (template=${tmplStyles.length}b, output=${outStyles.length}b)`);
+    const [sD1, sD2] = await Promise.all([
+      crypto.subtle.digest('SHA-256', tmplStyles),
+      crypto.subtle.digest('SHA-256', outStyles),
+    ]);
+    const h1 = new Uint8Array(sD1);
+    const h2 = new Uint8Array(sD2);
+    let stylesMatch = true;
+    for (let i = 0; i < h1.length; i++) { if (h1[i] !== h2[i]) { stylesMatch = false; break; } }
+    if (!stylesMatch) {
+      errors.push(`styles_xml_mismatch: xl/styles.xml differs (template=${tmplStyles.byteLength}b, output=${outStyles.byteLength}b)`);
     } else {
-      console.log(`[zip-verify:${exportName}] xl/styles.xml: IDENTICAL (${tmplStyles.length} bytes)`);
+      console.log(`[zip-verify:${exportName}] xl/styles.xml: IDENTICAL (${tmplStyles.byteLength} bytes)`);
     }
   }
+  await logStage?.('compare_styles_done');
 
-  // 2. Compare <sheetViews> (includes <pane> for freeze panes) in data sheet
+  // 2. Compare <sheetViews> in data sheet — decode only prefix before <sheetData to avoid huge allocations
+  // sheetViews is always before sheetData in OOXML, so decoding only the prefix (typically a few KB)
+  // avoids decoding the full data sheet XML (potentially 50MB+ for ~28k rows).
   const tmplSheetPath = getZipSheetXmlPath(tmplZip, dataSheetName);
   const outSheetPath = getZipSheetXmlPath(outZip, dataSheetName);
 
@@ -581,25 +617,40 @@ function compareZipXmlIntegrity(
   } else if (!outSheetPath) {
     errors.push(`freeze_panes_check_failed: cannot resolve sheet XML for "${dataSheetName}" in output`);
   } else {
-    const tmplSheetXml = new TextDecoder().decode(tmplZip[tmplSheetPath] || new Uint8Array());
-    const outSheetXml = new TextDecoder().decode(outZip[outSheetPath] || new Uint8Array());
-
-    const tmplSheetViews = extractXmlSection(tmplSheetXml, 'sheetViews');
-    const outSheetViews = extractXmlSection(outSheetXml, 'sheetViews');
-
-    if (tmplSheetViews === null && outSheetViews === null) {
-      console.log(`[zip-verify:${exportName}] sheetViews: both absent (OK)`);
-    } else if (tmplSheetViews === null) {
-      errors.push('freeze_panes_mismatch: template has no <sheetViews> but output does');
-    } else if (outSheetViews === null) {
-      errors.push('freeze_panes_mismatch: template has <sheetViews> but output does not');
-    } else if (tmplSheetViews !== outSheetViews) {
-      errors.push('freeze_panes_mismatch: <sheetViews> differs between template and output');
-      console.error(`[zip-verify:${exportName}] sheetViews MISMATCH:\n  tmpl: ${tmplSheetViews.substring(0, 300)}\n  out:  ${outSheetViews.substring(0, 300)}`);
+    const tmplSheetBytes = tmplZip[tmplSheetPath];
+    const outSheetBytes = outZip[outSheetPath];
+    if (!tmplSheetBytes || !outSheetBytes) {
+      if (!tmplSheetBytes) errors.push(`freeze_panes_check_failed: sheet XML bytes missing in template for "${dataSheetName}"`);
+      if (!outSheetBytes) errors.push(`freeze_panes_check_failed: sheet XML bytes missing in output for "${dataSheetName}"`);
     } else {
-      console.log(`[zip-verify:${exportName}] sheetViews (freeze panes): IDENTICAL`);
+      // Only decode prefix up to <sheetData (a few KB) instead of full sheet XML (potentially 50MB+)
+      const tmplCut = findByteSequencePos(tmplSheetBytes, '<sheetData');
+      const outCut = findByteSequencePos(outSheetBytes, '<sheetData');
+      const tmplPrefix = new TextDecoder().decode(
+        tmplSheetBytes.subarray(0, tmplCut > 0 ? tmplCut : Math.min(tmplSheetBytes.byteLength, 32768))
+      );
+      const outPrefix = new TextDecoder().decode(
+        outSheetBytes.subarray(0, outCut > 0 ? outCut : Math.min(outSheetBytes.byteLength, 32768))
+      );
+
+      const tmplSheetViews = extractXmlSection(tmplPrefix, 'sheetViews');
+      const outSheetViews = extractXmlSection(outPrefix, 'sheetViews');
+
+      if (tmplSheetViews === null && outSheetViews === null) {
+        console.log(`[zip-verify:${exportName}] sheetViews: both absent (OK)`);
+      } else if (tmplSheetViews === null) {
+        errors.push('freeze_panes_mismatch: template has no <sheetViews> but output does');
+      } else if (outSheetViews === null) {
+        errors.push('freeze_panes_mismatch: template has <sheetViews> but output does not');
+      } else if (tmplSheetViews !== outSheetViews) {
+        errors.push('freeze_panes_mismatch: <sheetViews> differs between template and output');
+        console.error(`[zip-verify:${exportName}] sheetViews MISMATCH:\n  tmpl: ${tmplSheetViews.substring(0, 300)}\n  out:  ${outSheetViews.substring(0, 300)}`);
+      } else {
+        console.log(`[zip-verify:${exportName}] sheetViews (freeze panes): IDENTICAL`);
+      }
     }
   }
+  await logStage?.('compare_sheetviews_done');
 
   return { errors, outZip };
 }
@@ -624,6 +675,7 @@ async function validateExportVsTemplate(
     // deno-lint-ignore no-explicit-any
     tmplWbOverride?: any; // Pre-parsed template workbook to avoid redundant XLSX.read
     preExtractedTmplZip?: Record<string, Uint8Array>; // Pre-extracted template ZIP entries to avoid redundant unzipSync
+    logStage?: (stage: string, extra?: Record<string, unknown>) => Promise<void>; // Fine-grained stage telemetry
   },
   outputBytes?: Uint8Array
 ): Promise<{ passed: boolean; errors: string[]; warnings: string[] }> {
@@ -641,6 +693,7 @@ async function validateExportVsTemplate(
   if (JSON.stringify(generatedWb.SheetNames) !== JSON.stringify(tmplWb.SheetNames)) {
     errors.push(`sheet_names: expected ${JSON.stringify(tmplWb.SheetNames)}, got ${JSON.stringify(generatedWb.SheetNames)}`);
   }
+  await options?.logStage?.('compare_workbook_done');
 
   // ============================================================
   // 2. Data sheet existence
@@ -720,7 +773,7 @@ async function validateExportVsTemplate(
   // This is a BLOCKING check: any mismatch fails validation.
   let extractedOutZip: Record<string, Uint8Array> | undefined;
   if (outputBytes) {
-    const zipResult = compareZipXmlIntegrity(templateBytes, outputBytes, dataSheet, exportName, options?.preExtractedTmplZip);
+    const zipResult = await compareZipXmlIntegrity(templateBytes, outputBytes, dataSheet, exportName, options?.preExtractedTmplZip, options?.logStage);
     extractedOutZip = zipResult.outZip;
     for (const e of zipResult.errors) {
       errors.push(e);
@@ -892,6 +945,14 @@ async function validateExportVsTemplate(
       }
     }
   }
+
+  if (options?.protectedSheets) {
+    await options?.logStage?.('compare_protected_sheets_done', {
+      protected_sheets_count: options.protectedSheets.length,
+      protected_sheets_names: options.protectedSheets,
+    });
+  }
+  await options?.logStage?.('validation_done', { passed: errors.length === 0, error_count: errors.length });
 
   return logAndReturn(errors, warnings);
 
@@ -2729,7 +2790,10 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
         headerCellsModifiedCount: 0,
         cellsWrittenBySheet: { 'Data': mwWritten * 22 },
         tmplWbOverride: wb,
-        preExtractedTmplZip: preExtractedTmplZip
+        preExtractedTmplZip: preExtractedTmplZip,
+        logStage: async (stage: string, extra: Record<string, unknown> = {}) => {
+          await logMWStage(stage, mwValT0, extra);
+        }
       },
       mwOutputBytes
     );
