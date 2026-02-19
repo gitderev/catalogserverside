@@ -536,7 +536,7 @@ function compareZipXmlIntegrity(
   dataSheetName: string,
   exportName: string,
   preExtractedTmplZip?: Record<string, Uint8Array>
-): { errors: string[] } {
+): { errors: string[]; outZip?: Record<string, Uint8Array> } {
   const errors: string[] = [];
 
   let tmplZip: Record<string, Uint8Array>;
@@ -601,7 +601,7 @@ function compareZipXmlIntegrity(
     }
   }
 
-  return { errors };
+  return { errors, outZip };
 }
 
 // ========== EXPORT VALIDATION: compare generated XLSX vs template ==========
@@ -718,8 +718,10 @@ async function validateExportVsTemplate(
   // Instead of relying on xlsx library (which cannot read freeze panes or styleId),
   // we unzip both XLSX files and compare the raw XML sections directly.
   // This is a BLOCKING check: any mismatch fails validation.
+  let extractedOutZip: Record<string, Uint8Array> | undefined;
   if (outputBytes) {
     const zipResult = compareZipXmlIntegrity(templateBytes, outputBytes, dataSheet, exportName, options?.preExtractedTmplZip);
+    extractedOutZip = zipResult.outZip;
     for (const e of zipResult.errors) {
       errors.push(e);
     }
@@ -812,16 +814,59 @@ async function validateExportVsTemplate(
 
   // ============================================================
   // 12. Protected sheets integrity (Mediaworld: ReferenceData, Columns)
-  // Verified via ZIP-level comparison in compareZipXmlIntegrity (styles.xml + sheetViews).
-  // No additional hash mechanism needed.
+  // Full ZIP-level XML comparison of each protected sheet's worksheet XML.
+  // Uses preExtractedTmplZip (already available) and extractedOutZip (from step 7/8).
+  // No hardcoded hashes; digest computed dynamically from template at runtime.
   // ============================================================
   if (options?.protectedSheets) {
-    for (const sheetName of options.protectedSheets) {
-      const tmplSheet = tmplWb.Sheets[sheetName];
-      const genSheet = generatedWb.Sheets[sheetName];
-      if (!tmplSheet) { errors.push(`protected_sheet_missing_in_template: ${sheetName}`); continue; }
-      if (!genSheet) { errors.push(`protected_sheet_missing_in_output: ${sheetName}`); continue; }
-      console.log(`[validate:${exportName}] Protected sheet ${sheetName}: presence verified OK`);
+    const tmplZipEntries = options?.preExtractedTmplZip;
+    if (!tmplZipEntries || !extractedOutZip) {
+      // Cannot perform ZIP-level protected sheet validation without ZIP entries
+      for (const sheetName of options.protectedSheets) {
+        errors.push(`protected_sheet_validation_unavailable: ${sheetName} (ZIP entries not available for comparison)`);
+      }
+    } else {
+      for (const sheetName of options.protectedSheets) {
+        // 12a. Presence check in workbook objects
+        const tmplSheet = tmplWb.Sheets[sheetName];
+        const genSheet = generatedWb.Sheets[sheetName];
+        if (!tmplSheet) { errors.push(`protected_sheet_missing_in_template: ${sheetName}`); continue; }
+        if (!genSheet) { errors.push(`protected_sheet_missing_in_output: ${sheetName}`); continue; }
+
+        // 12b. Resolve ZIP XML paths for this sheet in both template and output
+        const tmplXmlPath = getZipSheetXmlPath(tmplZipEntries, sheetName);
+        const outXmlPath = getZipSheetXmlPath(extractedOutZip, sheetName);
+        if (!tmplXmlPath) {
+          errors.push(`protected_sheet_xml_not_found_in_template: ${sheetName}`);
+          continue;
+        }
+        if (!outXmlPath) {
+          errors.push(`protected_sheet_xml_not_found_in_output: ${sheetName}`);
+          continue;
+        }
+
+        // 12c. Compare full worksheet XML content (byte-level via string comparison)
+        const tmplXmlBytes = tmplZipEntries[tmplXmlPath];
+        const outXmlBytes = extractedOutZip[outXmlPath];
+        if (!tmplXmlBytes) {
+          errors.push(`protected_sheet_xml_missing_in_template_zip: ${sheetName} (${tmplXmlPath})`);
+          continue;
+        }
+        if (!outXmlBytes) {
+          errors.push(`protected_sheet_xml_missing_in_output_zip: ${sheetName} (${outXmlPath})`);
+          continue;
+        }
+
+        const tmplXml = new TextDecoder().decode(tmplXmlBytes);
+        const outXml = new TextDecoder().decode(outXmlBytes);
+
+        if (tmplXml !== outXml) {
+          errors.push(`protected_sheet_content_mismatch: ${sheetName} (template XML ${tmplXmlBytes.length}b vs output XML ${outXmlBytes.length}b)`);
+          console.error(`[validate:${exportName}] Protected sheet ${sheetName}: XML MISMATCH (tmpl=${tmplXmlBytes.length}b, out=${outXmlBytes.length}b)`);
+        } else {
+          console.log(`[validate:${exportName}] Protected sheet ${sheetName}: XML IDENTICAL (${tmplXmlBytes.length}b)`);
+        }
+      }
     }
   }
 
@@ -2666,7 +2711,15 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
       mwOutputBytes
     );
     const mwValMs = Date.now() - mwValT0;
-    await logMWStage('after_validation', mwValT0, { passed: mwValidation.passed, integrity_mode: 'heavy', duration_ms: mwValMs });
+    const mwProtectedNames = ['ReferenceData', 'Columns'];
+    const mwMismatch = mwValidation.errors.find(e => e.startsWith('protected_sheet_content_mismatch:'));
+    const mwMismatchName = mwMismatch ? mwMismatch.split(': ')[1]?.split(' ')[0] : undefined;
+    await logMWStage('after_validation', mwValT0, {
+      passed: mwValidation.passed, integrity_mode: 'heavy', duration_ms: mwValMs,
+      protected_sheets_count: mwProtectedNames.length,
+      protected_sheets_names: mwProtectedNames,
+      ...(mwMismatchName ? { protected_sheet_mismatch_name: mwMismatchName } : {})
+    });
     if (mwValMs > 5000) {
       await safeLogEvent(supabase, runId, 'WARN', 'export_mediaworld_stage', {
         step: 'export_mediaworld', stage: 'slow_path', heap_mb: getMemMB(), duration_ms: mwValMs,
@@ -2679,6 +2732,10 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
       await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {}, validation_passed: false, validation_warnings: mwValidation.warnings } as StepResultData);
       return { success: false, error };
     }
+    
+    // Release ZIP entries after validation to reduce peak RAM
+    // deno-lint-ignore no-explicit-any
+    (preExtractedTmplZip as any) = null;
     
     const mwBlob = new Blob([xlsxBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
     
