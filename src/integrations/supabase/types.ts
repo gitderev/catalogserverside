@@ -310,6 +310,10 @@ export type Database = {
           new_warning_count: number
         }[]
       }
+      merge_sync_run_metrics: {
+        Args: { p_patch: Json; p_run_id: string }
+        Returns: undefined
+      }
       merge_sync_run_step: {
         Args: { p_patch: Json; p_run_id: string; p_step_name: string }
         Returns: undefined

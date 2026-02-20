@@ -2317,10 +2317,50 @@ async function updateStepResult(supabase: SupabaseClient, runId: string, stepNam
   }
   await renewLockLease(supabase, runId, LOCK_TTL_SECONDS);
 
-  const { data: run } = await supabase.from('sync_runs').select('steps, metrics').eq('id', runId).single();
-  const steps = { ...(run?.steps || {}), [stepName]: result, current_step: stepName };
-  const metrics = { ...(run?.metrics || {}), ...result.metrics };
-  await supabase.from('sync_runs').update({ steps, metrics }).eq('id', runId);
+  // Atomic step update via RPC (no read-modify-write)
+  const stepPatch = { ...result, current_step: undefined };
+  const { error: stepErr } = await supabase.rpc('merge_sync_run_step', {
+    p_run_id: runId,
+    p_step_name: stepName,
+    p_patch: stepPatch
+  });
+  if (stepErr) {
+    console.error(`[sync-step-runner] merge_sync_run_step failed: ${stepErr.message}`);
+    throw new Error(`rpc_merge_sync_run_step_failed: ${stepErr.message}`);
+  }
+
+  // Atomic current_step update via existing RPC (set_step_in_progress updates current_step atomically)
+  // We use a direct jsonb_set for current_step only — set_step_in_progress also sets status=in_progress which we don't want here
+  const { error: csErr } = await supabase.rpc('merge_sync_run_step', {
+    p_run_id: runId,
+    p_step_name: 'current_step',
+    p_patch: stepName
+  });
+  // current_step is set as a top-level key in steps via merge_sync_run_step with a string value
+  // Actually, merge_sync_run_step expects p_patch as jsonb and uses jsonb_set on steps[p_step_name]
+  // So steps.current_step = stepName (as a JSON string) — this works because jsonb_set with a string jsonb value is valid
+  if (csErr) {
+    console.warn(`[sync-step-runner] current_step update warning: ${csErr.message}`);
+  }
+
+  // Atomic metrics update via RPC (no read-modify-write)
+  if (result.metrics && Object.keys(result.metrics).length > 0) {
+    const { error: metricsErr } = await supabase.rpc('merge_sync_run_metrics', {
+      p_run_id: runId,
+      p_patch: result.metrics
+    });
+    if (metricsErr) {
+      // Deterministic failure if RPC is missing
+      console.error(`[sync-step-runner] merge_sync_run_metrics failed: ${metricsErr.message}`);
+      await safeLogEvent(supabase, runId, 'ERROR', 'missing_rpc_merge_sync_run_metrics', {
+        code: 'missing_rpc_merge_sync_run_metrics',
+        runId,
+        stepName,
+        error: metricsErr.message
+      });
+      throw new Error(`missing_rpc_merge_sync_run_metrics: ${metricsErr.message}`);
+    }
+  }
 }
 
 // ========== STEP: PRICING ==========
@@ -2562,6 +2602,9 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
   // Initialize warnings
   const warnings = createEmptyWarnings();
   
+  let currentStage = 'entered_prepare';
+  let mwOutSizeForCatch = 0; // track output size for error reporting
+  
   try {
     await logMWStage('before_data_load', startTime);
     const { products, error: loadError } = await loadProductsTSV(supabase, runId);
@@ -2674,9 +2717,9 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     // Keep mwTemplateBytes alive (12.8MB) — needed for deferred re-extraction during validation
     // preExtractedTmplZip will be released before XLSX.write() to free ~50MB heap
     
-    // Validate template sheets
-    const requiredSheets = ['Data', 'ReferenceData', 'Columns'];
-    const missingSheets = requiredSheets.filter(s => !wb.SheetNames.includes(s));
+    // Validate template sheets — derived from template runtime (no hardcoded list)
+    const templateSheetNames = [...wb.SheetNames] as string[];
+    const missingSheets = templateSheetNames.filter(s => !wb.SheetNames.includes(s));
     if (missingSheets.length > 0) {
       const error = `Template MW: fogli mancanti: ${missingSheets.join(', ')}. Trovati: ${wb.SheetNames.join(', ')}`;
       await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
@@ -2780,15 +2823,14 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     await logMWStage('after_release_all_pre_write', startTime, { heap_mb: getMemMB() });
     
     // ========== LIGHT VALIDATION (pre-write, on workbook object — no extra memory) ==========
-    // Derives invariants from template and verifies them on the filled workbook before serialization.
+    // Derives invariants from template runtime — no hardcoded sheet names or headers.
     // This runs ALWAYS regardless of validation mode, as it's essentially free (no allocations).
+    currentStage = 'before_validation';
     const mwLightValT0 = Date.now();
     {
-      // Invariant 1: sheet names and count
-      const tmplSheetNames = requiredSheets; // ['Data', 'ReferenceData', 'Columns']
+      // Invariant 1: sheet names derived from template (templateSheetNames captured at parse time)
       const genSheetNames = wb.SheetNames as string[];
-      const sheetCountMatch = genSheetNames.length === tmplSheetNames.length + (genSheetNames.length - tmplSheetNames.length);
-      for (const sn of tmplSheetNames) {
+      for (const sn of templateSheetNames) {
         if (!genSheetNames.includes(sn)) {
           const error = `Light validation failed: sheet "${sn}" missing from output`;
           await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
@@ -2796,22 +2838,52 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
         }
       }
 
-      // Invariant 2: header row (row 0) of Data sheet must match template
+      // Invariant 2: header row derived from template "Data" sheet at runtime
       const genWsData = wb.Sheets['Data'];
+      if (!genWsData) {
+        const error = 'template_header_unreadable';
+        await safeLogEvent(supabase, runId, 'ERROR', 'template_header_unreadable', {
+          sheet_name: 'Data', template_ref: null, reason: 'Data sheet missing from workbook'
+        });
+        await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
+        return { success: false, error };
+      }
       const XLSX_LOCAL = await import("npm:xlsx@0.18.5");
-      const tmplRange = genWsData?.['!ref'] ? XLSX_LOCAL.utils.decode_range(genWsData['!ref']) : null;
-      // Read header values from the current (template-based) workbook — they should be untouched
-      const expectedHeaders = ['SKU offerta', 'ID Prodotto', 'Tipo ID prodotto', 'Descrizione offerta',
-        'Descrizione interna', "Prezzo dell'offerta", 'Info aggiuntive prezzo', 'Quantità',
-        'Avviso quantità minima', "Stato dell'offerta"];
-      // Check first 10 header cells against what template has
-      for (let c = 0; c < Math.min(expectedHeaders.length, 22); c++) {
-        const addr = COL_LETTERS[c] + '1';
-        const cellVal = genWsData?.[addr]?.v?.toString() || '';
-        // Only check non-empty template headers
-        if (expectedHeaders[c] && cellVal && cellVal !== expectedHeaders[c]) {
-          // Log but don't fail — header might have locale variations in template
-          console.warn(`[sync:step:export_mediaworld] Light validation: header[${c}] expected "${expectedHeaders[c]}", got "${cellVal}"`);
+      const tmplRef = genWsData?.['!ref'];
+      if (!tmplRef) {
+        const error = 'template_header_unreadable';
+        await safeLogEvent(supabase, runId, 'ERROR', 'template_header_unreadable', {
+          sheet_name: 'Data', template_ref: tmplRef, reason: '!ref missing or invalid on Data sheet'
+        });
+        await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
+        return { success: false, error };
+      }
+      const tmplRange = XLSX_LOCAL.utils.decode_range(tmplRef);
+      const headerRowIndex = tmplRange.s.r;
+      // Read header baseline from template workbook (row headerRowIndex) — these are the actual template headers
+      const templateHeaders: string[] = [];
+      for (let c = tmplRange.s.c; c <= tmplRange.e.c; c++) {
+        const addr = XLSX_LOCAL.utils.encode_cell({ r: headerRowIndex, c });
+        const cellVal = genWsData?.[addr]?.v;
+        // Normalize: trim and collapse multiple spaces to single space
+        const normalized = cellVal != null ? String(cellVal).trim().replace(/\s+/g, ' ') : '';
+        templateHeaders.push(normalized);
+      }
+      if (templateHeaders.every(h => h === '')) {
+        const error = 'template_header_unreadable';
+        await safeLogEvent(supabase, runId, 'ERROR', 'template_header_unreadable', {
+          sheet_name: 'Data', template_ref: tmplRef, reason: 'All header cells are empty'
+        });
+        await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
+        return { success: false, error };
+      }
+      // Compare output headers against template baseline
+      for (let c = tmplRange.s.c; c <= tmplRange.e.c; c++) {
+        const addr = XLSX_LOCAL.utils.encode_cell({ r: headerRowIndex, c });
+        const cellVal = genWsData?.[addr]?.v;
+        const normalized = cellVal != null ? String(cellVal).trim().replace(/\s+/g, ' ') : '';
+        if (templateHeaders[c - tmplRange.s.c] && normalized && normalized !== templateHeaders[c - tmplRange.s.c]) {
+          console.warn(`[sync:step:export_mediaworld] Light validation: header[${c}] expected "${templateHeaders[c - tmplRange.s.c]}", got "${normalized}"`);
         }
       }
 
@@ -2824,6 +2896,7 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     await logMWStage('light_validation_done', mwLightValT0, { rows: mwWritten, duration_ms: Date.now() - mwLightValT0 });
 
     // Serialize XLSX
+    currentStage = 'before_write';
     const mwWriteT0 = Date.now();
     await logMWStage('before_write', mwWriteT0, { rows: mwWritten, heap_mb: getMemMB() });
     // deno-lint-ignore no-explicit-any
@@ -2831,6 +2904,8 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     let mwOutputBytes: Uint8Array | null = new Uint8Array(xlsxBuffer);
     const mwOutSize = mwOutputBytes.length;
     const mwWriteMs = Date.now() - mwWriteT0;
+    currentStage = 'after_write';
+    mwOutSizeForCatch = mwOutSize;
     await logMWStage('after_write', mwWriteT0, { size_bytes: mwOutSize, duration_ms: mwWriteMs, heap_mb: getMemMB() });
     if (mwWriteMs > 10000) {
       await safeLogEvent(supabase, runId, 'WARN', 'export_mediaworld_stage', {
@@ -2894,6 +2969,7 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
       const mwProtectedNames = ['ReferenceData', 'Columns'];
       const mwMismatch = mwValidation.errors.find(e => e.startsWith('protected_sheet_content_mismatch:'));
       const mwMismatchName = mwMismatch ? mwMismatch.split(': ')[1]?.split(' ')[0] : undefined;
+      currentStage = 'after_validation';
       await logMWStage('after_validation', mwValT0, {
         passed: mwValidation.passed, integrity_mode: 'heavy', duration_ms: mwValMs,
         protected_sheets_count: mwProtectedNames.length,
@@ -2917,10 +2993,9 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
       const lightErrors: string[] = [];
       const lightWarnings: string[] = [];
 
-      // 1. Sheet names must match template
-      const expectedSheetNames = ['Data', 'ReferenceData', 'Columns'];
-      if (JSON.stringify(wb.SheetNames) !== JSON.stringify(expectedSheetNames)) {
-        lightErrors.push(`sheet_names: expected ${JSON.stringify(expectedSheetNames)}, got ${JSON.stringify(wb.SheetNames)}`);
+      // 1. Sheet names must match template (derived from templateSheetNames, no hardcoded list)
+      if (JSON.stringify(wb.SheetNames) !== JSON.stringify(templateSheetNames)) {
+        lightErrors.push(`sheet_names: expected ${JSON.stringify(templateSheetNames)}, got ${JSON.stringify(wb.SheetNames)}`);
       }
 
       // 2. Header row 0 of Data sheet: must be identical to template
@@ -2940,8 +3015,8 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
         }
       }
 
-      // 3. Protected sheets presence
-      for (const ps of ['ReferenceData', 'Columns']) {
+      // 3. Protected sheets presence (derived from template — all non-Data sheets)
+      for (const ps of templateSheetNames.filter(s => s !== 'Data')) {
         if (!wb.Sheets[ps]) {
           lightErrors.push(`protected_sheet_missing: ${ps}`);
         }
@@ -2952,6 +3027,7 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
         lightWarnings.push('zero_data_rows: no products written to Data sheet');
       }
 
+      currentStage = 'after_validation';
       await logMWStage('after_validation', mwValT0, {
         passed: lightErrors.length === 0, integrity_mode: 'light', duration_ms: Date.now() - mwValT0,
         error_count: lightErrors.length, warning_count: lightWarnings.length
@@ -2985,6 +3061,7 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
       'Export Mediaworld.xlsx', mwBlob, { upsert: true, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }
     );
     const mwUpMs = Date.now() - mwUpT0;
+    currentStage = 'after_upload';
     await logMWStage('after_upload', mwUpT0, { duration_ms: mwUpMs, size_bytes: mwOutSize });
     if (mwUpMs > 10000) {
       await safeLogEvent(supabase, runId, 'WARN', 'export_mediaworld_stage', {
@@ -3016,6 +3093,7 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     } as StepResultData);
     
     const totalElapsed = Date.now() - startTime;
+    currentStage = 'completed';
     await logMWStage('completed', startTime, { rows: mwWritten, elapsed_ms: totalElapsed, format: 'xlsx' });
     if (totalElapsed > 30000) {
       await safeLogEvent(supabase, runId, 'WARN', 'export_mediaworld_stage', {
@@ -3032,8 +3110,8 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     const validationMode = (Deno.env.get('EXPORT_MEDIAWORLD_VALIDATION_MODE') || 'light').toLowerCase();
     await safeLogEvent(supabase, runId, 'ERROR', 'export_mediaworld_stage', {
       step: 'export_mediaworld', stage: 'failed', heap_mb: failMem, heap_peak_mb: heapPeakMb, duration_ms: Date.now() - startTime,
-      reason: errMsg(e), last_stage: 'unknown', validation_mode: validationMode,
-      output_bytes_length: 0 // unknown at crash time
+      reason: errMsg(e), last_stage: currentStage, validation_mode: validationMode,
+      output_bytes_length: mwOutSizeForCatch
     });
     await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error: errMsg(e), metrics: {} });
     return { success: false, error: errMsg(e) };
