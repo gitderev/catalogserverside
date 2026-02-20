@@ -2596,7 +2596,7 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     const mem = getMemMB();
     if (mem > heapPeakMb) heapPeakMb = mem;
     const durationMs = Date.now() - t0;
-    await safeLogEvent(supabase, runId, 'INFO', 'export_mediaworld_stage', { step: 'export_mediaworld', stage, heap_mb: mem, heap_peak_mb: heapPeakMb, duration_ms: durationMs, ...extra });
+    await safeLogEvent(supabase, runId, 'INFO', 'export_mediaworld_stage', { step: 'export_mediaworld', stage, last_stage: stage, heap_mb: mem, heap_peak_mb: heapPeakMb, duration_ms: durationMs, ...extra });
   };
   
   // Initialize warnings
@@ -2802,10 +2802,30 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
       mwWritten++;
     }
     
-    // Update sheet range to include new data rows
-    if (mwWritten > 0) {
-      const lastRow = DATA_START_ROW + mwWritten - 1;
-      ws['!ref'] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: lastRow, c: 21 } });
+    // Update sheet range to cover effective data area (always set, even if mwWritten=0)
+    {
+      const lastRow = mwWritten > 0 ? DATA_START_ROW + mwWritten - 1 : DATA_START_ROW - 1;
+      const lastCol = COL_LETTERS.length - 1; // 21
+      ws['!ref'] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: lastRow, c: lastCol } });
+    }
+
+    // Trim ws['!rows'] conservatively to reduce serialization overhead
+    {
+      const targetRows = mwWritten > 0 ? DATA_START_ROW + mwWritten : DATA_START_ROW;
+      const wsRows = ws['!rows'] as unknown[] | undefined;
+      if (Array.isArray(wsRows) && wsRows.length > targetRows + 100) {
+        ws['!rows'] = wsRows.slice(0, targetRows);
+        await logMWStage('rows_trim_applied', startTime, { original_length: wsRows.length, trimmed_to: targetRows });
+      } else {
+        await logMWStage('rows_trim_skipped', startTime, {
+          reason: !Array.isArray(wsRows) ? 'not_an_array' : `length_${wsRows.length}_within_threshold_${targetRows + 100}`
+        });
+      }
+      // Strip heavy metadata that inflates serialization cost (same as export_amazon)
+      delete ws['!cols'];
+      delete ws['!merges'];
+      delete ws['!autofilter'];
+      delete ws['!images'];
     }
     
     await logMWStage('data_filled_done', startTime, { rows: mwWritten });
@@ -2895,21 +2915,53 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     }
     await logMWStage('light_validation_done', mwLightValT0, { rows: mwWritten, duration_ms: Date.now() - mwLightValT0 });
 
+    // Pre-write snapshot for diagnostics if OOM persists
+    await logMWStage('pre_write_snapshot', startTime, {
+      ws_ref: ws['!ref'],
+      ws_rows_length: Array.isArray(ws['!rows']) ? (ws['!rows'] as unknown[]).length : null,
+      sheet_count: wb.SheetNames.length,
+      heap_mb: getMemMB()
+    });
+
     // Serialize XLSX
     currentStage = 'before_write';
     const mwWriteT0 = Date.now();
     await logMWStage('before_write', mwWriteT0, { rows: mwWritten, heap_mb: getMemMB() });
     // deno-lint-ignore no-explicit-any
     let xlsxBuffer: any = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: false, bookSST: false });
-    let mwOutputBytes: Uint8Array | null = new Uint8Array(xlsxBuffer);
+
+    // Deterministic buffer conversion — avoid unnecessary copies
+    let mwOutputBytes: Uint8Array | null;
+    if (xlsxBuffer instanceof Uint8Array) {
+      mwOutputBytes = xlsxBuffer;
+    } else if (xlsxBuffer instanceof ArrayBuffer) {
+      mwOutputBytes = new Uint8Array(xlsxBuffer);
+    } else if (Array.isArray(xlsxBuffer)) {
+      mwOutputBytes = new Uint8Array(xlsxBuffer);
+    } else {
+      const bufType = typeof xlsxBuffer;
+      const bufCtor = xlsxBuffer?.constructor?.name ?? 'unknown';
+      await safeLogEvent(supabase, runId, 'ERROR', 'export_mediaworld_stage', {
+        step: 'export_mediaworld', stage: 'write_buffer_type_unexpected', last_stage: 'before_write',
+        typeof: bufType, constructor_name: bufCtor,
+        reason: `XLSX.write returned unexpected type: ${bufType} (${bufCtor})`
+      });
+      await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error: 'mw_write_buffer_type_unexpected', metrics: {} });
+      return { success: false, error: 'mw_write_buffer_type_unexpected' };
+    }
+
     const mwOutSize = mwOutputBytes.length;
     const mwWriteMs = Date.now() - mwWriteT0;
     currentStage = 'after_write';
     mwOutSizeForCatch = mwOutSize;
+
+    // Post-write memory release — free xlsxBuffer (wb kept alive for post-write validation)
+    xlsxBuffer = null;
+
     await logMWStage('after_write', mwWriteT0, { size_bytes: mwOutSize, duration_ms: mwWriteMs, heap_mb: getMemMB() });
     if (mwWriteMs > 10000) {
       await safeLogEvent(supabase, runId, 'WARN', 'export_mediaworld_stage', {
-        step: 'export_mediaworld', stage: 'slow_path', heap_mb: getMemMB(), duration_ms: mwWriteMs,
+        step: 'export_mediaworld', stage: 'slow_path', last_stage: 'after_write', heap_mb: getMemMB(), duration_ms: mwWriteMs,
         size_bytes: mwOutSize, phase: 'write'
       });
     }
@@ -3047,13 +3099,12 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
       return { success: false, error };
     }
     
-    // Release validation-phase objects no longer needed (wb ~60MB, template bytes 12.8MB, outputBytes view)
+    // Release validation-phase objects no longer needed
     mwTemplateBytesForVal = null as unknown as Uint8Array;
-    // wb is not needed after validation — upload uses xlsxBuffer directly
-    wb = null;
-    mwOutputBytes = null;
+    wb = null; // wb no longer needed after validation
     
-    let mwBlob: Blob | null = new Blob([xlsxBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    let mwBlob: Blob | null = new Blob([mwOutputBytes!], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    mwOutputBytes = null;
     
     const mwUpT0 = Date.now();
     await logMWStage('before_upload', mwUpT0, { size_bytes: mwOutSize });
@@ -3076,8 +3127,7 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
       return { success: false, error };
     }
     
-    // Release upload buffers — upload completed successfully, bytes no longer needed
-    xlsxBuffer = null;
+    // Release upload buffers
     mwBlob = null;
     
     await safeLogEvent(supabase, runId, 'INFO', 'export_saved', { step: 'export_mediaworld', file: 'Export Mediaworld.xlsx', rows: mwWritten });
