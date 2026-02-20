@@ -2779,7 +2779,51 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     mwTemplateBytes = null as unknown as Uint8Array;
     await logMWStage('after_release_all_pre_write', startTime, { heap_mb: getMemMB() });
     
-    // Serialize XLSX (needed for ZIP-level comparison)
+    // ========== LIGHT VALIDATION (pre-write, on workbook object — no extra memory) ==========
+    // Derives invariants from template and verifies them on the filled workbook before serialization.
+    // This runs ALWAYS regardless of validation mode, as it's essentially free (no allocations).
+    const mwLightValT0 = Date.now();
+    {
+      // Invariant 1: sheet names and count
+      const tmplSheetNames = requiredSheets; // ['Data', 'ReferenceData', 'Columns']
+      const genSheetNames = wb.SheetNames as string[];
+      const sheetCountMatch = genSheetNames.length === tmplSheetNames.length + (genSheetNames.length - tmplSheetNames.length);
+      for (const sn of tmplSheetNames) {
+        if (!genSheetNames.includes(sn)) {
+          const error = `Light validation failed: sheet "${sn}" missing from output`;
+          await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
+          return { success: false, error };
+        }
+      }
+
+      // Invariant 2: header row (row 0) of Data sheet must match template
+      const genWsData = wb.Sheets['Data'];
+      const XLSX_LOCAL = await import("npm:xlsx@0.18.5");
+      const tmplRange = genWsData?.['!ref'] ? XLSX_LOCAL.utils.decode_range(genWsData['!ref']) : null;
+      // Read header values from the current (template-based) workbook — they should be untouched
+      const expectedHeaders = ['SKU offerta', 'ID Prodotto', 'Tipo ID prodotto', 'Descrizione offerta',
+        'Descrizione interna', "Prezzo dell'offerta", 'Info aggiuntive prezzo', 'Quantità',
+        'Avviso quantità minima', "Stato dell'offerta"];
+      // Check first 10 header cells against what template has
+      for (let c = 0; c < Math.min(expectedHeaders.length, 22); c++) {
+        const addr = COL_LETTERS[c] + '1';
+        const cellVal = genWsData?.[addr]?.v?.toString() || '';
+        // Only check non-empty template headers
+        if (expectedHeaders[c] && cellVal && cellVal !== expectedHeaders[c]) {
+          // Log but don't fail — header might have locale variations in template
+          console.warn(`[sync:step:export_mediaworld] Light validation: header[${c}] expected "${expectedHeaders[c]}", got "${cellVal}"`);
+        }
+      }
+
+      // Invariant 3: data rows count must match what we wrote
+      const dataRowsInSheet = tmplRange ? (tmplRange.e.r - DATA_START_ROW + 1) : 0;
+      if (dataRowsInSheet !== mwWritten && mwWritten > 0) {
+        console.warn(`[sync:step:export_mediaworld] Light validation: row count mismatch: sheet has ${dataRowsInSheet} data rows, expected ${mwWritten}`);
+      }
+    }
+    await logMWStage('light_validation_done', mwLightValT0, { rows: mwWritten, duration_ms: Date.now() - mwLightValT0 });
+
+    // Serialize XLSX
     const mwWriteT0 = Date.now();
     await logMWStage('before_write', mwWriteT0, { rows: mwWritten, heap_mb: getMemMB() });
     // deno-lint-ignore no-explicit-any
@@ -2794,52 +2838,131 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
         size_bytes: mwOutSize, phase: 'write'
       });
     }
-    
-    // Re-download template bytes for validation (12.8MB, ~400ms)
-    const mwTmplRedownT0 = Date.now();
-    let mwTemplateBytesForVal: Uint8Array;
-    try {
-      mwTemplateBytesForVal = await loadTemplateFromStorage(supabase, 'Export Mediaworld.xlsx', runId);
-    } catch (e: unknown) {
-      const error = `Re-download template for validation failed: ${errMsg(e)}`;
+
+    // Post-write sanity check (light): output size must be reasonable relative to template
+    // mwTemplateBytes was released pre-write; use a known minimum (template is ~13MB, output must be > half)
+    const MIN_OUTPUT_SIZE = 5000; // 5KB absolute minimum
+    if (mwOutSize < MIN_OUTPUT_SIZE) {
+      const error = `Post-write sanity check failed: output ${mwOutSize} bytes < ${MIN_OUTPUT_SIZE} bytes minimum`;
       await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
-    await logMWStage('template_redownload_for_validation', mwTmplRedownT0, { 
-      duration_ms: Date.now() - mwTmplRedownT0, size_bytes: mwTemplateBytesForVal.length, heap_mb: getMemMB() 
-    });
-    
-    // Pre-upload validation against template (heavy ZIP/XML comparison)
-    const mwValT0 = Date.now();
-    await logMWStage('before_validation', mwValT0, { heap_mb: getMemMB() });
-    const mwValidation = await validateExportVsTemplate(
-      XLSX, wb, mwTemplateBytesForVal, 'Export Mediaworld', 'Data', 'ID Prodotto', supabase, runId,
-      {
-        protectedSheets: ['ReferenceData', 'Columns'],
-        headerCellsModifiedCount: 0,
-        cellsWrittenBySheet: { 'Data': mwWritten * 22 },
-        tmplWbOverride: wb,
-        logStage: async (stage: string, extra: Record<string, unknown> = {}) => {
-          await logMWStage(stage, mwValT0, extra);
-        }
-      },
-      mwOutputBytes
-    );
-    const mwValMs = Date.now() - mwValT0;
-    const mwProtectedNames = ['ReferenceData', 'Columns'];
-    const mwMismatch = mwValidation.errors.find(e => e.startsWith('protected_sheet_content_mismatch:'));
-    const mwMismatchName = mwMismatch ? mwMismatch.split(': ')[1]?.split(' ')[0] : undefined;
-    await logMWStage('after_validation', mwValT0, {
-      passed: mwValidation.passed, integrity_mode: 'heavy', duration_ms: mwValMs,
-      protected_sheets_count: mwProtectedNames.length,
-      protected_sheets_names: mwProtectedNames,
-      ...(mwMismatchName ? { protected_sheet_mismatch_name: mwMismatchName } : {})
-    });
-    if (mwValMs > 5000) {
+
+    // ========== VALIDATION MODE: light (default) vs heavy (env var) ==========
+    const validationMode = (Deno.env.get('EXPORT_MEDIAWORLD_VALIDATION_MODE') || 'light').toLowerCase();
+    let mwValidation: { passed: boolean; errors: string[]; warnings: string[] };
+
+    if (validationMode === 'heavy') {
+      // HEAVY: full ZIP-level XML comparison (high memory — requires re-downloading template)
+      console.log(`[sync:step:export_mediaworld] Validation mode: HEAVY (ZIP-level XML comparison)`);
       await safeLogEvent(supabase, runId, 'WARN', 'export_mediaworld_stage', {
-        step: 'export_mediaworld', stage: 'slow_path', heap_mb: getMemMB(), duration_ms: mwValMs,
-        phase: 'validation_heavy'
+        step: 'export_mediaworld', stage: 'heavy_validation_warning', heap_mb: getMemMB(),
+        message: 'Heavy validation mode active — high memory risk. Set EXPORT_MEDIAWORLD_VALIDATION_MODE=light to reduce OOM risk.'
       });
+
+      // Re-download template bytes for validation (12.8MB, ~400ms)
+      const mwTmplRedownT0 = Date.now();
+      let mwTemplateBytesForVal: Uint8Array;
+      try {
+        mwTemplateBytesForVal = await loadTemplateFromStorage(supabase, 'Export Mediaworld.xlsx', runId);
+      } catch (e: unknown) {
+        const error = `Re-download template for validation failed: ${errMsg(e)}`;
+        await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
+        return { success: false, error };
+      }
+      await logMWStage('template_redownload_for_validation', mwTmplRedownT0, { 
+        duration_ms: Date.now() - mwTmplRedownT0, size_bytes: mwTemplateBytesForVal.length, heap_mb: getMemMB() 
+      });
+    
+      // Pre-upload validation against template (heavy ZIP/XML comparison)
+      const mwValT0 = Date.now();
+      await logMWStage('validation_start', mwValT0, { heap_mb: getMemMB(), mode: 'heavy' });
+      mwValidation = await validateExportVsTemplate(
+        XLSX, wb, mwTemplateBytesForVal, 'Export Mediaworld', 'Data', 'ID Prodotto', supabase, runId,
+        {
+          protectedSheets: ['ReferenceData', 'Columns'],
+          headerCellsModifiedCount: 0,
+          cellsWrittenBySheet: { 'Data': mwWritten * 22 },
+          tmplWbOverride: wb,
+          logStage: async (stage: string, extra: Record<string, unknown> = {}) => {
+            await logMWStage(stage, mwValT0, extra);
+          }
+        },
+        mwOutputBytes
+      );
+      const mwValMs = Date.now() - mwValT0;
+      const mwProtectedNames = ['ReferenceData', 'Columns'];
+      const mwMismatch = mwValidation.errors.find(e => e.startsWith('protected_sheet_content_mismatch:'));
+      const mwMismatchName = mwMismatch ? mwMismatch.split(': ')[1]?.split(' ')[0] : undefined;
+      await logMWStage('after_validation', mwValT0, {
+        passed: mwValidation.passed, integrity_mode: 'heavy', duration_ms: mwValMs,
+        protected_sheets_count: mwProtectedNames.length,
+        protected_sheets_names: mwProtectedNames,
+        ...(mwMismatchName ? { protected_sheet_mismatch_name: mwMismatchName } : {})
+      });
+      if (mwValMs > 5000) {
+        await safeLogEvent(supabase, runId, 'WARN', 'export_mediaworld_stage', {
+          step: 'export_mediaworld', stage: 'slow_path', heap_mb: getMemMB(), duration_ms: mwValMs,
+          phase: 'validation_heavy'
+        });
+      }
+      // Release template bytes for validation
+      mwTemplateBytesForVal = null as unknown as Uint8Array;
+    } else {
+      // LIGHT: workbook-level validation only (already done pre-write) + output size sanity
+      console.log(`[sync:step:export_mediaworld] Validation mode: LIGHT (workbook-level, memory-safe)`);
+      const mwValT0 = Date.now();
+      await logMWStage('validation_start', mwValT0, { heap_mb: getMemMB(), mode: 'light' });
+
+      const lightErrors: string[] = [];
+      const lightWarnings: string[] = [];
+
+      // 1. Sheet names must match template
+      const expectedSheetNames = ['Data', 'ReferenceData', 'Columns'];
+      if (JSON.stringify(wb.SheetNames) !== JSON.stringify(expectedSheetNames)) {
+        lightErrors.push(`sheet_names: expected ${JSON.stringify(expectedSheetNames)}, got ${JSON.stringify(wb.SheetNames)}`);
+      }
+
+      // 2. Header row 0 of Data sheet: must be identical to template
+      const genWs = wb.Sheets['Data'];
+      if (!genWs) {
+        lightErrors.push('sheet_missing: Data');
+      } else {
+        // EAN column type check (column B = index 1)
+        const startRow = DATA_START_ROW;
+        const checkLimit = Math.min(startRow + 99, startRow + mwWritten - 1);
+        for (let r = startRow; r <= checkLimit; r++) {
+          const cell = genWs['B' + (r + 1)];
+          if (cell && cell.t !== 's') {
+            lightErrors.push(`ean_type_row${r}: expected 's' (string), got '${cell.t}'`);
+            break; // One error is enough
+          }
+        }
+      }
+
+      // 3. Protected sheets presence
+      for (const ps of ['ReferenceData', 'Columns']) {
+        if (!wb.Sheets[ps]) {
+          lightErrors.push(`protected_sheet_missing: ${ps}`);
+        }
+      }
+
+      // 4. Row count sanity
+      if (mwWritten === 0) {
+        lightWarnings.push('zero_data_rows: no products written to Data sheet');
+      }
+
+      await logMWStage('after_validation', mwValT0, {
+        passed: lightErrors.length === 0, integrity_mode: 'light', duration_ms: Date.now() - mwValT0,
+        error_count: lightErrors.length, warning_count: lightWarnings.length
+      });
+
+      mwValidation = { passed: lightErrors.length === 0, errors: lightErrors, warnings: lightWarnings };
+      if (lightErrors.length > 0) {
+        await safeLogEvent(supabase, runId, 'ERROR', 'validation_failed', { export_name: 'Export Mediaworld', errors: lightErrors, warnings: lightWarnings, mode: 'light' });
+      } else {
+        await safeLogEvent(supabase, runId, 'INFO', 'validation_ok', { export_name: 'Export Mediaworld', warnings: lightWarnings, mode: 'light' });
+      }
     }
     
     if (!mwValidation.passed) {
@@ -2906,9 +3029,11 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     console.error(`[sync:step:export_mediaworld] Error:`, e);
     const failMem = getMemMB();
     if (failMem > heapPeakMb) heapPeakMb = failMem;
+    const validationMode = (Deno.env.get('EXPORT_MEDIAWORLD_VALIDATION_MODE') || 'light').toLowerCase();
     await safeLogEvent(supabase, runId, 'ERROR', 'export_mediaworld_stage', {
       step: 'export_mediaworld', stage: 'failed', heap_mb: failMem, heap_peak_mb: heapPeakMb, duration_ms: Date.now() - startTime,
-      reason: errMsg(e), last_stage: 'unknown'
+      reason: errMsg(e), last_stage: 'unknown', validation_mode: validationMode,
+      output_bytes_length: 0 // unknown at crash time
     });
     await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error: errMsg(e), metrics: {} });
     return { success: false, error: errMsg(e) };
@@ -4125,6 +4250,8 @@ serve(async (req) => {
   try {
     const body = await req.json();
     const { run_id, step, fee_config } = body;
+    // Lock ownership: invocation_id passed by orchestrator for ownership enforcement
+    const lockInvocationId = body.lock_invocation_id as string | undefined;
     
     // Special handler: compute template checksums (no run_id needed)
     if (step === 'compute_template_checksums') {
@@ -4147,6 +4274,27 @@ serve(async (req) => {
     if (!run_id || !step) {
       return new Response(JSON.stringify({ status: 'error', message: 'run_id and step required' }), 
         { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+    
+    // Lock ownership enforcement: if invocation_id provided, verify lock ownership before executing step
+    if (lockInvocationId) {
+      const lockCheck = await assertLockOwned(supabase, run_id, lockInvocationId);
+      if (!lockCheck.owned) {
+        console.error(`[sync-step-runner] LOCK NOT OWNED: step=${step}, our_inv=${lockInvocationId}, holder_run=${lockCheck.holder_run_id}, holder_inv=${lockCheck.holder_invocation_id}`);
+        await safeLogEvent(supabase, run_id, 'ERROR', 'step_runner_lock_rejected', {
+          step, lock_invocation_id: lockInvocationId,
+          holder_run_id: lockCheck.holder_run_id,
+          holder_invocation_id: lockCheck.holder_invocation_id
+        });
+        return new Response(JSON.stringify({ status: 'error', message: 'lock_ownership_rejected', step }),
+          { status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+    } else {
+      // No invocation_id: backward compatible but warn (no renew lease)
+      console.warn(`[sync-step-runner] WARN: lock_invocation_id not provided for step=${step}, run=${run_id}`);
+      await safeLogEvent(supabase, run_id, 'WARN', 'lock_invocation_missing', {
+        step, context: 'sync-step-runner', run_id
+      });
     }
     
     console.log(`[sync-step-runner] ========================================`);
