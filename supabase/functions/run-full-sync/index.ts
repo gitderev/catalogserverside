@@ -768,7 +768,7 @@ async function runPipeline(
       console.log(`[orchestrator] parse_merge chunk ${chunkCount} (this invocation)...`);
       
       const result = await callStep(supabaseUrl, supabaseServiceKey, 'sync-step-runner', { 
-        run_id: runId, step: 'parse_merge', fee_config: feeConfig 
+        run_id: runId, step: 'parse_merge', fee_config: feeConfig, lock_invocation_id: INVOCATION_ID 
       });
       
       // 546 on parse_merge
@@ -912,7 +912,7 @@ async function runPipeline(
       } catch (_) {}
       
       const result = await callStep(supabaseUrl, supabaseServiceKey, 'sync-step-runner', { 
-        run_id: runId, step, fee_config: feeConfig 
+        run_id: runId, step, fee_config: feeConfig, lock_invocation_id: INVOCATION_ID 
       });
       
       // ---- 546 WORKER_LIMIT: generalized for ALL steps ----

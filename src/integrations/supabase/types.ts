@@ -297,6 +297,7 @@ export type Database = {
     Functions: {
       add_self_as_admin: { Args: never; Returns: boolean }
       invoke_cron_tick: { Args: never; Returns: undefined }
+      jsonb_deep_merge: { Args: { base: Json; patch: Json }; Returns: Json }
       log_sync_event: {
         Args: {
           p_details?: Json
