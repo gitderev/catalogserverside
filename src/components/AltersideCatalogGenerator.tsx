@@ -689,7 +689,7 @@ const AltersideCatalogGenerator: React.FC = () => {
       // Upsert singleton row (insert if missing, update if exists)
       const { data: savedRow, error } = await supabase
         .from('fee_config')
-        .upsert({ id: FEE_CONFIG_SINGLETON_ID, ...updateData }, { onConflict: 'id' })
+        .upsert({ id: FEE_CONFIG_SINGLETON_ID, ...updateData } as any, { onConflict: 'id' })
         .select()
         .single();
       
@@ -844,7 +844,7 @@ const AltersideCatalogGenerator: React.FC = () => {
       // Upsert singleton row (insert if missing, update if exists)
       const { data: savedRow, error } = await supabase
         .from('fee_config')
-        .upsert({ id: FEE_CONFIG_SINGLETON_ID, ...updateData }, { onConflict: 'id' })
+        .upsert({ id: FEE_CONFIG_SINGLETON_ID, ...updateData } as any, { onConflict: 'id' })
         .select()
         .single();
       
