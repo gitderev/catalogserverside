@@ -2684,7 +2684,7 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     const aoa: (string | number)[][] = [headerRow1, headerRow2];
     let mwWritten = 0;
     let mwSkipped = 0;
-    const EAN_RE = /^[0-9]{13}$/;
+    const EAN_RE = /^[0-9]{13,14}$/;
 
     for (const p of products) {
       const norm = normalizeEAN(p.EAN);
@@ -2814,8 +2814,8 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
             validationErrors.push(`ean_type_row${r}: expected 's', got '${cell.t}'`);
             break;
           }
-          if (!EAN_RE.test(String(cell.v))) {
-            validationErrors.push(`ean_value_row${r}: "${cell.v}" does not match ^[0-9]{13}$`);
+            if (!EAN_RE.test(String(cell.v))) {
+            validationErrors.push(`ean_value_row${r}: "${cell.v}" does not match ^[0-9]{13,14}$`);
             break;
           }
         }
