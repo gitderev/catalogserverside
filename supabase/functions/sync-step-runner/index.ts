@@ -30,6 +30,10 @@ interface FeeConfig {
   epriceItPrepDays?: number;
   epriceEuPrepDays?: number;
   epricePrepDays?: number;
+  // Per-export pricing (null = use global)
+  eanFeeDrev?: number;
+  eanFeeMkt?: number;
+  eanShippingCost?: number;
 }
 
 interface StepResultData {
