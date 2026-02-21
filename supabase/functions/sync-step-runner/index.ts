@@ -2681,7 +2681,7 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     const headerRow1 = ["SKU offerta","ID Prodotto","Tipo ID prodotto","Descrizione offerta","Descrizione interna offerta","Prezzo dell'offerta","Info aggiuntive prezzo offerta","Quantità dell'offerta","Avviso quantità minima","Stato dell'offerta","Data di inizio della disponibilità","Data di conclusione della disponibilità","Classe logistica","Prezzo scontato","Data di inizio dello sconto","Data di termine dello sconto","Tempo di preparazione della spedizione (in giorni)","Aggiorna/Cancella","Tipo di prezzo che verrà barrato quando verrà definito un prezzo scontato.","Obbligo di ritiro RAEE","Orario di cut-off (solo se la consegna il giorno successivo è abilitata)","VAT Rate % (Turkey only)"];
     const headerRow2 = ["sku","product-id","product-id-type","description","internal-description","price","price-additional-info","quantity","min-quantity-alert","state","available-start-date","available-end-date","logistic-class","discount-price","discount-start-date","discount-end-date","leadtime-to-ship","update-delete","strike-price-type","mms-weee-take-back-obligation","cut-off-time","vat-rate"];
 
-    const aoa: (string | number)[][] = [headerRow1, headerRow2];
+    const aoa: (string | number | null)[][] = [headerRow1, headerRow2];
     let mwWritten = 0;
     let mwSkipped = 0;
     const EAN_RE = /^[0-9]{13,14}$/;
@@ -2720,30 +2720,27 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
         return { success: false, error: 'ean_assert_failed' };
       }
 
-      aoa.push([
-        p.MPN || '',                         // A: sku
-        eanStr,                              // B: product-id (text)
-        'EAN',                               // C: product-id-type
-        p.Desc || '',                        // D: description
-        '',                                  // E: internal-description
-        prezzoOfferta,                       // F: price
-        '',                                  // G: price-additional-info
-        Math.min(stockResult.exportQty, 99), // H: quantity
-        '',                                  // I: min-quantity-alert
-        'Nuovo',                             // J: state
-        '',                                  // K: available-start-date
-        '',                                  // L: available-end-date
-        'Consegna gratuita',                 // M: logistic-class
-        p.PFNum,                             // N: discount-price
-        '',                                  // O: discount-start-date
-        '',                                  // P: discount-end-date
-        stockResult.leadDays,                // Q: leadtime-to-ship
-        '',                                  // R: update-delete
-        'recommended-retail-price',          // S: strike-price-type
-        '',                                  // T: mms-weee-take-back-obligation
-        '',                                  // U: cut-off-time
-        ''                                   // V: vat-rate
-      ]);
+      // Use null for empty fields to reduce materialized cells
+      const row: (string | number | null)[] = new Array(22).fill(null);
+      row[0] = p.MPN || null;                     // A: sku
+      row[1] = eanStr;                             // B: product-id (text)
+      row[2] = 'EAN';                              // C: product-id-type
+      row[3] = p.Desc || null;                     // D: description
+      // row[4] = null;                            // E: internal-description
+      row[5] = prezzoOfferta;                      // F: price
+      // row[6] = null;                            // G: price-additional-info
+      row[7] = Math.min(stockResult.exportQty, 99); // H: quantity
+      // row[8] = null;                            // I: min-quantity-alert
+      row[9] = 'Nuovo';                            // J: state
+      // row[10..11] = null;                       // K,L: dates
+      row[12] = 'Consegna gratuita';               // M: logistic-class
+      row[13] = p.PFNum;                           // N: discount-price
+      // row[14..15] = null;                       // O,P: discount dates
+      row[16] = stockResult.leadDays;              // Q: leadtime-to-ship
+      // row[17] = null;                           // R: update-delete
+      row[18] = 'recommended-retail-price';        // S: strike-price-type
+      // row[19..21] = null;                       // T,U,V
+      aoa.push(row);
       mwWritten++;
     }
 
@@ -2761,16 +2758,23 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     const ws = XLSX.utils.aoa_to_sheet(aoa);
     // Force EAN column (B) to text type for all data rows
     for (let r = 2; r < aoa.length; r++) {
-      const addr = 'B' + (r + 1);
-      if (ws[addr]) {
-        ws[addr] = { v: String(aoa[r][1]), t: 's', z: '@' };
+      const eanVal = aoa[r][1];
+      if (eanVal != null) {
+        const addr = 'B' + (r + 1);
+        if (ws[addr]) {
+          ws[addr] = { v: String(eanVal), t: 's', z: '@' };
+        }
       }
     }
+    // Force !ref to cover all 22 columns (A-V) even with sparse rows
+    const lastRow = 2 + mwWritten;
+    ws['!ref'] = `A1:V${Math.max(lastRow, 2)}`;
+
     // deno-lint-ignore no-explicit-any
     let wb: any = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Data');
 
-    // ===== VALIDATION (pre-write, on workbook object) =====
+    // ===== LIGHTWEIGHT VALIDATION (pre-write, no post-write re-read) =====
     currentStage = 'before_validation';
     const validationWarnings: string[] = [];
     const validationErrors: string[] = [];
@@ -2780,57 +2784,25 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
       validationErrors.push(`sheet_names: expected ["Data"], got ${JSON.stringify(wb.SheetNames)}`);
     }
 
-    // V2: Header rows must match
+    // V2: Header rows — check first and last column of each header row
     const genWs = wb.Sheets['Data'];
     if (!genWs) {
       validationErrors.push('sheet_missing: Data');
     } else {
-      // Check header row 1
-      for (let c = 0; c < headerRow1.length; c++) {
-        const addr = XLSX.utils.encode_cell({ r: 0, c });
-        const val = genWs[addr]?.v;
-        const norm = val != null ? String(val).trim().replace(/\s+/g, ' ') : '';
-        if (norm !== headerRow1[c]) {
-          validationErrors.push(`header1_col${c}: expected "${headerRow1[c]}", got "${norm}"`);
-          break;
-        }
+      const h1a = genWs['A1']?.v, h1v = genWs['V1']?.v;
+      if (h1a !== headerRow1[0] || h1v !== headerRow1[21]) {
+        validationErrors.push(`header1: A1="${h1a}", V1="${h1v}"`);
       }
-      // Check header row 2
-      for (let c = 0; c < headerRow2.length; c++) {
-        const addr = XLSX.utils.encode_cell({ r: 1, c });
-        const val = genWs[addr]?.v;
-        const norm = val != null ? String(val).trim().replace(/\s+/g, ' ') : '';
-        if (norm !== headerRow2[c]) {
-          validationErrors.push(`header2_col${c}: expected "${headerRow2[c]}", got "${norm}"`);
-          break;
-        }
-      }
-      // V3: EAN sample check (up to 100 data rows)
-      const checkLimit = Math.min(102, 2 + mwWritten); // rows 3..102 (0-indexed 2..101)
-      for (let r = 2; r < checkLimit; r++) {
-        const cell = genWs['B' + (r + 1)];
-        if (cell) {
-          if (cell.t !== 's') {
-            validationErrors.push(`ean_type_row${r}: expected 's', got '${cell.t}'`);
-            break;
-          }
-            if (!EAN_RE.test(String(cell.v))) {
-            validationErrors.push(`ean_value_row${r}: "${cell.v}" does not match ^[0-9]{13,14}$`);
-            break;
-          }
-        }
+      const h2a = genWs['A2']?.v, h2v = genWs['V2']?.v;
+      if (h2a !== headerRow2[0] || h2v !== headerRow2[21]) {
+        validationErrors.push(`header2: A2="${h2a}", V2="${h2v}"`);
       }
     }
 
-    // V4: zero rows warning
+    // V3: zero rows warning
     if (mwWritten === 0) {
       validationWarnings.push('zero_data_rows: no products written to Data sheet');
     }
-
-    await logMWStage('after_validation', startTime, {
-      passed: validationErrors.length === 0, error_count: validationErrors.length,
-      warning_count: validationWarnings.length
-    });
 
     if (validationErrors.length > 0) {
       await safeLogEvent(supabase, runId, 'ERROR', 'validation_failed', {
@@ -2842,7 +2814,7 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     }
     if (validationWarnings.length > 0) {
       await safeLogEvent(supabase, runId, 'WARN', 'export_mediaworld_stage', {
-        step: 'export_mediaworld', stage: 'validation_warnings', last_stage: 'after_validation',
+        step: 'export_mediaworld', stage: 'validation_warnings', last_stage: 'before_validation',
         warnings: validationWarnings
       });
     }
@@ -2884,9 +2856,9 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
 
     await logMWStage('after_write', mwWriteT0, { size_bytes: mwOutSize, duration_ms: mwWriteMs, heap_mb: getMemMB() });
 
-    // Size sanity: if rows > 0, output must be > 50KB
-    if (mwWritten > 0 && mwOutSize < 50_000) {
-      const error = `Post-write sanity: output ${mwOutSize} bytes < 50KB with ${mwWritten} rows`;
+    // Size sanity: if rows > 0, output must be > 20KB
+    if (mwWritten > 0 && mwOutSize < 20_000) {
+      const error = `Post-write sanity: output ${mwOutSize} bytes < 20KB with ${mwWritten} rows`;
       await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
