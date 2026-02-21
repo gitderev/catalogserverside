@@ -2984,11 +2984,19 @@ async function stepExportEprice(supabase: SupabaseClient, runId: string, feeConf
     const epParseT0 = Date.now();
     const wb = XLSX.read(epTemplateBytes, { type: 'array' });
     await logEPStage('template_parse_done', epParseT0);
+    const templateSheetNames = [...wb.SheetNames];
     const ws = wb.Sheets['Tracciato_Inserimento_Offerte'];
     if (!ws) {
       const error = 'Template Export ePrice.xlsx: foglio Tracciato_Inserimento_Offerte non trovato';
       await updateStepResult(supabase, runId, 'export_eprice', { status: 'failed', error, metrics: {} });
       return { success: false, error };
+    }
+    
+    // Capture header row 0 values (cols 0..7) BEFORE clearing data rows
+    const header0Values: string[] = [];
+    for (let c = 0; c <= 7; c++) {
+      const cell = ws[XLSX.utils.encode_cell({ r: 0, c })];
+      header0Values.push(cell?.v?.toString() || '');
     }
     
     // Clear existing data rows from template (keep header at row 0)
@@ -3058,18 +3066,79 @@ async function stepExportEprice(supabase: SupabaseClient, runId: string, feeConf
     const epOutSize = epOutputBytes.length;
     await logEPStage('after_write', epWriteT0, { size_bytes: epOutSize });
     
-    // Pre-upload validation (ePrice-specific: column count check + ZIP comparison)
+    // Pre-upload validation: light (default) or heavy (env override)
+    const epValMode = (Deno.env.get('EXPORT_EPRICE_VALIDATION_MODE') || 'light').toLowerCase();
     const epValT0 = Date.now();
-    await logEPStage('before_validation', epValT0);
-    const epValidation = await validateExportVsTemplate(
-      XLSX, wb, epTemplateBytes, 'Export ePrice', 'Tracciato_Inserimento_Offerte', 'product-id', supabase, runId,
-      { headerCellsModifiedCount: 0, cellsWrittenBySheet: { 'Tracciato_Inserimento_Offerte': epWritten * 8 } },
-      epOutputBytes
-    );
-    await logEPStage('after_validation', epValT0, { passed: epValidation.passed, integrity_mode: 'heavy' });
-    if (!epValidation.passed) {
-      const error = `Pre-SFTP validation failed for Export ePrice.xlsx: ${epValidation.errors.join('; ')}`;
-      await updateStepResult(supabase, runId, 'export_eprice', { status: 'failed', error, metrics: {}, validation_passed: false, validation_warnings: epValidation.warnings } as StepResultData);
+    await logEPStage('before_validation', epValT0, { integrity_mode: epValMode });
+
+    let epValidationPassed = true;
+    let epValidationErrors: string[] = [];
+    const epValidationWarnings: string[] = [];
+
+    if (epValMode === 'heavy') {
+      // Heavy mode: full ZIP/XML comparison (existing behavior)
+      const epValidation = await validateExportVsTemplate(
+        XLSX, wb, epTemplateBytes, 'Export ePrice', 'Tracciato_Inserimento_Offerte', 'product-id', supabase, runId,
+        { headerCellsModifiedCount: 0, cellsWrittenBySheet: { 'Tracciato_Inserimento_Offerte': epWritten * 8 } },
+        epOutputBytes
+      );
+      epValidationPassed = epValidation.passed;
+      epValidationErrors = epValidation.errors;
+      epValidationWarnings.push(...(epValidation.warnings || []));
+    } else {
+      // Light mode: cheap deterministic checks, NO unzip, NO XLSX.read on buffer
+      // 1. SheetNames must match template
+      const currentSheetNames = wb.SheetNames;
+      if (JSON.stringify(currentSheetNames) !== JSON.stringify(templateSheetNames)) {
+        epValidationErrors.push(`sheet_names: expected ${JSON.stringify(templateSheetNames)}, got ${JSON.stringify(currentSheetNames)}`);
+      }
+      // 2. Sheet exists
+      if (!wb.Sheets['Tracciato_Inserimento_Offerte']) {
+        epValidationErrors.push('sheet_missing: Tracciato_Inserimento_Offerte');
+      }
+      // 3. Header row 0 unchanged (cols 0..7)
+      for (let c = 0; c <= 7; c++) {
+        const cell = ws[XLSX.utils.encode_cell({ r: 0, c })];
+        const currentVal = cell?.v?.toString() || '';
+        if (currentVal !== header0Values[c]) {
+          epValidationErrors.push(`header[${c}]: expected "${header0Values[c]}", got "${currentVal}"`);
+        }
+      }
+      // 4. Range and EAN column checks
+      if (epWritten > 0) {
+        const genRange = ws['!ref'] ? XLSX.utils.decode_range(ws['!ref']) : null;
+        if (!genRange) {
+          epValidationErrors.push('ref_missing: worksheet has no !ref');
+        } else {
+          if (genRange.e.c < 7) epValidationErrors.push(`column_count: expected >=8, got ${genRange.e.c + 1}`);
+          const expectedLastRow = EP_DATA_START + epWritten - 1;
+          if (genRange.e.r < expectedLastRow) epValidationErrors.push(`row_range: expected >=${expectedLastRow}, got ${genRange.e.r}`);
+        }
+        // EAN column (col 1) sample check: string, digits only, 13-14 chars
+        const eanCheckLimit = Math.min(epWritten, 100);
+        const EAN_RE = /^[0-9]{13,14}$/;
+        for (let i = 0; i < eanCheckLimit; i++) {
+          const cell = ws[XLSX.utils.encode_cell({ r: EP_DATA_START + i, c: 1 })];
+          if (!cell) continue;
+          if (cell.t !== 's') epValidationErrors.push(`ean_type_row${EP_DATA_START + i}: expected 's', got '${cell.t}'`);
+          const val = String(cell.v || '');
+          if (!EAN_RE.test(val)) epValidationErrors.push(`ean_value_row${EP_DATA_START + i}: "${val}" does not match ^[0-9]{13,14}$`);
+        }
+      }
+      // 5. Size sanity check on serialized buffer
+      if (epWritten > 0 && epOutSize <= 20000) {
+        epValidationErrors.push(`size_too_small: ${epOutSize} bytes with ${epWritten} rows, expected > 20000`);
+      }
+      if (epWritten === 0) {
+        epValidationWarnings.push('eprice_empty: 0 rows written, file will contain only headers');
+      }
+      epValidationPassed = epValidationErrors.length === 0;
+    }
+
+    await logEPStage('after_validation', epValT0, { passed: epValidationPassed, integrity_mode: epValMode, errors: epValidationErrors.length });
+    if (!epValidationPassed) {
+      const error = `Pre-SFTP validation failed for Export ePrice.xlsx: ${epValidationErrors.join('; ')}`;
+      await updateStepResult(supabase, runId, 'export_eprice', { status: 'failed', error, metrics: {}, validation_passed: false, validation_warnings: epValidationWarnings } as StepResultData);
       return { success: false, error };
     }
     
@@ -3094,7 +3163,7 @@ async function stepExportEprice(supabase: SupabaseClient, runId: string, feeConf
       status: 'success', duration_ms: Date.now() - startTime, rows: epWritten, skipped: epSkipped,
       metrics: { eprice_export_rows: epWritten, eprice_export_skipped: epSkipped, format: 'xlsx' },
       validation_passed: true,
-      validation_warnings: epValidation.warnings
+      validation_warnings: epValidationWarnings
     } as StepResultData);
     
     await logEPStage('completed', startTime, { rows: epWritten, elapsed_ms: Date.now() - startTime, format: 'xlsx' });
