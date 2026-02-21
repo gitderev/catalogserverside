@@ -812,6 +812,10 @@ const AltersideCatalogGenerator: React.FC = () => {
     setIsSavingPrepDays(true);
     try {
       const updateData = {
+        // Ensure NOT NULL columns are always present (prevents fee_drev null constraint violation)
+        fee_drev: feeConfig.feeDrev,
+        fee_mkt: feeConfig.feeMkt,
+        shipping_cost: feeConfig.shippingCost,
         // IT/EU stock config
         mediaworld_preparation_days: extendedFeeConfig.mediaworldItPreparationDays,
         eprice_preparation_days: extendedFeeConfig.epriceItPreparationDays,
@@ -901,6 +905,22 @@ const AltersideCatalogGenerator: React.FC = () => {
         description: "Stock IT/EU e pricing per-export salvati correttamente."
       });
       console.log('Export config salvato su Supabase (singleton ID, verified)', updateData);
+
+      // Reload from DB after successful save (use DB values, not local)
+      const { data: reloaded } = await supabase
+        .from('fee_config')
+        .select('*')
+        .eq('id', FEE_CONFIG_SINGLETON_ID)
+        .single();
+      if (reloaded) {
+        const row = reloaded as any;
+        setFeeConfig({
+          feeDrev: Number(row.fee_drev),
+          feeMkt: Number(row.fee_mkt),
+          shippingCost: Number(row.shipping_cost)
+        });
+        setExtendedFeeConfig(mapFeeConfigRowToState(row));
+      }
     } catch (err) {
       console.error('Errore handleSaveExportConfig:', err);
       toast({

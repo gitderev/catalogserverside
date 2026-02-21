@@ -34,6 +34,18 @@ interface FeeConfig {
   eanFeeDrev?: number;
   eanFeeMkt?: number;
   eanShippingCost?: number;
+  mediaworldFeeDrev?: number;
+  mediaworldFeeMkt?: number;
+  mediaworldShippingCost?: number;
+  epriceFeeDrev?: number;
+  epriceFeeMkt?: number;
+  epriceShippingCost?: number;
+  amazonIncludeEu?: boolean;
+  amazonItPrepDays?: number;
+  amazonEuPrepDays?: number;
+  amazonFeeDrev?: number;
+  amazonFeeMkt?: number;
+  amazonShippingCost?: number;
 }
 
 interface StepResultData {
@@ -2554,7 +2566,17 @@ async function stepExportEan(supabase: SupabaseClient, runId: string, feeConfig:
     const feeMkt = feeConfig?.eanFeeMkt ?? feeConfig?.feeMkt ?? 1.08;
     const shippingCost = feeConfig?.eanShippingCost ?? feeConfig?.shippingCost ?? 6.00;
     const shippingCents = Math.round(shippingCost * 100);
-    console.log(`[sync:step:export_ean] Fees: DREV=${feeDrev}, MKT=${feeMkt}, SHIP=${shippingCost}`);
+    // MW-specific fees (with global fallback)
+    const mwFeeDrev = feeConfig?.mediaworldFeeDrev ?? feeConfig?.feeDrev ?? 1.05;
+    const mwFeeMkt = feeConfig?.mediaworldFeeMkt ?? feeConfig?.feeMkt ?? 1.08;
+    const mwShippingCost = feeConfig?.mediaworldShippingCost ?? feeConfig?.shippingCost ?? 6.00;
+    const mwShippingCents = Math.round(mwShippingCost * 100);
+    // ePrice-specific fees (with global fallback)
+    const epFeeDrev = feeConfig?.epriceFeeDrev ?? feeConfig?.feeDrev ?? 1.05;
+    const epFeeMkt = feeConfig?.epriceFeeMkt ?? feeConfig?.feeMkt ?? 1.08;
+    const epShippingCost = feeConfig?.epriceShippingCost ?? feeConfig?.shippingCost ?? 6.00;
+    const epShippingCents = Math.round(epShippingCost * 100);
+    console.log(`[sync:step:export_ean] Fees: EAN=${feeDrev}/${feeMkt}/${shippingCost} MW=${mwFeeDrev}/${mwFeeMkt}/${mwShippingCost} EP=${epFeeDrev}/${epFeeMkt}/${epShippingCost}`);
 
     // 3. Load stock-location
     let stockLocIndex: Record<string, { stockIT: number; stockEU: number }> | null = null;
@@ -2627,13 +2649,13 @@ async function stepExportEan(supabase: SupabaseClient, runId: string, feeConfig:
       // Stock
       let stockIT: number, stockEU: number;
       if (stockLocIndex && stockLocIndex[p.Matnr]) {
-        stockIT = Math.min(stockLocIndex[p.Matnr].stockIT, 9876);
-        stockEU = Math.min(stockLocIndex[p.Matnr].stockEU, 9876);
+        stockIT = stockLocIndex[p.Matnr].stockIT;
+        stockEU = stockLocIndex[p.Matnr].stockEU;
       } else {
-        stockIT = Math.min(p.Stock || 0, 9876);
+        stockIT = p.Stock || 0;
         stockEU = 0;
       }
-      let existingStock = Math.min(stockIT + stockEU, 9876);
+      let existingStock = stockIT + stockEU;
 
       // Override detection
       let ovrRow: Record<string, unknown> | undefined;
@@ -2660,7 +2682,7 @@ async function stepExportEan(supabase: SupabaseClient, runId: string, feeConfig:
         } else {
           const qty = ovrRow.Quantity ?? ovrRow.quantity;
           if (qty !== undefined && qty !== '') {
-            const qv = Math.min(parseInt(String(qty)) || 0, 9876);
+            const qv = parseInt(String(qty)) || 0;
             existingStock = qv;
             ovrStockIT = String(qv);
             ovrStockEU = '0';
@@ -2693,45 +2715,86 @@ async function stepExportEan(supabase: SupabaseClient, runId: string, feeConfig:
       const prezzoConSpedIva = round2((basePriceCents / 100 + shippingCost) * 1.22);
       const subtotalePostFee = round2(afterFeesCents / 100);
 
+      // EAN ListPrice con Fee
       let listPriceConFee: number;
-      if (lp > 0) {
-        const lpShip = Math.round(lp * 100) + shippingCents;
-        const lpIva = Math.round(lpShip * 1.22);
-        const lpFees = Math.round(Math.round(lpIva * feeDrev) * feeMkt);
-        listPriceConFee = Math.ceil(lpFees / 100);
+      if (overrideListPrice !== null) {
+        listPriceConFee = Math.floor(overrideListPrice);
+      } else if (lp > 0) {
+        const lpAfterFees = (lp + shippingCost) * 1.22 * feeDrev * feeMkt;
+        listPriceConFee = Math.ceil(lpAfterFees);
+      } else if (cbp > 0) {
+        const fbBase = cbp * 1.25;
+        const fbAfterFees = (fbBase + shippingCost) * 1.22 * feeDrev * feeMkt;
+        const candidato = Math.ceil(fbAfterFees);
+        const minimo = Math.ceil((finalCents / 100) * 1.25);
+        listPriceConFee = Math.max(candidato, minimo);
       } else {
         listPriceConFee = Math.ceil((finalCents / 100) * 1.25);
       }
 
-      // Display values (override adjustments)
-      let dPF = pfStr, dFPE = pfStr, dFPM: string = pfStr, dFPEp: string = pfStr;
-      let dLP = String(lp), dLPF = String(listPriceConFee), dLPFE = String(listPriceConFee);
-      let dLPFM = String(listPriceConFee), dLPFEp = String(listPriceConFee);
-
+      // MW per-export pricing
+      let mwFinalPrice: number;
       if (overrideOfferPrice !== null) {
-        const opStr = overrideOfferPrice.toFixed(2).replace('.', ',');
-        dPF = opStr; dFPE = opStr;
-        dFPM = String(overrideOfferPrice); dFPEp = String(overrideOfferPrice);
+        mwFinalPrice = overrideOfferPrice;
+      } else {
+        const mwAfterShip = basePriceCents + mwShippingCents;
+        const mwAfterIva = Math.round(mwAfterShip * 1.22);
+        const mwAfterFees = Math.round(Math.round(mwAfterIva * mwFeeDrev) * mwFeeMkt);
+        mwFinalPrice = toComma99Cents(mwAfterFees) / 100;
       }
+      let mwListPriceConFee: number;
       if (overrideListPrice !== null) {
-        dLP = String(overrideListPrice);
-        dLPF = String(Math.floor(overrideListPrice));
-        dLPFM = String(Math.floor(overrideListPrice));
-        dLPFEp = String(Math.floor(overrideListPrice));
+        mwListPriceConFee = Math.floor(overrideListPrice);
+      } else if (lp > 0) {
+        mwListPriceConFee = Math.ceil((lp + mwShippingCost) * 1.22 * mwFeeDrev * mwFeeMkt);
+      } else if (cbp > 0) {
+        const fb = cbp * 1.25;
+        const cand = Math.ceil((fb + mwShippingCost) * 1.22 * mwFeeDrev * mwFeeMkt);
+        const min = Math.ceil(mwFinalPrice * 1.25);
+        mwListPriceConFee = Math.max(cand, min);
+      } else {
+        mwListPriceConFee = Math.ceil(mwFinalPrice * 1.25);
       }
+
+      // ePrice per-export pricing
+      let epFinalPrice: number;
+      if (overrideOfferPrice !== null) {
+        epFinalPrice = overrideOfferPrice;
+      } else {
+        const epAfterShip = basePriceCents + epShippingCents;
+        const epAfterIva = Math.round(epAfterShip * 1.22);
+        const epAfterFees = Math.round(Math.round(epAfterIva * epFeeDrev) * epFeeMkt);
+        epFinalPrice = toComma99Cents(epAfterFees) / 100;
+      }
+      let epListPriceConFee: number;
+      if (overrideListPrice !== null) {
+        epListPriceConFee = Math.floor(overrideListPrice);
+      } else if (lp > 0) {
+        epListPriceConFee = Math.ceil((lp + epShippingCost) * 1.22 * epFeeDrev * epFeeMkt);
+      } else {
+        epListPriceConFee = Math.ceil(epFinalPrice * 1.25);
+      }
+
+      // Display values
+      const dPF = overrideOfferPrice !== null ? overrideOfferPrice.toFixed(2).replace('.', ',') : pfStr;
+      const dLP = overrideListPrice !== null ? String(overrideListPrice) : String(lp);
+      const dLPF = String(listPriceConFee);
 
       eanRows.push([
-        p.Matnr, p.MPN || '', ean, (p.Desc || '').replace(/;/g, ','),
+        p.Matnr, p.MPN || '', ean, (p.Desc || '').replace(/\t/g, ' '),
         String(existingStock), String(stockIT), String(stockEU),
         String(cbp), String(sur), String(shippingCost), String(ivaVal), String(prezzoConSpedIva),
         String(feeDrev), String(feeMkt), String(subtotalePostFee), dPF, dLP, dLPF,
-        String(basePriceCents), dFPE, dLPFE,
-        dFPM, dLPFM, dFPEp, dLPFEp,
-        String(finalCents), String(finalCents), String(finalCents),
+        String(basePriceCents),
+        overrideOfferPrice !== null ? overrideOfferPrice.toFixed(2).replace('.', ',') : pfStr,
+        String(listPriceConFee),
+        String(mwFinalPrice), String(mwListPriceConFee),
+        String(epFinalPrice), String(epListPriceConFee),
+        String(finalCents), String(Math.round(mwFinalPrice * 100)), String(Math.round(epFinalPrice * 100)),
         'false', 'false', route, String(finalCents),
         isOvr ? 'true' : '', isOvr ? ovrSource : '',
         ovrStockIT, ovrStockEU, ovrLeadIT, ovrLeadEU
-      ].join(';'));
+      ].join('\t'));
     }
 
     // 6. OVR-only rows
@@ -2765,20 +2828,22 @@ async function stepExportEan(supabase: SupabaseClient, runId: string, feeConfig:
       eanRows.push([
         matnr, mpn, oEan.value, `Override item ${oSku}`,
         String(oES), String(oSI), '0',
-        '0', '0', '0,00', '22%', '0,00',
-        '0', '0', '0,00', opStr, String(olp), String(Math.floor(olp)),
+        '0', '0', '0', '0', '0',
+        '0', '0', '0', opStr, String(olp), String(Math.floor(olp) || 0),
         '', opStr, '',
-        String(op), String(Math.floor(olp)), String(op), String(Math.floor(olp)),
+        String(op), String(Math.floor(olp) || 0), String(op), String(Math.floor(olp) || 0),
         '', '', '',
         'false', 'false', '', '',
         'true', 'existing',
         oOSI, oOSE, '', ''
-      ].join(';'));
+      ].join('\t'));
     }
 
-    // 7. Save CSV
-    const eanCSV = [EAN_38_HEADERS.join(';'), ...eanRows].join('\n');
-    await uploadToStorage(supabase, 'exports', EAN_CATALOG_FILE_PATH, eanCSV, 'text/csv');
+    // 7. Save TSV (tab-separated, UTF-8, LF line endings)
+    const eanTSV = [EAN_38_HEADERS.join('\t'), ...eanRows].join('\n');
+    await uploadToStorage(supabase, 'exports', EAN_CATALOG_FILE_PATH, eanTSV, 'text/tab-separated-values');
+    // Also save as CSV for backward compatibility with export_ean_xlsx
+    const eanCSV = [EAN_38_HEADERS.join(';'), ...eanRows.map(r => r.replace(/\t/g, ';'))].join('\n');
     const saveResult = await uploadToStorage(supabase, 'exports', 'Catalogo EAN.csv', eanCSV, 'text/csv');
 
     if (!saveResult.success) {
@@ -2800,100 +2865,44 @@ async function stepExportEan(supabase: SupabaseClient, runId: string, feeConfig:
   }
 }
 
-// ========== STEP: EXPORT_MEDIAWORLD (with IT/EU stock support) ==========
+// ========== STEP: EXPORT_MEDIAWORLD (TSV-based, no cap) ==========
 async function stepExportMediaworld(supabase: SupabaseClient, runId: string, feeConfig: FeeConfig): Promise<{ success: boolean; error?: string }> {
-  const includeEu = feeConfig?.mediaworldIncludeEu || false;
+  // includeEU: null/undefined → true (backward compat, matches client)
+  const includeEu = feeConfig?.mediaworldIncludeEu == null ? true : !!feeConfig.mediaworldIncludeEu;
   const itDays = feeConfig?.mediaworldItPrepDays || 3;
   const euDays = feeConfig?.mediaworldEuPrepDays || 5;
   
-  console.log(`[sync:step:export_mediaworld] Starting for run ${runId}, IT days=${itDays}, EU days=${euDays}, includeEU=${includeEu}`);
+  console.log(`[sync:step:export_mediaworld] Starting for run ${runId}, IT=${itDays}, EU=${euDays}, includeEU=${includeEu}`);
   const startTime = Date.now();
-  let heapPeakMb = 0;
-  const logMWStage = async (stage: string, t0: number, extra: Record<string, unknown> = {}): Promise<void> => {
-    const mem = getMemMB();
-    if (mem > heapPeakMb) heapPeakMb = mem;
-    const durationMs = Date.now() - t0;
-    await safeLogEvent(supabase, runId, 'INFO', 'export_mediaworld_stage', { step: 'export_mediaworld', stage, last_stage: stage, heap_mb: mem, heap_peak_mb: heapPeakMb, duration_ms: durationMs, ...extra });
-  };
-  
-  const warnings = createEmptyWarnings();
-  let currentStage = 'entered_prepare';
-  let mwOutSizeForCatch = 0;
   
   try {
-    // ===== DATA LOAD =====
-    await logMWStage('before_data_load', startTime);
-    const { products, error: loadError } = await loadProductsTSV(supabase, runId);
-    
-    if (loadError || !products) {
-      const error = loadError || 'Products file not found';
+    // Load from TSV catalog (source of truth)
+    const { content: tsvContent, error: tsvError } = await downloadFromStorage(supabase, 'exports', EAN_CATALOG_FILE_PATH);
+    if (tsvError || !tsvContent) {
+      const error = `ean_catalog_missing_or_schema_mismatch: ${tsvError || 'file not found'}`;
+      await safeLogEvent(supabase, runId, 'ERROR', 'ean_catalog_missing_or_schema_mismatch', { step: 'export_mediaworld', error });
       await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
-    
-    // Load stock location index
-    let stockLocationIndex: Record<string, { stockIT: number; stockEU: number }> | null = null;
-    const stockLocationPath = `stock-location/runs/${runId}.txt`;
-    let stockLocationContent: string | null = null;
-    {
-      const dlResult = await downloadFromStorage(supabase, 'ftp-import', stockLocationPath);
-      stockLocationContent = dlResult.content ?? null;
+
+    const tsvLines = tsvContent.split('\n');
+    if (tsvLines.length < 2) {
+      const error = 'ean_catalog_empty: no data rows in TSV';
+      await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
+      return { success: false, error };
     }
-    const entries4254 = new Set<string>();
-    const entries4255 = new Set<string>();
-    
-    if (stockLocationContent) {
-      stockLocationIndex = {};
-      const lines = stockLocationContent.replace(/\r\n/g, '\n').split('\n');
-      const headers = lines[0]?.split(';').map((h: string) => h.trim().toLowerCase()) || [];
-      const matnrIdx = headers.indexOf('matnr');
-      const stockIdx = headers.indexOf('stock');
-      const locationIdx = headers.indexOf('locationid');
-      
-      if (matnrIdx >= 0 && stockIdx >= 0 && locationIdx >= 0) {
-        for (let i = 1; i < lines.length; i++) {
-          const vals = lines[i].split(';');
-          const matnr = vals[matnrIdx]?.trim();
-          if (!matnr) continue;
-          
-          const stockRaw = vals[stockIdx]?.trim() || '0';
-          let stock = parseInt(stockRaw, 10);
-          if (isNaN(stock) || !Number.isFinite(stock)) {
-            stock = 0;
-            warnings.invalid_stock_value++;
-          }
-          
-          const locationId = parseInt(vals[locationIdx]) || 0;
-          
-          if (!stockLocationIndex[matnr]) stockLocationIndex[matnr] = { stockIT: 0, stockEU: 0 };
-          
-          if (locationId === LOCATION_ID_IT) {
-            stockLocationIndex[matnr].stockIT += stock;
-          } else if (locationId === LOCATION_ID_EU) {
-            stockLocationIndex[matnr].stockEU += stock;
-            entries4254.add(matnr);
-          } else if (locationId === LOCATION_ID_EU_DUPLICATE) {
-            entries4255.add(matnr);
-          }
-        }
-        
-        for (const matnr of entries4255) {
-          if (!entries4254.has(matnr)) {
-            warnings.orphan_4255++;
-          }
-        }
-        
-        console.log(`[sync:step:export_mediaworld] Loaded stock location: ${Object.keys(stockLocationIndex).length} entries`);
-        stockLocationContent = null;
-      } else {
-        warnings.invalid_location_parse++;
-      }
-    } else {
-      warnings.missing_location_file++;
+
+    const tsvHeaders = tsvLines[0].split('\t').map((h: string) => h.trim());
+    const requiredCols = ['ManufPartNr', 'EAN', 'ShortDescription', 'StockIT', 'StockEU', 'final_price_mediaworld', 'listprice_with_fee_mediaworld'];
+    const colIdx: Record<string, number> = {};
+    for (let i = 0; i < tsvHeaders.length; i++) colIdx[tsvHeaders[i]] = i;
+    const missingCols = requiredCols.filter(c => colIdx[c] === undefined);
+    if (missingCols.length > 0) {
+      const error = `ean_catalog_missing_or_schema_mismatch: missing: ${missingCols.join(', ')}. Found: ${tsvHeaders.join(', ')}`;
+      await safeLogEvent(supabase, runId, 'ERROR', 'ean_catalog_missing_or_schema_mismatch', { step: 'export_mediaworld', missing: missingCols, found: tsvHeaders });
+      await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
+      return { success: false, error };
     }
-    
-    // ===== DATA PREPARATION (AoA — no template) =====
-    currentStage = 'after_data_load';
 
     const headerRow1 = ["SKU offerta","ID Prodotto","Tipo ID prodotto","Descrizione offerta","Descrizione interna offerta","Prezzo dell'offerta","Info aggiuntive prezzo offerta","Quantità dell'offerta","Avviso quantità minima","Stato dell'offerta","Data di inizio della disponibilità","Data di conclusione della disponibilità","Classe logistica","Prezzo scontato","Data di inizio dello sconto","Data di termine dello sconto","Tempo di preparazione della spedizione (in giorni)","Aggiorna/Cancella","Tipo di prezzo che verrà barrato quando verrà definito un prezzo scontato.","Obbligo di ritiro RAEE","Orario di cut-off (solo se la consegna il giorno successivo è abilitata)","VAT Rate % (Turkey only)"];
     const headerRow2 = ["sku","product-id","product-id-type","description","internal-description","price","price-additional-info","quantity","min-quantity-alert","state","available-start-date","available-end-date","logistic-class","discount-price","discount-start-date","discount-end-date","leadtime-to-ship","update-delete","strike-price-type","mms-weee-take-back-obligation","cut-off-time","vat-rate"];
@@ -2903,87 +2912,54 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     let mwSkipped = 0;
     const EAN_RE = /^[0-9]{13,14}$/;
 
-    for (const p of products) {
-      const norm = normalizeEAN(p.EAN);
-      if (!norm.ok) { mwSkipped++; continue; }
-      if (!p.PFNum || p.PFNum <= 0) { mwSkipped++; continue; }
-      
-      const lpfStr = String(p.LPF || '').replace(',', '.');
-      const lpfValue = parseFloat(lpfStr);
-      const prezzoOfferta = (Number.isFinite(lpfValue) && lpfValue > 0) ? lpfValue : p.PFNum;
-      
-      let stockIT = p.Stock || 0;
-      let stockEU = 0;
-      if (stockLocationIndex && stockLocationIndex[p.Matnr]) {
-        stockIT = stockLocationIndex[p.Matnr].stockIT;
-        stockEU = stockLocationIndex[p.Matnr].stockEU;
-      } else if (stockLocationIndex) {
-        warnings.missing_location_data++;
-        stockIT = 0;
-        stockEU = 0;
-      }
-      
+    for (let i = 1; i < tsvLines.length; i++) {
+      const line = tsvLines[i];
+      if (!line.trim()) continue;
+      const vals = line.split('\t');
+
+      const mpn = vals[colIdx['ManufPartNr']] || '';
+      const ean = vals[colIdx['EAN']] || '';
+      const desc = vals[colIdx['ShortDescription']] || '';
+      const stockIT = parseFloat(vals[colIdx['StockIT']]) || 0;
+      const stockEU = parseFloat(vals[colIdx['StockEU']]) || 0;
+      const finalPriceMW = parseFloat(vals[colIdx['final_price_mediaworld']]) || 0;
+      const lpFeeMW = parseFloat(vals[colIdx['listprice_with_fee_mediaworld']]) || 0;
+
+      // Skip rules (same as client)
+      if (!EAN_RE.test(ean)) { mwSkipped++; continue; }
+      if (!lpFeeMW || lpFeeMW <= 0) { mwSkipped++; continue; }
+      if (!finalPriceMW || finalPriceMW <= 0) { mwSkipped++; continue; }
+
       const stockResult = resolveMarketplaceStock(stockIT, stockEU, includeEu, itDays, euDays);
       if (!stockResult.shouldExport) { mwSkipped++; continue; }
 
-      // EAN deterministic assert
-      const eanStr = String(norm.value);
-      if (!EAN_RE.test(eanStr) || eanStr !== norm.value) {
-        await safeLogEvent(supabase, runId, 'ERROR', 'export_mediaworld_stage', {
-          step: 'export_mediaworld', stage: 'ean_assert_failed', last_stage: currentStage,
-          mpn: p.MPN, ean_raw: p.EAN, ean_normalized: norm.value, ean_str: eanStr
-        });
-        await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error: 'ean_assert_failed', metrics: {} });
-        return { success: false, error: 'ean_assert_failed' };
-      }
-
-      // Use null for empty fields to reduce materialized cells
       const row: (string | number | null)[] = new Array(22).fill(null);
-      row[0] = p.MPN || null;                     // A: sku
-      row[1] = eanStr;                             // B: product-id (text)
-      row[2] = 'EAN';                              // C: product-id-type
-      row[3] = p.Desc || null;                     // D: description
-      // row[4] = null;                            // E: internal-description
-      row[5] = prezzoOfferta;                      // F: price
-      // row[6] = null;                            // G: price-additional-info
-      row[7] = Math.min(stockResult.exportQty, 99); // H: quantity
-      // row[8] = null;                            // I: min-quantity-alert
-      row[9] = 'Nuovo';                            // J: state
-      // row[10..11] = null;                       // K,L: dates
-      row[12] = 'Consegna gratuita';               // M: logistic-class
-      row[13] = p.PFNum;                           // N: discount-price
-      // row[14..15] = null;                       // O,P: discount dates
-      row[16] = stockResult.leadDays;              // Q: leadtime-to-ship
-      // row[17] = null;                           // R: update-delete
-      row[18] = 'recommended-retail-price';        // S: strike-price-type
-      // row[19..21] = null;                       // T,U,V
+      row[0] = mpn || null;                                    // A: sku
+      row[1] = ean;                                             // B: product-id (text)
+      row[2] = 'EAN';                                           // C: product-id-type
+      row[3] = desc || null;                                    // D: description
+      row[5] = lpFeeMW;                                         // F: price (prezzo dell'offerta)
+      row[7] = stockResult.exportQty;                           // H: quantity (NO CAP)
+      row[9] = 'Nuovo';                                         // J: state
+      row[12] = 'Consegna gratuita';                            // M: logistic-class
+      row[13] = Math.round(finalPriceMW * 100) / 100;          // N: discount-price
+      row[16] = stockResult.leadDays;                           // Q: leadtime-to-ship
+      row[18] = 'recommended-retail-price';                     // S: strike-price-type
       aoa.push(row);
       mwWritten++;
     }
 
-    await logMWStage('after_data_preparation', startTime, { rows_written: mwWritten, rows_skipped: mwSkipped });
-
-    // Release data structures no longer needed
-    stockLocationIndex = null;
-    products.length = 0;
-    entries4254.clear();
-    entries4255.clear();
-
-    // ===== BUILD WORKBOOK =====
+    // Build workbook (template-free, single Data sheet)
     const XLSX = await import("npm:xlsx@0.18.5");
-
     const ws = XLSX.utils.aoa_to_sheet(aoa);
-    // Force EAN column (B) to text type for all data rows
+    // Force EAN column (B) to text type
     for (let r = 2; r < aoa.length; r++) {
       const eanVal = aoa[r][1];
       if (eanVal != null) {
         const addr = 'B' + (r + 1);
-        if (ws[addr]) {
-          ws[addr] = { v: String(eanVal), t: 's', z: '@' };
-        }
+        if (ws[addr]) ws[addr] = { v: String(eanVal), t: 's', z: '@' };
       }
     }
-    // Force !ref to cover all 22 columns (A-V) even with sparse rows
     const lastRow = 2 + mwWritten;
     ws['!ref'] = `A1:V${Math.max(lastRow, 2)}`;
 
@@ -2991,232 +2967,145 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     let wb: any = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Data');
 
-    // ===== LIGHTWEIGHT VALIDATION (pre-write, no post-write re-read) =====
-    currentStage = 'before_validation';
-    const validationWarnings: string[] = [];
+    // Validation
     const validationErrors: string[] = [];
-
-    // V1: Sheet names must be exactly ["Data"]
     if (wb.SheetNames.length !== 1 || wb.SheetNames[0] !== 'Data') {
       validationErrors.push(`sheet_names: expected ["Data"], got ${JSON.stringify(wb.SheetNames)}`);
     }
-
-    // V2: Header rows — check first and last column of each header row
     const genWs = wb.Sheets['Data'];
-    if (!genWs) {
-      validationErrors.push('sheet_missing: Data');
-    } else {
-      const h1a = genWs['A1']?.v, h1v = genWs['V1']?.v;
-      if (h1a !== headerRow1[0] || h1v !== headerRow1[21]) {
-        validationErrors.push(`header1: A1="${h1a}", V1="${h1v}"`);
+    if (genWs) {
+      if (genWs['A1']?.v !== headerRow1[0] || genWs['V1']?.v !== headerRow1[21]) {
+        validationErrors.push(`header1 mismatch`);
       }
-      const h2a = genWs['A2']?.v, h2v = genWs['V2']?.v;
-      if (h2a !== headerRow2[0] || h2v !== headerRow2[21]) {
-        validationErrors.push(`header2: A2="${h2a}", V2="${h2v}"`);
+      if (genWs['A2']?.v !== headerRow2[0] || genWs['V2']?.v !== headerRow2[21]) {
+        validationErrors.push(`header2 mismatch`);
       }
     }
-
-    // V3: zero rows warning
-    if (mwWritten === 0) {
-      validationWarnings.push('zero_data_rows: no products written to Data sheet');
-    }
-
     if (validationErrors.length > 0) {
-      await safeLogEvent(supabase, runId, 'ERROR', 'validation_failed', {
-        export_name: 'Export Mediaworld', errors: validationErrors.slice(0, 20), warnings: validationWarnings
-      });
       const error = `Validation failed: ${validationErrors.join('; ')}`;
+      await safeLogEvent(supabase, runId, 'ERROR', 'validation_failed', { export_name: 'Export Mediaworld', errors: validationErrors });
       await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {}, validation_passed: false } as StepResultData);
       return { success: false, error };
     }
-    if (validationWarnings.length > 0) {
-      await safeLogEvent(supabase, runId, 'WARN', 'export_mediaworld_stage', {
-        step: 'export_mediaworld', stage: 'validation_warnings', last_stage: 'before_validation',
-        warnings: validationWarnings
-      });
-    }
 
-    // ===== SERIALIZE =====
-    currentStage = 'before_write';
-    const mwWriteT0 = Date.now();
-    await logMWStage('before_write', mwWriteT0, { rows: mwWritten, heap_mb: getMemMB() });
-
+    // Serialize and upload
     // deno-lint-ignore no-explicit-any
     let xlsxBuffer: any = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: false, bookSST: false });
-
-    // Deterministic buffer conversion
-    let mwOutputBytes: Uint8Array | null;
-    if (xlsxBuffer instanceof Uint8Array) {
-      mwOutputBytes = xlsxBuffer;
-    } else if (xlsxBuffer instanceof ArrayBuffer) {
-      mwOutputBytes = new Uint8Array(xlsxBuffer);
-    } else if (Array.isArray(xlsxBuffer)) {
-      mwOutputBytes = new Uint8Array(xlsxBuffer);
-    } else {
-      const bufType = typeof xlsxBuffer;
-      const bufCtor = xlsxBuffer?.constructor?.name ?? 'unknown';
-      await safeLogEvent(supabase, runId, 'ERROR', 'export_mediaworld_stage', {
-        step: 'export_mediaworld', stage: 'write_buffer_type_unexpected', last_stage: 'before_write',
-        typeof: bufType, constructor_name: bufCtor,
-        reason: `XLSX.write returned unexpected type: ${bufType} (${bufCtor})`
-      });
+    let mwOutputBytes: Uint8Array;
+    if (xlsxBuffer instanceof Uint8Array) { mwOutputBytes = xlsxBuffer; }
+    else if (xlsxBuffer instanceof ArrayBuffer) { mwOutputBytes = new Uint8Array(xlsxBuffer); }
+    else if (Array.isArray(xlsxBuffer)) { mwOutputBytes = new Uint8Array(xlsxBuffer); }
+    else {
       await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error: 'mw_write_buffer_type_unexpected', metrics: {} });
       return { success: false, error: 'mw_write_buffer_type_unexpected' };
     }
-
-    const mwOutSize = mwOutputBytes.length;
-    const mwWriteMs = Date.now() - mwWriteT0;
-    currentStage = 'after_write';
-    mwOutSizeForCatch = mwOutSize;
     xlsxBuffer = null;
     wb = null;
 
-    await logMWStage('after_write', mwWriteT0, { size_bytes: mwOutSize, duration_ms: mwWriteMs, heap_mb: getMemMB() });
-
-    // Size sanity: if rows > 0, output must be > 20KB
-    if (mwWritten > 0 && mwOutSize < 20_000) {
-      const error = `Post-write sanity: output ${mwOutSize} bytes < 20KB with ${mwWritten} rows`;
+    if (mwWritten > 0 && mwOutputBytes.length < 20_000) {
+      const error = `Post-write sanity: output ${mwOutputBytes.length} bytes < 20KB with ${mwWritten} rows`;
       await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
 
-    // ===== UPLOAD =====
     let mwBlob: Blob | null = new Blob([mwOutputBytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-    mwOutputBytes = null;
-    
-    const mwUpT0 = Date.now();
-    currentStage = 'before_upload';
-    await logMWStage('before_upload', mwUpT0, { size_bytes: mwOutSize });
+    mwOutputBytes = null as unknown as Uint8Array;
+
     const { error: uploadError } = await supabase.storage.from('exports').upload(
       'Export Mediaworld.xlsx', mwBlob, { upsert: true, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }
     );
-    const mwUpMs = Date.now() - mwUpT0;
-    currentStage = 'after_upload';
-    await logMWStage('after_upload', mwUpT0, { duration_ms: mwUpMs, size_bytes: mwOutSize });
-    
+    mwBlob = null;
+
     if (uploadError) {
       const error = `Upload Export Mediaworld.xlsx fallito: ${uploadError.message}`;
       await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
-    
-    mwBlob = null;
-    
+
     await safeLogEvent(supabase, runId, 'INFO', 'export_saved', { step: 'export_mediaworld', file: 'Export Mediaworld.xlsx', rows: mwWritten });
-    
-    await updateLocationWarnings(supabase, runId, warnings);
-    
     await updateStepResult(supabase, runId, 'export_mediaworld', {
       status: 'success', duration_ms: Date.now() - startTime, rows: mwWritten, skipped: mwSkipped,
       metrics: { mediaworld_export_rows: mwWritten, mediaworld_export_skipped: mwSkipped, mediaworld_format: 'xlsx' },
-      validation_passed: true,
-      validation_warnings: validationWarnings
+      validation_passed: true
     } as StepResultData);
-    
-    currentStage = 'completed';
-    await logMWStage('completed', startTime, { rows: mwWritten, elapsed_ms: Date.now() - startTime, format: 'xlsx' });
-    console.log(`[sync:step:export_mediaworld] Completed: ${mwWritten} rows XLSX, ${mwSkipped} skipped, warnings:`, warnings);
+
+    console.log(`[sync:step:export_mediaworld] Completed: ${mwWritten} rows, ${mwSkipped} skipped (TSV-based, no cap)`);
     return { success: true };
-    
+
   } catch (e: unknown) {
     console.error(`[sync:step:export_mediaworld] Error:`, e);
-    const failMem = getMemMB();
-    if (failMem > heapPeakMb) heapPeakMb = failMem;
-    await safeLogEvent(supabase, runId, 'ERROR', 'export_mediaworld_stage', {
-      step: 'export_mediaworld', stage: 'failed', heap_mb: failMem, heap_peak_mb: heapPeakMb,
-      duration_ms: Date.now() - startTime, reason: errMsg(e), last_stage: currentStage,
-      output_bytes_length: mwOutSizeForCatch
-    });
     await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error: errMsg(e), metrics: {} });
     return { success: false, error: errMsg(e) };
   }
 }
 
-// ========== STEP: EXPORT_EPRICE (with IT/EU stock support) ==========
+// ========== STEP: EXPORT_EPRICE (TSV-based, no cap) ==========
 async function stepExportEprice(supabase: SupabaseClient, runId: string, feeConfig: FeeConfig): Promise<{ success: boolean; error?: string }> {
-  const includeEu = feeConfig?.epriceIncludeEu || false;
+  // includeEU: null/undefined → true (backward compat, matches client)
+  const includeEu = feeConfig?.epriceIncludeEu == null ? true : !!feeConfig.epriceIncludeEu;
   const itDays = feeConfig?.epriceItPrepDays || feeConfig?.epricePrepDays || 1;
   const euDays = feeConfig?.epriceEuPrepDays || 3;
   
-  console.log(`[sync:step:export_eprice] Starting for run ${runId}, IT days=${itDays}, EU days=${euDays}, includeEU=${includeEu}`);
+  console.log(`[sync:step:export_eprice] Starting for run ${runId}, IT=${itDays}, EU=${euDays}, includeEU=${includeEu}`);
   const startTime = Date.now();
-  const logEPStage = async (stage: string, t0: number, extra: Record<string, unknown> = {}): Promise<void> => {
-    const mem = getMemMB();
-    const durationMs = Date.now() - t0;
-    await safeLogEvent(supabase, runId, 'INFO', 'export_eprice_stage', { step: 'export_eprice', stage, heap_mb: mem, duration_ms: durationMs, ...extra });
-  };
   
   try {
-    await logEPStage('before_data_load', startTime);
-    const { products, error: loadError } = await loadProductsTSV(supabase, runId);
-    
-    if (loadError || !products) {
-      const error = loadError || 'Products file not found';
+    // Load from TSV catalog (source of truth)
+    const { content: tsvContent, error: tsvError } = await downloadFromStorage(supabase, 'exports', EAN_CATALOG_FILE_PATH);
+    if (tsvError || !tsvContent) {
+      const error = `ean_catalog_missing_or_schema_mismatch: ${tsvError || 'file not found'}`;
+      await safeLogEvent(supabase, runId, 'ERROR', 'ean_catalog_missing_or_schema_mismatch', { step: 'export_eprice', error });
       await updateStepResult(supabase, runId, 'export_eprice', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
-    
-    // Load stock location (same as Mediaworld)
-    let stockLocationIndex: Record<string, { stockIT: number; stockEU: number }> | null = null;
-    const stockLocationPath = `stock-location/runs/${runId}.txt`;
-    const { content: stockLocationContent } = await downloadFromStorage(supabase, 'ftp-import', stockLocationPath);
-    
-    if (stockLocationContent) {
-      stockLocationIndex = {};
-      const lines = stockLocationContent.replace(/\r\n/g, '\n').split('\n');
-      const headers = lines[0]?.split(';').map((h: string) => h.trim().toLowerCase()) || [];
-      const matnrIdx = headers.indexOf('matnr');
-      const stockIdx = headers.indexOf('stock');
-      const locationIdx = headers.indexOf('locationid');
-      
-      if (matnrIdx >= 0 && stockIdx >= 0 && locationIdx >= 0) {
-        for (let i = 1; i < lines.length; i++) {
-          const vals = lines[i].split(';');
-          const matnr = vals[matnrIdx]?.trim();
-          if (!matnr) continue;
-          const stock = parseInt(vals[stockIdx]) || 0;
-          const locationId = parseInt(vals[locationIdx]) || 0;
-          
-          if (!stockLocationIndex[matnr]) stockLocationIndex[matnr] = { stockIT: 0, stockEU: 0 };
-          if (locationId === 4242) stockLocationIndex[matnr].stockIT += stock;
-          else if (locationId === 4254) stockLocationIndex[matnr].stockEU += stock;
-        }
-      }
+
+    const tsvLines = tsvContent.split('\n');
+    if (tsvLines.length < 2) {
+      const error = 'ean_catalog_empty: no data rows';
+      await updateStepResult(supabase, runId, 'export_eprice', { status: 'failed', error, metrics: {} });
+      return { success: false, error };
     }
-    
+
+    const tsvHeaders = tsvLines[0].split('\t').map((h: string) => h.trim());
+    const requiredCols = ['ManufPartNr', 'Matnr', 'EAN', 'StockIT', 'StockEU', 'final_price_eprice'];
+    const colIdx: Record<string, number> = {};
+    for (let i = 0; i < tsvHeaders.length; i++) colIdx[tsvHeaders[i]] = i;
+    const missingCols = requiredCols.filter(c => colIdx[c] === undefined);
+    if (missingCols.length > 0) {
+      const error = `ean_catalog_missing_or_schema_mismatch: missing: ${missingCols.join(', ')}. Found: ${tsvHeaders.join(', ')}`;
+      await safeLogEvent(supabase, runId, 'ERROR', 'ean_catalog_missing_or_schema_mismatch', { step: 'export_eprice', missing: missingCols, found: tsvHeaders });
+      await updateStepResult(supabase, runId, 'export_eprice', { status: 'failed', error, metrics: {} });
+      return { success: false, error };
+    }
+
+    // Load ePrice template
     const XLSX = await import("npm:xlsx@0.18.5");
-    
-    // Load ePrice template from storage bucket (unified loader)
-    const epTmplT0 = Date.now();
     let epTemplateBytes: Uint8Array;
     try {
       epTemplateBytes = await loadTemplateFromStorage(supabase, 'Export ePrice.xlsx', runId);
     } catch (e: unknown) {
-      const error = `Template Export ePrice.xlsx non trovato in storage: ${errMsg(e)}`;
+      const error = `Template Export ePrice.xlsx non trovato: ${errMsg(e)}`;
       await updateStepResult(supabase, runId, 'export_eprice', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
-    await logEPStage('template_download_ok', epTmplT0, { size_bytes: epTemplateBytes.length });
-    
-    const epParseT0 = Date.now();
+
     const wb = XLSX.read(epTemplateBytes, { type: 'array' });
-    await logEPStage('template_parse_done', epParseT0);
     const templateSheetNames = [...wb.SheetNames];
     const ws = wb.Sheets['Tracciato_Inserimento_Offerte'];
     if (!ws) {
-      const error = 'Template Export ePrice.xlsx: foglio Tracciato_Inserimento_Offerte non trovato';
+      const error = 'Template: foglio Tracciato_Inserimento_Offerte non trovato';
       await updateStepResult(supabase, runId, 'export_eprice', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
-    
-    // Capture header row 0 values (cols 0..7) BEFORE clearing data rows
+
+    // Capture header row 0
     const header0Values: string[] = [];
     for (let c = 0; c <= 7; c++) {
       const cell = ws[XLSX.utils.encode_cell({ r: 0, c })];
       header0Values.push(cell?.v?.toString() || '');
     }
-    
-    // Clear existing data rows from template (keep header at row 0)
+
+    // Clear data rows (keep header at row 0)
     const epTmplRange = ws['!ref'] ? XLSX.utils.decode_range(ws['!ref']) : null;
     if (epTmplRange) {
       for (let R = 1; R <= epTmplRange.e.r; R++) {
@@ -3225,25 +3114,27 @@ async function stepExportEprice(supabase: SupabaseClient, runId: string, feeConf
         }
       }
     }
-    
-    await safeLogEvent(supabase, runId, 'INFO', 'export_started', { step: 'export_eprice', products: products.length });
-    
-    const EP_DATA_START = 1; // Data starts at row 2 (index 1)
+
+    const EP_DATA_START = 1;
     let epWritten = 0;
     let epSkipped = 0;
-    
-    for (const p of products) {
-      const norm = normalizeEAN(p.EAN);
-      if (!norm.ok) { epSkipped++; continue; }
-      if (!p.PFNum || p.PFNum <= 0) { epSkipped++; continue; }
-      
-      let stockIT = p.Stock || 0;
-      let stockEU = 0;
-      if (stockLocationIndex && stockLocationIndex[p.Matnr]) {
-        stockIT = stockLocationIndex[p.Matnr].stockIT;
-        stockEU = stockLocationIndex[p.Matnr].stockEU;
-      }
-      
+    const EAN_RE = /^[0-9]{13,14}$/;
+
+    for (let i = 1; i < tsvLines.length; i++) {
+      const line = tsvLines[i];
+      if (!line.trim()) continue;
+      const vals = line.split('\t');
+
+      const mpn = vals[colIdx['ManufPartNr']] || '';
+      const matnr = vals[colIdx['Matnr']] || '';
+      const ean = vals[colIdx['EAN']] || '';
+      const stockIT = parseFloat(vals[colIdx['StockIT']]) || 0;
+      const stockEU = parseFloat(vals[colIdx['StockEU']]) || 0;
+      const finalPriceEP = parseFloat(vals[colIdx['final_price_eprice']]) || 0;
+
+      if (!EAN_RE.test(ean)) { epSkipped++; continue; }
+      if (!finalPriceEP || finalPriceEP <= 0) { epSkipped++; continue; }
+
       // ePrice: IT-first with fixed IT fulfillment-latency = 1
       let exportQty: number, fulfillmentLatency: number, shouldExport: boolean;
       if (stockIT >= 2) {
@@ -3253,140 +3144,84 @@ async function stepExportEprice(supabase: SupabaseClient, runId: string, feeConf
       } else {
         shouldExport = false; exportQty = 0; fulfillmentLatency = 0;
       }
-      
+
       if (!shouldExport) { epSkipped++; continue; }
-      
+
       const r = EP_DATA_START + epWritten;
-      ws[XLSX.utils.encode_cell({ r, c: 0 })] = { v: p.MPN || p.Matnr || '', t: 's' };
-      ws[XLSX.utils.encode_cell({ r, c: 1 })] = { v: String(norm.value!), t: 's', z: '@' }; // EAN as text
+      ws[XLSX.utils.encode_cell({ r, c: 0 })] = { v: mpn || matnr || '', t: 's' };
+      ws[XLSX.utils.encode_cell({ r, c: 1 })] = { v: ean, t: 's', z: '@' }; // EAN as text
       ws[XLSX.utils.encode_cell({ r, c: 2 })] = { v: 'EAN', t: 's' };
-      ws[XLSX.utils.encode_cell({ r, c: 3 })] = { v: p.PFNum, t: 'n', z: '0.00' };
-      ws[XLSX.utils.encode_cell({ r, c: 4 })] = { v: Math.min(exportQty, 99), t: 'n' };
+      ws[XLSX.utils.encode_cell({ r, c: 3 })] = { v: Math.round(finalPriceEP * 100) / 100, t: 'n', z: '0.00' };
+      ws[XLSX.utils.encode_cell({ r, c: 4 })] = { v: exportQty, t: 'n' }; // NO CAP
       ws[XLSX.utils.encode_cell({ r, c: 5 })] = { v: 11, t: 'n' };
       ws[XLSX.utils.encode_cell({ r, c: 6 })] = { v: fulfillmentLatency, t: 'n' };
       ws[XLSX.utils.encode_cell({ r, c: 7 })] = { v: 'K', t: 's' };
       epWritten++;
     }
-    
+
     // Update range
     if (epWritten > 0) {
       ws['!ref'] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: EP_DATA_START + epWritten - 1, c: 7 } });
     }
-    
-    await logEPStage('data_filled_done', startTime, { rows: epWritten });
-    
-    // Serialize XLSX first (needed for ZIP-level comparison)
-    const epWriteT0 = Date.now();
-    await logEPStage('before_write', epWriteT0, { rows: epWritten });
+
+    // Light validation
+    const epValidationErrors: string[] = [];
+    if (JSON.stringify(wb.SheetNames) !== JSON.stringify(templateSheetNames)) {
+      epValidationErrors.push(`sheet_names: expected ${JSON.stringify(templateSheetNames)}, got ${JSON.stringify(wb.SheetNames)}`);
+    }
+    for (let c = 0; c <= 7; c++) {
+      const cell = ws[XLSX.utils.encode_cell({ r: 0, c })];
+      const currentVal = cell?.v?.toString() || '';
+      if (currentVal !== header0Values[c]) {
+        epValidationErrors.push(`header[${c}]: expected "${header0Values[c]}", got "${currentVal}"`);
+      }
+    }
+    if (epWritten > 0) {
+      const eanCheckLimit = Math.min(epWritten, 100);
+      for (let j = 0; j < eanCheckLimit; j++) {
+        const cell = ws[XLSX.utils.encode_cell({ r: EP_DATA_START + j, c: 1 })];
+        if (cell && cell.t !== 's') epValidationErrors.push(`ean_type_row${EP_DATA_START + j}: '${cell.t}'`);
+      }
+    }
+    if (epValidationErrors.length > 0) {
+      const error = `Validation failed: ${epValidationErrors.join('; ')}`;
+      await safeLogEvent(supabase, runId, 'ERROR', 'validation_failed', { export_name: 'Export ePrice', errors: epValidationErrors });
+      await updateStepResult(supabase, runId, 'export_eprice', { status: 'failed', error, metrics: {}, validation_passed: false } as StepResultData);
+      return { success: false, error };
+    }
+
+    // Serialize and upload
     const xlsxBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: false, bookSST: false });
     const epOutputBytes = new Uint8Array(xlsxBuffer);
     const epOutSize = epOutputBytes.length;
-    await logEPStage('after_write', epWriteT0, { size_bytes: epOutSize });
-    
-    // Pre-upload validation: light (default) or heavy (env override)
-    const epValMode = (Deno.env.get('EXPORT_EPRICE_VALIDATION_MODE') || 'light').toLowerCase();
-    const epValT0 = Date.now();
-    await logEPStage('before_validation', epValT0, { integrity_mode: epValMode });
 
-    let epValidationPassed = true;
-    let epValidationErrors: string[] = [];
-    const epValidationWarnings: string[] = [];
-
-    if (epValMode === 'heavy') {
-      // Heavy mode: full ZIP/XML comparison (existing behavior)
-      const epValidation = await validateExportVsTemplate(
-        XLSX, wb, epTemplateBytes, 'Export ePrice', 'Tracciato_Inserimento_Offerte', 'product-id', supabase, runId,
-        { headerCellsModifiedCount: 0, cellsWrittenBySheet: { 'Tracciato_Inserimento_Offerte': epWritten * 8 } },
-        epOutputBytes
-      );
-      epValidationPassed = epValidation.passed;
-      epValidationErrors = epValidation.errors;
-      epValidationWarnings.push(...(epValidation.warnings || []));
-    } else {
-      // Light mode: cheap deterministic checks, NO unzip, NO XLSX.read on buffer
-      // 1. SheetNames must match template
-      const currentSheetNames = wb.SheetNames;
-      if (JSON.stringify(currentSheetNames) !== JSON.stringify(templateSheetNames)) {
-        epValidationErrors.push(`sheet_names: expected ${JSON.stringify(templateSheetNames)}, got ${JSON.stringify(currentSheetNames)}`);
-      }
-      // 2. Sheet exists
-      if (!wb.Sheets['Tracciato_Inserimento_Offerte']) {
-        epValidationErrors.push('sheet_missing: Tracciato_Inserimento_Offerte');
-      }
-      // 3. Header row 0 unchanged (cols 0..7)
-      for (let c = 0; c <= 7; c++) {
-        const cell = ws[XLSX.utils.encode_cell({ r: 0, c })];
-        const currentVal = cell?.v?.toString() || '';
-        if (currentVal !== header0Values[c]) {
-          epValidationErrors.push(`header[${c}]: expected "${header0Values[c]}", got "${currentVal}"`);
-        }
-      }
-      // 4. Range and EAN column checks
-      if (epWritten > 0) {
-        const genRange = ws['!ref'] ? XLSX.utils.decode_range(ws['!ref']) : null;
-        if (!genRange) {
-          epValidationErrors.push('ref_missing: worksheet has no !ref');
-        } else {
-          if (genRange.e.c < 7) epValidationErrors.push(`column_count: expected >=8, got ${genRange.e.c + 1}`);
-          const expectedLastRow = EP_DATA_START + epWritten - 1;
-          if (genRange.e.r < expectedLastRow) epValidationErrors.push(`row_range: expected >=${expectedLastRow}, got ${genRange.e.r}`);
-        }
-        // EAN column (col 1) sample check: string, digits only, 13-14 chars
-        const eanCheckLimit = Math.min(epWritten, 100);
-        const EAN_RE = /^[0-9]{13,14}$/;
-        for (let i = 0; i < eanCheckLimit; i++) {
-          const cell = ws[XLSX.utils.encode_cell({ r: EP_DATA_START + i, c: 1 })];
-          if (!cell) continue;
-          if (cell.t !== 's') epValidationErrors.push(`ean_type_row${EP_DATA_START + i}: expected 's', got '${cell.t}'`);
-          const val = String(cell.v || '');
-          if (!EAN_RE.test(val)) epValidationErrors.push(`ean_value_row${EP_DATA_START + i}: "${val}" does not match ^[0-9]{13,14}$`);
-        }
-      }
-      // 5. Size sanity check on serialized buffer
-      if (epWritten > 0 && epOutSize <= 20000) {
-        epValidationErrors.push(`size_too_small: ${epOutSize} bytes with ${epWritten} rows, expected > 20000`);
-      }
-      if (epWritten === 0) {
-        epValidationWarnings.push('eprice_empty: 0 rows written, file will contain only headers');
-      }
-      epValidationPassed = epValidationErrors.length === 0;
-    }
-
-    await logEPStage('after_validation', epValT0, { passed: epValidationPassed, integrity_mode: epValMode, errors: epValidationErrors.length });
-    if (!epValidationPassed) {
-      const error = `Pre-SFTP validation failed for Export ePrice.xlsx: ${epValidationErrors.join('; ')}`;
-      await updateStepResult(supabase, runId, 'export_eprice', { status: 'failed', error, metrics: {}, validation_passed: false, validation_warnings: epValidationWarnings } as StepResultData);
+    if (epWritten > 0 && epOutSize <= 20000) {
+      const error = `size_too_small: ${epOutSize} bytes with ${epWritten} rows`;
+      await updateStepResult(supabase, runId, 'export_eprice', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
-    
-    const epBlob = new Blob([xlsxBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-    
-    const epUpT0 = Date.now();
-    await logEPStage('before_upload', epUpT0, { size_bytes: epOutSize });
+
+    const epBlob = new Blob([epOutputBytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
     const { error: uploadError } = await supabase.storage.from('exports').upload(
       'Export ePrice.xlsx', epBlob, { upsert: true, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }
     );
-    await logEPStage('after_upload', epUpT0, { duration_ms: Date.now() - epUpT0, size_bytes: epOutSize });
-    
+
     if (uploadError) {
       const error = `Upload Export ePrice.xlsx fallito: ${uploadError.message}`;
       await updateStepResult(supabase, runId, 'export_eprice', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
-    
+
     await safeLogEvent(supabase, runId, 'INFO', 'export_saved', { step: 'export_eprice', file: 'Export ePrice.xlsx', rows: epWritten });
-    
     await updateStepResult(supabase, runId, 'export_eprice', {
       status: 'success', duration_ms: Date.now() - startTime, rows: epWritten, skipped: epSkipped,
       metrics: { eprice_export_rows: epWritten, eprice_export_skipped: epSkipped, format: 'xlsx' },
-      validation_passed: true,
-      validation_warnings: epValidationWarnings
+      validation_passed: true
     } as StepResultData);
-    
-    await logEPStage('completed', startTime, { rows: epWritten, elapsed_ms: Date.now() - startTime, format: 'xlsx' });
-    console.log(`[sync:step:export_eprice] Completed: ${epWritten} rows XLSX (template-based), ${epSkipped} skipped`);
+
+    console.log(`[sync:step:export_eprice] Completed: ${epWritten} rows, ${epSkipped} skipped (TSV-based, no cap)`);
     return { success: true };
-    
+
   } catch (e: unknown) {
     console.error(`[sync:step:export_eprice] Error:`, e);
     await updateStepResult(supabase, runId, 'export_eprice', { status: 'failed', error: errMsg(e), metrics: {} });

@@ -587,10 +587,11 @@ function buildFeeConfig(feeData: Record<string, unknown> | null): Record<string,
     shippingCost: feeData?.shipping_cost ?? 6.00,
     mediaworldPrepDays: feeData?.mediaworld_preparation_days ?? 3,
     epricePrepDays: feeData?.eprice_preparation_days ?? 1,
-    mediaworldIncludeEu: feeData?.mediaworld_include_eu ?? false,
+    // CRITICAL: null/undefined → true (backward compat, matches client)
+    mediaworldIncludeEu: feeData?.mediaworld_include_eu == null ? true : !!feeData.mediaworld_include_eu,
     mediaworldItPrepDays: feeData?.mediaworld_it_preparation_days ?? 3,
     mediaworldEuPrepDays: feeData?.mediaworld_eu_preparation_days ?? 5,
-    epriceIncludeEu: feeData?.eprice_include_eu ?? false,
+    epriceIncludeEu: feeData?.eprice_include_eu == null ? true : !!feeData.eprice_include_eu,
     epriceItPrepDays: feeData?.eprice_it_preparation_days ?? 1,
     epriceEuPrepDays: feeData?.eprice_eu_preparation_days ?? 3,
     eanFeeDrev: feeData?.ean_fee_drev ?? null,
@@ -601,7 +602,14 @@ function buildFeeConfig(feeData: Record<string, unknown> | null): Record<string,
     mediaworldShippingCost: feeData?.mediaworld_shipping_cost ?? null,
     epriceFeeDrev: feeData?.eprice_fee_drev ?? null,
     epriceFeeMkt: feeData?.eprice_fee_mkt ?? null,
-    epriceShippingCost: feeData?.eprice_shipping_cost ?? null
+    epriceShippingCost: feeData?.eprice_shipping_cost ?? null,
+    // Amazon: null/undefined → true (backward compat)
+    amazonIncludeEu: feeData?.amazon_include_eu == null ? true : !!feeData.amazon_include_eu,
+    amazonItPrepDays: feeData?.amazon_it_preparation_days ?? 3,
+    amazonEuPrepDays: feeData?.amazon_eu_preparation_days ?? 5,
+    amazonFeeDrev: feeData?.amazon_fee_drev ?? null,
+    amazonFeeMkt: feeData?.amazon_fee_mkt ?? null,
+    amazonShippingCost: feeData?.amazon_shipping_cost ?? null
   };
 }
 
