@@ -2523,63 +2523,276 @@ async function stepPricing(supabase: SupabaseClient, runId: string, feeConfig: F
   }
 }
 
-// ========== STEP: EXPORT_EAN ==========
-async function stepExportEan(supabase: SupabaseClient, runId: string): Promise<{ success: boolean; error?: string }> {
-  console.log(`[sync:step:export_ean] Starting for run ${runId}`);
+// ========== STEP: EXPORT_EAN (38-column Catalogo EAN) ==========
+const EAN_38_HEADERS = [
+  'Matnr','ManufPartNr','EAN','ShortDescription','ExistingStock','StockIT','StockEU',
+  'CustBestPrice','Surcharge','Costo di Spedizione','IVA','Prezzo con spediz e IVA',
+  'FeeDeRev','Fee Marketplace','Subtotale post-fee','Prezzo Finale','ListPrice',
+  'ListPrice con Fee','basePriceCents','final_price_ean','listprice_with_fee_ean',
+  'final_price_mediaworld','listprice_with_fee_mediaworld','final_price_eprice',
+  'listprice_with_fee_eprice','_finalCents_ean','_finalCents_mediaworld',
+  '_finalCents_eprice','mediaworldPricingError','epricePricingError','_route',
+  '_finalCents','__override','__overrideSource','__overrideStockIT',
+  '__overrideStockEU','__overrideLeadDaysIT','__overrideLeadDaysEU'
+];
+
+async function stepExportEan(supabase: SupabaseClient, runId: string, feeConfig: FeeConfig): Promise<{ success: boolean; error?: string }> {
+  console.log(`[sync:step:export_ean] Starting 38-col for run ${runId}`);
   const startTime = Date.now();
-  
+
   try {
+    // 1. Load products
     const { products, error: loadError } = await loadProductsTSV(supabase, runId);
-    
     if (loadError || !products) {
       const error = loadError || 'Products file not found';
       await updateStepResult(supabase, runId, 'export_ean', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
-    
+
+    // 2. EAN-specific fees (with global fallback)
+    const feeDrev = feeConfig?.eanFeeDrev ?? feeConfig?.feeDrev ?? 1.05;
+    const feeMkt = feeConfig?.eanFeeMkt ?? feeConfig?.feeMkt ?? 1.08;
+    const shippingCost = feeConfig?.eanShippingCost ?? feeConfig?.shippingCost ?? 6.00;
+    const shippingCents = Math.round(shippingCost * 100);
+    console.log(`[sync:step:export_ean] Fees: DREV=${feeDrev}, MKT=${feeMkt}, SHIP=${shippingCost}`);
+
+    // 3. Load stock-location
+    let stockLocIndex: Record<string, { stockIT: number; stockEU: number }> | null = null;
+    {
+      const { content } = await downloadFromStorage(supabase, 'ftp-import', `stock-location/runs/${runId}.txt`);
+      if (content) {
+        stockLocIndex = {};
+        const lines = content.replace(/\r\n/g, '\n').split('\n');
+        const hdrs = lines[0]?.split(';').map((h: string) => h.trim().toLowerCase()) || [];
+        const mI = hdrs.indexOf('matnr'), sI = hdrs.indexOf('stock'), lI = hdrs.indexOf('locationid');
+        if (mI >= 0 && sI >= 0 && lI >= 0) {
+          for (let i = 1; i < lines.length; i++) {
+            const v = lines[i].split(';');
+            const m = v[mI]?.trim();
+            if (!m) continue;
+            const s = parseInt(v[sI]) || 0;
+            const l = parseInt(v[lI]) || 0;
+            if (!stockLocIndex[m]) stockLocIndex[m] = { stockIT: 0, stockEU: 0 };
+            if (l === 4242) stockLocIndex[m].stockIT += s;
+            else if (l === 4254) stockLocIndex[m].stockEU += s;
+          }
+        }
+        console.log(`[sync:step:export_ean] Stock location: ${Object.keys(stockLocIndex).length} entries`);
+      } else {
+        await safeLogEvent(supabase, runId, 'WARN', 'stock_location_missing_fallback_used', { step: 'export_ean' });
+      }
+    }
+
+    // 4. Load override file
+    const overrideByEan = new Map<string, Record<string, unknown>>();
+    const overrideBySku = new Map<string, Record<string, unknown>>();
+    let allOverrideRows: Record<string, unknown>[] = [];
+    {
+      const { data: files } = await supabase.storage.from('mapping-files').list('', { search: 'override' });
+      const ovrFile = files?.find((f: { name: string }) =>
+        f.name.toLowerCase().includes('override') && (f.name.toLowerCase().endsWith('.xlsx') || f.name.toLowerCase().endsWith('.xls'))
+      );
+      if (ovrFile) {
+        const { data: ovrData } = await supabase.storage.from('mapping-files').download(ovrFile.name);
+        if (ovrData) {
+          const XLSX = await import("npm:xlsx@0.18.5");
+          const wb = XLSX.read(new Uint8Array(await ovrData.arrayBuffer()), { type: 'array' });
+          const wsName = wb.SheetNames[0];
+          if (wsName) {
+            allOverrideRows = XLSX.utils.sheet_to_json(wb.Sheets[wsName], { defval: '' });
+            for (const row of allOverrideRows) {
+              const ean = normalizeEAN(row.EAN || row.ean);
+              const sku = String(row.SKU || row.sku || row.MPN || row.mpn || '').trim();
+              if (ean.ok && ean.value) overrideByEan.set(ean.value, row);
+              if (sku) overrideBySku.set(sku.toLowerCase(), row);
+            }
+          }
+        }
+      }
+      console.log(`[sync:step:export_ean] Override: ${overrideByEan.size} byEAN, ${overrideBySku.size} bySKU`);
+    }
+
+    // 5. Build 38-column rows
+    const round2 = (v: number) => Math.round(v * 100) / 100;
     const eanRows: string[] = [];
     let eanSkipped = 0;
-    
-    const headers = ['EAN', 'MPN', 'Matnr', 'Descrizione', 'Prezzo', 'ListPrice con Fee', 'Stock'];
-    
+    const matchedOvrKeys = new Set<string>();
+
     for (const p of products) {
+      if (!p.Matnr?.trim()) { eanSkipped++; continue; }
       const norm = normalizeEAN(p.EAN);
-      if (!norm.ok) {
-        eanSkipped++;
-        continue;
+      if (!norm.ok || !norm.value) { eanSkipped++; continue; }
+      const ean = norm.value;
+
+      // Stock
+      let stockIT: number, stockEU: number;
+      if (stockLocIndex && stockLocIndex[p.Matnr]) {
+        stockIT = Math.min(stockLocIndex[p.Matnr].stockIT, 9876);
+        stockEU = Math.min(stockLocIndex[p.Matnr].stockEU, 9876);
+      } else {
+        stockIT = Math.min(p.Stock || 0, 9876);
+        stockEU = 0;
       }
-      
+      let existingStock = Math.min(stockIT + stockEU, 9876);
+
+      // Override detection
+      let ovrRow: Record<string, unknown> | undefined;
+      if (p.MPN) ovrRow = overrideBySku.get(p.MPN.trim().toLowerCase());
+      if (!ovrRow) ovrRow = overrideByEan.get(ean);
+
+      let isOvr = false, ovrSource = '', ovrStockIT = '', ovrStockEU = '';
+      let ovrLeadIT = '', ovrLeadEU = '';
+      let overrideOfferPrice: number | null = null, overrideListPrice: number | null = null;
+
+      if (ovrRow) {
+        isOvr = true;
+        ovrSource = 'existing';
+        const oSku = String(ovrRow.SKU || ovrRow.sku || ovrRow.MPN || ovrRow.mpn || '').trim();
+        if (oSku) matchedOvrKeys.add(oSku.toLowerCase());
+        const oEan = normalizeEAN(ovrRow.EAN || ovrRow.ean);
+        if (oEan.ok && oEan.value) matchedOvrKeys.add('ean:' + oEan.value);
+
+        const hasSIT = Object.keys(ovrRow).some(k => k.toLowerCase() === 'stockit');
+        const hasSEU = Object.keys(ovrRow).some(k => k.toLowerCase() === 'stockeu');
+        if (hasSIT && hasSEU) {
+          ovrStockIT = String(parseInt(String(ovrRow[Object.keys(ovrRow).find(k => k.toLowerCase() === 'stockit')!])) || 0);
+          ovrStockEU = String(parseInt(String(ovrRow[Object.keys(ovrRow).find(k => k.toLowerCase() === 'stockeu')!])) || 0);
+        } else {
+          const qty = ovrRow.Quantity ?? ovrRow.quantity;
+          if (qty !== undefined && qty !== '') {
+            const qv = Math.min(parseInt(String(qty)) || 0, 9876);
+            existingStock = qv;
+            ovrStockIT = String(qv);
+            ovrStockEU = '0';
+          }
+        }
+        const ldItK = Object.keys(ovrRow).find(k => k.toLowerCase() === 'leaddaysit');
+        const ldEuK = Object.keys(ovrRow).find(k => k.toLowerCase() === 'leaddayseu');
+        if (ldItK) ovrLeadIT = String(parseInt(String(ovrRow[ldItK])) || 0);
+        if (ldEuK) ovrLeadEU = String(parseInt(String(ovrRow[ldEuK])) || 0);
+
+        const op = ovrRow.OfferPrice ?? ovrRow.offerPrice ?? ovrRow.offer_price;
+        if (op !== undefined && op !== '') overrideOfferPrice = parseFloat(String(op)) || null;
+        const olp = ovrRow.ListPrice ?? ovrRow.listPrice ?? ovrRow.list_price;
+        if (olp !== undefined && olp !== '') overrideListPrice = parseFloat(String(olp)) || null;
+      }
+
+      // Pricing
+      const cbp = p.CBP || 0, sur = p.Sur || 0, lp = p.LP || 0;
+      let basePriceCents: number, route: string;
+      if (cbp > 0) { basePriceCents = Math.round((cbp + sur) * 100); route = 'cbp'; }
+      else { basePriceCents = Math.round(lp * 100); route = 'lp'; }
+
+      const afterShippingCents = basePriceCents + shippingCents;
+      const afterIvaCents = Math.round(afterShippingCents * 1.22);
+      const afterFeesCents = Math.round(Math.round(afterIvaCents * feeDrev) * feeMkt);
+      const finalCents = toComma99Cents(afterFeesCents);
+      const pfStr = (finalCents / 100).toFixed(2).replace('.', ',');
+
+      const ivaVal = round2((basePriceCents / 100 + shippingCost) * 0.22);
+      const prezzoConSpedIva = round2((basePriceCents / 100 + shippingCost) * 1.22);
+      const subtotalePostFee = round2(afterFeesCents / 100);
+
+      let listPriceConFee: number;
+      if (lp > 0) {
+        const lpShip = Math.round(lp * 100) + shippingCents;
+        const lpIva = Math.round(lpShip * 1.22);
+        const lpFees = Math.round(Math.round(lpIva * feeDrev) * feeMkt);
+        listPriceConFee = Math.ceil(lpFees / 100);
+      } else {
+        listPriceConFee = Math.ceil((finalCents / 100) * 1.25);
+      }
+
+      // Display values (override adjustments)
+      let dPF = pfStr, dFPE = pfStr, dFPM: string = pfStr, dFPEp: string = pfStr;
+      let dLP = String(lp), dLPF = String(listPriceConFee), dLPFE = String(listPriceConFee);
+      let dLPFM = String(listPriceConFee), dLPFEp = String(listPriceConFee);
+
+      if (overrideOfferPrice !== null) {
+        const opStr = overrideOfferPrice.toFixed(2).replace('.', ',');
+        dPF = opStr; dFPE = opStr;
+        dFPM = String(overrideOfferPrice); dFPEp = String(overrideOfferPrice);
+      }
+      if (overrideListPrice !== null) {
+        dLP = String(overrideListPrice);
+        dLPF = String(Math.floor(overrideListPrice));
+        dLPFM = String(Math.floor(overrideListPrice));
+        dLPFEp = String(Math.floor(overrideListPrice));
+      }
+
       eanRows.push([
-        norm.value,
-        p.MPN || '',
-        p.Matnr || '',
-        (p.Desc || '').replace(/;/g, ','),
-        p.PF || '',
-        p.LPF || '',
-        String(p.Stock || 0)
+        p.Matnr, p.MPN || '', ean, (p.Desc || '').replace(/;/g, ','),
+        String(existingStock), String(stockIT), String(stockEU),
+        String(cbp), String(sur), String(shippingCost), String(ivaVal), String(prezzoConSpedIva),
+        String(feeDrev), String(feeMkt), String(subtotalePostFee), dPF, dLP, dLPF,
+        String(basePriceCents), dFPE, dLPFE,
+        dFPM, dLPFM, dFPEp, dLPFEp,
+        String(finalCents), String(finalCents), String(finalCents),
+        'false', 'false', route, String(finalCents),
+        isOvr ? 'true' : '', isOvr ? ovrSource : '',
+        ovrStockIT, ovrStockEU, ovrLeadIT, ovrLeadEU
       ].join(';'));
     }
-    
-    const eanCSV = [headers.join(';'), ...eanRows].join('\n');
-    
-    // Save to both locations
+
+    // 6. OVR-only rows
+    for (const ovrRow of allOverrideRows) {
+      const oSku = String(ovrRow.SKU || ovrRow.sku || ovrRow.MPN || ovrRow.mpn || '').trim();
+      const oEan = normalizeEAN(ovrRow.EAN || ovrRow.ean);
+      if (oSku && matchedOvrKeys.has(oSku.toLowerCase())) continue;
+      if (oEan.ok && oEan.value && matchedOvrKeys.has('ean:' + oEan.value)) continue;
+      if (!oEan.ok || !oEan.value || !oSku) continue;
+
+      const matnr = oSku.startsWith('OVR-') ? oSku : 'OVR-' + oSku;
+      const mpn = oSku.startsWith('OVR-') ? oSku.substring(4) : oSku;
+      const hasSIT = Object.keys(ovrRow).some(k => k.toLowerCase() === 'stockit');
+      const hasSEU = Object.keys(ovrRow).some(k => k.toLowerCase() === 'stockeu');
+      let oES = 0, oSI = 0, oSE = 0, oOSI = '0', oOSE = '0';
+      if (hasSIT && hasSEU) {
+        oOSI = String(parseInt(String(ovrRow[Object.keys(ovrRow).find(k => k.toLowerCase() === 'stockit')!])) || 0);
+        oOSE = String(parseInt(String(ovrRow[Object.keys(ovrRow).find(k => k.toLowerCase() === 'stockeu')!])) || 0);
+        oES = parseInt(oOSI) + parseInt(oOSE); oSI = oES;
+      } else {
+        const qty = ovrRow.Quantity ?? ovrRow.quantity;
+        if (qty !== undefined && qty !== '') {
+          const qv = Math.floor(parseFloat(String(qty)) || 0);
+          oOSI = String(qv); oES = qv; oSI = qv;
+        }
+      }
+      const op = parseFloat(String(ovrRow.OfferPrice ?? ovrRow.offerPrice ?? ovrRow.offer_price ?? 0)) || 0;
+      const olp = parseFloat(String(ovrRow.ListPrice ?? ovrRow.listPrice ?? ovrRow.list_price ?? 0)) || 0;
+      const opStr = op.toFixed(2).replace('.', ',');
+
+      eanRows.push([
+        matnr, mpn, oEan.value, `Override item ${oSku}`,
+        String(oES), String(oSI), '0',
+        '0', '0', '0,00', '22%', '0,00',
+        '0', '0', '0,00', opStr, String(olp), String(Math.floor(olp)),
+        '', opStr, '',
+        String(op), String(Math.floor(olp)), String(op), String(Math.floor(olp)),
+        '', '', '',
+        'false', 'false', '', '',
+        'true', 'existing',
+        oOSI, oOSE, '', ''
+      ].join(';'));
+    }
+
+    // 7. Save CSV
+    const eanCSV = [EAN_38_HEADERS.join(';'), ...eanRows].join('\n');
     await uploadToStorage(supabase, 'exports', EAN_CATALOG_FILE_PATH, eanCSV, 'text/csv');
     const saveResult = await uploadToStorage(supabase, 'exports', 'Catalogo EAN.csv', eanCSV, 'text/csv');
-    
+
     if (!saveResult.success) {
       const error = `Failed to save Catalogo EAN.csv: ${saveResult.error}`;
       await updateStepResult(supabase, runId, 'export_ean', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
-    
+
     await updateStepResult(supabase, runId, 'export_ean', {
       status: 'success', duration_ms: Date.now() - startTime, rows: eanRows.length, skipped: eanSkipped,
       metrics: { ean_export_rows: eanRows.length, ean_export_skipped: eanSkipped }
     });
-    
-    console.log(`[sync:step:export_ean] Completed: ${eanRows.length} rows, ${eanSkipped} skipped`);
+    console.log(`[sync:step:export_ean] Completed: ${eanRows.length} rows (38 cols), ${eanSkipped} skipped`);
     return { success: true };
-    
   } catch (e: unknown) {
     console.error(`[sync:step:export_ean] Error:`, e);
     await updateStepResult(supabase, runId, 'export_ean', { status: 'failed', error: errMsg(e), metrics: {} });
@@ -3181,6 +3394,19 @@ async function stepExportEprice(supabase: SupabaseClient, runId: string, feeConf
   }
 }
 
+// ========== EAN CELL TYPE HELPER ==========
+const EAN_TEXT_FORMAT_COLS = new Set(['EAN']);
+const EAN_ALWAYS_STRING_COLS = new Set(['Prezzo Finale', 'final_price_ean']);
+
+function makeEanCell(colName: string, val: string): Record<string, unknown> | null {
+  if (val === '' || val === undefined || val === null) return null;
+  if (EAN_TEXT_FORMAT_COLS.has(colName)) return { v: val, t: 's', z: '@' };
+  if (EAN_ALWAYS_STRING_COLS.has(colName)) return { v: val, t: 's' };
+  // Try number: no commas, no % signs, not boolean text
+  if (/^-?\d+(\.\d+)?$/.test(val)) return { v: Number(val), t: 'n' };
+  return { v: val, t: 's' };
+}
+
 // ========== LIGHTWEIGHT EAN VALIDATION (no ZIP unzip, no double parse) ==========
 function validateEanLightweight(
   // deno-lint-ignore no-explicit-any
@@ -3196,7 +3422,7 @@ function validateEanLightweight(
 ): { passed: boolean; errors: string[] } {
   const errors: string[] = [];
 
-  // 1. Sheet names must match template
+  // 1. Sheet must exist
   if (!wb.SheetNames.includes(dataSheetName)) {
     errors.push(`sheet_missing: ${dataSheetName}`);
     return { passed: false, errors };
@@ -3205,7 +3431,7 @@ function validateEanLightweight(
   const ws = wb.Sheets[dataSheetName];
   if (!ws) { errors.push(`sheet_null: ${dataSheetName}`); return { passed: false, errors }; }
 
-  // 2. Header row identical to template
+  // 2. Header row identical to template (covers 38-header check)
   const tmplRange = templateWs['!ref'] ? XLSX.utils.decode_range(templateWs['!ref']) : null;
   if (tmplRange) {
     for (let c = 0; c <= tmplRange.e.c; c++) {
@@ -3234,22 +3460,58 @@ function validateEanLightweight(
     }
   }
 
-  // 5. EAN column type check (sample first 100 data rows)
+  // 5. EAN column: digits only, length 13/14, text type (sample 200 rows)
   if (eanColIdx >= 0) {
-    const checkLimit = Math.min(rowsWritten, 100);
+    const checkLimit = Math.min(rowsWritten, 200);
+    let eanViolations = 0;
+    const eanExamples: string[] = [];
     for (let r = 1; r <= checkLimit; r++) {
       const cell = ws[XLSX.utils.encode_cell({ r, c: eanColIdx })];
       if (!cell) continue;
-      if (cell.t !== 's') errors.push(`ean_type_row${r}: expected 's', got '${cell.t}'`);
+      if (cell.t !== 's') { eanViolations++; if (eanExamples.length < 3) eanExamples.push(`row${r}:type=${cell.t}`); continue; }
       const val = String(cell.v || '');
-      if (val && /^\d+$/.test(val) && val.length < 12) errors.push(`ean_leading_zeros_row${r}: "${val}" too short`);
+      if (val && !/^\d{13,14}$/.test(val)) { eanViolations++; if (eanExamples.length < 3) eanExamples.push(`row${r}:${val}`); }
+    }
+    if (eanViolations > 0 && (eanViolations / checkLimit) > 0.01) {
+      errors.push(`ean_invalid_values_detected: ${eanViolations}/${checkLimit} violations, examples: ${eanExamples.join(', ')}`);
     }
   }
 
   // 6. Column count check
   const genRange = ws['!ref'] ? XLSX.utils.decode_range(ws['!ref']) : null;
-  if (genRange && tmplRange && genRange.e.c !== tmplRange.e.c) {
-    errors.push(`column_count: expected ${tmplRange.e.c + 1}, got ${genRange.e.c + 1}`);
+  if (genRange && tmplRange && genRange.e.c < tmplRange.e.c) {
+    errors.push(`column_count: expected >= ${tmplRange.e.c + 1}, got ${genRange.e.c + 1}`);
+  }
+
+  // 7. finalCents % 100 == 99 check (find _finalCents column, sample standard rows)
+  if (tmplRange) {
+    let fcColIdx = -1;
+    let matnrColIdx = -1;
+    for (let c = 0; c <= tmplRange.e.c; c++) {
+      const hdr = ws[XLSX.utils.encode_cell({ r: 0, c })]?.v?.toString() || '';
+      if (hdr === '_finalCents') fcColIdx = c;
+      if (hdr === 'Matnr') matnrColIdx = c;
+    }
+    if (fcColIdx >= 0) {
+      const fcLimit = Math.min(rowsWritten, 200);
+      const fcExamples: string[] = [];
+      for (let r = 1; r <= fcLimit; r++) {
+        // Skip OVR rows
+        if (matnrColIdx >= 0) {
+          const mCell = ws[XLSX.utils.encode_cell({ r, c: matnrColIdx })];
+          if (mCell && String(mCell.v || '').startsWith('OVR-')) continue;
+        }
+        const fcCell = ws[XLSX.utils.encode_cell({ r, c: fcColIdx })];
+        if (!fcCell || fcCell.v === '' || fcCell.v === null || fcCell.v === undefined) continue;
+        const fcVal = Number(fcCell.v);
+        if (!isNaN(fcVal) && fcVal > 0 && fcVal % 100 !== 99) {
+          if (fcExamples.length < 3) fcExamples.push(`row${r}:${fcVal}`);
+        }
+      }
+      if (fcExamples.length > 0) {
+        errors.push(`ean_final_price_not_comma99: ${fcExamples.join(', ')}`);
+      }
+    }
   }
 
   return { passed: errors.length === 0, errors };
@@ -3366,6 +3628,16 @@ async function stepExportEanXlsx(supabase: SupabaseClient, runId: string): Promi
     let headerParsed = false;
     let chunkCount = 0;
 
+    // Read template headers for column name mapping
+    const tmplHeaders: string[] = [];
+    if (tmplEanRange) {
+      for (let c = 0; c <= tmplEanRange.e.c; c++) {
+        const cell = ws[XLSX.utils.encode_cell({ r: 0, c })];
+        tmplHeaders.push(cell?.v?.toString() || '');
+      }
+    }
+    let csvToTmplCol: number[] = [];
+
     const t2 = Date.now();
     while (true) {
       const rangeEnd = cursorPos + XLSX_STREAM_CHUNK_BYTES - 1;
@@ -3395,6 +3667,8 @@ async function stepExportEanXlsx(supabase: SupabaseClient, runId: string): Promi
         if (!headerParsed) {
           headers = trimmed.split(';');
           eanColIdx = headers.indexOf('EAN');
+          // Build CSV→template column mapping by name
+          csvToTmplCol = headers.map(h => tmplHeaders.indexOf(h));
           headerParsed = true;
           continue;
         }
@@ -3403,11 +3677,12 @@ async function stepExportEanXlsx(supabase: SupabaseClient, runId: string): Promi
         rowsWritten++;
         const r = rowsWritten;
         for (let c = 0; c < headers.length; c++) {
+          const tmplC = csvToTmplCol[c];
+          if (tmplC < 0) continue;
           const val = vals[c] || '';
-          const cell: Record<string, unknown> = { v: val, t: 's' };
-          if (c === eanColIdx) { cell.z = '@'; }
-          if (c < 26) ws[`${String.fromCharCode(65 + c)}${r + 1}`] = cell;
-          else ws[XLSX.utils.encode_cell({ r, c })] = cell;
+          const cell = makeEanCell(headers[c], val);
+          if (!cell) continue;
+          ws[XLSX.utils.encode_cell({ r, c: tmplC })] = cell;
         }
       }
 
@@ -3419,11 +3694,12 @@ async function stepExportEanXlsx(supabase: SupabaseClient, runId: string): Promi
           rowsWritten++;
           const r = rowsWritten;
           for (let c = 0; c < headers.length; c++) {
+            const tmplC = csvToTmplCol[c];
+            if (tmplC < 0) continue;
             const val = vals[c] || '';
-            const cell: Record<string, unknown> = { v: val, t: 's' };
-            if (c === eanColIdx) { cell.z = '@'; }
-            if (c < 26) ws[`${String.fromCharCode(65 + c)}${r + 1}`] = cell;
-            else ws[XLSX.utils.encode_cell({ r, c })] = cell;
+            const cell = makeEanCell(headers[c], val);
+            if (!cell) continue;
+            ws[XLSX.utils.encode_cell({ r, c: tmplC })] = cell;
           }
         }
         break;
@@ -3440,8 +3716,9 @@ async function stepExportEanXlsx(supabase: SupabaseClient, runId: string): Promi
       return { success: false, error };
     }
 
-    // 5. Update range
-    ws['!ref'] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: rowsWritten, c: headers.length - 1 } });
+    // 5. Update range — use template column width (not CSV width)
+    const maxCol = tmplEanRange ? tmplEanRange.e.c : headers.length - 1;
+    ws['!ref'] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: rowsWritten, c: maxCol } });
     const wb = templateWb;
     
     // 6. Lightweight validation (no ZIP unzip, O(n_columns))
@@ -3565,6 +3842,15 @@ async function processEanXlsxFromContent(supabase: SupabaseClient, runId: string
         }
       }
     }
+
+    // Read template headers for column name mapping
+    const tmplHeaders: string[] = [];
+    if (tmplRange) {
+      for (let c = 0; c <= tmplRange.e.c; c++) {
+        const cell = ws[XLSX.utils.encode_cell({ r: 0, c })];
+        tmplHeaders.push(cell?.v?.toString() || '');
+      }
+    }
     
     const lines = csvContent.split('\n');
     const headerLine = lines[0]?.trim();
@@ -3575,6 +3861,9 @@ async function processEanXlsxFromContent(supabase: SupabaseClient, runId: string
     }
     const headers = headerLine.split(';');
     const eanColIdx = headers.indexOf('EAN');
+    // Build CSV→template column mapping by name
+    const csvToTmplCol = headers.map(h => tmplHeaders.indexOf(h));
+
     let rowsWritten = 0;
     const t2 = Date.now();
     for (let lineIdx = 1; lineIdx < lines.length; lineIdx++) {
@@ -3584,15 +3873,18 @@ async function processEanXlsxFromContent(supabase: SupabaseClient, runId: string
       rowsWritten++;
       const r = rowsWritten;
       for (let c = 0; c < headers.length; c++) {
+        const tmplC = csvToTmplCol[c];
+        if (tmplC < 0) continue;
         const val = vals[c] || '';
-        const cell: Record<string, unknown> = { v: val, t: 's' };
-        if (c === eanColIdx) { cell.z = '@'; }
-        if (c < 26) ws[`${String.fromCharCode(65 + c)}${r + 1}`] = cell;
-        else ws[XLSX.utils.encode_cell({ r, c })] = cell;
+        const cell = makeEanCell(headers[c], val);
+        if (!cell) continue;
+        ws[XLSX.utils.encode_cell({ r, c: tmplC })] = cell;
       }
     }
     await logStg('data_filled_done', t2, { rows: rowsWritten });
-    ws['!ref'] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: rowsWritten, c: headers.length - 1 } });
+    // Use template column width for !ref
+    const maxCol = tmplRange ? tmplRange.e.c : headers.length - 1;
+    ws['!ref'] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: rowsWritten, c: maxCol } });
     
     // Lightweight validation
     const t3 = Date.now();
@@ -4262,7 +4554,7 @@ serve(async (req) => {
       case 'ean_mapping': result = await stepEanMapping(supabase, run_id); break;
       case 'pricing': result = await stepPricing(supabase, run_id, fee_config); break;
       case 'override_products': result = await stepOverrideProducts(supabase, run_id); break;
-      case 'export_ean': result = await stepExportEan(supabase, run_id); break;
+      case 'export_ean': result = await stepExportEan(supabase, run_id, fee_config); break;
       case 'export_ean_xlsx': result = await stepExportEanXlsx(supabase, run_id); break;
       case 'export_amazon': result = await stepExportAmazon(supabase, run_id, fee_config); break;
       case 'export_mediaworld': result = await stepExportMediaworld(supabase, run_id, fee_config); break;

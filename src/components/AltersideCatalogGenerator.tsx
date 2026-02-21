@@ -566,7 +566,33 @@ const AltersideCatalogGenerator: React.FC = () => {
             }
           });
         } else {
-          console.log('Nessuna fee config trovata, utilizzo valori predefiniti');
+          // Singleton not found — try fallback: latest row by updated_at
+          console.warn('[FeeConfig] fee_config_singleton_missing — trying fallback');
+          const { data: fallbackRow, error: fallbackErr } = await supabase
+            .from('fee_config')
+            .select('*')
+            .order('updated_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+
+          if (fallbackErr) {
+            console.error('[FeeConfig] Fallback query failed:', fallbackErr);
+          } else if (fallbackRow) {
+            console.warn('[FeeConfig] fee_config_singleton_missing_using_latest_row', { id: fallbackRow.id });
+            const loadedConfig = mapFeeConfigRowToState(fallbackRow as any);
+            setFeeConfig({
+              feeDrev: loadedConfig.feeDrev,
+              feeMkt: loadedConfig.feeMkt,
+              shippingCost: loadedConfig.shippingCost
+            });
+            setExtendedFeeConfig(loadedConfig);
+            toast({
+              title: "Configurazione recuperata",
+              description: "Riga singleton mancante. Salvare per ricrearla.",
+            });
+          } else {
+            console.log('Nessuna fee config trovata, utilizzo valori predefiniti');
+          }
         }
       } catch (err) {
         console.error('Errore loadFeesFromSupabase:', err);
@@ -660,26 +686,58 @@ const AltersideCatalogGenerator: React.FC = () => {
         updated_at: new Date().toISOString()
       };
 
-      // Always update singleton row
-      const { error } = await supabase
+      // Upsert singleton row (insert if missing, update if exists)
+      const { data: savedRow, error } = await supabase
         .from('fee_config')
-        .update(updateData)
-        .eq('id', FEE_CONFIG_SINGLETON_ID);
+        .upsert({ id: FEE_CONFIG_SINGLETON_ID, ...updateData }, { onConflict: 'id' })
+        .select()
+        .single();
       
       if (error) {
         console.error('Errore salvataggio fee config:', error);
         toast({
           title: "Errore salvataggio",
-          description: "Impossibile salvare le regole di calcolo sul server.",
+          description: `Impossibile salvare le regole di calcolo: ${error.message}`,
           variant: "destructive"
         });
-      } else {
-        toast({
-          title: "Regole salvate",
-          description: "Le regole di calcolo (globali e per-export) sono state salvate."
-        });
-        console.log('Fee config salvato su Supabase (singleton ID)');
+        return;
       }
+
+      // Read-after-write verification
+      const { data: verifyRow, error: verifyError } = await supabase
+        .from('fee_config')
+        .select('fee_drev, fee_mkt, shipping_cost, updated_at')
+        .eq('id', FEE_CONFIG_SINGLETON_ID)
+        .maybeSingle();
+
+      if (verifyError || !verifyRow) {
+        console.error('Read-after-write failed:', { verifyError, verifyRow });
+        toast({
+          title: "Salvataggio non riuscito",
+          description: "Configurazione non persistita. Riprovare.",
+          variant: "destructive"
+        });
+        return;
+      }
+
+      const mismatch = Number(verifyRow.fee_drev) !== updateData.fee_drev ||
+                        Number(verifyRow.fee_mkt) !== updateData.fee_mkt ||
+                        Number(verifyRow.shipping_cost) !== updateData.shipping_cost;
+      if (mismatch) {
+        console.error('Read-after-write mismatch:', { expected: updateData, actual: verifyRow });
+        toast({
+          title: "Salvataggio non riuscito",
+          description: "Configurazione non persistita: valori non corrispondono.",
+          variant: "destructive"
+        });
+        return;
+      }
+
+      toast({
+        title: "Regole salvate",
+        description: "Le regole di calcolo (globali e per-export) sono state salvate."
+      });
+      console.log('Fee config salvato su Supabase (singleton ID, verified)');
     } catch (err) {
       console.error('Errore handleSaveFees:', err);
       toast({
@@ -783,29 +841,66 @@ const AltersideCatalogGenerator: React.FC = () => {
         updated_at: new Date().toISOString()
       };
       
-      // Always update singleton row
-      const { error } = await supabase
+      // Upsert singleton row (insert if missing, update if exists)
+      const { data: savedRow, error } = await supabase
         .from('fee_config')
-        .update(updateData)
-        .eq('id', FEE_CONFIG_SINGLETON_ID);
+        .upsert({ id: FEE_CONFIG_SINGLETON_ID, ...updateData }, { onConflict: 'id' })
+        .select()
+        .single();
       
       if (error) {
         console.error('Errore salvataggio configurazione export:', error);
         toast({
           title: "Errore salvataggio",
-          description: "Impossibile salvare la configurazione export sul server.",
+          description: `Impossibile salvare la configurazione export: ${error.message}`,
           variant: "destructive"
         });
-      } else {
-        // Sync legacy prepDays state
-        setPrepDaysMediaworld(extendedFeeConfig.mediaworldItPreparationDays);
-        setPrepDays(extendedFeeConfig.epriceItPreparationDays);
-        toast({
-          title: "Configurazione export salvata",
-          description: "Stock IT/EU e pricing per-export salvati correttamente."
-        });
-        console.log('Export config salvato su Supabase (singleton ID)', updateData);
+        return;
       }
+
+      // Read-after-write verification on IT/EU fields
+      const { data: verifyRow, error: verifyError } = await supabase
+        .from('fee_config')
+        .select('mediaworld_it_preparation_days, mediaworld_eu_preparation_days, eprice_it_preparation_days, eprice_eu_preparation_days, amazon_it_preparation_days, amazon_eu_preparation_days')
+        .eq('id', FEE_CONFIG_SINGLETON_ID)
+        .maybeSingle();
+
+      if (verifyError || !verifyRow) {
+        console.error('Read-after-write failed:', { verifyError, verifyRow });
+        toast({
+          title: "Salvataggio non riuscito",
+          description: "Configurazione non persistita. Riprovare.",
+          variant: "destructive"
+        });
+        return;
+      }
+
+      const daysMismatch =
+        verifyRow.mediaworld_it_preparation_days !== updateData.mediaworld_it_preparation_days ||
+        verifyRow.mediaworld_eu_preparation_days !== updateData.mediaworld_eu_preparation_days ||
+        verifyRow.eprice_it_preparation_days !== updateData.eprice_it_preparation_days ||
+        verifyRow.eprice_eu_preparation_days !== updateData.eprice_eu_preparation_days ||
+        verifyRow.amazon_it_preparation_days !== updateData.amazon_it_preparation_days ||
+        verifyRow.amazon_eu_preparation_days !== updateData.amazon_eu_preparation_days;
+
+      if (daysMismatch) {
+        console.error('Read-after-write mismatch:', { expected: updateData, actual: verifyRow });
+        toast({
+          title: "Salvataggio non riuscito",
+          description: "Configurazione non persistita: valori non corrispondono.",
+          variant: "destructive"
+        });
+        return;
+      }
+
+      // Sync legacy prepDays state
+      setPrepDaysMediaworld(extendedFeeConfig.mediaworldItPreparationDays);
+      setPrepDays(extendedFeeConfig.epriceItPreparationDays);
+      toast({
+        title: "Configurazione export salvata",
+        description: "Stock IT/EU e pricing per-export salvati correttamente."
+      });
+      console.log('Export config salvato su Supabase (singleton ID, verified)', updateData);
     } catch (err) {
       console.error('Errore handleSaveExportConfig:', err);
       toast({
