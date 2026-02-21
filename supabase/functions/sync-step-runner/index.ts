@@ -2599,13 +2599,12 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     await safeLogEvent(supabase, runId, 'INFO', 'export_mediaworld_stage', { step: 'export_mediaworld', stage, last_stage: stage, heap_mb: mem, heap_peak_mb: heapPeakMb, duration_ms: durationMs, ...extra });
   };
   
-  // Initialize warnings
   const warnings = createEmptyWarnings();
-  
   let currentStage = 'entered_prepare';
-  let mwOutSizeForCatch = 0; // track output size for error reporting
+  let mwOutSizeForCatch = 0;
   
   try {
+    // ===== DATA LOAD =====
     await logMWStage('before_data_load', startTime);
     const { products, error: loadError } = await loadProductsTSV(supabase, runId);
     
@@ -2615,7 +2614,7 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
       return { success: false, error };
     }
     
-    // Load stock location index from per-run file with robust parsing
+    // Load stock location index
     let stockLocationIndex: Record<string, { stockIT: number; stockEU: number }> | null = null;
     const stockLocationPath = `stock-location/runs/${runId}.txt`;
     let stockLocationContent: string | null = null;
@@ -2623,7 +2622,6 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
       const dlResult = await downloadFromStorage(supabase, 'ftp-import', stockLocationPath);
       stockLocationContent = dlResult.content ?? null;
     }
-    // Track 4255 vs 4254 entries for orphan detection
     const entries4254 = new Set<string>();
     const entries4255 = new Set<string>();
     
@@ -2658,12 +2656,10 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
             stockLocationIndex[matnr].stockEU += stock;
             entries4254.add(matnr);
           } else if (locationId === LOCATION_ID_EU_DUPLICATE) {
-            // LocationID 4255 is ignored in calculations
             entries4255.add(matnr);
           }
         }
         
-        // Check for orphan_4255 warnings
         for (const matnr of entries4255) {
           if (!entries4254.has(matnr)) {
             warnings.orphan_4255++;
@@ -2671,7 +2667,7 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
         }
         
         console.log(`[sync:step:export_mediaworld] Loaded stock location: ${Object.keys(stockLocationIndex).length} entries`);
-        stockLocationContent = null; // release parsed string (~5MB)
+        stockLocationContent = null;
       } else {
         warnings.invalid_location_parse++;
       }
@@ -2679,74 +2675,26 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
       warnings.missing_location_file++;
     }
     
-    // Load Mediaworld template from storage bucket (unified loader)
-    const mwTmplT0 = Date.now();
-    let mwTemplateBytes: Uint8Array;
-    try {
-      mwTemplateBytes = await loadTemplateFromStorage(supabase, 'Export Mediaworld.xlsx', runId);
-    } catch (e: unknown) {
-      const error = `Template Export Mediaworld.xlsx non trovato in storage: ${errMsg(e)}`;
-      await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
-      return { success: false, error };
-    }
-    await logMWStage('template_download_ok', mwTmplT0, { size_bytes: mwTemplateBytes.length });
-    
-    const XLSX = await import("npm:xlsx@0.18.5");
-    
-    // NOTE: preExtractedTmplZip removed — was allocating ~50MB via unzipSync but never passed to validation.
-    // Validation re-extracts from re-downloaded template bytes after write (compareZipXmlIntegrity line 568).
-    
-    const mwParseT0 = Date.now();
-    // sheetRows optimization skipped for Mediaworld: full parse needed for protected sheet presence validation and heavy ZIP/XML checks
-    await safeLogEvent(supabase, runId, 'INFO', 'export_mediaworld_stage', {
-      step: 'export_mediaworld', stage: 'mediaworld_sheetRows_skipped', heap_mb: getMemMB(), duration_ms: 0,
-      reason: 'protected_sheets_ReferenceData_Columns_require_full_parse'
-    });
-    // cellStyles:false + cellFormula/cellHTML/cellText:false reduces parse CPU without affecting output
-    // (styles live in xl/styles.xml preserved by round-trip; formulas/HTML/richtext not used in data writes)
-    // deno-lint-ignore no-explicit-any
-    let wb: any = XLSX.read(mwTemplateBytes, { type: 'array', cellStyles: false, cellFormula: false, cellHTML: false, cellText: false });
-    const mwParseMs = Date.now() - mwParseT0;
-    await logMWStage('template_parse_done', mwParseT0, { duration_ms: mwParseMs, size_bytes: mwTemplateBytes.length });
-    if (mwParseMs > 1000) {
-      await safeLogEvent(supabase, runId, 'WARN', 'export_mediaworld_stage', {
-        step: 'export_mediaworld', stage: 'slow_path', heap_mb: getMemMB(), duration_ms: mwParseMs,
-        size_bytes: mwTemplateBytes.length, phase: 'template_parse'
-      });
-    }
-    // Keep mwTemplateBytes alive (12.8MB) — needed for deferred re-extraction during validation
-    // preExtractedTmplZip will be released before XLSX.write() to free ~50MB heap
-    
-    // Validate template sheets — derived from template runtime (no hardcoded list)
-    const templateSheetNames = [...wb.SheetNames] as string[];
-    const missingSheets = templateSheetNames.filter(s => !wb.SheetNames.includes(s));
-    if (missingSheets.length > 0) {
-      const error = `Template MW: fogli mancanti: ${missingSheets.join(', ')}. Trovati: ${wb.SheetNames.join(', ')}`;
-      await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
-      return { success: false, error };
-    }
-    
-    const ws = wb.Sheets['Data'];
+    // ===== DATA PREPARATION (AoA — no template) =====
+    currentStage = 'after_data_load';
+
+    const headerRow1 = ["SKU offerta","ID Prodotto","Tipo ID prodotto","Descrizione offerta","Descrizione interna offerta","Prezzo dell'offerta","Info aggiuntive prezzo offerta","Quantità dell'offerta","Avviso quantità minima","Stato dell'offerta","Data di inizio della disponibilità","Data di conclusione della disponibilità","Classe logistica","Prezzo scontato","Data di inizio dello sconto","Data di termine dello sconto","Tempo di preparazione della spedizione (in giorni)","Aggiorna/Cancella","Tipo di prezzo che verrà barrato quando verrà definito un prezzo scontato.","Obbligo di ritiro RAEE","Orario di cut-off (solo se la consegna il giorno successivo è abilitata)","VAT Rate % (Turkey only)"];
+    const headerRow2 = ["sku","product-id","product-id-type","description","internal-description","price","price-additional-info","quantity","min-quantity-alert","state","available-start-date","available-end-date","logistic-class","discount-price","discount-start-date","discount-end-date","leadtime-to-ship","update-delete","strike-price-type","mms-weee-take-back-obligation","cut-off-time","vat-rate"];
+
+    const aoa: (string | number)[][] = [headerRow1, headerRow2];
     let mwWritten = 0;
     let mwSkipped = 0;
-    
-    // Data starts at row 3 (index 2): row 1=headers (index 0), row 2=technical row (index 1)
-    const DATA_START_ROW = 2;
-    
-    // Precompute column letters A-V (22 columns) to avoid encode_cell overhead in tight loop
-    const COL_LETTERS = ['A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V'];
-    
+    const EAN_RE = /^[0-9]{13}$/;
+
     for (const p of products) {
       const norm = normalizeEAN(p.EAN);
       if (!norm.ok) { mwSkipped++; continue; }
       if (!p.PFNum || p.PFNum <= 0) { mwSkipped++; continue; }
       
-      // Parse ListPrice con Fee
       const lpfStr = String(p.LPF || '').replace(',', '.');
       const lpfValue = parseFloat(lpfStr);
       const prezzoOfferta = (Number.isFinite(lpfValue) && lpfValue > 0) ? lpfValue : p.PFNum;
       
-      // IT/EU stock resolution
       let stockIT = p.Stock || 0;
       let stockEU = 0;
       if (stockLocationIndex && stockLocationIndex[p.Matnr]) {
@@ -2760,177 +2708,154 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
       
       const stockResult = resolveMarketplaceStock(stockIT, stockEU, includeEu, itDays, euDays);
       if (!stockResult.shouldExport) { mwSkipped++; continue; }
-      
-      const r = DATA_START_ROW + mwWritten;
-      const rowStr = String(r + 1); // Excel rows are 1-indexed
-      
-      // Write 22 columns matching Mediaworld template using precomputed addresses
-      const rowData: (string | number)[] = [
-        p.MPN || '',                         // A: SKU offerta
-        norm.value!,                         // B: ID Prodotto (EAN)
-        'EAN',                               // C: Tipo ID prodotto
-        p.Desc || '',                        // D: Descrizione offerta
-        '',                                  // E: Descrizione interna
-        prezzoOfferta,                       // F: Prezzo dell'offerta
-        '',                                  // G: Info aggiuntive prezzo
-        Math.min(stockResult.exportQty, 99), // H: Quantità
-        '',                                  // I: Avviso quantità minima
-        'Nuovo',                             // J: Stato dell'offerta
-        '', '',                              // K-L: Date disponibilità
-        'Consegna gratuita',                 // M: Classe logistica
-        p.PFNum,                             // N: Prezzo scontato
-        '', '',                              // O-P: Date sconto
-        stockResult.leadDays,                // Q: Tempo preparazione spedizione
-        '',                                  // R: Aggiorna/Cancella
-        'recommended-retail-price',          // S: Tipo prezzo barrato
-        '', '', ''                           // T-V: RAEE, Cut-off, VAT
-      ];
-      
-      for (let c = 0; c < rowData.length; c++) {
-        const addr = COL_LETTERS[c] + rowStr;
-        const val = rowData[c];
-        if (c === 1) {
-          // EAN: force text to preserve leading zeros
-          ws[addr] = { v: String(val), t: 's', z: '@' };
-        } else if (typeof val === 'number') {
-          ws[addr] = { v: val, t: 'n', z: (c === 5 || c === 13) ? '0.00' : undefined };
-        } else {
-          ws[addr] = { v: val, t: 's' };
-        }
+
+      // EAN deterministic assert
+      const eanStr = String(norm.value);
+      if (!EAN_RE.test(eanStr) || eanStr !== norm.value) {
+        await safeLogEvent(supabase, runId, 'ERROR', 'export_mediaworld_stage', {
+          step: 'export_mediaworld', stage: 'ean_assert_failed', last_stage: currentStage,
+          mpn: p.MPN, ean_raw: p.EAN, ean_normalized: norm.value, ean_str: eanStr
+        });
+        await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error: 'ean_assert_failed', metrics: {} });
+        return { success: false, error: 'ean_assert_failed' };
       }
-      
+
+      aoa.push([
+        p.MPN || '',                         // A: sku
+        eanStr,                              // B: product-id (text)
+        'EAN',                               // C: product-id-type
+        p.Desc || '',                        // D: description
+        '',                                  // E: internal-description
+        prezzoOfferta,                       // F: price
+        '',                                  // G: price-additional-info
+        Math.min(stockResult.exportQty, 99), // H: quantity
+        '',                                  // I: min-quantity-alert
+        'Nuovo',                             // J: state
+        '',                                  // K: available-start-date
+        '',                                  // L: available-end-date
+        'Consegna gratuita',                 // M: logistic-class
+        p.PFNum,                             // N: discount-price
+        '',                                  // O: discount-start-date
+        '',                                  // P: discount-end-date
+        stockResult.leadDays,                // Q: leadtime-to-ship
+        '',                                  // R: update-delete
+        'recommended-retail-price',          // S: strike-price-type
+        '',                                  // T: mms-weee-take-back-obligation
+        '',                                  // U: cut-off-time
+        ''                                   // V: vat-rate
+      ]);
       mwWritten++;
     }
-    
-    // Update sheet range to cover effective data area (always set, even if mwWritten=0)
-    {
-      const lastRow = mwWritten > 0 ? DATA_START_ROW + mwWritten - 1 : DATA_START_ROW - 1;
-      const lastCol = COL_LETTERS.length - 1; // 21
-      ws['!ref'] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: lastRow, c: lastCol } });
-    }
 
-    // Trim ws['!rows'] conservatively to reduce serialization overhead
-    {
-      const targetRows = mwWritten > 0 ? DATA_START_ROW + mwWritten : DATA_START_ROW;
-      const wsRows = ws['!rows'] as unknown[] | undefined;
-      if (Array.isArray(wsRows) && wsRows.length > targetRows + 100) {
-        ws['!rows'] = wsRows.slice(0, targetRows);
-        await logMWStage('rows_trim_applied', startTime, { original_length: wsRows.length, trimmed_to: targetRows });
-      } else {
-        await logMWStage('rows_trim_skipped', startTime, {
-          reason: !Array.isArray(wsRows) ? 'not_an_array' : `length_${wsRows.length}_within_threshold_${targetRows + 100}`
-        });
-      }
-      // Strip heavy metadata that inflates serialization cost (same as export_amazon)
-      delete ws['!cols'];
-      delete ws['!merges'];
-      delete ws['!autofilter'];
-      delete ws['!images'];
-    }
-    
-    await logMWStage('data_filled_done', startTime, { rows: mwWritten });
-    
-    // preExtractedTmplZip removed (was dead code — never passed to validation)
-    
-    // Release data structures no longer needed — frees ~15MB heap before memory-intensive XLSX.write()
+    await logMWStage('after_data_preparation', startTime, { rows_written: mwWritten, rows_skipped: mwSkipped });
+
+    // Release data structures no longer needed
     stockLocationIndex = null;
     products.length = 0;
     entries4254.clear();
     entries4255.clear();
-    
-    // Release mwTemplateBytes (12.8MB) BEFORE write — will re-download for validation after write
-    mwTemplateBytes = null as unknown as Uint8Array;
-    await logMWStage('after_release_all_pre_write', startTime, { heap_mb: getMemMB() });
-    
-    // ========== LIGHT VALIDATION (pre-write, on workbook object — no extra memory) ==========
-    // Derives invariants from template runtime — no hardcoded sheet names or headers.
-    // This runs ALWAYS regardless of validation mode, as it's essentially free (no allocations).
-    currentStage = 'before_validation';
-    const mwLightValT0 = Date.now();
-    {
-      // Invariant 1: sheet names derived from template (templateSheetNames captured at parse time)
-      const genSheetNames = wb.SheetNames as string[];
-      for (const sn of templateSheetNames) {
-        if (!genSheetNames.includes(sn)) {
-          const error = `Light validation failed: sheet "${sn}" missing from output`;
-          await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
-          return { success: false, error };
-        }
-      }
 
-      // Invariant 2: header row derived from template "Data" sheet at runtime
-      const genWsData = wb.Sheets['Data'];
-      if (!genWsData) {
-        const error = 'template_header_unreadable';
-        await safeLogEvent(supabase, runId, 'ERROR', 'template_header_unreadable', {
-          sheet_name: 'Data', template_ref: null, reason: 'Data sheet missing from workbook'
-        });
-        await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
-        return { success: false, error };
-      }
-      const XLSX_LOCAL = await import("npm:xlsx@0.18.5");
-      const tmplRef = genWsData?.['!ref'];
-      if (!tmplRef) {
-        const error = 'template_header_unreadable';
-        await safeLogEvent(supabase, runId, 'ERROR', 'template_header_unreadable', {
-          sheet_name: 'Data', template_ref: tmplRef, reason: '!ref missing or invalid on Data sheet'
-        });
-        await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
-        return { success: false, error };
-      }
-      const tmplRange = XLSX_LOCAL.utils.decode_range(tmplRef);
-      const headerRowIndex = tmplRange.s.r;
-      // Read header baseline from template workbook (row headerRowIndex) — these are the actual template headers
-      const templateHeaders: string[] = [];
-      for (let c = tmplRange.s.c; c <= tmplRange.e.c; c++) {
-        const addr = XLSX_LOCAL.utils.encode_cell({ r: headerRowIndex, c });
-        const cellVal = genWsData?.[addr]?.v;
-        // Normalize: trim and collapse multiple spaces to single space
-        const normalized = cellVal != null ? String(cellVal).trim().replace(/\s+/g, ' ') : '';
-        templateHeaders.push(normalized);
-      }
-      if (templateHeaders.every(h => h === '')) {
-        const error = 'template_header_unreadable';
-        await safeLogEvent(supabase, runId, 'ERROR', 'template_header_unreadable', {
-          sheet_name: 'Data', template_ref: tmplRef, reason: 'All header cells are empty'
-        });
-        await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
-        return { success: false, error };
-      }
-      // Compare output headers against template baseline
-      for (let c = tmplRange.s.c; c <= tmplRange.e.c; c++) {
-        const addr = XLSX_LOCAL.utils.encode_cell({ r: headerRowIndex, c });
-        const cellVal = genWsData?.[addr]?.v;
-        const normalized = cellVal != null ? String(cellVal).trim().replace(/\s+/g, ' ') : '';
-        if (templateHeaders[c - tmplRange.s.c] && normalized && normalized !== templateHeaders[c - tmplRange.s.c]) {
-          console.warn(`[sync:step:export_mediaworld] Light validation: header[${c}] expected "${templateHeaders[c - tmplRange.s.c]}", got "${normalized}"`);
-        }
-      }
+    // ===== BUILD WORKBOOK =====
+    const XLSX = await import("npm:xlsx@0.18.5");
 
-      // Invariant 3: data rows count must match what we wrote
-      const dataRowsInSheet = tmplRange ? (tmplRange.e.r - DATA_START_ROW + 1) : 0;
-      if (dataRowsInSheet !== mwWritten && mwWritten > 0) {
-        console.warn(`[sync:step:export_mediaworld] Light validation: row count mismatch: sheet has ${dataRowsInSheet} data rows, expected ${mwWritten}`);
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    // Force EAN column (B) to text type for all data rows
+    for (let r = 2; r < aoa.length; r++) {
+      const addr = 'B' + (r + 1);
+      if (ws[addr]) {
+        ws[addr] = { v: String(aoa[r][1]), t: 's', z: '@' };
       }
     }
-    await logMWStage('light_validation_done', mwLightValT0, { rows: mwWritten, duration_ms: Date.now() - mwLightValT0 });
+    // deno-lint-ignore no-explicit-any
+    let wb: any = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Data');
 
-    // Pre-write snapshot for diagnostics if OOM persists
-    await logMWStage('pre_write_snapshot', startTime, {
-      ws_ref: ws['!ref'],
-      ws_rows_length: Array.isArray(ws['!rows']) ? (ws['!rows'] as unknown[]).length : null,
-      sheet_count: wb.SheetNames.length,
-      heap_mb: getMemMB()
+    // ===== VALIDATION (pre-write, on workbook object) =====
+    currentStage = 'before_validation';
+    const validationWarnings: string[] = [];
+    const validationErrors: string[] = [];
+
+    // V1: Sheet names must be exactly ["Data"]
+    if (wb.SheetNames.length !== 1 || wb.SheetNames[0] !== 'Data') {
+      validationErrors.push(`sheet_names: expected ["Data"], got ${JSON.stringify(wb.SheetNames)}`);
+    }
+
+    // V2: Header rows must match
+    const genWs = wb.Sheets['Data'];
+    if (!genWs) {
+      validationErrors.push('sheet_missing: Data');
+    } else {
+      // Check header row 1
+      for (let c = 0; c < headerRow1.length; c++) {
+        const addr = XLSX.utils.encode_cell({ r: 0, c });
+        const val = genWs[addr]?.v;
+        const norm = val != null ? String(val).trim().replace(/\s+/g, ' ') : '';
+        if (norm !== headerRow1[c]) {
+          validationErrors.push(`header1_col${c}: expected "${headerRow1[c]}", got "${norm}"`);
+          break;
+        }
+      }
+      // Check header row 2
+      for (let c = 0; c < headerRow2.length; c++) {
+        const addr = XLSX.utils.encode_cell({ r: 1, c });
+        const val = genWs[addr]?.v;
+        const norm = val != null ? String(val).trim().replace(/\s+/g, ' ') : '';
+        if (norm !== headerRow2[c]) {
+          validationErrors.push(`header2_col${c}: expected "${headerRow2[c]}", got "${norm}"`);
+          break;
+        }
+      }
+      // V3: EAN sample check (up to 100 data rows)
+      const checkLimit = Math.min(102, 2 + mwWritten); // rows 3..102 (0-indexed 2..101)
+      for (let r = 2; r < checkLimit; r++) {
+        const cell = genWs['B' + (r + 1)];
+        if (cell) {
+          if (cell.t !== 's') {
+            validationErrors.push(`ean_type_row${r}: expected 's', got '${cell.t}'`);
+            break;
+          }
+          if (!EAN_RE.test(String(cell.v))) {
+            validationErrors.push(`ean_value_row${r}: "${cell.v}" does not match ^[0-9]{13}$`);
+            break;
+          }
+        }
+      }
+    }
+
+    // V4: zero rows warning
+    if (mwWritten === 0) {
+      validationWarnings.push('zero_data_rows: no products written to Data sheet');
+    }
+
+    await logMWStage('after_validation', startTime, {
+      passed: validationErrors.length === 0, error_count: validationErrors.length,
+      warning_count: validationWarnings.length
     });
 
-    // Serialize XLSX
+    if (validationErrors.length > 0) {
+      await safeLogEvent(supabase, runId, 'ERROR', 'validation_failed', {
+        export_name: 'Export Mediaworld', errors: validationErrors.slice(0, 20), warnings: validationWarnings
+      });
+      const error = `Validation failed: ${validationErrors.join('; ')}`;
+      await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {}, validation_passed: false } as StepResultData);
+      return { success: false, error };
+    }
+    if (validationWarnings.length > 0) {
+      await safeLogEvent(supabase, runId, 'WARN', 'export_mediaworld_stage', {
+        step: 'export_mediaworld', stage: 'validation_warnings', last_stage: 'after_validation',
+        warnings: validationWarnings
+      });
+    }
+
+    // ===== SERIALIZE =====
     currentStage = 'before_write';
     const mwWriteT0 = Date.now();
     await logMWStage('before_write', mwWriteT0, { rows: mwWritten, heap_mb: getMemMB() });
+
     // deno-lint-ignore no-explicit-any
     let xlsxBuffer: any = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: false, bookSST: false });
 
-    // Deterministic buffer conversion — avoid unnecessary copies
+    // Deterministic buffer conversion
     let mwOutputBytes: Uint8Array | null;
     if (xlsxBuffer instanceof Uint8Array) {
       mwOutputBytes = xlsxBuffer;
@@ -2954,159 +2879,24 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     const mwWriteMs = Date.now() - mwWriteT0;
     currentStage = 'after_write';
     mwOutSizeForCatch = mwOutSize;
-
-    // Post-write memory release — free xlsxBuffer (wb kept alive for post-write validation)
     xlsxBuffer = null;
+    wb = null;
 
     await logMWStage('after_write', mwWriteT0, { size_bytes: mwOutSize, duration_ms: mwWriteMs, heap_mb: getMemMB() });
-    if (mwWriteMs > 10000) {
-      await safeLogEvent(supabase, runId, 'WARN', 'export_mediaworld_stage', {
-        step: 'export_mediaworld', stage: 'slow_path', last_stage: 'after_write', heap_mb: getMemMB(), duration_ms: mwWriteMs,
-        size_bytes: mwOutSize, phase: 'write'
-      });
-    }
 
-    // Post-write sanity check (light): output size must be reasonable relative to template
-    // mwTemplateBytes was released pre-write; use a known minimum (template is ~13MB, output must be > half)
-    const MIN_OUTPUT_SIZE = 5000; // 5KB absolute minimum
-    if (mwOutSize < MIN_OUTPUT_SIZE) {
-      const error = `Post-write sanity check failed: output ${mwOutSize} bytes < ${MIN_OUTPUT_SIZE} bytes minimum`;
+    // Size sanity: if rows > 0, output must be > 50KB
+    if (mwWritten > 0 && mwOutSize < 50_000) {
+      const error = `Post-write sanity: output ${mwOutSize} bytes < 50KB with ${mwWritten} rows`;
       await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
 
-    // ========== VALIDATION MODE: light (default) vs heavy (env var) ==========
-    const validationMode = (Deno.env.get('EXPORT_MEDIAWORLD_VALIDATION_MODE') || 'light').toLowerCase();
-    let mwValidation: { passed: boolean; errors: string[]; warnings: string[] };
-
-    if (validationMode === 'heavy') {
-      // HEAVY: full ZIP-level XML comparison (high memory — requires re-downloading template)
-      console.log(`[sync:step:export_mediaworld] Validation mode: HEAVY (ZIP-level XML comparison)`);
-      await safeLogEvent(supabase, runId, 'WARN', 'export_mediaworld_stage', {
-        step: 'export_mediaworld', stage: 'heavy_validation_warning', heap_mb: getMemMB(),
-        message: 'Heavy validation mode active — high memory risk. Set EXPORT_MEDIAWORLD_VALIDATION_MODE=light to reduce OOM risk.'
-      });
-
-      // Re-download template bytes for validation (12.8MB, ~400ms)
-      const mwTmplRedownT0 = Date.now();
-      let mwTemplateBytesForVal: Uint8Array;
-      try {
-        mwTemplateBytesForVal = await loadTemplateFromStorage(supabase, 'Export Mediaworld.xlsx', runId);
-      } catch (e: unknown) {
-        const error = `Re-download template for validation failed: ${errMsg(e)}`;
-        await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
-        return { success: false, error };
-      }
-      await logMWStage('template_redownload_for_validation', mwTmplRedownT0, { 
-        duration_ms: Date.now() - mwTmplRedownT0, size_bytes: mwTemplateBytesForVal.length, heap_mb: getMemMB() 
-      });
-    
-      // Pre-upload validation against template (heavy ZIP/XML comparison)
-      const mwValT0 = Date.now();
-      await logMWStage('validation_start', mwValT0, { heap_mb: getMemMB(), mode: 'heavy' });
-      mwValidation = await validateExportVsTemplate(
-        XLSX, wb, mwTemplateBytesForVal, 'Export Mediaworld', 'Data', 'ID Prodotto', supabase, runId,
-        {
-          protectedSheets: ['ReferenceData', 'Columns'],
-          headerCellsModifiedCount: 0,
-          cellsWrittenBySheet: { 'Data': mwWritten * 22 },
-          tmplWbOverride: wb,
-          logStage: async (stage: string, extra: Record<string, unknown> = {}) => {
-            await logMWStage(stage, mwValT0, extra);
-          }
-        },
-        mwOutputBytes
-      );
-      const mwValMs = Date.now() - mwValT0;
-      const mwProtectedNames = ['ReferenceData', 'Columns'];
-      const mwMismatch = mwValidation.errors.find(e => e.startsWith('protected_sheet_content_mismatch:'));
-      const mwMismatchName = mwMismatch ? mwMismatch.split(': ')[1]?.split(' ')[0] : undefined;
-      currentStage = 'after_validation';
-      await logMWStage('after_validation', mwValT0, {
-        passed: mwValidation.passed, integrity_mode: 'heavy', duration_ms: mwValMs,
-        protected_sheets_count: mwProtectedNames.length,
-        protected_sheets_names: mwProtectedNames,
-        ...(mwMismatchName ? { protected_sheet_mismatch_name: mwMismatchName } : {})
-      });
-      if (mwValMs > 5000) {
-        await safeLogEvent(supabase, runId, 'WARN', 'export_mediaworld_stage', {
-          step: 'export_mediaworld', stage: 'slow_path', heap_mb: getMemMB(), duration_ms: mwValMs,
-          phase: 'validation_heavy'
-        });
-      }
-      // Release template bytes for validation
-      mwTemplateBytesForVal = null as unknown as Uint8Array;
-    } else {
-      // LIGHT: workbook-level validation only (already done pre-write) + output size sanity
-      console.log(`[sync:step:export_mediaworld] Validation mode: LIGHT (workbook-level, memory-safe)`);
-      const mwValT0 = Date.now();
-      await logMWStage('validation_start', mwValT0, { heap_mb: getMemMB(), mode: 'light' });
-
-      const lightErrors: string[] = [];
-      const lightWarnings: string[] = [];
-
-      // 1. Sheet names must match template (derived from templateSheetNames, no hardcoded list)
-      if (JSON.stringify(wb.SheetNames) !== JSON.stringify(templateSheetNames)) {
-        lightErrors.push(`sheet_names: expected ${JSON.stringify(templateSheetNames)}, got ${JSON.stringify(wb.SheetNames)}`);
-      }
-
-      // 2. Header row 0 of Data sheet: must be identical to template
-      const genWs = wb.Sheets['Data'];
-      if (!genWs) {
-        lightErrors.push('sheet_missing: Data');
-      } else {
-        // EAN column type check (column B = index 1)
-        const startRow = DATA_START_ROW;
-        const checkLimit = Math.min(startRow + 99, startRow + mwWritten - 1);
-        for (let r = startRow; r <= checkLimit; r++) {
-          const cell = genWs['B' + (r + 1)];
-          if (cell && cell.t !== 's') {
-            lightErrors.push(`ean_type_row${r}: expected 's' (string), got '${cell.t}'`);
-            break; // One error is enough
-          }
-        }
-      }
-
-      // 3. Protected sheets presence (derived from template — all non-Data sheets)
-      for (const ps of templateSheetNames.filter(s => s !== 'Data')) {
-        if (!wb.Sheets[ps]) {
-          lightErrors.push(`protected_sheet_missing: ${ps}`);
-        }
-      }
-
-      // 4. Row count sanity
-      if (mwWritten === 0) {
-        lightWarnings.push('zero_data_rows: no products written to Data sheet');
-      }
-
-      currentStage = 'after_validation';
-      await logMWStage('after_validation', mwValT0, {
-        passed: lightErrors.length === 0, integrity_mode: 'light', duration_ms: Date.now() - mwValT0,
-        error_count: lightErrors.length, warning_count: lightWarnings.length
-      });
-
-      mwValidation = { passed: lightErrors.length === 0, errors: lightErrors, warnings: lightWarnings };
-      if (lightErrors.length > 0) {
-        await safeLogEvent(supabase, runId, 'ERROR', 'validation_failed', { export_name: 'Export Mediaworld', errors: lightErrors, warnings: lightWarnings, mode: 'light' });
-      } else {
-        await safeLogEvent(supabase, runId, 'INFO', 'validation_ok', { export_name: 'Export Mediaworld', warnings: lightWarnings, mode: 'light' });
-      }
-    }
-    
-    if (!mwValidation.passed) {
-      const error = `Pre-SFTP validation failed for Export Mediaworld.xlsx: ${mwValidation.errors.join('; ')}`;
-      await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {}, validation_passed: false, validation_warnings: mwValidation.warnings } as StepResultData);
-      return { success: false, error };
-    }
-    
-    // Release validation-phase objects no longer needed
-    mwTemplateBytesForVal = null as unknown as Uint8Array;
-    wb = null; // wb no longer needed after validation
-    
-    let mwBlob: Blob | null = new Blob([mwOutputBytes!], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    // ===== UPLOAD =====
+    let mwBlob: Blob | null = new Blob([mwOutputBytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
     mwOutputBytes = null;
     
     const mwUpT0 = Date.now();
+    currentStage = 'before_upload';
     await logMWStage('before_upload', mwUpT0, { size_bytes: mwOutSize });
     const { error: uploadError } = await supabase.storage.from('exports').upload(
       'Export Mediaworld.xlsx', mwBlob, { upsert: true, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }
@@ -3114,12 +2904,6 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     const mwUpMs = Date.now() - mwUpT0;
     currentStage = 'after_upload';
     await logMWStage('after_upload', mwUpT0, { duration_ms: mwUpMs, size_bytes: mwOutSize });
-    if (mwUpMs > 10000) {
-      await safeLogEvent(supabase, runId, 'WARN', 'export_mediaworld_stage', {
-        step: 'export_mediaworld', stage: 'slow_path', heap_mb: getMemMB(), duration_ms: mwUpMs,
-        size_bytes: mwOutSize, phase: 'upload'
-      });
-    }
     
     if (uploadError) {
       const error = `Upload Export Mediaworld.xlsx fallito: ${uploadError.message}`;
@@ -3127,29 +2911,21 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
       return { success: false, error };
     }
     
-    // Release upload buffers
     mwBlob = null;
     
     await safeLogEvent(supabase, runId, 'INFO', 'export_saved', { step: 'export_mediaworld', file: 'Export Mediaworld.xlsx', rows: mwWritten });
     
-    // Update location_warnings in sync_runs
     await updateLocationWarnings(supabase, runId, warnings);
     
     await updateStepResult(supabase, runId, 'export_mediaworld', {
       status: 'success', duration_ms: Date.now() - startTime, rows: mwWritten, skipped: mwSkipped,
-      metrics: { mediaworld_export_rows: mwWritten, mediaworld_export_skipped: mwSkipped, format: 'xlsx' },
+      metrics: { mediaworld_export_rows: mwWritten, mediaworld_export_skipped: mwSkipped, mediaworld_format: 'xlsx' },
       validation_passed: true,
-      validation_warnings: mwValidation.warnings
+      validation_warnings: validationWarnings
     } as StepResultData);
     
-    const totalElapsed = Date.now() - startTime;
     currentStage = 'completed';
-    await logMWStage('completed', startTime, { rows: mwWritten, elapsed_ms: totalElapsed, format: 'xlsx' });
-    if (totalElapsed > 30000) {
-      await safeLogEvent(supabase, runId, 'WARN', 'export_mediaworld_stage', {
-        step: 'export_mediaworld', stage: 'slow_path', heap_mb: getMemMB(), duration_ms: totalElapsed, phase: 'total'
-      });
-    }
+    await logMWStage('completed', startTime, { rows: mwWritten, elapsed_ms: Date.now() - startTime, format: 'xlsx' });
     console.log(`[sync:step:export_mediaworld] Completed: ${mwWritten} rows XLSX, ${mwSkipped} skipped, warnings:`, warnings);
     return { success: true };
     
@@ -3157,10 +2933,9 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
     console.error(`[sync:step:export_mediaworld] Error:`, e);
     const failMem = getMemMB();
     if (failMem > heapPeakMb) heapPeakMb = failMem;
-    const validationMode = (Deno.env.get('EXPORT_MEDIAWORLD_VALIDATION_MODE') || 'light').toLowerCase();
     await safeLogEvent(supabase, runId, 'ERROR', 'export_mediaworld_stage', {
-      step: 'export_mediaworld', stage: 'failed', heap_mb: failMem, heap_peak_mb: heapPeakMb, duration_ms: Date.now() - startTime,
-      reason: errMsg(e), last_stage: currentStage, validation_mode: validationMode,
+      step: 'export_mediaworld', stage: 'failed', heap_mb: failMem, heap_peak_mb: heapPeakMb,
+      duration_ms: Date.now() - startTime, reason: errMsg(e), last_stage: currentStage,
       output_bytes_length: mwOutSizeForCatch
     });
     await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error: errMsg(e), metrics: {} });
