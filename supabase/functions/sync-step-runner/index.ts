@@ -2865,7 +2865,7 @@ async function stepExportEan(supabase: SupabaseClient, runId: string, feeConfig:
   }
 }
 
-// ========== STEP: EXPORT_MEDIAWORLD (TSV-based, no cap) ==========
+// ========== STEP: EXPORT_MEDIAWORLD (template-based, TSV data, no cap) ==========
 async function stepExportMediaworld(supabase: SupabaseClient, runId: string, feeConfig: FeeConfig): Promise<{ success: boolean; error?: string }> {
   // includeEU: null/undefined → true (backward compat, matches client)
   const includeEu = feeConfig?.mediaworldIncludeEu == null ? true : !!feeConfig.mediaworldIncludeEu;
@@ -2876,7 +2876,73 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
   const startTime = Date.now();
   
   try {
-    // Load from TSV catalog (source of truth)
+    // --- Load template via loadTemplateFromStorage (checksum-pinned) ---
+    let templateBytes: Uint8Array;
+    try {
+      templateBytes = await loadTemplateFromStorage(supabase, 'Export Mediaworld.xlsx', runId);
+    } catch (e: unknown) {
+      const error = `mediaworld_template_load_failed: ${errMsg(e)}`;
+      await safeLogEvent(supabase, runId, 'ERROR', 'mediaworld_template_load_failed', { templateName: 'Export Mediaworld.xlsx', reason: errMsg(e) });
+      await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
+      return { success: false, error };
+    }
+
+    const XLSX = await import("npm:xlsx@0.18.5");
+    // deno-lint-ignore no-explicit-any
+    let wb: any = XLSX.read(templateBytes, { type: 'array', cellStyles: true });
+    templateBytes = null as unknown as Uint8Array; // free memory
+
+    // --- Validate 3 sheets ---
+    const requiredSheets = ['Data', 'ReferenceData', 'Columns'];
+    const missingSheets = requiredSheets.filter(s => !wb.SheetNames.includes(s));
+    if (missingSheets.length > 0) {
+      const error = `mediaworld_template_sheet_missing: missing ${missingSheets.join(', ')}`;
+      await safeLogEvent(supabase, runId, 'ERROR', 'mediaworld_template_sheet_missing', { sheetNames: wb.SheetNames, missing: missingSheets });
+      await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
+      return { success: false, error };
+    }
+
+    const ws = wb.Sheets['Data'];
+
+    // --- Snapshot A1:V2 (22 cols × 2 rows) ---
+    const COL_LETTERS = ['A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V'];
+    const headerSnapshot: (string | number | boolean | undefined)[][] = [];
+    for (let r = 1; r <= 2; r++) {
+      const rowVals: (string | number | boolean | undefined)[] = [];
+      for (const c of COL_LETTERS) {
+        const cell = ws[`${c}${r}`];
+        rowVals.push(cell?.v);
+      }
+      headerSnapshot.push(rowVals);
+    }
+
+    // --- Deterministic cleanup: clear data rows (r >= 3, cols A-V) ---
+    let lastRowToClear = 2;
+    const wsKeys = Object.keys(ws).filter(k => !k.startsWith('!'));
+    for (const key of wsKeys) {
+      const colMatch = key.match(/^([A-V])(\d+)$/);
+      if (!colMatch) continue;
+      const rowNum = parseInt(colMatch[2], 10);
+      if (rowNum < 3) continue;
+      const cell = ws[key];
+      if (cell && cell.v !== undefined && cell.v !== null && cell.v !== '') {
+        if (rowNum > lastRowToClear) lastRowToClear = rowNum;
+      }
+    }
+    if (lastRowToClear >= 3) {
+      for (let r = 3; r <= lastRowToClear; r++) {
+        for (const c of COL_LETTERS) {
+          const addr = `${c}${r}`;
+          if (ws[addr]) {
+            ws[addr].v = undefined;
+            delete ws[addr].w;
+            ws[addr].t = 'z';
+          }
+        }
+      }
+    }
+
+    // --- Load TSV catalog (source of truth) ---
     const { content: tsvContent, error: tsvError } = await downloadFromStorage(supabase, 'exports', EAN_CATALOG_FILE_PATH);
     if (tsvError || !tsvContent) {
       const error = `ean_catalog_missing_or_schema_mismatch: ${tsvError || 'file not found'}`;
@@ -2904,10 +2970,7 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
       return { success: false, error };
     }
 
-    const headerRow1 = ["SKU offerta","ID Prodotto","Tipo ID prodotto","Descrizione offerta","Descrizione interna offerta","Prezzo dell'offerta","Info aggiuntive prezzo offerta","Quantità dell'offerta","Avviso quantità minima","Stato dell'offerta","Data di inizio della disponibilità","Data di conclusione della disponibilità","Classe logistica","Prezzo scontato","Data di inizio dello sconto","Data di termine dello sconto","Tempo di preparazione della spedizione (in giorni)","Aggiorna/Cancella","Tipo di prezzo che verrà barrato quando verrà definito un prezzo scontato.","Obbligo di ritiro RAEE","Orario di cut-off (solo se la consegna il giorno successivo è abilitata)","VAT Rate % (Turkey only)"];
-    const headerRow2 = ["sku","product-id","product-id-type","description","internal-description","price","price-additional-info","quantity","min-quantity-alert","state","available-start-date","available-end-date","logistic-class","discount-price","discount-start-date","discount-end-date","leadtime-to-ship","update-delete","strike-price-type","mms-weee-take-back-obligation","cut-off-time","vat-rate"];
-
-    const aoa: (string | number | null)[][] = [headerRow1, headerRow2];
+    // --- Write data rows starting at row 3 ---
     let mwWritten = 0;
     let mwSkipped = 0;
     const EAN_RE = /^[0-9]{13,14}$/;
@@ -2927,70 +2990,90 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
 
       // Skip rules (same as client)
       if (!EAN_RE.test(ean)) { mwSkipped++; continue; }
-      if (!lpFeeMW || lpFeeMW <= 0) { mwSkipped++; continue; }
-      if (!finalPriceMW || finalPriceMW <= 0) { mwSkipped++; continue; }
+      if (!Number.isFinite(lpFeeMW) || lpFeeMW <= 0) { mwSkipped++; continue; }
+      if (!Number.isFinite(finalPriceMW) || finalPriceMW <= 0) { mwSkipped++; continue; }
 
       const stockResult = resolveMarketplaceStock(stockIT, stockEU, includeEu, itDays, euDays);
       if (!stockResult.shouldExport) { mwSkipped++; continue; }
 
-      const row: (string | number | null)[] = new Array(22).fill(null);
-      row[0] = mpn || null;                                    // A: sku
-      row[1] = ean;                                             // B: product-id (text)
-      row[2] = 'EAN';                                           // C: product-id-type
-      row[3] = desc || null;                                    // D: description
-      row[5] = lpFeeMW;                                         // F: price (prezzo dell'offerta)
-      row[7] = stockResult.exportQty;                           // H: quantity (NO CAP)
-      row[9] = 'Nuovo';                                         // J: state
-      row[12] = 'Consegna gratuita';                            // M: logistic-class
-      row[13] = Math.round(finalPriceMW * 100) / 100;          // N: discount-price
-      row[16] = stockResult.leadDays;                           // Q: leadtime-to-ship
-      row[18] = 'recommended-retail-price';                     // S: strike-price-type
-      aoa.push(row);
+      const r = 3 + mwWritten; // Excel row (1-based)
+
+      // A: sku (string)
+      ws[`A${r}`] = { v: mpn, t: 's' };
+      // B: EAN (text, preserve leading zeros)
+      ws[`B${r}`] = { v: String(ean), t: 's', z: '@' };
+      // C: product-id-type
+      ws[`C${r}`] = { v: 'EAN', t: 's' };
+      // D: description
+      ws[`D${r}`] = { v: desc, t: 's' };
+      // F: price (numeric, format '0')
+      ws[`F${r}`] = { v: lpFeeMW, t: 'n', z: '0' };
+      // H: quantity (numeric, NO CAP)
+      ws[`H${r}`] = { v: stockResult.exportQty, t: 'n' };
+      // J: state
+      ws[`J${r}`] = { v: 'Nuovo', t: 's' };
+      // M: logistic-class
+      ws[`M${r}`] = { v: 'Consegna gratuita', t: 's' };
+      // N: discount-price (text with comma and 2 decimals)
+      ws[`N${r}`] = { v: finalPriceMW.toFixed(2).replace('.', ','), t: 's', z: '@' };
+      // Q: leadtime-to-ship (numeric integer)
+      ws[`Q${r}`] = { v: stockResult.leadDays, t: 'n', z: '#,##0' };
+      // S: strike-price-type
+      ws[`S${r}`] = { v: 'recommended-retail-price', t: 's' };
+
       mwWritten++;
     }
 
-    // Build workbook (template-free, single Data sheet)
-    const XLSX = await import("npm:xlsx@0.18.5");
-    const ws = XLSX.utils.aoa_to_sheet(aoa);
-    // Force EAN column (B) to text type
-    for (let r = 2; r < aoa.length; r++) {
-      const eanVal = aoa[r][1];
-      if (eanVal != null) {
-        const addr = 'B' + (r + 1);
-        if (ws[addr]) ws[addr] = { v: String(eanVal), t: 's', z: '@' };
-      }
-    }
-    const lastRow = 2 + mwWritten;
-    ws['!ref'] = `A1:V${Math.max(lastRow, 2)}`;
+    // --- Update !ref ---
+    const lastDataRow = Math.max(2, 2 + mwWritten);
+    ws['!ref'] = `A1:V${lastDataRow}`;
 
-    // deno-lint-ignore no-explicit-any
-    let wb: any = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'Data');
+    // --- Verify A1:V2 unchanged ---
+    for (let r = 1; r <= 2; r++) {
+      for (let ci = 0; ci < COL_LETTERS.length; ci++) {
+        const addr = `${COL_LETTERS[ci]}${r}`;
+        const currentVal = ws[addr]?.v;
+        const snapshotVal = headerSnapshot[r - 1][ci];
+        if (currentVal !== snapshotVal) {
+          const error = `mediaworld_headers_modified: cell ${addr} changed from "${snapshotVal}" to "${currentVal}"`;
+          await safeLogEvent(supabase, runId, 'ERROR', 'mediaworld_headers_modified', { cell: addr, expected: snapshotVal, actual: currentVal });
+          await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
+          return { success: false, error };
+        }
+      }
+    }
 
-    // Validation
-    const validationErrors: string[] = [];
-    if (wb.SheetNames.length !== 1 || wb.SheetNames[0] !== 'Data') {
-      validationErrors.push(`sheet_names: expected ["Data"], got ${JSON.stringify(wb.SheetNames)}`);
-    }
-    const genWs = wb.Sheets['Data'];
-    if (genWs) {
-      if (genWs['A1']?.v !== headerRow1[0] || genWs['V1']?.v !== headerRow1[21]) {
-        validationErrors.push(`header1 mismatch`);
-      }
-      if (genWs['A2']?.v !== headerRow2[0] || genWs['V2']?.v !== headerRow2[21]) {
-        validationErrors.push(`header2 mismatch`);
-      }
-    }
-    if (validationErrors.length > 0) {
-      const error = `Validation failed: ${validationErrors.join('; ')}`;
-      await safeLogEvent(supabase, runId, 'ERROR', 'validation_failed', { export_name: 'Export Mediaworld', errors: validationErrors });
-      await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {}, validation_passed: false } as StepResultData);
+    // --- Validate sheets still present ---
+    const postMissingSheets = requiredSheets.filter(s => !wb.SheetNames.includes(s));
+    if (postMissingSheets.length > 0) {
+      const error = `mediaworld_template_sheet_missing: post-write missing ${postMissingSheets.join(', ')}`;
+      await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
       return { success: false, error };
     }
 
-    // Serialize and upload
+    // --- Validate cell formats on first data row ---
+    if (mwWritten > 0) {
+      const b3 = ws['B3'];
+      const f3 = ws['F3'];
+      const n3 = ws['N3'];
+      const formatErrors: string[] = [];
+      if (!b3 || b3.t !== 's' || b3.z !== '@') formatErrors.push(`B3: expected t='s' z='@', got t='${b3?.t}' z='${b3?.z}'`);
+      if (f3 && f3.v !== undefined) {
+        if (f3.t !== 'n' || f3.z !== '0') formatErrors.push(`F3: expected t='n' z='0', got t='${f3?.t}' z='${f3?.z}'`);
+      }
+      if (!n3 || n3.t !== 's' || n3.z !== '@') formatErrors.push(`N3: expected t='s' z='@', got t='${n3?.t}' z='${n3?.z}'`);
+      if (n3 && typeof n3.v === 'string' && !/,\d{2}$/.test(n3.v)) formatErrors.push(`N3: expected comma+2decimals, got '${n3.v}'`);
+      if (formatErrors.length > 0) {
+        const error = `mediaworld_cell_format_invalid: ${formatErrors.join('; ')}`;
+        await safeLogEvent(supabase, runId, 'ERROR', 'mediaworld_cell_format_invalid', { errors: formatErrors });
+        await updateStepResult(supabase, runId, 'export_mediaworld', { status: 'failed', error, metrics: {} });
+        return { success: false, error };
+      }
+    }
+
+    // --- Serialize and upload ---
     // deno-lint-ignore no-explicit-any
-    let xlsxBuffer: any = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: false, bookSST: false });
+    let xlsxBuffer: any = XLSX.write(wb, { bookType: 'xlsx', type: 'buffer', cellStyles: true });
     let mwOutputBytes: Uint8Array;
     if (xlsxBuffer instanceof Uint8Array) { mwOutputBytes = xlsxBuffer; }
     else if (xlsxBuffer instanceof ArrayBuffer) { mwOutputBytes = new Uint8Array(xlsxBuffer); }
@@ -3022,14 +3105,14 @@ async function stepExportMediaworld(supabase: SupabaseClient, runId: string, fee
       return { success: false, error };
     }
 
-    await safeLogEvent(supabase, runId, 'INFO', 'export_saved', { step: 'export_mediaworld', file: 'Export Mediaworld.xlsx', rows: mwWritten });
+    await safeLogEvent(supabase, runId, 'INFO', 'export_mediaworld_completed', { file: 'Export Mediaworld.xlsx', rows_written: mwWritten, rows_skipped: mwSkipped });
     await updateStepResult(supabase, runId, 'export_mediaworld', {
       status: 'success', duration_ms: Date.now() - startTime, rows: mwWritten, skipped: mwSkipped,
-      metrics: { mediaworld_export_rows: mwWritten, mediaworld_export_skipped: mwSkipped, mediaworld_format: 'xlsx' },
+      metrics: { mediaworld_export_rows: mwWritten, mediaworld_export_skipped: mwSkipped, mediaworld_format: 'xlsx_template' },
       validation_passed: true
     } as StepResultData);
 
-    console.log(`[sync:step:export_mediaworld] Completed: ${mwWritten} rows, ${mwSkipped} skipped (TSV-based, no cap)`);
+    console.log(`[sync:step:export_mediaworld] Completed: ${mwWritten} rows, ${mwSkipped} skipped (template-based, 3 sheets, no cap)`);
     return { success: true };
 
   } catch (e: unknown) {

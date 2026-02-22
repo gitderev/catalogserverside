@@ -645,22 +645,49 @@ const AltersideCatalogGenerator: React.FC = () => {
 
   // Save fee config to Supabase (using singleton pattern)
   const handleSaveFees = async () => {
-    // Validate fee inputs
-    if (feeConfig.feeDrev <= 0 || feeConfig.feeMkt <= 0) {
+    // NaN-safe validation: block NaN/Infinity before any DB call
+    if (!Number.isFinite(feeConfig.feeDrev) || feeConfig.feeDrev <= 0 ||
+        !Number.isFinite(feeConfig.feeMkt) || feeConfig.feeMkt <= 0) {
       toast({
         title: "Errore validazione",
-        description: "I moltiplicatori Fee DeRev e Fee Marketplace devono essere > 0",
+        description: "I moltiplicatori Fee DeRev e Fee Marketplace devono essere numeri validi > 0",
         variant: "destructive"
       });
       return;
     }
-    if (feeConfig.shippingCost < 0) {
+    if (!Number.isFinite(feeConfig.shippingCost) || feeConfig.shippingCost < 0) {
       toast({
         title: "Errore validazione",
-        description: "Il costo di spedizione deve essere >= 0",
+        description: "Il costo di spedizione deve essere un numero valido >= 0",
         variant: "destructive"
       });
       return;
+    }
+
+    // Validate per-export pricing (null ok, but non-null must be finite)
+    const perExportFields: [number | null, string][] = [
+      [extendedFeeConfig.eanFeeDrev, 'EAN Fee DeRev'],
+      [extendedFeeConfig.eanFeeMkt, 'EAN Fee Mkt'],
+      [extendedFeeConfig.eanShippingCost, 'EAN Shipping'],
+      [extendedFeeConfig.mediaworldFeeDrev, 'MW Fee DeRev'],
+      [extendedFeeConfig.mediaworldFeeMkt, 'MW Fee Mkt'],
+      [extendedFeeConfig.mediaworldShippingCost, 'MW Shipping'],
+      [extendedFeeConfig.epriceFeeDrev, 'eP Fee DeRev'],
+      [extendedFeeConfig.epriceFeeMkt, 'eP Fee Mkt'],
+      [extendedFeeConfig.epriceShippingCost, 'eP Shipping'],
+      [extendedFeeConfig.amazonFeeDrev, 'Amazon Fee DeRev'],
+      [extendedFeeConfig.amazonFeeMkt, 'Amazon Fee Mkt'],
+      [extendedFeeConfig.amazonShippingCost, 'Amazon Shipping'],
+    ];
+    for (const [val, name] of perExportFields) {
+      if (val !== null && !Number.isFinite(val)) {
+        toast({
+          title: "Errore validazione",
+          description: `${name} contiene un valore non valido (NaN). Correggi prima di salvare.`,
+          variant: "destructive"
+        });
+        return;
+      }
     }
 
     setIsSavingFees(true);
@@ -733,11 +760,36 @@ const AltersideCatalogGenerator: React.FC = () => {
         return;
       }
 
+      // Reload full row from DB and update local state
+      const { data: reloaded, error: reloadError } = await supabase
+        .from('fee_config')
+        .select('*')
+        .eq('id', FEE_CONFIG_SINGLETON_ID)
+        .single();
+
+      if (reloadError || !reloaded) {
+        console.error('Reload post-save failed:', reloadError);
+        toast({
+          title: "Salvataggio parziale",
+          description: "Salvato ma impossibile ricaricare. Ricarica la pagina.",
+          variant: "destructive"
+        });
+        return;
+      }
+
+      const reloadedRow = reloaded as any;
+      setFeeConfig({
+        feeDrev: Number(reloadedRow.fee_drev),
+        feeMkt: Number(reloadedRow.fee_mkt),
+        shippingCost: Number(reloadedRow.shipping_cost)
+      });
+      setExtendedFeeConfig(mapFeeConfigRowToState(reloadedRow));
+
       toast({
         title: "Regole salvate",
         description: "Le regole di calcolo (globali e per-export) sono state salvate."
       });
-      console.log('Fee config salvato su Supabase (singleton ID, verified)');
+      console.log('Fee config salvato su Supabase (singleton ID, verified + reloaded)');
     } catch (err) {
       console.error('Errore handleSaveFees:', err);
       toast({
@@ -752,6 +804,25 @@ const AltersideCatalogGenerator: React.FC = () => {
 
   // Save export configuration to Supabase (IT/EU stock + per-export pricing)
   const handleSaveExportConfig = async () => {
+    // NaN-safe validation on global fees (they're included in the upsert payload)
+    if (!Number.isFinite(feeConfig.feeDrev) || feeConfig.feeDrev <= 0 ||
+        !Number.isFinite(feeConfig.feeMkt) || feeConfig.feeMkt <= 0) {
+      toast({
+        title: "Errore validazione",
+        description: "Fee DeRev e Fee Marketplace devono essere numeri validi > 0. Salva prima le regole globali.",
+        variant: "destructive"
+      });
+      return;
+    }
+    if (!Number.isFinite(feeConfig.shippingCost) || feeConfig.shippingCost < 0) {
+      toast({
+        title: "Errore validazione",
+        description: "Costo spedizione deve essere un numero valido >= 0. Salva prima le regole globali.",
+        variant: "destructive"
+      });
+      return;
+    }
+
     // Validate IT/EU days inputs
     if (!Number.isInteger(extendedFeeConfig.epriceItPreparationDays) || extendedFeeConfig.epriceItPreparationDays < 1) {
       toast({
@@ -770,12 +841,12 @@ const AltersideCatalogGenerator: React.FC = () => {
       return;
     }
     
-    // Validate per-export fees (null is allowed, but if set must be > 0)
+    // Validate per-export fees (null is allowed, but if set must be finite and > 0)
     const validateFee = (val: number | null, name: string): boolean => {
-      if (val !== null && val <= 0) {
+      if (val !== null && (!Number.isFinite(val) || val <= 0)) {
         toast({
           title: "Errore validazione",
-          description: `${name} deve essere > 0`,
+          description: `${name} deve essere un numero valido > 0`,
           variant: "destructive"
         });
         return false;
@@ -784,10 +855,10 @@ const AltersideCatalogGenerator: React.FC = () => {
     };
     
     const validateShipping = (val: number | null, name: string): boolean => {
-      if (val !== null && val < 0) {
+      if (val !== null && (!Number.isFinite(val) || val < 0)) {
         toast({
           title: "Errore validazione",
-          description: `${name} deve essere >= 0`,
+          description: `${name} deve essere un numero valido >= 0`,
           variant: "destructive"
         });
         return false;
